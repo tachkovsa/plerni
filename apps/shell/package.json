@@ -1,8 +1,0 @@
-{
-  "name": "@plerni/shell",
-  "version": "0.0.0",
-  "private": true,
-  "description": "Plerni shell SPA — just an API client (React 19 + Vite, FSD pragmatic variant)",
-  "license": "Apache-2.0",
-  "type": "module"
-}

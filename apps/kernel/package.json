@@ -1,8 +1,0 @@
-{
-  "name": "@plerni/kernel",
-  "version": "0.0.0",
-  "private": true,
-  "description": "Plerni kernel — the only version-conservative component (spec §3)",
-  "license": "Apache-2.0",
-  "type": "module"
-}

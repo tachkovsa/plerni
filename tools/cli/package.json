@@ -1,7 +1,0 @@
-{
-  "name": "@plerni/cli",
-  "version": "0.0.0",
-  "description": "Plerni plugin CLI: scaffold / pack / sign / verify / install",
-  "license": "Apache-2.0",
-  "type": "module"
-}
