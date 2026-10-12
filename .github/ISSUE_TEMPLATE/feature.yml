@@ -1,0 +1,33 @@
+name: Feature proposal
+description: Propose a new capability — must be accepted before implementation
+title: "feature: "
+labels: ["kind/feature", "needs-triage"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / user outcome
+      description: What becomes possible that is impossible today?
+    validations:
+      required: true
+  - type: textarea
+    id: usecase
+    attributes:
+      label: Concrete use case
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Proposed scope (and non-goals)
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: input
+    id: spec
+    attributes:
+      label: Affected spec section (if any)
+      description: Link docs/specs/ section or ADR this would touch

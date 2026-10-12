@@ -1,0 +1,40 @@
+name: Task
+description: Scoped, executable work item — docs, gates, spikes, maintenance
+title: "task: "
+labels: ["kind/task"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Each acceptance criterion must name an observable result and how to verify it. Completion evidence identifies the revision, the commands or workflow exercised, observed results, and remaining limitations — "tests pass" alone is insufficient. Each active task has an accountable owner; delegated agents may execute it.
+  - type: input
+    id: ref
+    attributes:
+      label: Accepted spec/ADR and parent plan
+      description: Link the contract this task implements
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope and exclusions
+    validations:
+      required: true
+  - type: textarea
+    id: deps
+    attributes:
+      label: Dependencies
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Observable results, each with its verification method
+    validations:
+      required: true
+  - type: textarea
+    id: verification
+    attributes:
+      label: Verification plan
+      description: What will be run, what will be observed, where evidence is posted
+    validations:
+      required: true

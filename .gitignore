@@ -5,10 +5,12 @@ coverage/
 .DS_Store
 .env
 .env.*
-!.env.example
 temp/
 .turbo/
+# local agent tooling — contributors bring their own (AGENTS.md §0)
+.mcp.json
+.private-markers.local
 *.local.md
-# gate fixtures intentionally track a fake node_modules package
-!scripts/gates/fixtures/
-!scripts/gates/fixtures/**
+# gate fixtures intentionally track fake node_modules packages (nothing else under fixtures is exempt)
+!scripts/gates/fixtures/*/node_modules/
+!scripts/gates/fixtures/*/node_modules/**

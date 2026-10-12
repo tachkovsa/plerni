@@ -1,0 +1,12 @@
+# Label taxonomy — source of truth. Kept deliberately minimal; area labels are
+# added only when real routing needs emerge. Create/sync on GitHub when the
+# repository is public (e.g. `gh label create` per entry). If the repo moves to
+# an organization, native issue types can replace the three kind/* labels.
+- name: kind/bug          # something is broken
+- name: kind/feature      # new capability proposal (needs acceptance before implementation)
+- name: kind/task         # scoped work item: docs, gates, spikes, maintenance
+- name: needs-triage      # not yet reviewed by the maintainer
+- name: blocked           # cannot proceed; reason in a comment
+- name: risk/high         # touches authz, tenancy, crypto, plugin admission, migrations, CI/gates, credentials, or policy
+- name: good first issue
+- name: help wanted

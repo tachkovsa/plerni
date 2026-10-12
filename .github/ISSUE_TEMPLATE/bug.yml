@@ -1,0 +1,30 @@
+name: Bug report
+description: Something is broken — behavior, gates, docs, or tooling
+title: "bug: "
+labels: ["kind/bug", "needs-triage"]
+body:
+  - type: input
+    id: revision
+    attributes:
+      label: Revision / version
+      description: Commit SHA or release where the problem appears
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: Steps, commands, or a demonstrable documentation defect. Sanitize everything (AGENTS.md §0).
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected vs observed behavior
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: Logs and output, sanitized — no secrets, personal data, machine-local paths, or private tooling details
