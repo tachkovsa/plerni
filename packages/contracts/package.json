@@ -1,0 +1,7 @@
+{
+  "name": "@plerni/contracts",
+  "version": "0.0.0",
+  "description": "Plerni contracts: zod schemas, event registry, port types — the ONLY code shared between kernel and plugins",
+  "license": "Apache-2.0",
+  "type": "module"
+}

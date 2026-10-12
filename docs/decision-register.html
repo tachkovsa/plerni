@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Plerni — Реестр решений</title>
+<style>
+  :root {
+    --bg: #0f1115; --surface: #171a21; --surface2: #1e222b; --border: #2a2f3a;
+    --fg: #e6e9ef; --muted: #9aa3b2; --accent: #4f8cff; --success: #34c77b;
+    --warning: #e5a13d; --danger: #e5534b; --radius: 10px;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.55 -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
+  header { position: sticky; top: 0; z-index: 10; background: var(--bg); border-bottom: 1px solid var(--border); padding: 16px 24px; }
+  header h1 { margin: 0 0 4px; font-size: 20px; }
+  header .sub { color: var(--muted); font-size: 13px; }
+  .bar { display: flex; gap: 12px; align-items: center; margin-top: 12px; flex-wrap: wrap; }
+  .progress { flex: 1; min-width: 200px; height: 8px; background: var(--surface2); border-radius: 99px; overflow: hidden; }
+  .progress > div { height: 100%; background: var(--success); width: 0%; transition: width .2s; }
+  .counts { color: var(--muted); font-size: 13px; white-space: nowrap; }
+  button { font: inherit; cursor: pointer; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--surface2); color: var(--fg); padding: 7px 14px; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  main { max-width: 980px; margin: 0 auto; padding: 20px 24px 120px; }
+  .filters { display: flex; gap: 8px; margin: 4px 0 18px; flex-wrap: wrap; }
+  .filters button.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .area { margin: 26px 0 10px; font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px 18px; margin-bottom: 12px; }
+  .card.approved { border-left: 3px solid var(--success); }
+  .card.discuss { border-left: 3px solid var(--warning); }
+  .top { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+  .id { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+  .title { font-weight: 650; font-size: 15px; }
+  .choice { margin-left: auto; font-size: 13px; color: var(--accent); font-weight: 600; }
+  .row { margin-top: 8px; font-size: 13.5px; }
+  .lbl { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .06em; margin-right: 6px; }
+  .flip { color: var(--warning); }
+  .ev { color: var(--muted); }
+  .actions { display: flex; gap: 8px; margin-top: 12px; align-items: flex-start; }
+  .actions .vote { display: flex; gap: 6px; }
+  .vote button.on-a { background: var(--success); border-color: var(--success); color: #06130c; font-weight: 600; }
+  .vote button.on-d { background: var(--warning); border-color: var(--warning); color: #1a1206; font-weight: 600; }
+  textarea { flex: 1; background: var(--surface2); border: 1px solid var(--border); border-radius: 8px;
+    color: var(--fg); font: inherit; font-size: 13px; padding: 8px 10px; min-height: 36px; resize: vertical; }
+  textarea:focus { outline: none; border-color: var(--accent); }
+  footer { position: fixed; bottom: 0; left: 0; right: 0; background: var(--surface); border-top: 1px solid var(--border);
+    padding: 12px 24px; display: flex; gap: 12px; align-items: center; }
+  footer .hint { color: var(--muted); font-size: 12.5px; flex: 1; }
+  .toast { position: fixed; bottom: 70px; right: 24px; background: var(--success); color: #06130c;
+    padding: 10px 16px; border-radius: 8px; font-weight: 600; opacity: 0; transition: opacity .25s; pointer-events: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Plerni — Реестр решений</h1>
+  <div class="sub">Просмотри каждое решение. Одобри или отметь для обсуждения (можно с комментарием), затем экспортируй результат и пришли файл обратно. Состояние сохраняется локально по мере работы.</div>
+  <div class="bar">
+    <div class="progress"><div id="bar"></div></div>
+    <span class="counts" id="counts"></span>
+  </div>
+</header>
+<main>
+  <div class="filters" id="filters">
+    <button data-f="all" class="active">Все</button>
+    <button data-f="pending">Ожидают</button>
+    <button data-f="approved">Одобрено</button>
+    <button data-f="discuss">Обсудить</button>
+  </div>
+  <div id="list"></div>
+</main>
+<footer>
+  <span class="hint">Экспорт формирует Markdown-файл с голосами и комментариями. Положи его в <code>temp/meridian/</code> или вставь текстом в чат.</span>
+  <button id="copy">Скопировать</button>
+  <button id="export" class="primary">Экспорт ревью (.md)</button>
+</footer>
+<div class="toast" id="toast"></div>
+<script>
+const DECISIONS = [
+ {id:"D01", area:"Продукт", title:"Ядро + равноправные плагины", choice:"Базовая архитектура",
+  why:"Стабильное ядро (аутентификация, тенантность, очередь, администрирование); каждая возможность, включая штатные, — плагин на едином публичном SDK. Идентичный контракт И идентичный пайплайн установки для всех плагинов (гейты import parity + admission parity).",
+  evidence:"Бэкдоры для first-party в предшественнике дали второсортный DX для сторонних разработчиков; GLM: import-parity ≠ admission-parity.",
+  flip:"Инвариант равенства не пересматривается никогда; уровни доверия могут различаться изоляцией, но не доступом к контракту."},
+ {id:"D02", area:"Продукт", title:"Позиционирование: AI-first open-source LXP", choice:"LXP, не полный HCM",
+  why:"Навыки/компетенции, обучение, цели развития, карьерные процессы, менторство. Позиция «copilot в каждом процессе» (AI предлагает — человек подтверждает). Зарплата/рекрутинг — вне рамок.",
+  evidence:"Решение основателя; карьерно-компетентностная цепочка была главной ценностью предшественника.",
+  flip:"Не планируется."},
+ {id:"D03", area:"Продукт", title:"Лицензия: Apache-2.0 + DCO", choice:"Чистый OSS, монетизация позже",
+  why:"Максимально приемлемо для юристов enterprise-заказчиков, максимум адопшна; DCO + трейлер AI-assisted для честного происхождения кода. Никакой machinery энтитлмента в v1.",
+  evidence:"Решение основателя; Sol D11 (патентный грант, без товарного знака); GLM (замечание про честность DCO).",
+  flip:"Если SaaS-стрип-майнинг станет экзистенциальной угрозой — переоценить AGPL/BSL для новых компонентов, никогда ретроактивно."},
+ {id:"D04", area:"Продукт", title:"Никакого маркетплейса до спроса + ранняя лицензионная политика плагинов", choice:"Phase 5 по требованию; лицензии решены сейчас",
+  why:"Каталог/модерация/инструменты издателей ждут реального спроса. НО: SDK и понятный формат установки — с P2; манифест требует SPDX-поле license; сторонние авторы сохраняют свои лицензии (включая коммерческие) — платформа никогда не претендует на чужой код и не редистрибьютирует проприетарные плагины без разрешения. P5-каталог МОЖЕТ поддерживать платные плагины с revenue share как путь монетизации.",
+  evidence:"Комментарий основателя при ревью; предшественник построил маркетплейс до спроса и удалил его (−11,7 тыс. строк; ADR-0218/0219).",
+  flip:"Триггер: внешние авторы успешно распространяют плагины вручную."},
+ {id:"D05", area:"Данные и тенантность", title:"Мультитенантность: одна БД + Postgres RLS", choice:"Общие таблицы, строгий RLS",
+  why:"tenant_id NOT NULL + FORCE RLS + ровно одна каноническая политика на таблицу, проверяется CI на живой БД; поверх — app-layer tenant guard (урок про «тёплые» пулы со сброшенным SET LOCAL). v1 — только shared-DB.",
+  evidence:"Предшественник: RLS — «настоящий пол» (реестр пентеста); дрейф FORCE-RLS (ADR-0252); баг тёплого пула в docs/auth.md; #2962/2966.",
+  flip:"Выделенные БД для крупных тенантов — только через будущий placement-аннекс (роутинг, per-DB журналы/релеи)."},
+ {id:"D06", area:"Данные и тенантность", title:"ORM: Kysely над node-postgres — оба ревьюера сошлись независимо", choice:"РЕШЕНО: Kysely (спайк-гейт остаётся)",
+  why:"Sol и GLM независимо выбрали Kysely: миграции-SQL — единственный источник истины (наш журнал), TS-интерфейс Database ПРОИЗВОДЕН от неё (kysely-codegen в CI, вывод закоммичен — дрейф = ошибка компиляции, fail-closed для агентного кода); ноль runtime-зависимостей, нет шага generate (air-gap чист по построению); прямой контроль Pool → SET LOCAL pinning прозрачен и грепается в одной точке; API настолько мал, что один инженер может его завендорить в экстренном случае. Drizzle — документированный запасной (та же без-codegen природа; но schema.ts — второе представление, которое надо синхронизировать). Prisma 6 отклонён ДЛЯ ЭТОГО ПРОЕКТА: источник OOM — сгенерированные ТИПЫ (47 МБ .d.ts / 7,3 ГБ RSS), а не движок; codegen-дрейф по ~140 ворктри — твоя уже оплаченная боль (его RLS-pinning проверен в проде — уважаем и фиксируем).",
+  evidence:"Два независимых консалта (temp/sol-6.1-founder-review.md, temp/glm-5.3-founder-review.md); опыт основателя с Prisma; ADR-0253/0254.",
+  flip:"P0-спайк: pinning в transaction().execute + set_config локально-транзакционный + PgBouncer transaction mode + безымянные стейтменты + бенчмарк typecheck-RSS дженериков. Провал на уровне драйвера предсказывает и провал Prisma (это свойства node-postgres) → тогда пересматриваем субстрат тенантности, а не ORM. Провал по эргономике типов → фолбэк на Drizzle (та же без-codegen природа), никогда на отклонённый за compile-стоимость инструмент (когерентность фолбэка — Opus M1)."},
+ {id:"D07", area:"Данные и тенантность", title:"Брокерская персистентность: статический SQL + WorkUnit", choice:"Без tx-объектов и runtime-SQL",
+  why:"Плагины объявляют SQL при сборке пакета; парсинг — на ПРИЁМКЕ ядром (не только в CLI автора), настоящим SQL-парсером по ALLOWLIST'у типов узлов/функций (denylist даёт ложную уверенность — Opus; парсер классифицирует стейтменты, data-modifying CTE внутри «чтения» отклоняется); динамика UI — через ограниченную грамматику (whitelisted sort, объявленные предикаты, keyset-пагинация); брокер инжектирует authz-предикаты в AST до выполнения. Все записи идут через типизированный WorkUnit (с precondition'ами expect и lock-чтениями внутри транзакции), коммитящийся одной транзакцией на стороне брокера (запись + аудит + outbox атомарно).",
+  evidence:"Блокеры фальсификации Sol 1–2 (crash-gap атомарности; подделка GUC через процедуры); критика GLM №1; форма ADR-0148 предшественника.",
+  flip:"Никогда — это фундамент сдерживания."},
+ {id:"D08", area:"Данные и тенантность", title:"Миграционная идентичность + boundary checker", choice:"Per-plugin схемы, только таблицы",
+  why:"Схемы плагинов — только таблицы/индексы/констрейнты (без функций/триггеров/DO); миграционная роль имеет CREATE только в своей схеме; чекер проверяет точный текст канонической RLS-политики (атака OR-композицией permissive-политик), составные FK с tenant_id, гранты только на DML; подписанный approval-артефакт на каждую миграцию.",
+  evidence:"Блокер Sol №2; критика GLM №2 + противоречие approval-гейта; GRANT ALL escape предшественника (#2966), дрейф FORCE-RLS (ADR-0252).",
+  flip:"Никогда."},
+ {id:"D09", area:"Платформа", title:"Рантайм: Node LTS + TypeScript + Hono за адаптером transport/", choice:"Hono, изолированный; Fastify — документированная замена",
+  why:"Модели разошлись: Sol — Fastify ради энтерпрайз-узнаваемости; GLM — Hono (гравитация фреймворков: NestJS > Express > Fastify > Hono; Hono — роутер + Web-стандарт Request/Response, бороться не с чем). Решение-адьюдикация: Hono остаётся, но lint запрещает импорты `hono` вне `transport/` — фреймворк становится заменяемым адаптером из ~N строк. Доверие энтерпрайза отвечается АРТЕФАКТАМИ, не брендом: SBOM с одной прямой транспортной зависимостью и минимальным деревом транзитивных, генерируемый в CI OpenAPI 3.1 для сканеров, стандартный OIDC, отсутствие фреймворковой session-магии. Плагины никогда не видят сырые контексты — ядро владеет диспетчеризацией.",
+  evidence:"Спор Sol/GLM зафиксирован в temp/*-founder-review.md; ловушки Hono-эры ADR-0194 (cookie ALS, порядок маршрутов, env-валидация, process-local SSE) — с исправлениями.",
+  flip:"Если procurement требует известный бренд — замена ограничена transport/ (с учётом предупреждения Fastify: компиляция схем исполняет код — хост никогда не компилирует схемы плагинов)."},
+ {id:"D10", area:"Платформа", title:"Очередь и события: единый outbox + pg-boss, мульти-реплика по контракту", choice:"Одна durable-система; масштаб — по измерениям",
+  why:"События и задачи — строки outbox в транзакции записи (WorkUnit). Stateless конкурирующие релеи на каждой реплике, БЕЗ лидера; claiming через короткие FOR UPDATE SKIP LOCKED транзакции; NOTIFY — zero-payload подсказка, polling (~1с) — сеть корректности. События (переписаны после Opus): единый append-only лог с глобальным bigserial seq (пропуски от роллбэков — просто отсутствующие строки, пропускаются lagging-горизонтом 10с — никаких тombstone'ов); ОДИН глобальный курсор на подписку (не per-aggregate — тот дизайн дважды ломался: фильтрация по типам и ретенция); per-aggregate порядок сохраняется дисциплиной writer-side блокировок; доставка = dedup-маркер + эффекты + курсор + fencing в одной транзакции; retention по min живого курсора (припаркованные подписки — по квоте §4.5); обнаружение работы — простым индексным сканом, без S×A анти-join. Джобы: pg-boss (expiredIn ≥ 3×p99 с консервативным дефолтом на холодный старт), хендофф outbox→job одной транзакцией (exactly-once ВНУТРИ PG; снаружи — at-least-once + Idempotency-Key, и SDK говорит об этом письменно). Масштаб: измеряемая ёмкость C (p99 lag ≤1с и т.д.), триггер миграции >50%C → Debezium CDC → Kafka; OLTP-предел → cell-sharding. §16 тест 17 — батарея дублей/потерь на двух репликах.",
+  evidence:"Opus B2 + слепой K3 B1 + Sol Q4 (конвергенция трёх семейств); операционные баги outbox предшественника GH-3443/3402/3404.",
+  flip:"Прогнозируемый пик > 50% измеренной C → миграция на Kafka; никогда раньше измерений."},
+ {id:"D11", area:"Платформа", title:"Изоляция плагинов: ступени доверия, child-процессы, runner без egress", choice:"Топология вместо доверия",
+  why:"Операторски-одобренные плагины — супервизируемые child-процессы (никогда «на тенанта») в internal-only сети: прямого egress нет, весь трафик и телеметрия идут через брокера с тенант-контекстом. worker_threads отклонены как граница. Untrusted-уровень — контейнерная изоляция или remote-only, отложен.",
+  evidence:"Sol D1 danger (утечка возможностей Node); находка GLM про egress; исследование VS Code/Grafana/Backstage.",
+  flip:"Спрос на недоверенный сторонний код → строим контейнерный уровень (P5)."},
+ {id:"D12", area:"Платформа", title:"UI плагинов: только декларативные слоты до P5", choice:"Без JS плагинов в хосте, точка",
+  why:"Настройки/формы/меню/виджеты/листы объявляются данными (ограниченная грамматика над компонентами кита) и рендерятся шеллом — НОЛЬ plugin JavaScript в хосте; принципы интерфейса (8–12) форсируются конструкцией. Module Federation ОТЛОЖЕН в P5 (по спросу): Opus доказал, что admission-линт по минифицированным бандлам нереализуем (порядок кнопок, сигнальная избыточность, токены после CSS-in-JS компиляции статически не доказуемы) — линт снят, а не поставлен как резиновый штамп. Когда спрос появится: пины дайджестов, иммутабельный хостинг, shared-синглтоны React/кита с политикой мажорных апгрейдов, ErrorBoundary + CSS-изоляция + disable-хэтч от ядра.",
+  evidence:"ADR-0193 предшественника (runtime JS плагинов отклонён по имени); Opus H7 (линт нереализуем); Sol D9 (MF — доверие приёмки, не изоляция).",
+  flip:"Триггер P5: ≥3 внешних автора с реальными установками через ручную дистрибуцию."},
+ {id:"D26", area:"Платформа", title:"Единый реестр контрактов → REST + OpenAPI + MCP + декларативный UI", choice:"MCP первоклассно, синхронно по построению",
+  why:"Интерфейсы смещаются в агентные поверхности (OpenWebUI + MCP). MCP — КУРИРУЕМЫЙ инвентарь инструментов (не «каждый REST-эндпоинт»: admin/upload/streaming остаются REST-only — Opus M4), генерируемый из того же реестра контрактов: схемы и права идентичны по построению. Честная синхронность: read-паритет с P1, write-инструменты — с церемонией proposals в P3. MCP-аутентификация: service principals + OAuth auth-code/PKCE-делегация (DCR отложен в P4 вместе с SAML/SCIM-волной); никакого привилегированного agent API; passthrough токенов запрещён; деструктивные инструменты проходят proposal/impact-preview + proof-of-human (browser-gated).",
+  evidence:"Стиринг основателя 2026-10-12; предшественник реально запускал MCP-сервер (ADR-0162/0164, 49 файлов, MCP OAuth с DCR и refresh-семействами); Sol: MCP через тот же слой авторизации.",
+  flip:"Никогда — суть именно в синхронности через генерацию."},
+ {id:"D13", area:"Фронтенд", title:"UI-кит: Ant Design + lucide-react", choice:"Готовый кит, без своих компонентов",
+  why:"Инвариант основателя против AI-слопа. Плотные enterprise-компоненты, локали ru/kk/uz, CSS-переменные в v6, мейнстрим в СНГ и в обучающих данных агентов. Открытость проверена: лицензия MIT; официальные Figma-ресурсы (импортируются в Pixso); работает на энтерпрайз-масштабе (экосистема Ant Financial, тысячи B2B-продуктов) — у предшественника проблемой была не масштабируемость, а пиксельная бренд-фиделити кита (BDS, ADR-0185).",
+  evidence:"UI-консультация Sol (antd, Mantine — запасной, лицензирование MUI X); комментарий основателя про Pixso; запись о BDS сохранена честно.",
+  flip:"Провал по procurement-критичному сценарию a11y на запиненной версии или клиент с требованием бренд-фиделити уровня BDS → замена адаптера, не переписывание продукта."},
+ {id:"D14", area:"Фронтенд", title:"Кит-агностичный токен-компилятор + темизация из админки", choice:"Своя схема токенов, кит за адаптером",
+  why:"Слои foundation→semantic→component; тенант-оверрайды типизированы со schemaVersion+revision; ограниченные диапазоны + валидация контраста; готовый CSS отдаётся до монтирования React; live preview той же компиляцией. Плагины используют только --meridian-* переменные.",
+  evidence:"UI-консультация Sol; требование white-label от основателя; урок runtime-white-label предшественника (CLAUDE.md).",
+  flip:"Никогда — это страховочный слой."},
+ {id:"D15", area:"Фронтенд", title:"Прагматичный FSD + EN-master i18n с первоклассными локалями СНГ", choice:"Глобально-готовый, СНГ-полный",
+  why:"FSD с ratchet-базлайном + дополнительным слоем entities + задокументированными npm-алиасами (прагматичный вариант предшественника). **По умолчанию пара EN + RU с первого дня** (директива основателя); KK/UZ следующие (у предшественника уже было ~65% покрытия KK/UZ); гейт локаль-парити в CI; ноль захардкоженных строк; кириллически-полная типографика в токен-фундаменте.",
+  evidence:"Burn-down FSD предшественника (72→0) + ADR-0217; долг хардкода строк (122+ строк, 4 зачистки); урок I-14 про дрейф доков.",
+  flip:"Ничего структурного."},
+ {id:"D25", area:"Рынок", title:"Адаптации «СНГ прежде всего, глобально готовый»", choice:"Встроено с первого дня",
+  why:"Локальные AI-провайдеры (GigaChat — учтён переезд на cloud.ru с OpenAI-совместимым API, YandexGPT, Ollama/локальные модели) как первоклассные адаптеры-плагины в P3 — многие предприятия СНГ не могут использовать OpenAI/Anthropic (санкции, резидентность данных); Keycloak-first тестирование OIDC (де-факто IdP предприятий СНГ); air-gap как первоклассный профиль развёртывания (default-deny egress, офлайн-бандлы, без облачного KMS); задокументированная позиция по резидентности данных (ответы в духе 152-ФЗ); кириллическая типографика проверена в fixture-галерее. **UX провайдеров исправлен:** пресет + ключ один раз → список моделей и их модальностей (текст/картинки/звук/видео) подтягивается автоматически — не «каждый раз новая модель с ключами», как в старом продукте. Глобальный рынок открыт: EN-master репозиторий, Apache-2.0, никаких региональных ограничений.",
+  evidence:"Рыночный опыт основателя; регрессия CA-сертификата GigaChat у предшественника (A7-5) и харденинг Keycloak; находка GLM про on-prem AI.",
+  flip:"Никогда — это аддитивные адаптеры и профили, не форки."},
+ {id:"D16", area:"Аутентификация", title:"Идентичность: локальный IdP + OIDC + протокол мгновенного отключения", choice:"PG — единственный авторитет отзыва",
+  why:"Твой баг рассинхрона (наша неделя против 15 минут SSO) решён протоколом: худший случай отзыва для обычных запросов = 5-минутный identity-freshness lease; админские и чувствительные поверхности валидируют сессию per-request (мгновенно); strict_disable-политика — для регулируемых. Локальное отключение — одна атомарная транзакция PG (disabled + epoch bump + revoke + audit + NOTIFY) и НЕ зависит от IdP; успешный SSO никогда не снимает локальный disable. Backchannel logout — быстрый путь; ревалидация на refresh через коннектор с контрактом «disabled ⇒ revalidation падает»; per-request introspection отклонён (ломает автономность air-gap); лестница деградации при падении IdP (degraded_since + аудит, >24ч privileged → logout, >72ч → локальный re-auth; для SSO-only тенантов — приостановка политики через break-glass с аудитом, никогда молчаливый откат к запрещённому локальному логину — находка слепой панели); позднее событие увольнения после повторного найма не отключает аккаунт (инкарнации личности); break-glass админы на WebAuthn; kernel-команда identity.deprovision в v1 (SCIM-плагин позже, идемпотентно по event_id — позднее событие безопасно). Audit-поле decision_basis (local | idp-confirmed | degraded-grace) отвечает «почему он был активен на день 3».",
+  evidence:"Консолидированный протокол Sol+GLM (temp/*-founder-review.md); полевой баг основателя.",
+  flip:"Лайфтаймы — tenant-overridable политика; сам протокол не пересматривается."},
+ {id:"D27", area:"Аутентификация", title:"Расширяемая плагинами RBAC", choice:"Generic resource authz + неймспейсы плагинов",
+  why:"Авторизация ядра полностью generic (resource-type + id + action + grants); плагины объявляют в манифесте неймспейсы разрешений, типы ресурсов, действия и дефолтные привязки ролей; роли компонуются на тенанте. **Делегирование — первоклассный тип гранта:** пользователь может передать подмножество своих прав другому на срок (отпуск), с истечением, авто-отзывом и полным аудитом. Идентичная оценка для человеческих сессий, service principals и MCP/AI-акторов (агент через MCP имеет ровно права своего актора или делегированного подмножества — никогда больше). Проверка — kernel-side в реестре маршрутов до IPC и повторно в брокере на уровне объектов.",
+  evidence:"Стиринг основателя (включая кейс отпуска); уроки RBAC + feature-gate предшественника; находка GLM про kernel-таксономию (service identities).",
+  flip:"Никогда."},
+ {id:"D32", area:"Аутентификация", title:"Directory-сервис + relationship-гранты + классификация действий", choice:"ReBAC-lite в ядре; proof-of-human для чувствительного",
+  why:"Opus B3: RBAC «resource-type+id+action» не выражает флагманский сценарий («менеджер видит прогресс сотрудника» — это РЕЛЯЦИЯ, не роль). Ядро владеет доменно-нейтральным Directory (пользователи, группы, типизированные рёбра вида reports_to — типы рёбер это данные, не схема, так что гейт чистоты ядра не нарушается); гранты могут быть реляционно-квалифицированы («держатель reports_to → ресурсы типа learning.assignment субъекта, read») — ReBAC-lite без переподдержки грантов при реорганизациях; плагины читают через Directory-порт. Плюс классификация действий в манифесте (routine/sensitive/destructive, линт против route-контрактов): рутинные записи делегированным агентам разрешены с аудитом; чувствительные требуют durable proposal + неделегируемого proof-of-human (WebAuthn/MFA ≤5 мин, привязка к хэшу действия; браузерный гейт, вырезан из API-parity).",
+  evidence:"Opus B3/B5; твой пример ролевой цепочки (менеджер↔сотрудник); потребность в отпускном делегировании (D27).",
+  flip:"Никогда."},
+ {id:"D17", area:"AI", title:"AI-гейтвей: контроль в ядре, интеллект в плагинах", choice:"Тонкий gateway в ядре",
+  why:"Ядро: реестр возможностей провайдеров, политика PII-egress (default-deny офлайн), атомарные резервирования бюджета с TTL-свипером, ограниченное исполнение, durable proposals (consume-once, атомарно с execution intent), версионируемые записи. Плагины: адаптеры провайдеров, ретривал, копилоты.",
+  evidence:"Sol D8; находка GLM про утечку резервирований; форма AI-слоя предшественника (сильнейшая подсистема).",
+  flip:"Никогда."},
+ {id:"D18", area:"CI и безопасность", title:"Блокирующий набор гейтов с первого дня", choice:"Всё блокирует",
+  why:"gitleaks, CodeQL+Semgrep, osv-scanner+Renovate-с-мажорами, Trivy, SBOM-дифф, лицензионный аудит, coverage ratchet, RLS-сьют с vacuity-гардой, миграционный чекер+grant-линтер+подписанные аппрувалы, чистота ядра, breaking-change контрактов, black-box установка, admission parity, негативные фикстуры здоровья гейтов. Исключения — только с истечением срока.",
+  evidence:"Предшественник: 53 прод-уязвимости без enforcement, SAST был, SCA — нет, один гейт был тихо fail-open.",
+  flip:"Пороги severity могут настраиваться; гейты никогда не становятся advisory."},
+ {id:"D28", area:"CI и безопасность", title:"Анти-слоп гейты + AI-ревью в пайплайне", choice:"Комплаенс в коде, не в промптах",
+  why:"Всё механизируемое механизируется с P0: ratchet размера файлов (god-файлы), детект дублей тестов (у предшественника — 98%-совпадения), линт плотности ассертов (никаких toBeDefined-сьютов), бюджет skip/todo, knip (мёртвый код), линт захардкоженных строк, связка поведение↔доки, линт next_step в error-конверте, линт классификации действий (routine/sensitive/destructive). Плюс AI-ревью каждого диффа через настраиваемый OpenAI-совместимый эндпоинт (DeepSeek/GigaChat/self-hosted — просто API-ключ в секретах CI): ревьюер пинится к точной ревизии, находки без file:line и сценария отбраковываются, секьюрити-диффы ревьюит другая семья моделей. Статус — СТРОГО advisory: machinery промоушена в blocking по FP-rate снята как pre-demand оверхед (Opus); мейнтейнеры размечают находки оппортунистически для будущего пересмотра по доказательствам.",
+  evidence:"Директива основателя; данные предшественника: конвенции в промптах гнили (хардкод пережил 4 зачистки), fail-open гейт, дубли тестов.",
+  flip:"AI-ревью никогда не заменяет механические гейты; промоушен в blocking — только по метрикам."},
+ {id:"D29", area:"CI и безопасность", title:"Ролевые цепочечные e2e-проходы (истина на уровне процесса)", choice:"Фича ≠ готова без цепочки ролей",
+  why:"Каждая фича поставляется с multi-ролевым e2e-проходом по живому UI: каждый шаг проверяет, что последствия предыдущего ВИДНЫ на поверхности следующей роли. Канон: автор создаёт и публикует → сотрудник находит и назначает → автор видит назначение в статистике → менеджер видит прогресс сотрудника → админ видит и подтверждает на дашборде. Персона-фикстуры (author/employee/manager/admin минимум); инвентарь процессов (§10) = инвентарь цепочек — фича без цепочки считается необъявленной работой; тот же чейн гоняется headless через API/MCP-гейты. Так ловятся сломанные ПРОЦЕССЫ, а не только сломанный код.",
+  evidence:"Полевой урок основателя (так находились ошибочные процессы); правило предшественника «done = живой кликабельный прогон + e2e-спек, а не зелёный CI».",
+  flip:"Никогда — это исполняемая форма принципа 6."},
+ {id:"D19", area:"Процесс", title:"Агент-нативная разработка с конфигурируемыми гейтами", choice:"Агенты строят и ревьюят; люди — идеи и критика",
+  why:"Машинно-форсированные границы, типизированные контракты, маленькие файлы, ADR. Аппрувалы — политика, не зашитые люди: по умолчанию cross-family агент-ревью с подписанным recorded-артефактом для миграций и изменений гейтов; человек-мейнтейнер владеет политикой, правилами эскалации и периодическим аудитом. Люди держат идеи/фичи/критику (по директиве основателя), агенты несут исполнение и первичное ревью — аудит сохраняет подотчётность. Ревьюеры пинят ревизию git; дешёвые модели вне конвенционально-тяжёлых задач; автоматическая гигиена репо.",
+  evidence:"Директива основателя при ревью; режимы отказа агент-армии предшественника (god-файлы, ревью не той ревизии, 22× стоимость ревью, 3 ГБ мусора, 98%-дубли тестов).",
+  flip:"Никогда."},
+ {id:"D30", area:"Процесс", title:"Никто не trusted по умолчанию — в обе стороны", choice:"Генерация ≠ верификация",
+  why:"Агенты не соглашаются blindly с людьми: утверждение человека — гипотеза для проверки, как и вывод модели. Одна модель никогда не генерирует И не верифицирует одновременно — верификация уходит другому семейству с запиненной ревизией. Если человек не знает — спрашиваем другую модель, а не угадываем вместе. Согласие — не доказательство; доказательство — проверка. Вся эта сессия построена так: фальсификационные панели, red-team по истории репо, cross-family ревью.",
+  evidence:"Директива основателя; урок предшественника: «confidence одного канала — не сигнал» (кросс-семейный ревьюер однажды проверил не ту ревизию).",
+  flip:"Никогда."},
+ {id:"D31", area:"Процесс", title:"Стоящие правила агентов: «сделано» проверяется, баги имеют владельца", choice:"Верификация фактов + ноль фантомных багов",
+  why:"Отчёт о завершении НАЧИНАЕТ проверку, а не заканчивает её: запусти, пройди изменённый путь, наблюдай результат — claimed-unverified артефакты считаются шумом (гейты и негативные фикстуры там, где механизируемо; агент-верификатор там, где нет). И: заметил баг — чини немедленно или заводи трекнутую задачу на deep-dive; «это не моя зона, код писал другой агент» запрещено — именно так размножаются фантомные баги (slop-инвентарь предшественника — задокументированный контрпример).",
+  evidence:"Директива основателя; уроки предшественника (fail-open гейт, выжившие после 4 зачисток хардкод-строки); правило уже исполнялось в этой сессии (каждая правка страницы решений проверялась в браузере).",
+  flip:"Никогда."},
+ {id:"D20", area:"Поставка", title:"Один артефакт: апплаенс + SaaS; контракт само-апгрейда", choice:"Compose + один образ",
+  why:"Один образ для обоих профилей; plugin-runner во внутренней сети; artifact manifest (ядро+плагины+журнал) как идентичность исполняемого состояния; координированный бэкап PG+S3+секреты; expand-контракт миграции; preflight-гейт; backup-before-migrate. **Удобство установки — поставляемая фича:** docker-compose И Helm chart с P4; каждая инструкция по установке/апгрейду проверяется дриллом на чистой ВМ (агент по докам «как написано» обязан дойти до успеха — в прошлый раз инструкции были неполными; теперь это тест).",
+  evidence:"Решение основателя про один артефакт + комментарий про удобство/helm; находки Sol 3+7 (протокол активации, восстанавливаемость).",
+  flip:"Никогда."},
+ {id:"D21", area:"Поставка", title:"Свежесть зависимостей: новейшая ВАЛИДИРОВАННАЯ stable", choice:"Ограниченная свежесть",
+  why:"Секьюрити-фиксы — триаж <24ч; патчи/миноры — выдержка ~7 дней, еженедельные батчи, актуальность ≤30 дней; мажоры — отдельные PR + решение за 30–60 дней, без автомёрджа; stateful-сервисы — новейший минор поддерживаемого мажора; исключения именованные/с владельцем/с истечением; ~10–15% ёмкости на поддержку; Docker-базы по дайджесту с авто-обновлением.",
+  evidence:"Боль деплоев основателя; таблица границ свежести Sol.",
+  flip:"Никогда."},
+ {id:"D22", area:"Поставка", title:"Valkey (не Redis-бренд)", choice:"BSD-совместимый дефолт",
+  why:"Redis Ltd теперь AGPLv3/RSAL/SSPL — враждебно для чистого OSS-апплаенса. Valkey (Linux Foundation, BSD) — drop-in замена; настоящий Redis остаётся BYO-опцией. Да, вариант от Microsoft существует — Garnet (MIT, Redis-протокол): зафиксирован как приемлемая альтернатива, но Valkey шире по экосистеме и сообществу.",
+  evidence:"Лицензионная находка Sol D11; вопрос основателя про Microsoft-вариант.",
+  flip:"Если Valkey несовместимо разойдётся (маловероятно; Linux Foundation) — пересмотреть."},
+ {id:"D23", area:"Дорожная карта", title:"Фазовый план P0–P5 с определёнными критериями выхода", choice:"Гейтинг по exit-критериям",
+  why:"P0 фундамент+негативные фикстуры+DB-спайк+аннекс ёмкости; P1 ядро (именованные API-only и MCP процессы); P2 плагин-платформа (доказательства внешним fixture-плагином, декларативные слоты); P3 AI + Competencies/Learning + MF-ремоуты; P4 enterprise-харденинг (протокол трения внешнего автора); P5 экосистема по спросу.",
+  evidence:"Изменения секвенсинга Sol; де-вакуумизация критериев GLM.",
+  flip:"Риск реализуемости микрокомандой (§17.9): резать уровни доверия и MF первыми, никогда — контракты/тенантность/CI."},
+ {id:"D24", area:"Сокращения объёма", title:"Реестр YAGNI", choice:"Вырезано из v1",
+  why:"Ключи энтитлмента, OpenSearch в ядре, общая eval-платформа, per-tenant SaaS-machinery, iframe-протокол недоверенного UI, маркетплейс-machinery, dedicated-DB размещение, SCORM/xAPI/LTI (позже — плагинами).",
+  evidence:"YAGNI-проход GLM + таблица недостающих решений Sol.",
+  flip:"Каждое возвращается только по своему именованному триггеру."}
+];
+
+const LS_KEY = "plerni-decisions-v1";
+let state = JSON.parse(localStorage.getItem(LS_KEY) || "{}");
+let filter = "all";
+
+function save(){ localStorage.setItem(LS_KEY, JSON.stringify(state)); }
+function toast(msg){ const t=document.getElementById("toast"); t.textContent=msg; t.style.opacity=1; setTimeout(()=>t.style.opacity=0,1800); }
+
+function render(){
+  const list = document.getElementById("list");
+  list.innerHTML = "";
+  let area = null, shown=0, approved=0, discuss=0;
+  DECISIONS.forEach(d=>{
+    const s = state[d.id] || {};
+    if (s.vote === "approved") approved++;
+    if (s.vote === "discuss") discuss++;
+    if (filter!=="all" && (s.vote||"pending")!==filter) return;
+    if (d.area!==area){ area=d.area; const h=document.createElement("div"); h.className="area"; h.textContent=area; list.appendChild(h); }
+    shown++;
+    const card = document.createElement("div");
+    card.className = "card" + (s.vote==="approved"?" approved":s.vote==="discuss"?" discuss":"");
+    card.innerHTML = `
+      <div class="top"><span class="id">${d.id}</span><span class="title">${d.title}</span><span class="choice">${d.choice}</span></div>
+      <div class="row"><span class="lbl">Почему</span>${d.why}</div>
+      <div class="row ev"><span class="lbl">Доказательства</span>${d.evidence}</div>
+      <div class="row flip"><span class="lbl">Условие пересмотра</span>${d.flip}</div>
+      <div class="actions">
+        <div class="vote">
+          <button data-v="approved" class="${s.vote==="approved"?"on-a":""}">✓ Одобрить</button>
+          <button data-v="discuss" class="${s.vote==="discuss"?"on-d":""}">? Обсудить</button>
+        </div>
+        <textarea placeholder="Комментарий (необязательно)…">${s.comment||""}</textarea>
+      </div>`;
+    card.querySelectorAll(".vote button").forEach(b=>b.onclick=()=>{
+      const cur = state[d.id]||{};
+      cur.vote = cur.vote===b.dataset.v ? undefined : b.dataset.v;
+      state[d.id]=cur; save(); render();
+    });
+    const ta = card.querySelector("textarea");
+    ta.oninput=()=>{ const cur=state[d.id]||{}; cur.comment=ta.value; state[d.id]=cur; save(); };
+    list.appendChild(card);
+  });
+  if (!shown) list.innerHTML += `<div class="card"><span class="ev">Нет решений в этом фильтре.</span></div>`;
+  document.getElementById("bar").style.width = (approved/DECISIONS.length*100)+"%";
+  document.getElementById("counts").textContent = `${approved}/${DECISIONS.length} одобрено · ${discuss} на обсуждении`;
+}
+
+document.querySelectorAll("#filters button").forEach(b=>b.onclick=()=>{
+  document.querySelectorAll("#filters button").forEach(x=>x.classList.remove("active"));
+  b.classList.add("active"); filter=b.dataset.f; render();
+});
+
+function buildMarkdown(){
+  const votes = {approved:"одобрено", discuss:"обсудить", pending:"ожидает"};
+  const lines = ["# Ревью решений Plerni","",`Дата: ${new Date().toISOString().slice(0,10)}`,""];
+  DECISIONS.forEach(d=>{
+    const s = state[d.id]||{};
+    lines.push(`## ${d.id} — ${d.title}`,`**Решение:** ${d.choice}`,`**Голос:** ${votes[s.vote||"pending"]}`);
+    if (s.comment) lines.push(`**Комментарий:** ${s.comment}`);
+    lines.push("");
+  });
+  return lines.join("\n");
+}
+
+document.getElementById("export").onclick=()=>{
+  const blob = new Blob([buildMarkdown()], {type:"text/markdown"});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "meridian-decision-review.md"; a.click();
+  toast("Экспортировано meridian-decision-review.md");
+};
+document.getElementById("copy").onclick=async()=>{
+  await navigator.clipboard.writeText(buildMarkdown()); toast("Скопировано в буфер обмена");
+};
+
+render();
+</script>
+</body>
+</html>

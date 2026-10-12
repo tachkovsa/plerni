@@ -1,0 +1,13 @@
+node_modules/
+dist/
+coverage/
+*.log
+.DS_Store
+.env
+.env.*
+!.env.example
+temp/
+.turbo/
+# gate fixtures intentionally track a fake node_modules package
+!scripts/gates/fixtures/
+!scripts/gates/fixtures/**

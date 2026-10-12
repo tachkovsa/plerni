@@ -1,0 +1,12 @@
+# ADRs
+
+Architectural Decision Records. Short, dated, and they explain **why**, not just what.
+
+- Get the next free number by listing this directory — never trust a number written in prose.
+- New SDK capability or trust boundary → ADR first (spec §13).
+
+The pre-implementation decision record (32 decisions with evidence and flip conditions) lives in [`../decision-register.html`](../decision-register.html) and is summarized by ADR-0001.
+
+## Index
+
+- [0001 — Kernel + equal-citizen plugins](0001-kernel-and-equal-citizen-plugins.md)

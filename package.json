@@ -1,0 +1,20 @@
+{
+  "name": "plerni",
+  "private": true,
+  "packageManager": "pnpm@11.5.0",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "build": "turbo run build",
+    "test": "turbo run test",
+    "typecheck": "turbo run typecheck",
+    "gates": "pnpm run gate:licenses && pnpm run gate:kernel-purity && pnpm run gate:private-markers && pnpm run gate:health",
+    "gate:licenses": "node scripts/gates/license-audit.mjs",
+    "gate:kernel-purity": "node scripts/gates/kernel-purity.mjs",
+    "gate:private-markers": "node scripts/gates/private-markers.mjs",
+    "gate:health": "node scripts/gates/gate-health.test.mjs"
+  },
+  "devDependencies": {
+    "turbo": "^2.5.8",
+    "typescript": "^5.9.3"
+  }
+}

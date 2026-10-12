@@ -1,0 +1,7 @@
+{
+  "name": "@plerni/plugin-competencies",
+  "version": "0.0.0",
+  "description": "First-party plugin: versioned competency definitions, proficiency scales, assessments, development goals (spec §16)",
+  "license": "Apache-2.0",
+  "type": "module"
+}

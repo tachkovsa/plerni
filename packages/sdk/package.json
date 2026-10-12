@@ -1,0 +1,8 @@
+{
+  "name": "@plerni/sdk",
+  "version": "0.0.0-experimental",
+  "description": "Plerni plugin SDK — v0 experimental with a stated support window (spec §4.2). First-party and third-party plugins use this identically.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "keywords": ["plerni", "plugin", "sdk"]
+}

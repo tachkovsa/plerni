@@ -1,0 +1,4 @@
+# kernel-purity allowlist (governed — spec §3).
+# Format: <relative/path/from/repo/root>:<noun>
+# Every line here requires an ADR and a reviewer outside first-party plugin authors.
+# An ungoverned allowlist is the leak channel; keep this empty.

@@ -1,0 +1,7 @@
+{
+  "name": "@plerni/plugin-learning",
+  "version": "0.0.0",
+  "description": "First-party plugin: learning catalog, goal-linked assignments, completion evidence (spec §16)",
+  "license": "Apache-2.0",
+  "type": "module"
+}

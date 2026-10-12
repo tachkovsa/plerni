@@ -1,0 +1,26 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended", ":dependencyDashboard"],
+  "rangeStrategy": "bump",
+  "minimumReleaseAge": "7 days",
+  "packageRules": [
+    {
+      "matchUpdateTypes": ["patch", "minor"],
+      "automerge": false,
+      "groupName": "routine minor/patch batch",
+      "schedule": ["weekly"]
+    },
+    {
+      "matchUpdateTypes": ["major"],
+      "automerge": false,
+      "groupName": null,
+      "labels": ["major-review"],
+      "description": "Majors are never auto-merged: separate PR, explicit decision within 30–60 days (spec §14)"
+    },
+    {
+      "matchDepTypes": ["action"],
+      "groupName": "github-actions"
+    }
+  ],
+  "vulnerabilityAlerts": { "labels": ["security"], "schedule": ["at any time"] }
+}

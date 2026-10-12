@@ -1,0 +1,22 @@
+# Governed domain nouns (spec §3, kernel-purity gate).
+# The kernel must not contain domain logic. Any hit of these words in
+# apps/kernel/src fails the build. Changes to this list require an ADR.
+# Allowlist lives in kernel-purity-allowlist.txt (same governance).
+competency
+competencies
+goal
+course
+lesson
+assignment
+assessment
+enrollment
+enrolment
+mentorship
+mentor
+quiz
+certificate
+curriculum
+syllabus
+webinar
+badge
+leaderboard
