@@ -11,7 +11,11 @@ Plerni is a self-hostable LXP (Learning Experience Platform): competency/skill m
 - [`docs/specs/2026-10-12-plerni-design.md`](docs/specs/2026-10-12-plerni-design.md) — the full product & architecture specification (multi-model reviewed: Kimi K3, GPT 6.1 "Sol", GLM 5.3, Claude Opus 5.5)
 - [`docs/decision-register.html`](docs/decision-register.html) — 32 architectural decisions with rationale, evidence, and flip conditions (open in a browser)
 - [`docs/adr/`](docs/adr/) — architectural decision records
-- [`docs/reviews/`](docs/reviews/) — the raw adversarial review transcripts the design survived
+- [`docs/reviews/`](docs/reviews/) — integrity manifest of the adversarial review transcripts the design survived (transcripts retained privately per AGENTS.md §0)
+
+## License
+
+Apache-2.0 (see LICENSE). Plerni was founded by **Sergei Tachkov** — see NOTICE: derivative works must carry founder attribution (Apache-2.0 §4(d)).
 
 ## Principles (short form)
 

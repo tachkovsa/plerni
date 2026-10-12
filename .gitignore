@@ -8,6 +8,7 @@ coverage/
 !.env.example
 temp/
 .turbo/
+*.local.md
 # gate fixtures intentionally track a fake node_modules package
 !scripts/gates/fixtures/
 !scripts/gates/fixtures/**
