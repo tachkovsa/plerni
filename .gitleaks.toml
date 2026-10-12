@@ -4,5 +4,6 @@ title = "plerni-gitleaks"
 useDefault = true
 
 [allowlist]
-description = "Gate fixtures contain synthetic secrets used to prove the secrets gate fail-closed"
+description = "Gate fixtures contain synthetic secrets used to prove the secrets gate fail-closed; 'plerni-decisions-v1' is a localStorage key name (present without the inline allow marker in history)"
 paths = ['''scripts/gates/fixtures/gitleaks/''']
+regexes = ['''plerni-decisions-v1''']
