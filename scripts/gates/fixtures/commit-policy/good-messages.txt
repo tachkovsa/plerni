@@ -1,0 +1,10 @@
+feat(kernel): add tenant guard
+
+Problem, decision, verification evidence.
+
+AI-assisted: yes
+Signed-off-by: Dev Example <dev@example.com>
+===
+docs: fix typo in CONTRIBUTING
+
+Signed-off-by: Dev Example <dev@example.com>

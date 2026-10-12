@@ -17,6 +17,17 @@ jobs:
       - uses: gitleaks/gitleaks-action@v2
         env:
           GITLEAKS_ENABLE_COMMENTS: "false"
+      - name: negative proof — the synthetic fixture secret MUST be detected
+        run: |
+          set +e
+          docker run --rm -v "$PWD/scripts/gates/fixtures/gitleaks:/scan" zricethezav/gitleaks:v8.30.1 dir --no-banner /scan
+          code=$?
+          set -e
+          if [ "$code" -eq 0 ]; then
+            echo "gitleaks failed to detect the synthetic fixture secret — the secrets gate is NOT proven fail-closed"
+            exit 1
+          fi
+          echo "secrets negative proof OK (gitleaks exit $code)"
 
   private-markers:
     runs-on: ubuntu-latest
@@ -39,6 +50,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
@@ -46,4 +59,5 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: node scripts/gates/license-audit.mjs
       - run: node scripts/gates/kernel-purity.mjs
+      - run: node scripts/gates/commit-policy.mjs --base "origin/${{ github.base_ref || 'main' }}"
       - run: node scripts/gates/gate-health.test.mjs

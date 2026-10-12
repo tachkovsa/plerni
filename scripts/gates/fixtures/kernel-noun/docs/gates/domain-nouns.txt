@@ -1,0 +1,5 @@
+# Fixture noun policy for gate-health (mirrors the governed format).
+course
+employee
+competency
+goal

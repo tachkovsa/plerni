@@ -1,0 +1,8 @@
+title = "plerni-gitleaks"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Gate fixtures contain synthetic secrets used to prove the secrets gate fail-closed"
+paths = ['''scripts/gates/fixtures/gitleaks/''']

@@ -1,0 +1,12 @@
+feat: add tenant guard
+
+Body text.
+
+AI-assisted: author=some-model-9
+Signed-off-by: Dev Example <dev@example.com>
+===
+update stuff
+
+Signed-off-by: Dev Example <dev@example.com>
+===
+fix: correct RLS policy
