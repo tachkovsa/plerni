@@ -8,7 +8,7 @@ Commits containing substantial AI-generated or AI-rewritten code, tests, configu
 
 ## Commits & PRs
 
-- PR titles and commits retained on main follow [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/). Each retained commit is one coherent, independently revertible change; tests and documentation ride with it. For nontrivial changes the body explains the problem, why this solution, spec/issue references, and verification performed; trivial changes need no body.
+- PR titles and commits retained on the default branch (`dev`) follow [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/). Each retained commit is one coherent, independently revertible change; tests and documentation ride with it. For nontrivial changes the body explains the problem, why this solution, spec/issue references, and verification performed; trivial changes need no body.
 - **Squash merge is the default**, for humans and agents alike. Split unrelated outcomes into separate PRs. A multi-commit series is preserved only by explicit maintainer exception, when its history helps review or bisection.
 - One PR delivers one coherent outcome. Aim for at most 400 changed handwritten lines including tests and docs; above 800, split the change or record a maintainer-approved explanation. Generated files and lockfiles count separately and still get reviewed. These are review guidelines, not correctness guarantees.
 - Trunk-based: short-lived branches; draft PRs early (drafts are for work in progress; ready PRs carry complete scope and verification evidence). Auto-merge is maintainer-enabled per PR after review.

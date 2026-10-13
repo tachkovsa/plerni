@@ -6,7 +6,7 @@
  * or model identities, AGENTS.md §0).
  *
  * Modes:
- *   (default)     check `git log <base>..HEAD`; base = --base, else origin/main
+ *   (default)     check `git log <base>..HEAD`; base = --base, else origin/dev
  *                 when it exists, else HEAD (an empty range passes vacuously —
  *                 enforcement happens on PRs in CI).
  *   --file <path> check messages from a file; records separated by a line
@@ -33,8 +33,8 @@ if (values.file) {
   let base = values.base;
   if (!base) {
     try {
-      execFileSync("git", ["rev-parse", "--verify", "origin/main"], { stdio: "pipe" });
-      base = "origin/main";
+      execFileSync("git", ["rev-parse", "--verify", "origin/dev"], { stdio: "pipe" });
+      base = "origin/dev";
     } catch {
       base = "HEAD";
     }
