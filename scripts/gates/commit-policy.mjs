@@ -57,7 +57,8 @@ if (values.file) {
 const violations = [];
 for (const { id, message } of records) {
   const subject = message.split("\n")[0];
-  if (!subject.startsWith("Merge ") && !SUBJECT.test(subject)) {
+  if (subject.startsWith("Merge ")) continue; // transient merge commits (e.g. GitHub's PR merge refs) carry no policy metadata
+  if (!SUBJECT.test(subject)) {
     violations.push(`${id}: non-conventional subject "${subject.slice(0, 60)}"`);
   }
   if (!SIGNOFF.test(message)) violations.push(`${id}: missing human DCO sign-off (Signed-off-by: Name <email>)`);

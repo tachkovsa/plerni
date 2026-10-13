@@ -1,0 +1,3 @@
+# Example maintainer-local patterns for gate-health (AGENTS.md §0).
+# One regex per line; case-insensitive; an offending file must be blocked.
+acme-internal-[a-z-]+

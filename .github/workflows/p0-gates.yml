@@ -14,9 +14,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: gitleaks/gitleaks-action@v2
-        env:
-          GITLEAKS_ENABLE_COMMENTS: "false"
+      - name: gitleaks history scan (pinned v8.30.1)
+        run: docker run --rm -v "$PWD:/repo" --entrypoint sh zricethezav/gitleaks:v8.30.1 -c "git config --global --add safe.directory /repo && gitleaks git --no-banner --redact /repo"
       - name: negative proof — the synthetic fixture secret MUST be detected
         run: |
           set +e
@@ -37,14 +36,15 @@ jobs:
         run: node scripts/gates/private-markers.mjs
 
   sca:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: google/osv-scanner-action@v2
-        with:
-          scan-args: |-
-            --recursive
-            ./
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@v2.7.0
+    with:
+      scan-args: |-
+        --recursive
+        ./
 
   gates:
     runs-on: ubuntu-latest
@@ -59,5 +59,5 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: node scripts/gates/license-audit.mjs
       - run: node scripts/gates/kernel-purity.mjs
-      - run: node scripts/gates/commit-policy.mjs --base "origin/${{ github.base_ref || 'dev' }}"
+      - run: node scripts/gates/commit-policy.mjs --base "${{ github.event_name == 'push' && github.event.before || format('origin/{0}', github.base_ref || 'dev') }}"
       - run: node scripts/gates/gate-health.test.mjs
