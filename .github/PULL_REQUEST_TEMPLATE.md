@@ -19,3 +19,7 @@
 - [ ] No secrets, personal data, third-party confidential info, or private tooling/model identities in the diff or metadata (AGENTS.md §0)
 - [ ] Human DCO sign-off(s) present; substantial AI-generated content carries `AI-assisted: yes`
 - [ ] New SDK capability or trust boundary → ADR linked
+
+---
+
+AI-assisted: yes
