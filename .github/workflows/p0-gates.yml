@@ -37,14 +37,13 @@ jobs:
         run: node scripts/gates/private-markers.mjs
 
   sca:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: google/osv-scanner-action@v2
-        with:
-          scan-args: |-
-            --recursive
-            ./
+    permissions:
+      contents: read
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@v2.7.0
+    with:
+      scan-args: |-
+        --recursive
+        ./
 
   gates:
     runs-on: ubuntu-latest
@@ -59,5 +58,5 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: node scripts/gates/license-audit.mjs
       - run: node scripts/gates/kernel-purity.mjs
-      - run: node scripts/gates/commit-policy.mjs --base "origin/${{ github.base_ref || 'dev' }}"
+      - run: node scripts/gates/commit-policy.mjs --base "${{ github.event_name == 'push' && github.event.before || format('origin/{0}', github.base_ref || 'dev') }}"
       - run: node scripts/gates/gate-health.test.mjs

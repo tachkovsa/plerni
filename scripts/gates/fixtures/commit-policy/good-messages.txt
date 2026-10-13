@@ -8,3 +8,5 @@ Signed-off-by: Dev Example <dev@example.com>
 docs: fix typo in CONTRIBUTING
 
 Signed-off-by: Dev Example <dev@example.com>
+===
+Merge 3ba63c7 into dev
