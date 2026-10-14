@@ -39,14 +39,14 @@ function reservedConnection() {
   return new pg.Client({ connectionString: dsn });
 }
 
-// Main connection for effects/commits (pooled in production).
+// Main connection for effects/commits (pooled through PgBouncer).
 function mainConnection() {
   const dsn = process.env.HARNESS_POOLED_DSN
     ?? `postgres://plerni_app:${envOrDie('PLERNI_APP_PASSWORD')}@localhost:54321/plerni`;
   return new pg.Client({ connectionString: dsn });
 }
 
-// Fallback for direct-only mode when PgBouncer auth is not working
+// Direct connection fallback (for VMs where PgBouncer setup fails).
 function directConnection() {
   const dsn = process.env.HARNESS_DIRECT_DSN
     ?? `postgres://plerni_app:${envOrDie('PLERNI_APP_PASSWORD')}@localhost:54320/plerni`;
@@ -91,8 +91,13 @@ export async function dispatch(id, useDirect = false) {
 
 /**
  * Executor: heartbeat renewal on the reserved path.
+ * Optional slow mode (pg_sleep before UPDATE) for testing in-flight renewal collision.
  */
-async function renew(id, reserved) {
+async function renew(id, reserved, slowMs = 0) {
+  if (slowMs > 0) {
+    // Two separate queries: sleep, then update
+    await reserved.query(`SELECT pg_sleep(${slowMs / 1000})`);
+  }
   await reserved.query(
     `UPDATE fencing_authority SET heartbeat_at = clock_timestamp() WHERE id = $1 AND status = 'ACTIVE'`,
     [id]
@@ -118,8 +123,9 @@ async function conditionalCommit(id, token, c) {
  * 4. Await in-flight renewals.
  * Returns { committed: boolean, renewals: number, lastRenewalToLockMs: number, boundViolation: boolean }.
  * @param {boolean} useDirect - use direct connection for main path (fallback when pooled unavailable)
+ * @param {number} slowRenewalMs - inject slow renewal (for testing in-flight collision)
  */
-export async function commitExecution(id, token, effectsFn, useDirect = false) {
+export async function commitExecution(id, token, effectsFn, useDirect = false, slowRenewalMs = 0) {
   const reserved = reservedConnection();
   await reserved.connect();
   const c = useDirect ? directConnection() : mainConnection();
@@ -128,7 +134,7 @@ export async function commitExecution(id, token, effectsFn, useDirect = false) {
   let renewalHandle;
   let renewalsStopped = false;
   let inflightRenewal = null;
-  const metrics = { renewals: 0, lastRenewalAt: null };
+  const metrics = { renewals: 0, lastRenewalAt: null, lastRenewalStart: null };
 
   // BOUND: last-renewal→row-lock interval must be < CADENCE_MS (5s). If a renewal ran within
   // the cadence window, it cannot still be in flight when we take the lock (renewal queries
@@ -145,9 +151,11 @@ export async function commitExecution(id, token, effectsFn, useDirect = false) {
       if (renewalsStopped) return;
       const renewalPromise = (async () => {
         try {
-          await renew(id, reserved);
           metrics.renewals++;
+          const renewalStart = Date.now();
+          await renew(id, reserved, slowRenewalMs);
           metrics.lastRenewalAt = Date.now();
+          metrics.lastRenewalStart = renewalStart;
         } catch (e) {
           console.warn(`renewal error: ${e.message}`);
         }
@@ -181,12 +189,14 @@ export async function commitExecution(id, token, effectsFn, useDirect = false) {
     await c.query('COMMIT');
 
     const lastRenewalToLockMs = metrics.lastRenewalAt ? beforeLock - metrics.lastRenewalAt : null;
+    const lastRenewalStartToLockMs = metrics.lastRenewalStart ? beforeLock - metrics.lastRenewalStart : null;
     const boundViolation = lastRenewalToLockMs !== null && lastRenewalToLockMs > LAST_RENEWAL_TO_LOCK_BOUND_MS;
 
     return {
       committed: true,
       renewals: metrics.renewals,
       lastRenewalToLockMs,
+      lastRenewalStartToLockMs,
       boundViolation,
       bound: LAST_RENEWAL_TO_LOCK_BOUND_MS,
     };

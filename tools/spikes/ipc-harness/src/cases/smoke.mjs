@@ -18,8 +18,8 @@ const echoPath = join(__dirname, '../children/echo.mjs');
 
 export async function smoke() {
   const evidence = { pass: true, detail: {} };
-  // Use direct connection fallback until PgBouncer auth_query issue is resolved
-  const useDirect = true;
+  // Default to pooled main path (54321); direct only if SPIKE_USE_DIRECT=1
+  const useDirect = process.env.SPIKE_USE_DIRECT === '1';
 
   // ================
   // Part 1: Framing
@@ -150,7 +150,37 @@ export async function smoke() {
       effectsDuration: '16s',
     };
 
-    // Case 4: Cancellation path
+    // Case 4: Slow in-flight renewal racing the COMMITTED lock (2s renewal injected at ~9s mark)
+    console.log('[smoke] starting slow-renewal execution (11s + 2s slow renewal) to test lock collision...');
+    const id6 = await createExecution('test-plugin', 'token-6', useDirect);
+    await dispatch(id6, useDirect);
+    const commitResult6 = await commitExecution(id6, 'token-6', async (c) => {
+      // 11s effects: renewals fire at 0s, 5s, 10s; last renewal starts ~10s, we inject 2s sleep
+      await c.query('SELECT pg_sleep(11)');
+    }, useDirect, 2000); // slowRenewalMs=2000
+    if (!commitResult6.committed) {
+      evidence.pass = false;
+      evidence.detail.authority_commit_slowrenewal = { expected: 'committed', got: commitResult6 };
+    }
+    // Slow renewal case: bound may be violated (renewal starts before lock, completes during drain)
+    // The drain awaits it, so outcome stays correct even if lastRenewalToLockMs > CADENCE
+    status = await getStatus(id6, useDirect);
+    if (status.status !== 'COMMITTED') {
+      evidence.pass = false;
+      evidence.detail.authority_committed_slowrenewal = { expected: 'COMMITTED', got: status.status };
+    }
+    evidence.detail.authority_metrics_slowrenewal = {
+      renewals: commitResult6.renewals,
+      lastRenewalToLockMs: commitResult6.lastRenewalToLockMs,
+      lastRenewalStartToLockMs: commitResult6.lastRenewalStartToLockMs,
+      bound: commitResult6.bound,
+      boundViolation: commitResult6.boundViolation,
+      effectsDuration: '11s',
+      injectedSlowRenewalMs: 2000,
+      note: 'Slow renewal (2s) races lock; drain awaits it; outcome correct despite bound violation',
+    };
+
+    // Case 5: Cancellation path
     const id2 = await createExecution('test-plugin', 'token-2', useDirect);
     await dispatch(id2, useDirect);
     const cancelled = await cancelExecution(id2, useDirect);
@@ -164,7 +194,7 @@ export async function smoke() {
       evidence.detail.authority_cancelled = { expected: 'CANCELLED', got: status.status };
     }
 
-    // Case 5: Sweeper abandonment (create ACTIVE, wait for lease expiry)
+    // Case 6: Sweeper abandonment (create ACTIVE, wait for lease expiry)
     const id3 = await createExecution('test-plugin', 'token-3', useDirect);
     await dispatch(id3, useDirect);
     const statusBefore = await getStatus(id3, useDirect);
