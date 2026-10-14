@@ -1,0 +1,8 @@
+{
+  "name": "@plerni/harness",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "pg": "8.23.1"
+  }
+}

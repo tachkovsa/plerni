@@ -1,0 +1,29 @@
+# Dev harness
+
+Minimal compose substrate both P0 spikes run against: PostgreSQL 18 (digest-pinned) + PgBouncer 1.26 (`pool_mode = transaction`, digest-pinned). From it grow the P1 isolation suite and the `onprem/` compose skeleton.
+
+**Honesty note:** this single-host compose topology relaxes the production egress-denied topology (spec §4.4) — the runner/plugin isolation boundary is *not* modeled here, and this file says so rather than pretending.
+
+## Quickstart
+
+```bash
+export POSTGRES_PASSWORD=… PLERNI_APP_PASSWORD=… PLERNI_MIGRATE_PASSWORD=… PLERNI_ADMIN_PASSWORD=…
+./reset.sh        # render-secrets → compose up → create db → apply sql/001–003
+node seed.mjs     # 2 tenants, overlapping labels
+```
+
+Any unset variable fails the script with a named message. Passwords are never committed: `render-secrets.mjs` generates `pgbouncer/userlist.txt` (gitignored, mode 600).
+
+## The three datasources
+
+| Purpose | Connection |
+|---|---|
+| Direct PG | `host=localhost port=54320 dbname=plerni` |
+| Pooled (PgBouncer, transaction mode) | `host=localhost port=54321 dbname=plerni` |
+| PgBouncer admin console (read-only, `SHOW CONFIG/DATABASES/USERS`) | `host=localhost port=54321 dbname=pgbouncer user=plerni_admin_ro` |
+
+(Host ports are 54320/54321, not 5432/6432: the standard ports are commonly occupied on dev machines by other projects' containers — the datasource contract is the topology, not the port number.)
+
+Spike heartbeat traffic (plan §4 B2) uses a **dedicated direct connection on 54320**, never the main pooled datasource — renewals sharing the main pool can starve under load.
+
+Image digests are recorded here at implementation time: postgres:18 `@sha256:74935e72…fc4336` · edoburu/pgbouncer:v1.26.0-p0 `@sha256:b17551c7…95b711` (full values in docker-compose.yml).
