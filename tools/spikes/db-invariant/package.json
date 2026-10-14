@@ -1,0 +1,17 @@
+{
+  "name": "@plerni-spike/db-invariant",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "spike": "node src/run.ts"
+  },
+  "dependencies": {
+    "kysely": "0.29.6",
+    "pg": "8.23.1"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3",
+    "@types/pg": "8.23.1"
+  }
+}
