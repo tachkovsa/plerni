@@ -1,0 +1,16 @@
+{
+  "name": "@plerni-spike/ipc-harness",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "spike": "node src/run.mjs",
+    "test": "node --test src/framing.test.mjs"
+  },
+  "dependencies": {
+    "pg": "8.23.1"
+  },
+  "devDependencies": {
+    "@types/pg": "8.23.1",
+    "@types/node": "26.6.5"
+  }
+}
