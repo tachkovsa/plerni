@@ -106,8 +106,8 @@ async function conditionalCommit(id, token, c) {
  * 1. Stop renewal scheduling immediately before the conditional COMMITTED update.
  * 2. Issue the conditional COMMITTED update (acquires the row lock).
  * 3. Resolve the effects transaction.
- * 4. Drain outstanding renewals.
- * Returns { committed: boolean, lastRenewalToLockMs: number }.
+ * 4. Await in-flight renewals.
+ * Returns { committed: boolean, renewals: number, lastRenewalToLockMs: number, boundViolation: boolean }.
  */
 export async function commitExecution(id, token, effectsFn) {
   const reserved = reservedConnection();
@@ -117,7 +117,15 @@ export async function commitExecution(id, token, effectsFn) {
 
   let renewalHandle;
   let renewalsStopped = false;
+  let inflightRenewal = null;
   const metrics = { renewals: 0, lastRenewalAt: null };
+
+  // BOUND: last-renewal→row-lock interval must be < CADENCE_MS (5s). If a renewal ran within
+  // the cadence window, it cannot still be in flight when we take the lock (renewal queries
+  // are fast, O(10ms)). A slow renewal racing the lock would block our COMMITTED update, but
+  // PG serializes: one waits, then the predicate rechecks. Our WHERE status='ACTIVE' ensures
+  // correctness even if the renewal is delayed.
+  const LAST_RENEWAL_TO_LOCK_BOUND_MS = CADENCE_MS;
 
   try {
     await c.query('BEGIN');
@@ -125,13 +133,18 @@ export async function commitExecution(id, token, effectsFn) {
     // Start renewal loop on the reserved path
     renewalHandle = setInterval(async () => {
       if (renewalsStopped) return;
-      try {
-        await renew(id, reserved);
-        metrics.renewals++;
-        metrics.lastRenewalAt = Date.now();
-      } catch (e) {
-        console.warn(`renewal error: ${e.message}`);
-      }
+      const renewalPromise = (async () => {
+        try {
+          await renew(id, reserved);
+          metrics.renewals++;
+          metrics.lastRenewalAt = Date.now();
+        } catch (e) {
+          console.warn(`renewal error: ${e.message}`);
+        }
+      })();
+      inflightRenewal = renewalPromise;
+      await renewalPromise;
+      if (inflightRenewal === renewalPromise) inflightRenewal = null;
     }, CADENCE_MS);
 
     // Execute effects inside the transaction
@@ -141,6 +154,11 @@ export async function commitExecution(id, token, effectsFn) {
     renewalsStopped = true;
     clearInterval(renewalHandle);
     const beforeLock = Date.now();
+
+    // Await any in-flight renewal before taking the lock
+    if (inflightRenewal) {
+      await inflightRenewal;
+    }
 
     // Conditional COMMITTED update (acquires row lock)
     const { committed, rowCount } = await conditionalCommit(id, token, c);
@@ -152,12 +170,16 @@ export async function commitExecution(id, token, effectsFn) {
     // Resolve the effects transaction
     await c.query('COMMIT');
 
-    // Drain outstanding renewals (none should be scheduled, but wait for any in-flight)
-    await new Promise((resolve) => setTimeout(resolve, 100));
-
     const lastRenewalToLockMs = metrics.lastRenewalAt ? beforeLock - metrics.lastRenewalAt : null;
+    const boundViolation = lastRenewalToLockMs !== null && lastRenewalToLockMs > LAST_RENEWAL_TO_LOCK_BOUND_MS;
 
-    return { committed: true, renewals: metrics.renewals, lastRenewalToLockMs };
+    return {
+      committed: true,
+      renewals: metrics.renewals,
+      lastRenewalToLockMs,
+      boundViolation,
+      bound: LAST_RENEWAL_TO_LOCK_BOUND_MS,
+    };
   } catch (e) {
     if (e instanceof FencedError) throw e;
     await c.query('ROLLBACK').catch(() => {});
@@ -189,6 +211,12 @@ export async function cancelExecution(id) {
 /**
  * Sweeper: conditional ABANDONED on expired lease. Runs periodically.
  * QUEUED work is never abandoned (queued past lease stays QUEUED).
+ *
+ * Uses now() (transaction start time) for the lease check, while renewals use clock_timestamp()
+ * (actual current time). This is intentional: now() gives the sweeper a consistent view within
+ * its transaction, and the lease margin (20s, 4× the cadence) absorbs clock skew and scheduling
+ * jitter. A renewal racing the sweeper will update heartbeat_at with clock_timestamp(), and
+ * PG's conflicting-update serialization ensures exactly one transition wins.
  */
 export async function sweepAbandoned() {
   const c = mainConnection();

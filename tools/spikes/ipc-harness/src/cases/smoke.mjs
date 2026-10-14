@@ -84,11 +84,24 @@ export async function smoke() {
       evidence.pass = false;
       evidence.detail.authority_commit = { expected: 'committed', got: commitResult };
     }
+    // Check bound assertion
+    if (commitResult.boundViolation) {
+      evidence.pass = false;
+      evidence.detail.authority_bound_violation = {
+        lastRenewalToLockMs: commitResult.lastRenewalToLockMs,
+        bound: commitResult.bound,
+      };
+    }
     status = await getStatus(id1);
     if (status.status !== 'COMMITTED') {
       evidence.pass = false;
       evidence.detail.authority_committed = { expected: 'COMMITTED', got: status.status };
     }
+    evidence.detail.authority_metrics = {
+      renewals: commitResult.renewals,
+      lastRenewalToLockMs: commitResult.lastRenewalToLockMs,
+      bound: commitResult.bound,
+    };
 
     // Test cancellation path
     const id2 = await createExecution('test-plugin', 'token-2');
