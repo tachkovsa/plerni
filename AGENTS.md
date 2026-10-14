@@ -157,3 +157,15 @@ Each finding: `[severity] file:line — description (proposed fix or question)`.
 - **Don't propose unrequested features** — scope changes belong in a separate task/issue, not in code review.
 - **Distinguish blocking issues from preferences** — use severity levels honestly; save BLOCKER for correctness/security/policy violations; style preferences are NITs.
 - **When you don't know, verify** — consult the spec, the plan, the gates, or another model family; agreement is not evidence (principle 18).
+
+### 4.7 Handling review comments (PR authors)
+
+Every review comment requires a response in its thread:
+
+- **Fixed:** Reply with the fixing commit SHA and a one-line summary of the change (e.g., "Fixed in abc1234: added the missing tenant guard"). Then resolve the thread.
+- **Declined or deferred:** Reply with the reason. If deferred, link the tracking issue. Leave the thread unresolved — the reviewer or maintainer decides whether to accept the response.
+- **Questions:** Answer directly. Resolve the thread only when nothing further is needed.
+- **Never resolve without replying** — a silently resolved thread wastes the reviewer's time and hides whether the issue was addressed.
+- **Never resolve BLOCKER or security findings without the fix commit** — severity matters; a response alone doesn't close a blocking issue.
+
+A PR is not ready for merge while any review thread remains unresolved.
