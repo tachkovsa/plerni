@@ -39,20 +39,26 @@ function reservedConnection() {
   return new pg.Client({ connectionString: dsn });
 }
 
-// Main connection for effects/commits (direct for spike, pooled for production).
-// Spike note: using direct connection due to PgBouncer auth_file configuration complexity in containerized dev environment.
+// Main connection for effects/commits (pooled in production).
 function mainConnection() {
-  const dsn = process.env.HARNESS_MAIN_DSN
-    ?? process.env.HARNESS_DIRECT_DSN
+  const dsn = process.env.HARNESS_POOLED_DSN
+    ?? `postgres://plerni_app:${envOrDie('PLERNI_APP_PASSWORD')}@localhost:54321/plerni`;
+  return new pg.Client({ connectionString: dsn });
+}
+
+// Fallback for direct-only mode when PgBouncer auth is not working
+function directConnection() {
+  const dsn = process.env.HARNESS_DIRECT_DSN
     ?? `postgres://plerni_app:${envOrDie('PLERNI_APP_PASSWORD')}@localhost:54320/plerni`;
   return new pg.Client({ connectionString: dsn });
 }
 
 /**
  * Creates a new execution with QUEUED status. Sweeper never touches QUEUED.
+ * @param {boolean} useDirect - use direct connection (fallback when pooled unavailable)
  */
-export async function createExecution(pluginId, token) {
-  const c = mainConnection();
+export async function createExecution(pluginId, token, useDirect = false) {
+  const c = useDirect ? directConnection() : mainConnection();
   await c.connect();
   try {
     const r = await c.query(
@@ -67,9 +73,10 @@ export async function createExecution(pluginId, token) {
 
 /**
  * Dispatch transition: QUEUED→ACTIVE, stamps heartbeat_at.
+ * @param {boolean} useDirect - use direct connection (fallback when pooled unavailable)
  */
-export async function dispatch(id) {
-  const c = mainConnection();
+export async function dispatch(id, useDirect = false) {
+  const c = useDirect ? directConnection() : mainConnection();
   await c.connect();
   try {
     const r = await c.query(
@@ -110,11 +117,12 @@ async function conditionalCommit(id, token, c) {
  * 3. Resolve the effects transaction.
  * 4. Await in-flight renewals.
  * Returns { committed: boolean, renewals: number, lastRenewalToLockMs: number, boundViolation: boolean }.
+ * @param {boolean} useDirect - use direct connection for main path (fallback when pooled unavailable)
  */
-export async function commitExecution(id, token, effectsFn) {
+export async function commitExecution(id, token, effectsFn, useDirect = false) {
   const reserved = reservedConnection();
   await reserved.connect();
-  const c = mainConnection();
+  const c = useDirect ? directConnection() : mainConnection();
   await c.connect();
 
   let renewalHandle;
@@ -195,9 +203,10 @@ export async function commitExecution(id, token, effectsFn) {
 
 /**
  * Revocation: conditional CANCELLED update. Returns true if the transition won.
+ * @param {boolean} useDirect - use direct connection (fallback when pooled unavailable)
  */
-export async function cancelExecution(id) {
-  const c = mainConnection();
+export async function cancelExecution(id, useDirect = false) {
+  const c = useDirect ? directConnection() : mainConnection();
   await c.connect();
   try {
     const r = await c.query(
@@ -219,9 +228,10 @@ export async function cancelExecution(id) {
  * its transaction, and the lease margin (20s, 4× the cadence) absorbs clock skew and scheduling
  * jitter. A renewal racing the sweeper will update heartbeat_at with clock_timestamp(), and
  * PG's conflicting-update serialization ensures exactly one transition wins.
+ * @param {boolean} useDirect - use direct connection (fallback when pooled unavailable)
  */
-export async function sweepAbandoned() {
-  const c = mainConnection();
+export async function sweepAbandoned(useDirect = false) {
+  const c = useDirect ? directConnection() : mainConnection();
   await c.connect();
   try {
     const r = await c.query(
@@ -236,11 +246,12 @@ export async function sweepAbandoned() {
 
 /**
  * Starts a background sweeper that runs every SWEEP_INTERVAL_MS.
+ * @param {boolean} useDirect - use direct connection (fallback when pooled unavailable)
  */
-export function startSweeper() {
+export function startSweeper(useDirect = false) {
   const handle = setInterval(async () => {
     try {
-      const abandoned = await sweepAbandoned();
+      const abandoned = await sweepAbandoned(useDirect);
       if (abandoned.length > 0) {
         console.log(`[sweeper] marked ${abandoned.length} executions ABANDONED`);
       }
@@ -253,9 +264,10 @@ export function startSweeper() {
 
 /**
  * Query the current status of an execution.
+ * @param {boolean} useDirect - use direct connection (fallback when pooled unavailable)
  */
-export async function getStatus(id) {
-  const c = mainConnection();
+export async function getStatus(id, useDirect = false) {
+  const c = useDirect ? directConnection() : mainConnection();
   await c.connect();
   try {
     const r = await c.query(

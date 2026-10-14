@@ -6,7 +6,7 @@ import { writeFileSync, chmodSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
-const required = ['PLERNI_APP_PASSWORD', 'PLERNI_MIGRATE_PASSWORD', 'PLERNI_ADMIN_PASSWORD'];
+const required = ['POSTGRES_PASSWORD', 'PLERNI_APP_PASSWORD', 'PLERNI_MIGRATE_PASSWORD', 'PLERNI_ADMIN_PASSWORD'];
 const missing = required.filter((k) => !process.env[k]);
 if (missing.length) {
   console.error(`render-secrets: missing env vars: ${missing.join(', ')}`);
@@ -16,6 +16,7 @@ if (missing.length) {
 const dir = dirname(fileURLToPath(import.meta.url));
 const target = join(dir, 'pgbouncer', 'userlist.txt');
 const lines = [
+  `"postgres" "${process.env.POSTGRES_PASSWORD}"`,
   `"plerni_app" "${process.env.PLERNI_APP_PASSWORD}"`,
   `"plerni_migrate" "${process.env.PLERNI_MIGRATE_PASSWORD}"`,
   `"plerni_admin_ro" "${process.env.PLERNI_ADMIN_PASSWORD}"`,

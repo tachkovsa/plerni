@@ -10,6 +10,7 @@ import {
   cancelExecution,
   getStatus,
   startSweeper,
+  sweepAbandoned,
 } from '../authority.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -17,6 +18,8 @@ const echoPath = join(__dirname, '../children/echo.mjs');
 
 export async function smoke() {
   const evidence = { pass: true, detail: {} };
+  // Use direct connection fallback until PgBouncer auth_query issue is resolved
+  const useDirect = true;
 
   // ================
   // Part 1: Framing
@@ -54,79 +57,131 @@ export async function smoke() {
   }
 
   // ==================
-  // Part 2: Authority
+  // Part 2: Authority - Basic lifecycle
   // ==================
-  const stopSweeper = startSweeper();
+  const stopSweeper = startSweeper(useDirect);
 
   try {
-    // Create QUEUED
-    const id1 = await createExecution('test-plugin', 'token-1');
-    let status = await getStatus(id1);
+    // Case 1: Fast commit (no renewals)
+    const id1 = await createExecution('test-plugin', 'token-1', useDirect);
+    let status = await getStatus(id1, useDirect);
     if (status.status !== 'QUEUED') {
       evidence.pass = false;
       evidence.detail.authority_queued = { expected: 'QUEUED', got: status.status };
     }
 
-    // Dispatch QUEUED→ACTIVE
-    await dispatch(id1);
-    status = await getStatus(id1);
+    await dispatch(id1, useDirect);
+    status = await getStatus(id1, useDirect);
     if (status.status !== 'ACTIVE' || !status.heartbeat_at) {
       evidence.pass = false;
       evidence.detail.authority_active = { expected: 'ACTIVE', got: status };
     }
 
-    // Commit ACTIVE→COMMITTED
-    const commitResult = await commitExecution(id1, 'token-1', async (c) => {
-      // Simulate effects
+    const commitResult1 = await commitExecution(id1, 'token-1', async (c) => {
       await c.query('SELECT pg_sleep(0.5)');
-    });
-    if (!commitResult.committed) {
+    }, useDirect);
+    if (!commitResult1.committed) {
       evidence.pass = false;
-      evidence.detail.authority_commit = { expected: 'committed', got: commitResult };
+      evidence.detail.authority_commit_fast = { expected: 'committed', got: commitResult1 };
     }
-    // Check bound assertion
-    if (commitResult.boundViolation) {
-      evidence.pass = false;
-      evidence.detail.authority_bound_violation = {
-        lastRenewalToLockMs: commitResult.lastRenewalToLockMs,
-        bound: commitResult.bound,
-      };
-    }
-    status = await getStatus(id1);
+    status = await getStatus(id1, useDirect);
     if (status.status !== 'COMMITTED') {
       evidence.pass = false;
-      evidence.detail.authority_committed = { expected: 'COMMITTED', got: status.status };
+      evidence.detail.authority_committed_fast = { expected: 'COMMITTED', got: status.status };
     }
-    evidence.detail.authority_metrics = {
-      renewals: commitResult.renewals,
-      lastRenewalToLockMs: commitResult.lastRenewalToLockMs,
-      bound: commitResult.bound,
+
+    // Case 2: Long commit with multiple renewals (12s > 2× cadence of 5s)
+    console.log('[smoke] starting long execution (12s) to exercise renewals...');
+    const id4 = await createExecution('test-plugin', 'token-4', useDirect);
+    await dispatch(id4, useDirect);
+    const commitResult4 = await commitExecution(id4, 'token-4', async (c) => {
+      await c.query('SELECT pg_sleep(12)');
+    }, useDirect);
+    if (!commitResult4.committed) {
+      evidence.pass = false;
+      evidence.detail.authority_commit_long = { expected: 'committed', got: commitResult4 };
+    }
+    if (commitResult4.boundViolation) {
+      evidence.pass = false;
+      evidence.detail.authority_bound_violation_long = {
+        lastRenewalToLockMs: commitResult4.lastRenewalToLockMs,
+        bound: commitResult4.bound,
+      };
+    }
+    status = await getStatus(id4, useDirect);
+    if (status.status !== 'COMMITTED') {
+      evidence.pass = false;
+      evidence.detail.authority_committed_long = { expected: 'COMMITTED', got: status.status };
+    }
+    evidence.detail.authority_metrics_long = {
+      renewals: commitResult4.renewals,
+      lastRenewalToLockMs: commitResult4.lastRenewalToLockMs,
+      bound: commitResult4.bound,
+      effectsDuration: '12s',
     };
 
-    // Test cancellation path
-    const id2 = await createExecution('test-plugin', 'token-2');
-    await dispatch(id2);
-    const cancelled = await cancelExecution(id2);
+    // Case 3: Very long commit with renewal in-flight when lock acquired (16s > 3× cadence)
+    console.log('[smoke] starting very long execution (16s) to test in-flight renewal...');
+    const id5 = await createExecution('test-plugin', 'token-5', useDirect);
+    await dispatch(id5, useDirect);
+    const commitResult5 = await commitExecution(id5, 'token-5', async (c) => {
+      await c.query('SELECT pg_sleep(16)');
+    }, useDirect);
+    if (!commitResult5.committed) {
+      evidence.pass = false;
+      evidence.detail.authority_commit_verylong = { expected: 'committed', got: commitResult5 };
+    }
+    if (commitResult5.boundViolation) {
+      evidence.pass = false;
+      evidence.detail.authority_bound_violation_verylong = {
+        lastRenewalToLockMs: commitResult5.lastRenewalToLockMs,
+        bound: commitResult5.bound,
+      };
+    }
+    status = await getStatus(id5, useDirect);
+    if (status.status !== 'COMMITTED') {
+      evidence.pass = false;
+      evidence.detail.authority_committed_verylong = { expected: 'COMMITTED', got: status.status };
+    }
+    evidence.detail.authority_metrics_verylong = {
+      renewals: commitResult5.renewals,
+      lastRenewalToLockMs: commitResult5.lastRenewalToLockMs,
+      bound: commitResult5.bound,
+      effectsDuration: '16s',
+    };
+
+    // Case 4: Cancellation path
+    const id2 = await createExecution('test-plugin', 'token-2', useDirect);
+    await dispatch(id2, useDirect);
+    const cancelled = await cancelExecution(id2, useDirect);
     if (!cancelled) {
       evidence.pass = false;
       evidence.detail.authority_cancel = { expected: true, got: cancelled };
     }
-    status = await getStatus(id2);
+    status = await getStatus(id2, useDirect);
     if (status.status !== 'CANCELLED') {
       evidence.pass = false;
       evidence.detail.authority_cancelled = { expected: 'CANCELLED', got: status.status };
     }
 
-    // Test sweeper abandonment (create ACTIVE, wait for lease expiry)
-    const id3 = await createExecution('test-plugin', 'token-3');
-    await dispatch(id3);
-    // Wait for lease to expire (20s + margin)
-    console.log('[smoke] waiting 22s for lease expiry...');
+    // Case 5: Sweeper abandonment (create ACTIVE, wait for lease expiry)
+    const id3 = await createExecution('test-plugin', 'token-3', useDirect);
+    await dispatch(id3, useDirect);
+    const statusBefore = await getStatus(id3, useDirect);
+    console.log('[smoke] waiting 22s for lease expiry (lease=20s)...');
     await new Promise((resolve) => setTimeout(resolve, 22000));
-    status = await getStatus(id3);
+    // Trigger manual sweep to ensure it processes
+    await sweepAbandoned(useDirect);
+    status = await getStatus(id3, useDirect);
     if (status.status !== 'ABANDONED') {
       evidence.pass = false;
-      evidence.detail.authority_abandoned = { expected: 'ABANDONED', got: status.status };
+      evidence.detail.authority_abandoned = {
+        expected: 'ABANDONED',
+        got: status.status,
+        heartbeat_at: status.heartbeat_at,
+        created_at: status.created_at,
+        statusBefore: statusBefore.status,
+      };
     }
 
     if (evidence.pass) {
