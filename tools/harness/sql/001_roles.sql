@@ -19,11 +19,15 @@ ALTER ROLE plerni_admin_ro PASSWORD :'admin_password';
 -- Migration role may create schemas in the harness database only.
 GRANT CREATE ON DATABASE plerni TO plerni_migrate;
 
--- The pinned search_path is installed as the app role's default (plan §2 / γ-N3):
--- legitimate first-use backends come up clean; the hygiene protocol's step ② compares
--- against exactly this value.
-ALTER ROLE plerni_app SET search_path TO "$user", public;
+-- The pinned search_path is installed as the app role's default (plan §2 / γ-N3).
+-- MUST be a non-default explicit value (δ-MAJOR-1): "$user", public is PostgreSQL's built-in
+-- default — a backend whose role default was never installed would read back the SAME value,
+-- making the bring-up check vacuous; and $user-first resolution opens a shadowing path
+-- (a schema named after the role can shadow tables past RLS). Pin to exactly `public`.
+ALTER ROLE plerni_app SET search_path TO public;
 
--- Membership fixture: lets the spike inject a leaked SET ROLE plerni_plugin_a
--- (without membership the injection cannot even be built).
-GRANT plerni_plugin_a TO plerni_app;
+-- Membership fixture: lets the spike inject a leaked SET ROLE plerni_plugin_a.
+-- WITH INHERIT FALSE, SET TRUE (δ-MAJOR-2): inherited privileges would make the app role
+-- the union of plugin roles (the opposite of spec §5's per-plugin switches) and the
+-- leaked-role test would measure an empty difference — it could not fail.
+GRANT plerni_plugin_a TO plerni_app WITH INHERIT FALSE, SET TRUE;
