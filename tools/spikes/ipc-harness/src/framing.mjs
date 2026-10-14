@@ -12,15 +12,17 @@ const MAX_PARTIAL_BUFFER = 2 * MAX_FRAME_SIZE; // per-connection buffer cap
 export class NdjsonFramingError extends Error {}
 export class NdjsonOversizeError extends NdjsonFramingError {}
 export class NdjsonNeverTerminatedError extends NdjsonFramingError {}
+export class NdjsonUnterminatedAtEofError extends NdjsonFramingError {}
 
 export class NdjsonFramer {
-  #buffer = '';
+  #buffer = Buffer.alloc(0);
 
   feed(chunk) {
-    if (this.#buffer.length + chunk.length > MAX_PARTIAL_BUFFER) {
+    const chunkBuf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, 'utf8');
+    if (this.#buffer.length + chunkBuf.length > MAX_PARTIAL_BUFFER) {
       throw new NdjsonNeverTerminatedError(`partial frame exceeded ${MAX_PARTIAL_BUFFER} bytes without newline`);
     }
-    this.#buffer += chunk;
+    this.#buffer = Buffer.concat([this.#buffer, chunkBuf]);
   }
 
   *frames() {
@@ -32,13 +34,20 @@ export class NdjsonFramer {
       if (line.length > MAX_FRAME_SIZE) {
         throw new NdjsonOversizeError(`frame ${line.length} bytes > ${MAX_FRAME_SIZE}`);
       }
-      if (line.trim()) {
+      const lineStr = line.toString('utf8').trim();
+      if (lineStr) {
         try {
-          yield JSON.parse(line);
+          yield JSON.parse(lineStr);
         } catch (e) {
           throw new NdjsonFramingError(`malformed JSON: ${e.message}`);
         }
       }
+    }
+  }
+
+  eof() {
+    if (this.#buffer.length > 0) {
+      throw new NdjsonUnterminatedAtEofError(`unterminated frame at EOF: ${this.#buffer.length} bytes`);
     }
   }
 
@@ -49,8 +58,9 @@ export class NdjsonFramer {
 
 export function encodeNdjson(obj) {
   const payload = JSON.stringify(obj);
-  if (payload.length > MAX_FRAME_SIZE) {
-    throw new NdjsonOversizeError(`payload ${payload.length} bytes > ${MAX_FRAME_SIZE}`);
+  const payloadBytes = Buffer.byteLength(payload, 'utf8');
+  if (payloadBytes > MAX_FRAME_SIZE) {
+    throw new NdjsonOversizeError(`payload ${payloadBytes} bytes > ${MAX_FRAME_SIZE}`);
   }
   return payload + '\n';
 }
@@ -64,24 +74,30 @@ export class MuxOversizeError extends MuxFramingError {}
 export class MuxNeverTerminatedError extends MuxFramingError {}
 
 export class MuxFramer {
-  #buffer = Buffer.alloc(0);
+  #chunks = [];
+  #totalBytes = 0;
 
   feed(chunk) {
-    if (this.#buffer.length + chunk.length > MAX_PARTIAL_BUFFER) {
+    if (this.#totalBytes + chunk.length > MAX_PARTIAL_BUFFER) {
       throw new MuxNeverTerminatedError(`partial frame exceeded ${MAX_PARTIAL_BUFFER} bytes without complete length prefix`);
     }
-    this.#buffer = Buffer.concat([this.#buffer, chunk]);
+    this.#chunks.push(chunk);
+    this.#totalBytes += chunk.length;
   }
 
   *frames() {
-    while (this.#buffer.length >= 4) {
-      const len = this.#buffer.readUInt32BE(0);
+    while (this.#totalBytes >= 4) {
+      // Coalesce chunks only when we need to read the length prefix
+      const buf = this.#chunks.length === 1 ? this.#chunks[0] : Buffer.concat(this.#chunks, this.#totalBytes);
+      const len = buf.readUInt32BE(0);
       if (len > MAX_FRAME_SIZE) {
         throw new MuxOversizeError(`frame length ${len} > ${MAX_FRAME_SIZE}`);
       }
-      if (this.#buffer.length < 4 + len) break; // incomplete
-      const payload = this.#buffer.slice(4, 4 + len);
-      this.#buffer = this.#buffer.slice(4 + len);
+      if (this.#totalBytes < 4 + len) break; // incomplete
+      const payload = buf.slice(4, 4 + len);
+      const remainder = buf.slice(4 + len);
+      this.#chunks = remainder.length > 0 ? [remainder] : [];
+      this.#totalBytes = remainder.length;
       try {
         yield JSON.parse(payload.toString('utf8'));
       } catch (e) {
@@ -91,14 +107,15 @@ export class MuxFramer {
   }
 
   pendingBytes() {
-    return this.#buffer.length;
+    return this.#totalBytes;
   }
 }
 
 export function encodeMux(obj) {
   const payload = JSON.stringify(obj);
-  if (payload.length > MAX_FRAME_SIZE) {
-    throw new MuxOversizeError(`payload ${payload.length} bytes > ${MAX_FRAME_SIZE}`);
+  const payloadBytes = Buffer.byteLength(payload, 'utf8');
+  if (payloadBytes > MAX_FRAME_SIZE) {
+    throw new MuxOversizeError(`payload ${payloadBytes} bytes > ${MAX_FRAME_SIZE}`);
   }
   const buf = Buffer.from(payload, 'utf8');
   const len = Buffer.alloc(4);

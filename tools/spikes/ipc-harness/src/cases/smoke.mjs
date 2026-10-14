@@ -172,12 +172,11 @@ export async function smoke() {
     evidence.detail.authority_metrics_slowrenewal = {
       renewals: commitResult6.renewals,
       lastRenewalToLockMs: commitResult6.lastRenewalToLockMs,
-      lastRenewalStartToLockMs: commitResult6.lastRenewalStartToLockMs,
       bound: commitResult6.bound,
       boundViolation: commitResult6.boundViolation,
       effectsDuration: '11s',
       injectedSlowRenewalMs: 2000,
-      note: 'Slow renewal (2s) races lock; drain awaits it; outcome correct despite bound violation',
+      note: 'Slow renewal (2s) races lock; drained after COMMIT; lastRenewalToLockMs measured at actual lock boundary',
     };
 
     // Case 5: Cancellation path

@@ -219,3 +219,43 @@ test('Mux: partial frame waits for completion', () => {
   }
   assert.deepEqual(out, [msg]);
 });
+
+test('NDJSON: unterminated frame at EOF rejected', () => {
+  const framer = new NdjsonFramer();
+  framer.feed(Buffer.from('{"incomplete":true'));
+  assert.strictEqual([...framer.frames()].length, 0);
+  assert.throws(() => framer.eof(), NdjsonFramingError);
+});
+
+test('NDJSON: short truncation at EOF rejected', () => {
+  const framer = new NdjsonFramer();
+  framer.feed(Buffer.from('{"a":1}\n{"b":2}')); // second frame incomplete
+  assert.strictEqual([...framer.frames()].length, 1);
+  assert.throws(() => framer.eof(), NdjsonFramingError);
+});
+
+test('NDJSON: byte-length limits (not UTF-16)', () => {
+  // 4-byte UTF-8 emoji: U+1F600
+  const emoji = '😀';
+  const payload = { text: emoji.repeat(300000) }; // ~1.2MB in bytes
+  assert.throws(() => encodeNdjson(payload), NdjsonOversizeError);
+});
+
+test('Mux: byte-by-byte feed (no quadratic concatenation)', () => {
+  const framer = new MuxFramer();
+  const msg = { text: 'a'.repeat(10000) };
+  const encoded = encodeMux(msg);
+  // Feed one byte at a time
+  for (let i = 0; i < encoded.length; i++) {
+    framer.feed(encoded.slice(i, i + 1));
+  }
+  const frames = [...framer.frames()];
+  assert.strictEqual(frames.length, 1);
+  assert.strictEqual(frames[0].text, msg.text);
+});
+
+test('Mux: byte-length limits (not UTF-16)', () => {
+  const emoji = '😀';
+  const payload = { text: emoji.repeat(300000) };
+  assert.throws(() => encodeMux(payload), MuxOversizeError);
+});

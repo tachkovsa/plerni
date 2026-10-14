@@ -91,6 +91,7 @@ export async function dispatch(id, useDirect = false) {
 
 /**
  * Executor: heartbeat renewal on the reserved path.
+ * Returns completion timestamp if exactly 1 ACTIVE row updated (durable renewal), null otherwise.
  * Optional slow mode (pg_sleep before UPDATE) for testing in-flight renewal collision.
  */
 async function renew(id, reserved, slowMs = 0) {
@@ -98,10 +99,12 @@ async function renew(id, reserved, slowMs = 0) {
     // Two separate queries: sleep, then update
     await reserved.query(`SELECT pg_sleep(${slowMs / 1000})`);
   }
-  await reserved.query(
-    `UPDATE fencing_authority SET heartbeat_at = clock_timestamp() WHERE id = $1 AND status = 'ACTIVE'`,
+  const r = await reserved.query(
+    `UPDATE fencing_authority SET heartbeat_at = clock_timestamp() WHERE id = $1 AND status = 'ACTIVE' RETURNING id`,
     [id]
   );
+  // Return timestamp only for durable renewals (exactly 1 ACTIVE row updated)
+  return r.rowCount === 1 ? Date.now() : null;
 }
 
 /**
@@ -128,13 +131,11 @@ async function conditionalCommit(id, token, c) {
 export async function commitExecution(id, token, effectsFn, useDirect = false, slowRenewalMs = 0) {
   const reserved = reservedConnection();
   await reserved.connect();
-  const c = useDirect ? directConnection() : mainConnection();
-  await c.connect();
 
   let renewalHandle;
   let renewalsStopped = false;
   let inflightRenewal = null;
-  const metrics = { renewals: 0, lastRenewalAt: null, lastRenewalStart: null };
+  const metrics = { renewals: 0, lastRenewalAt: null };
 
   // BOUND: last-renewal→row-lock interval must be < CADENCE_MS (5s). If a renewal ran within
   // the cadence window, it cannot still be in flight when we take the lock (renewal queries
@@ -143,60 +144,65 @@ export async function commitExecution(id, token, effectsFn, useDirect = false, s
   // correctness even if the renewal is delayed.
   const LAST_RENEWAL_TO_LOCK_BOUND_MS = CADENCE_MS;
 
-  try {
-    await c.query('BEGIN');
-
-    // Start renewal loop on the reserved path
-    renewalHandle = setInterval(async () => {
-      if (renewalsStopped) return;
-      const renewalPromise = (async () => {
-        try {
+  // Start renewal loop on the reserved path BEFORE waiting on the pooled connection
+  // (under pool saturation, the lease could expire before renewals start)
+  renewalHandle = setInterval(async () => {
+    if (renewalsStopped) return;
+    const renewalPromise = (async () => {
+      try {
+        const renewalCompletedAt = await renew(id, reserved, slowRenewalMs);
+        if (renewalCompletedAt) {
+          // Count only durable renewals (1-row UPDATEs)
           metrics.renewals++;
-          const renewalStart = Date.now();
-          await renew(id, reserved, slowRenewalMs);
-          metrics.lastRenewalAt = Date.now();
-          metrics.lastRenewalStart = renewalStart;
-        } catch (e) {
-          console.warn(`renewal error: ${e.message}`);
+          metrics.lastRenewalAt = renewalCompletedAt;
         }
-      })();
-      inflightRenewal = renewalPromise;
-      await renewalPromise;
-      if (inflightRenewal === renewalPromise) inflightRenewal = null;
-    }, CADENCE_MS);
+      } catch (e) {
+        console.warn(`[renewal] error: ${e.message}`);
+      }
+    })();
+    inflightRenewal = renewalPromise;
+    await renewalPromise;
+    if (inflightRenewal === renewalPromise) inflightRenewal = null;
+  }, CADENCE_MS);
+
+  const c = useDirect ? directConnection() : mainConnection();
+  try {
+    await c.connect();
+    await c.query('BEGIN');
 
     // Execute effects inside the transaction
     await effectsFn(c);
 
-    // SHUTDOWN ORDERING: stop renewal scheduling immediately before the conditional update
+    // SHUTDOWN ORDERING per plan line 158:
+    // 1. Stop renewal scheduling
     renewalsStopped = true;
     clearInterval(renewalHandle);
-    const beforeLock = Date.now();
 
-    // Await any in-flight renewal before taking the lock
+    // 2. Conditional COMMITTED update (acquires row lock)
+    const lockAcquiredAt = Date.now();
+    const { committed, rowCount } = await conditionalCommit(id, token, c);
+    if (!committed) {
+      await c.query('ROLLBACK');
+      // Drain any renewal still blocked on the row lock
+      if (inflightRenewal) await inflightRenewal;
+      throw new FencedError(`conditional COMMITTED failed: 0 rows (id=${id}, token=${token})`);
+    }
+
+    // 3. Resolve (COMMIT) the effects transaction
+    await c.query('COMMIT');
+
+    // 4. THEN drain renewals (renewal blocked on the lock can now proceed and fail benignly)
     if (inflightRenewal) {
       await inflightRenewal;
     }
 
-    // Conditional COMMITTED update (acquires row lock)
-    const { committed, rowCount } = await conditionalCommit(id, token, c);
-    if (!committed) {
-      await c.query('ROLLBACK');
-      throw new FencedError(`conditional COMMITTED failed: 0 rows (id=${id}, token=${token})`);
-    }
-
-    // Resolve the effects transaction
-    await c.query('COMMIT');
-
-    const lastRenewalToLockMs = metrics.lastRenewalAt ? beforeLock - metrics.lastRenewalAt : null;
-    const lastRenewalStartToLockMs = metrics.lastRenewalStart ? beforeLock - metrics.lastRenewalStart : null;
+    const lastRenewalToLockMs = metrics.lastRenewalAt ? lockAcquiredAt - metrics.lastRenewalAt : null;
     const boundViolation = lastRenewalToLockMs !== null && lastRenewalToLockMs > LAST_RENEWAL_TO_LOCK_BOUND_MS;
 
     return {
       committed: true,
       renewals: metrics.renewals,
       lastRenewalToLockMs,
-      lastRenewalStartToLockMs,
       boundViolation,
       bound: LAST_RENEWAL_TO_LOCK_BOUND_MS,
     };
@@ -256,10 +262,14 @@ export async function sweepAbandoned(useDirect = false) {
 
 /**
  * Starts a background sweeper that runs every SWEEP_INTERVAL_MS.
+ * Single-flight: no overlapping iterations.
  * @param {boolean} useDirect - use direct connection (fallback when pooled unavailable)
  */
 export function startSweeper(useDirect = false) {
+  let inFlight = false;
   const handle = setInterval(async () => {
+    if (inFlight) return; // skip overlapping iterations
+    inFlight = true;
     try {
       const abandoned = await sweepAbandoned(useDirect);
       if (abandoned.length > 0) {
@@ -267,6 +277,8 @@ export function startSweeper(useDirect = false) {
       }
     } catch (e) {
       console.warn(`[sweeper] error: ${e.message}`);
+    } finally {
+      inFlight = false;
     }
   }, SWEEP_INTERVAL_MS);
   return () => clearInterval(handle);
