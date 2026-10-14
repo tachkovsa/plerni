@@ -5,6 +5,7 @@
 import { NdjsonFramer, encodeNdjson } from '../framing.mjs';
 
 const framer = new NdjsonFramer();
+let framingError = false;
 
 process.stdin.on('data', (chunk) => {
   try {
@@ -16,6 +17,7 @@ process.stdin.on('data', (chunk) => {
     }
   } catch (e) {
     console.error(`[echo] framing error: ${e.message}`);
+    framingError = true;
     process.exitCode = 1;
   }
 });
@@ -23,8 +25,10 @@ process.stdin.on('data', (chunk) => {
 process.stdin.on('end', () => {
   try {
     framer.eof(); // reject unterminated frames at EOF
-    // Use exitCode to allow stdout to drain
-    process.exitCode = 0;
+    // Only set success if no earlier framing error occurred
+    if (!framingError) {
+      process.exitCode = 0;
+    }
   } catch (e) {
     console.error(`[echo] EOF error: ${e.message}`);
     process.exitCode = 1;

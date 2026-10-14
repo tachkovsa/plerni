@@ -34,23 +34,44 @@ function envOrDie(name) {
 
 // RESERVED PATH: dedicated direct connection for renewals (never shares the main pool).
 function reservedConnection() {
-  const dsn = process.env.HARNESS_DIRECT_DSN
-    ?? `postgres://plerni_app:${envOrDie('PLERNI_APP_PASSWORD')}@localhost:54320/plerni`;
-  return new pg.Client({ connectionString: dsn });
+  if (process.env.HARNESS_DIRECT_DSN) {
+    return new pg.Client({ connectionString: process.env.HARNESS_DIRECT_DSN });
+  }
+  return new pg.Client({
+    host: 'localhost',
+    port: 54320,
+    database: 'plerni',
+    user: 'plerni_app',
+    password: envOrDie('PLERNI_APP_PASSWORD'),
+  });
 }
 
 // Main connection for effects/commits (pooled through PgBouncer).
 function mainConnection() {
-  const dsn = process.env.HARNESS_POOLED_DSN
-    ?? `postgres://plerni_app:${envOrDie('PLERNI_APP_PASSWORD')}@localhost:54321/plerni`;
-  return new pg.Client({ connectionString: dsn });
+  if (process.env.HARNESS_POOLED_DSN) {
+    return new pg.Client({ connectionString: process.env.HARNESS_POOLED_DSN });
+  }
+  return new pg.Client({
+    host: 'localhost',
+    port: 54321,
+    database: 'plerni',
+    user: 'plerni_app',
+    password: envOrDie('PLERNI_APP_PASSWORD'),
+  });
 }
 
 // Direct connection fallback (for VMs where PgBouncer setup fails).
 function directConnection() {
-  const dsn = process.env.HARNESS_DIRECT_DSN
-    ?? `postgres://plerni_app:${envOrDie('PLERNI_APP_PASSWORD')}@localhost:54320/plerni`;
-  return new pg.Client({ connectionString: dsn });
+  if (process.env.HARNESS_DIRECT_DSN) {
+    return new pg.Client({ connectionString: process.env.HARNESS_DIRECT_DSN });
+  }
+  return new pg.Client({
+    host: 'localhost',
+    port: 54320,
+    database: 'plerni',
+    user: 'plerni_app',
+    password: envOrDie('PLERNI_APP_PASSWORD'),
+  });
 }
 
 /**
@@ -146,8 +167,9 @@ export async function commitExecution(id, token, effectsFn, useDirect = false, s
 
   // Start renewal loop on the reserved path BEFORE waiting on the pooled connection
   // (under pool saturation, the lease could expire before renewals start)
+  // Single-flight: skip ticks if previous renewal still in progress
   renewalHandle = setInterval(async () => {
-    if (renewalsStopped) return;
+    if (renewalsStopped || inflightRenewal) return;
     const renewalPromise = (async () => {
       try {
         const renewalCompletedAt = await renew(id, reserved, slowRenewalMs);
@@ -179,8 +201,8 @@ export async function commitExecution(id, token, effectsFn, useDirect = false, s
     clearInterval(renewalHandle);
 
     // 2. Conditional COMMITTED update (acquires row lock)
-    const lockAcquiredAt = Date.now();
     const { committed, rowCount } = await conditionalCommit(id, token, c);
+    const lockAcquiredAt = Date.now(); // timestamp after awaited update completes
     if (!committed) {
       await c.query('ROLLBACK');
       // Drain any renewal still blocked on the row lock

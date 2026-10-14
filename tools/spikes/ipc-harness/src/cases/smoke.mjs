@@ -113,6 +113,14 @@ export async function smoke() {
       evidence.pass = false;
       evidence.detail.authority_committed_long = { expected: 'COMMITTED', got: status.status };
     }
+    // Assert that renewals actually fired (heartbeat path required)
+    if (commitResult4.renewals < 1) {
+      evidence.pass = false;
+      evidence.detail.authority_no_renewals_long = {
+        expected: '>=1',
+        got: commitResult4.renewals,
+      };
+    }
     evidence.detail.authority_metrics_long = {
       renewals: commitResult4.renewals,
       lastRenewalToLockMs: commitResult4.lastRenewalToLockMs,
@@ -142,6 +150,14 @@ export async function smoke() {
     if (status.status !== 'COMMITTED') {
       evidence.pass = false;
       evidence.detail.authority_committed_verylong = { expected: 'COMMITTED', got: status.status };
+    }
+    // Assert that renewals actually fired
+    if (commitResult5.renewals < 1) {
+      evidence.pass = false;
+      evidence.detail.authority_no_renewals_verylong = {
+        expected: '>=1',
+        got: commitResult5.renewals,
+      };
     }
     evidence.detail.authority_metrics_verylong = {
       renewals: commitResult5.renewals,
