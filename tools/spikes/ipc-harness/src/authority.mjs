@@ -39,10 +39,12 @@ function reservedConnection() {
   return new pg.Client({ connectionString: dsn });
 }
 
-// Main connection for effects/commits (pooled).
+// Main connection for effects/commits (direct for spike, pooled for production).
+// Spike note: using direct connection due to PgBouncer auth_file configuration complexity in containerized dev environment.
 function mainConnection() {
-  const dsn = process.env.HARNESS_POOLED_DSN
-    ?? `postgres://plerni_app:${envOrDie('PLERNI_APP_PASSWORD')}@localhost:54321/plerni`;
+  const dsn = process.env.HARNESS_MAIN_DSN
+    ?? process.env.HARNESS_DIRECT_DSN
+    ?? `postgres://plerni_app:${envOrDie('PLERNI_APP_PASSWORD')}@localhost:54320/plerni`;
   return new pg.Client({ connectionString: dsn });
 }
 
