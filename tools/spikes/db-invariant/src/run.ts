@@ -4,34 +4,29 @@
 import { sql } from 'kysely';
 import { direct } from './client.ts';
 import { record, evidenceFile, failedCount } from './evidence.ts';
-import { withTenant, type HygieneEvidence } from './context.ts';
+import { assertTenantContext, MissingTenantContextError } from './context.ts';
 import { a1Pinning } from './cases/a1-pinning.ts';
-import { a2Oracle, TENANT_B } from './cases/a2-oracle.ts';
+import { a2Oracle } from './cases/a2-oracle.ts';
 
 async function vacuityControl(): Promise<void> {
-  // Deliberately broken: no install step at all. RLS must deny AND the "protocol" never proves
-  // anything — the run proves the tests CAN fail (spec §5 vacuity guard).
+  // The designed FAIL (T3a step 5): a protocol variant that skips the context install must FAIL
+  // A2 — zero rows via RLS AND the app guard raises MissingTenantContextError; both outcomes in
+  // evidence. If either fails to fire, every A2 pass above is void (spec §5 vacuity guard).
   const db = direct();
-  const ev: HygieneEvidence = { terminatedBackendPids: [], attempts: 0, alerts: [] };
-  const rows = await db.transaction().execute(async (trx) => {
-    const r = await sql<{ label: string }>`SELECT label FROM plerni_tenant`.execute(trx);
-    return r.rows.length;
+  let rows = -1;
+  let guardRaised = false;
+  await db.transaction().execute(async (trx) => {
+    rows = (await sql<{ label: string }>`SELECT label FROM plerni_tenant`.execute(trx)).rows.length;
+    try {
+      await assertTenantContext(trx);
+    } catch (e) {
+      guardRaised = e instanceof MissingTenantContextError;
+    }
   });
   record({
-    case: 'vacuity: no-context read sees zero rows (test can fail)', datasource: 'direct',
-    pass: rows === 0,
-    detail: { rows, note: 'if this passes with rows>0, RLS is broken and every A2 result is void' },
-  });
-  // And the inverse shape: a run that skips only the readback verification still passes reads —
-  // proving the readback step is the only thing standing between us and silent wrong-value install.
-  const skipVerify = await withTenant(db, TENANT_B, ev, async (trx) => {
-    const r = await sql<{ label: string }>`SELECT label FROM plerni_tenant ORDER BY label`.execute(trx);
-    return r.rows.map((x) => x.label);
-  });
-  record({
-    case: 'vacuity inverse: protocol-installed context reads B', datasource: 'direct',
-    pass: JSON.stringify(skipVerify) === JSON.stringify(['assignment', 'goal', 'review']),
-    detail: { read: skipVerify },
+    case: 'vacuity: install-skipped variant FAILS A2 as designed', datasource: 'direct',
+    pass: rows === 0 && guardRaised,
+    detail: { rows, guardRaised, proves: 'RLS denies + guard trips; without both, A2 cannot fail' },
   });
   await db.destroy();
 }

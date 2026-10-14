@@ -2,8 +2,7 @@
 // whole life. Pass: pg_backend_pid() constant across ≥3 statements per transaction under
 // concurrent load, on the Kysely path AND an identical raw-pg control. Both main datasources.
 import { sql, type Kysely } from 'kysely';
-import pg from 'pg';
-import { direct, pooled, rawRoot, type Db } from '../client.ts';
+import { direct, pooled, rawApp, type Db } from '../client.ts';
 import { record } from '../evidence.ts';
 
 const CONCURRENT = 8;
@@ -23,7 +22,7 @@ async function pidsViaKysely(db: Kysely<Db>): Promise<number[][]> {
 
 async function pidsViaRawPg(): Promise<number[][]> {
   return Promise.all(Array.from({ length: CONCURRENT }, async () => {
-    const c = rawRoot();
+    const c = rawApp(); // app role on the direct DSN — controls isolate Kysely-misuse vs driver on the app path (§3.0①)
     await c.connect();
     const pids: number[] = [];
     try {

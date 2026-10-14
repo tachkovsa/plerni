@@ -60,8 +60,11 @@ export async function installTenantContext(trx: Transaction<Db>, tenantId: strin
   if (contamination.length > 0) {
     ev.terminatedBackendPids.push(before.pid);
     ev.alerts.push(`SECURITY contamination on backend ${before.pid}: ${contamination.join('; ')}`);
-    await sql`SELECT pg_terminate_backend(pg_backend_pid())`.execute(trx); // designed connection error follows
-    throw new ContaminationError(contamination.join('; ')); // unreachable in practice — the backend dies
+    // Termination is performed by the PRIVILEGED terminator in withTenant (γ-M1):
+    // after a leaked SET ROLE, current_user lacks the privilege to kill this backend
+    // ("permission denied to terminate process") — self-termination is impossible for the
+    // role class, and the TCP-healthy contaminated client would wedge the pool.
+    throw new ContaminationError(JSON.stringify({ pid: before.pid, reasons: contamination }));
   }
   await sql`SELECT set_config('plerni.tenant_id', ${tenantId}, true)`.execute(trx);
   const after = await readSessionState(trx);
@@ -82,6 +85,7 @@ export async function withTenant<T>(
   db: Kysely<Db>,
   tenantId: string,
   ev: HygieneEvidence,
+  terminateBackend: (pid: number) => Promise<void>, // privileged path (γ-M1); spike: harness root
   fn: (trx: Transaction<Db>) => Promise<T>,
 ): Promise<T> {
   for (let attempt = 1; ; attempt++) {
@@ -92,18 +96,26 @@ export async function withTenant<T>(
         return fn(trx); // ⑤ tenant access
       });
     } catch (e) {
-      // Retry only the contamination-recovery / connection-death class: our terminate kills the
-      // backend; through PgBouncer the client sees "server conn crashed?" / FATAL 08P01, on the
-      // direct path "terminating connection…". Anything else is a real failure — never retried.
+      if (e instanceof ContaminationError) {
+        const pid = Number(JSON.parse(e.message).pid);
+        await terminateBackend(pid); // evict the contaminated backend, then retry on a fresh one
+        if (attempt > MAX_RETRY) throw new Error(`loud failure: contamination persisted after ${MAX_RETRY} retries`, { cause: e });
+        continue;
+      }
+      // Connection-death class only, classified by SQLSTATE (γ-m1: message matching catches
+      // business text like "could not TERMINATE the rows" — never retry those):
+      // 57P01 admin_shutdown, 08* connection exceptions, PgBouncer's exact "server conn crashed?".
       const errCode = typeof e === 'object' && e !== null && 'code' in e ? e.code : undefined;
-      const isDeath = e instanceof ContaminationError
-        || (e instanceof Error && /terminat|server conn|connection (terminated|ended|reset)/i.test(e.message))
-        || (typeof errCode === 'string' && errCode.startsWith('08'));
+      const msg = e instanceof Error ? e.message : '';
+      const isDeath = (typeof errCode === 'string' && (errCode === '57P01' || errCode.startsWith('08')))
+        || msg === 'server conn crashed?'
+        || msg.startsWith('terminating connection')
+        || msg.startsWith('Connection terminated');
       if (isDeath) {
-        if (attempt > MAX_RETRY) throw new Error(`loud failure: contamination persisted after ${MAX_RETRY} retries: ${String(e)}`);
+        if (attempt > MAX_RETRY) throw new Error(`loud failure: connection death persisted after ${MAX_RETRY} retries`, { cause: e });
         continue; // fresh connection
       }
-      throw e;
+      throw e; // real failure — never retried
     }
   }
 }
