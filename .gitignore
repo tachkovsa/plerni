@@ -11,6 +11,8 @@ temp/
 .mcp.json
 .private-markers.local
 *.local.md
+# generated at reset time from env — never committed (credentials)
+tools/harness/pgbouncer/userlist.txt
 # gate fixtures intentionally track fake node_modules packages (nothing else under fixtures is exempt)
 !scripts/gates/fixtures/*/node_modules/
 !scripts/gates/fixtures/*/node_modules/**
