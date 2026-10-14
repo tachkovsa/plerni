@@ -1,0 +1,13 @@
+{
+  "extends": "../../../tsconfig.base.json",
+  "compilerOptions": {
+    // Required combination under the base's NodeNext + verbatimModuleSyntax (detailed plan, β-M4):
+    // type-stripped .ts execution needs allowImportingTsExtensions, which requires noEmit.
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+    "declaration": false,
+    "sourceMap": false,
+    "types": ["node"]
+  },
+  "include": ["src/**/*.ts"]
+}
