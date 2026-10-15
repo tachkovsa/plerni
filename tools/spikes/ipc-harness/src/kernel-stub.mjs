@@ -53,6 +53,10 @@ export class PendingTable {
     return removed;
   }
 
+  sizeOf(pluginId, lane = 'call') {
+    return this.#byLane.get(lane)?.get(pluginId)?.size ?? 0;
+  }
+
   get size() {
     let n = 0;
     for (const byPlugin of this.#byLane.values()) {
@@ -131,6 +135,11 @@ export class KernelStub {
     this.framingFault = null;
     this.shut = false;
     this.pendingCap = opts.pendingCap ?? KERNEL_PENDING_CAP;
+    // One plugin's calls must not occupy every slot. The leftover seats admit
+    // a sibling call, and cancelReserve keeps a cancellation out of that race.
+    this.cancelReserve = Math.min(opts.cancelReserve ?? 1, Math.max(0, this.pendingCap - 1));
+    const callRoom = Math.max(1, this.pendingCap - this.cancelReserve);
+    this.pendingPerPlugin = opts.pendingPerPlugin ?? Math.max(1, Math.floor(callRoom / 2));
     this.byteCap = opts.byteCap ?? KERNEL_BYTE_CAP;
     this.outbound = 0;
     this.writeQueue = [];
@@ -226,6 +235,12 @@ export class KernelStub {
     if (this.shut || this.socket.destroyed) return Promise.reject(fail('closed'));
     const lane = bucket === this.cancels ? 'cancel' : 'call';
     if (bucket.has(frame.pluginId, frame.correlationId)) return Promise.reject(fail('duplicate-correlation'));
+    if (lane === 'call' && this.calls.sizeOf(frame.pluginId) >= this.pendingPerPlugin) {
+      return Promise.reject(fail('pending-cap'));
+    }
+    if (lane === 'call' && this.calls.size >= this.pendingCap - this.cancelReserve) {
+      return Promise.reject(fail('pending-cap'));
+    }
     if (this.#occupied() >= this.pendingCap) return Promise.reject(fail('pending-cap'));
     frame.timeoutMs = timeoutMs;
     frame.sendTs = performance.now();

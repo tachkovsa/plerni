@@ -660,7 +660,7 @@ test('a paused child keeps its unread tail and the buffer stops growing', { time
   const cap = 8 * 1024;
   const pair = await connectPair({
     sweeper: false,
-    caps: { total: cap, totalGlobal: cap, partial: 1024 * 1024 },
+    caps: { total: 1024 * 1024, totalGlobal: cap, partial: 1024 * 1024 },
     partialHighWater: 1024 * 1024,
   });
   try {
@@ -668,7 +668,7 @@ test('a paused child keeps its unread tail and the buffer stops growing', { time
       pluginId: 'partial',
       script: floodPath,
       env: { FLOOD_MODE: 'partial' },
-      total: cap,
+      total: 1024 * 1024,
     });
     const rec = pair.sup.children.get('partial');
     const paused = await waitUntil(() => rec.paused && !rec.dead, 3_000);
@@ -1209,7 +1209,7 @@ test('pushed-back stdout bytes count against the per-plugin and global caps', as
   const cap = 1024;
   const pair = await connectPair({
     sweeper: false,
-    caps: { total: cap, totalGlobal: cap, partial: 1024 * 1024 },
+    caps: { lo: 16, total: 64 * 1024, totalGlobal: cap, partial: 1024 * 1024 },
     partialHighWater: 1024 * 1024,
   });
   try {
@@ -1217,15 +1217,19 @@ test('pushed-back stdout bytes count against the per-plugin and global caps', as
       pluginId: 'partial',
       script: floodPath,
       env: { FLOOD_MODE: 'silent' },
-      total: cap,
+      total: 64 * 1024,
     });
     const rec = pair.sup.children.get('partial');
+    pair.sup.socket.write = () => false;
+    const floods = [];
+    for (let i = 0; i < 20; i++) floods.push(encodeNdjson({ kind: 'flood' }));
+    rec.child.stdout.emit('data', Buffer.from(floods.join('')));
+    assert.equal(rec.pauseReason, 'bulk');
     rec.child.stdout.emit('data', Buffer.alloc(20_000, 0x61));
     const unread = rec.child.stdout.readableLength;
-    assert.ok(unread > cap, String(unread));
+    assert.ok(unread > 1024, String(unread));
     const pluginBytes = pair.sup.queueDepth('partial').pluginBytes;
     assert.ok(pluginBytes >= unread, String(pluginBytes));
-    assert.ok(pluginBytes > cap, String(pluginBytes));
     assert.ok(pair.sup.bufferedBytes() >= unread, String(pair.sup.bufferedBytes()));
     assert.equal(rec.dead, false);
     assert.equal(rec.paused, true);
@@ -1323,6 +1327,228 @@ test('numeric and NUL identities do not retire each other\'s waiters', async () 
     for (const rec of pair.sup.children.values()) {
       if (rec.child.exitCode == null && rec.child.signalCode == null) rec.child.kill('SIGKILL');
     }
+    await pair.close();
+  }
+});
+
+test('an unfinished frame past the total cap is a typed fault', { timeout: 10_000 }, async () => {
+  const pair = await connectPair({
+    sweeper: false,
+    caps: { total: 32 * 1024, totalGlobal: 8 * 1024 * 1024, partial: 1024 * 1024 },
+    partialHighWater: 1024 * 1024,
+  });
+  try {
+    const kid = pair.sup.spawn({
+      pluginId: 'echo',
+      script: echoPath,
+      total: 32 * 1024,
+    });
+    const rec = pair.sup.children.get('echo');
+    rec.child.kill('SIGSTOP');
+    const pending = pair.stub.call({
+      pluginId: 'echo',
+      credential: kid.credential,
+      correlationId: 1,
+      port: 'db',
+      method: 'get',
+      payload: { ok: true },
+    }, 2_000).catch((err) => err);
+    const armed = await waitUntil(() => pair.sup.pending.size === 1, 2_000);
+    assert.equal(armed, true);
+    rec.child.stdout.emit('data', Buffer.from(encodeNdjson({
+      kind: 'result',
+      correlationId: 1,
+      payload: { blob: 'z'.repeat(80_000) },
+    })));
+    const settled = await pending;
+    assert.equal(settled.code, 'total-cap');
+    assert.equal(rec.dead, true);
+    assert.equal(rec.paused, false);
+    assert.ok(pair.sup.faults.some((fault) => fault.pluginId === 'echo' && fault.code === 'total-cap'));
+  } finally {
+    const proc = pair.sup.children.get('echo')?.child;
+    if (proc && proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL');
+    await pair.close();
+  }
+});
+
+test('socket writes stay in the global byte count until flushed', async () => {
+  const cap = 32 * 1024;
+  const pair = await connectPair({
+    sweeper: false,
+    caps: {
+      lo: 1000,
+      hi: 64,
+      pending: 80,
+      pendingGlobal: 80,
+      total: 8 * 1024 * 1024,
+      totalGlobal: cap,
+    },
+  });
+  try {
+    const kid = pair.sup.spawn({
+      pluginId: 'echo',
+      script: echoPath,
+      pending: 80,
+      total: 8 * 1024 * 1024,
+    });
+    const rec = pair.sup.children.get('echo');
+    rec.child.kill('SIGSTOP');
+    const calls = [];
+    for (let i = 0; i < 40; i++) {
+      calls.push(pair.stub.call({
+        pluginId: 'echo',
+        credential: kid.credential,
+        correlationId: i + 1,
+        port: 'db',
+        method: 'get',
+        payload: { i },
+      }, 1_500).catch((err) => err));
+    }
+    const armed = await waitUntil(() => pair.sup.pending.size >= 40, 2_000);
+    assert.equal(armed, true);
+    let held = 0;
+    pair.sup.socket.write = (buf) => {
+      held += buf.length;
+      return true;
+    };
+    const lines = [];
+    for (let i = 0; i < 40; i++) {
+      lines.push(encodeNdjson({ kind: 'result', correlationId: i + 1, payload: { n: 'x'.repeat(2000) } }));
+    }
+    rec.child.stdout.emit('data', Buffer.from(lines.join('')));
+    assert.ok(held > cap, String(held));
+    assert.ok(pair.sup.bufferedBytes() >= held, `${pair.sup.bufferedBytes()} vs ${held}`);
+    assert.ok(held < 40 * 2000, String(held));
+    await Promise.all(calls);
+  } finally {
+    const proc = pair.sup.children.get('echo')?.child;
+    if (proc && proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL');
+    await pair.close();
+  }
+});
+
+test('overlapping respawns do not leave a duplicate generation running', { timeout: 15_000 }, async () => {
+  const pair = await connectPair({ sweeper: false });
+  try {
+    const first = pair.sup.spawn({ pluginId: 'echo', script: echoPath });
+    const generation = first.credential.generation;
+    const [left, right] = await Promise.all([
+      pair.sup.respawn('echo'),
+      pair.sup.respawn('echo'),
+    ]);
+    assert.equal(left.credential.generation, generation + 1);
+    assert.equal(right.credential.generation, generation + 2);
+    const live = pair.sup.children.get('echo');
+    assert.equal(live.child.pid, right.pid);
+    assert.equal(live.credential.generation, generation + 2);
+    assert.notEqual(left.pid, right.pid);
+    const gone = await waitUntil(() => {
+      try {
+        process.kill(left.pid, 0);
+        return false;
+      } catch {
+        return true;
+      }
+    }, 3_000);
+    assert.equal(gone, true);
+    const res = await pair.stub.call({
+      pluginId: 'echo',
+      credential: right.credential,
+      correlationId: 1,
+      port: 'db',
+      method: 'get',
+      payload: { who: 'live' },
+    }, 2_000);
+    assert.equal(res.payload?.who, 'live');
+    assert.equal(res.generation, generation + 2);
+  } finally {
+    const proc = pair.sup.children.get('echo')?.child;
+    if (proc && proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL');
+    await pair.close();
+  }
+});
+
+test('one stdout chunk cannot enqueue results past the low-priority cap', async () => {
+  const pair = await connectPair({
+    sweeper: false,
+    caps: {
+      lo: 4,
+      hi: 64,
+      pending: 80,
+      pendingGlobal: 80,
+      total: 8 * 1024 * 1024,
+      totalGlobal: 8 * 1024 * 1024,
+    },
+  });
+  try {
+    const kid = pair.sup.spawn({
+      pluginId: 'echo',
+      script: echoPath,
+      pending: 80,
+      total: 8 * 1024 * 1024,
+    });
+    const rec = pair.sup.children.get('echo');
+    rec.child.kill('SIGSTOP');
+    const calls = [];
+    for (let i = 0; i < 40; i++) {
+      calls.push(pair.stub.call({
+        pluginId: 'echo',
+        credential: kid.credential,
+        correlationId: i + 1,
+        port: 'db',
+        method: 'get',
+        payload: { i },
+      }, 1_000).catch((err) => err));
+    }
+    const armed = await waitUntil(() => pair.sup.pending.size >= 40, 2_000);
+    assert.equal(armed, true);
+    pair.sup.socket.write = () => false;
+    const lines = [];
+    for (let i = 0; i < 40; i++) {
+      lines.push(encodeNdjson({ kind: 'result', correlationId: i + 1, payload: { i } }));
+    }
+    rec.child.stdout.emit('data', Buffer.from(lines.join('')));
+    assert.ok(pair.sup.queueDepth('echo').lo <= 4, String(pair.sup.queueDepth('echo').lo));
+    assert.equal(pair.sup.caps.lo, true);
+    await Promise.all(calls);
+  } finally {
+    const proc = pair.sup.children.get('echo')?.child;
+    if (proc && proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL');
+    await pair.close();
+  }
+});
+
+test('one plugin cannot fill the kernel ahead of a sibling cancel', async () => {
+  const pair = await connectPair({ sweeper: false });
+  try {
+    const silent = pair.sup.spawn({
+      pluginId: 'silent',
+      script: floodPath,
+      env: { FLOOD_MODE: 'silent' },
+    });
+    const sib = pair.sup.spawn({ pluginId: 'sib', script: echoPath });
+    const burst = [];
+    for (let i = 0; i < pair.stub.pendingCap; i++) {
+      burst.push(pair.stub.call({
+        pluginId: 'silent',
+        credential: silent.credential,
+        correlationId: i + 1,
+        port: 'db',
+        method: 'get',
+        payload: { i },
+      }, 300).catch((err) => err));
+    }
+    assert.ok(pair.stub.calls.sizeOf('silent') <= pair.stub.pendingPerPlugin);
+    assert.ok(pair.stub.calls.size < pair.stub.pendingCap);
+    const cancel = await pair.stub.cancel({
+      pluginId: 'sib',
+      credential: sib.credential,
+      correlationId: 1,
+    }, 1_000).catch((err) => err);
+    assert.notEqual(cancel.code, 'pending-cap');
+    await Promise.all(burst);
+  } finally {
     await pair.close();
   }
 });

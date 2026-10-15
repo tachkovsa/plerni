@@ -145,7 +145,11 @@ export class Supervisor {
     this.loTurn = 0;
     this.terminal = [];
     this.queuedBytes = 0;
+    // Bytes accepted by socket.write until the flush callback. They have left
+    // the mux queues and are not visible in queuedBytes.
+    this.socketOutbound = 0;
     this.draining = false;
+    this.respawnTail = new Map();
     this.inputPaused = false;
     this.unknownRejectQueued = false;
     this.unknownRejectsCoalesced = 0;
@@ -214,6 +218,23 @@ export class Supervisor {
   }
 
   async respawn(pluginId) {
+    const previous = this.respawnTail.get(pluginId) ?? Promise.resolve();
+    const run = previous.then(
+      () => this.#respawnOnce(pluginId),
+      () => this.#respawnOnce(pluginId),
+    );
+    this.respawnTail.set(pluginId, run);
+    try {
+      return await run;
+    } finally {
+      if (this.respawnTail.get(pluginId) === run) this.respawnTail.delete(pluginId);
+    }
+  }
+
+  // One respawn at a time per plugin. Overlapping callers used to snapshot the
+  // same generation, then the later one deleted the newer map entry and left
+  // that child running with a duplicate generation.
+  async #respawnOnce(pluginId) {
     const prev = this.children.get(pluginId);
     if (!prev) throw new Error(`unknown plugin ${pluginId}`);
     this.retiredTokens.add(prev.token);
@@ -247,7 +268,7 @@ export class Supervisor {
   // low-priority queue can be refilled while that prefetch is still counted
   // in bufferedBytes().
   #acceptedBytes() {
-    let total = this.queuedBytes + this.bridge.pendingBytes();
+    let total = this.queuedBytes + this.socketOutbound + this.bridge.pendingBytes();
     for (const rec of this.children.values()) {
       if (rec.dead) continue;
       total += rec.framer.pendingBytes();
@@ -533,6 +554,13 @@ export class Supervisor {
   }
 
   #accountCaps(rec) {
+    // An unfinished frame cannot shrink while stdout is paused, so crossing
+    // the total cap with one is a typed fault rather than a permanent pause.
+    if (!rec.dead && rec.framer.pendingBytes() > rec.limits.total) {
+      this.caps.total = true;
+      this.#fault(rec, 'total-cap');
+      return;
+    }
     if (this.#pluginBytes(rec) > rec.limits.total) {
       this.caps.total = true;
       this.#pause(rec, 'total');
@@ -672,6 +700,14 @@ export class Supervisor {
       return false;
     }
     if (pending.generation !== rec.credential.generation) return false;
+    const priority = msg.kind === 'cancelled' ? 10 : 1;
+    // One stdout chunk can carry many results. Pause does not stop this loop,
+    // so the cap is checked before each result is queued.
+    if (priority < 10 && (this.lo.get(pluginId)?.length ?? 0) >= this.capsConfig.lo) {
+      this.caps.lo = true;
+      this.#pause(rec, 'bulk');
+      return false;
+    }
     const frame = {
       kind: msg.kind,
       code: msg.code,
@@ -701,7 +737,6 @@ export class Supervisor {
       });
       return false;
     }
-    const priority = msg.kind === 'cancelled' ? 10 : 1;
     if (priority >= 10 && !this.#roomHi(pluginId)) {
       this.#take(pluginId, msg.correlationId, lane);
       return false;
@@ -927,6 +962,10 @@ export class Supervisor {
 
   #drain() {
     if (this.draining || this.closed || this.framingFault) return;
+    if (this.socketOutbound > this.capsConfig.totalGlobal) {
+      this.#pauseOverGlobal();
+      return;
+    }
     this.draining = true;
     const step = () => {
       if (this.closed || this.framingFault) {
@@ -947,15 +986,27 @@ export class Supervisor {
         }
         wrote++;
         if (this.#loLength() < 8) this.#resumeBulk();
+        const buf = next.buf;
+        this.socketOutbound += buf.length;
         let ok = true;
         try {
-          ok = this.socket.write(next.buf);
+          ok = this.socket.write(buf, () => {
+            this.socketOutbound = Math.max(0, this.socketOutbound - buf.length);
+            this.#maybeResumeAll();
+            if (!this.draining && !this.closed && !this.framingFault) this.#drain();
+          });
         } catch {
+          this.socketOutbound = Math.max(0, this.socketOutbound - buf.length);
           this.draining = false;
           return;
         }
+        if (this.bufferedBytes() > this.capsConfig.totalGlobal) this.#pauseOverGlobal();
         if (!ok) {
           this.socket.once('drain', step);
+          return;
+        }
+        if (this.socketOutbound > this.capsConfig.totalGlobal) {
+          this.draining = false;
           return;
         }
       }

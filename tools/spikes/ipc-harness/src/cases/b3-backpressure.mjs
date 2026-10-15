@@ -221,15 +221,17 @@ async function holdRep({ warmupMs, windowMs, readRss }) {
     const filled = await until(() => {
       const pending = pair.sup.queueDepth('silent').pending >= PENDING_CAP;
       const partialBytes = pair.sup.faults.some((fault) => fault.pluginId === 'partial' && fault.code === 'NdjsonOversizeError');
-      const byteBytes = pair.sup.queueDepth('bytes').pluginBytes >= BYTE_CAP;
+      const byteFault = pair.sup.faults.some((fault) => fault.pluginId === 'bytes' && fault.code === 'total-cap');
+      const byteBytes = byteFault || pair.sup.queueDepth('bytes').pluginBytes >= BYTE_CAP;
       const lo = pair.sup.queueDepth('frames').lo >= LO_CAP;
       const hi = pair.sup.faults.some((fault) => fault.pluginId === 'forger' && fault.code === 'hi-cap');
       return pending && partialBytes && byteBytes && lo && hi;
     }, FILL_MS);
-    const partialRec = pair.sup.children.get('partial');
-    if (partialRec?.dead) {
-      const partialPid = pids.indexOf(partial.pid);
-      if (partialPid >= 0) pids.splice(partialPid, 1);
+    for (const spawned of [partial, bytes]) {
+      const rec = pair.sup.children.get(spawned.credential.pluginId);
+      if (!rec?.dead) continue;
+      const idx = pids.indexOf(spawned.pid);
+      if (idx >= 0) pids.splice(idx, 1);
     }
     const warmStart = performance.now();
     if (filled) await delay(warmupMs);
@@ -276,6 +278,7 @@ async function holdRep({ warmupMs, windowMs, readRss }) {
           partial: pair.sup.queueDepth('partial').partial,
           partialFault: pair.sup.faults.some((fault) => fault.pluginId === 'partial' && fault.code === 'NdjsonOversizeError'),
           bytes: pair.sup.queueDepth('bytes').pluginBytes,
+          bytesFault: pair.sup.faults.some((fault) => fault.pluginId === 'bytes' && fault.code === 'total-cap'),
           lo: pair.sup.queueDepth('frames').lo,
           hi: pair.sup.faults.some((fault) => fault.code === 'hi-cap'),
           outbound: pair.sup.queueDepth('sib').outbound,
@@ -327,7 +330,7 @@ async function holdRep({ warmupMs, windowMs, readRss }) {
       near: {
         pending: near((row) => row.pending >= PENDING_CAP),
         partial: near((row) => row.partialFault && row.partial === 0),
-        bytes: near((row) => row.bytes >= BYTE_CAP && row.bytes <= BYTE_CAP + 192 * 1024),
+        bytes: near((row) => row.bytesFault || (row.bytes >= BYTE_CAP && row.bytes <= BYTE_CAP + 192 * 1024)),
         lo: near((row) => row.lo >= LO_CAP),
       },
       samples: samples.length,
