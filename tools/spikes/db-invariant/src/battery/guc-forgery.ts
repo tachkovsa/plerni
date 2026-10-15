@@ -9,6 +9,7 @@ import { sql, type Kysely } from 'kysely';
 import { pooled, terminateBackendByPid, type Db } from '../client.ts';
 import { withTenant } from '../context.ts';
 import { TENANT_A, TENANT_B } from '../cases/a2-oracle.ts';
+import { watchOutboundSql } from '../cases/a4-protocol.ts';
 import {
   blankEv, drainAppBackends, onlyTenant, rawSessionGuc, readRows, recordProbe,
 } from '../cases/a3-pgbouncer.ts';
@@ -19,6 +20,7 @@ const PHASE = {
   tenancyGateSuite: 'spec §12 / P1',
   acceptance: 'spec §16.13 / P3',
   sessionGucDenial: 'unavailable — no role privilege denies session-setting an ordinary custom GUC',
+  admissionParser: 'P2 must classify from a parse tree, not from lexical scanning',
 } as const;
 
 const ALLOWED_STATEMENTS = new Set(['select', 'insert', 'update', 'delete']);
@@ -69,15 +71,36 @@ const SMUGGLED: DeclaredQuery[] = [
   { statement: 'select', functions: ['count'], text: "SELECT count(*), set_config('plerni.tenant_id', $1, true)" },
 ];
 
+// The lexical scanner misses these. They are expected to pass classification.
+const SCANNER_BYPASSES: DeclaredQuery[] = [
+  { statement: 'select', functions: [], text: `SELECT "set_config"('plerni.tenant_id', $1, true)` },
+  { statement: 'select', functions: [], text: `SELECT set_config/**/('plerni.tenant_id', $1, true)` },
+  { statement: 'select', functions: [], text: `SELECT U&"set_config"('plerni.tenant_id', $1, true)` },
+];
+
+const RAW_PLUGIN_TEXT = "SELECT set_config('plerni.tenant_id', 'x', true)";
+const MISSING_RELATION_TEXT = 'SELECT count(*) FROM definitely_missing_relation';
+
 export async function gucForgery(): Promise<void> {
   await recordProbe(
     { case: 'battery guc-forgery classifier', datasource: 'prototype' },
     async () => {
       const rejected = SMUGGLED.map((q) => classify(q));
+      const bypasses = SCANNER_BYPASSES.map((q) => ({ text: q.text, ...classify(q) }));
       const clean = classify({ statement: 'select', functions: ['count'], text: 'SELECT count(*) FROM plerni_tenant' });
       return {
-        pass: rejected.every((v) => !v.ok && v.reason.includes('set_config')) && clean.ok === true,
-        detail: { scope: PHASE.scope, phase: PHASE, rejected, cleanAccepted: clean.ok === true },
+        pass: rejected.every((v) => !v.ok && v.reason.includes('set_config'))
+          && bypasses.every((v) => v.ok === true)
+          && clean.ok === true,
+        detail: {
+          scope: PHASE.scope,
+          phase: PHASE,
+          rejected,
+          cleanAccepted: clean.ok === true,
+          knownPrototypeBypasses: bypasses,
+          bypassExpectation: 'these forms get through the lexical scanner',
+          admissionParser: PHASE.admissionParser,
+        },
       };
     },
     rawSessionGuc,
@@ -90,28 +113,42 @@ export async function gucForgery(): Promise<void> {
       { case: 'battery plugin SQL never executes raw', datasource: 'pooled(1)' },
       async () => {
         const before = brokerExecutions;
+        const pluginTexts = [RAW_PLUGIN_TEXT, SMUGGLED[1]!.text, MISSING_RELATION_TEXT];
+        const outbound: string[] = [];
+        const unwatch = watchOutboundSql(outbound);
         let rawRejected = false;
-        try {
-          await submitPluginQuery(db, "SELECT set_config('plerni.tenant_id', 'x', true)");
-        } catch (e) {
-          rawRejected = e instanceof Error && e.message === 'plugin SQL never executes raw';
-        }
         let smuggleRejected = false;
+        let labels: string[] = [];
         try {
-          await submitPluginQuery(db, SMUGGLED[1]);
-        } catch (e) {
-          smuggleRejected = e instanceof Error && e.message.includes('not allowlisted');
+          try {
+            await submitPluginQuery(db, RAW_PLUGIN_TEXT);
+          } catch (e) {
+            rawRejected = e instanceof Error && e.message === 'plugin SQL never executes raw';
+          }
+          try {
+            await submitPluginQuery(db, SMUGGLED[1]);
+          } catch (e) {
+            smuggleRejected = e instanceof Error && e.message.includes('not allowlisted');
+          }
+          // Text names a missing relation. Executing it would error; the broker runs its own read.
+          labels = await submitPluginQuery(db, {
+            statement: 'select',
+            functions: ['count'],
+            text: MISSING_RELATION_TEXT,
+          });
+        } finally {
+          unwatch();
         }
-        // Text names a missing relation. Executing it would error; the broker runs its own read.
-        const labels = await submitPluginQuery(db, {
-          statement: 'select',
-          functions: ['count'],
-          text: 'SELECT count(*) FROM definitely_missing_relation',
-        });
+        const leaked = outbound.filter((sql) => pluginTexts.some((text) => sql.includes(text)));
+        const sawBrokerRead = outbound.some((sql) => sql.includes('plerni_tenant'));
         return {
           pass: rawRejected && smuggleRejected && brokerExecutions === before + 1
-            && JSON.stringify(labels) === JSON.stringify(['assignment', 'goal', 'review']),
-          detail: { rawRejected, smuggleRejected, brokerExecutions, labels, phase: PHASE },
+            && JSON.stringify(labels) === JSON.stringify(['assignment', 'goal', 'review'])
+            && outbound.length > 0 && sawBrokerRead && leaked.length === 0,
+          detail: {
+            rawRejected, smuggleRejected, brokerExecutions, labels, phase: PHASE,
+            outboundCount: outbound.length, sawBrokerRead, leaked,
+          },
         };
       },
       rawSessionGuc,

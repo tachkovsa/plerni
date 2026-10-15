@@ -42,7 +42,7 @@ export function kyselyOf(dsn: string, max = 10): Kysely<Db> {
   return new Kysely<Db>({ dialect: new PostgresDialect({ pool }) });
 }
 
-export const direct = () => kyselyOf(DIRECT);
+export const direct = (max = 10) => kyselyOf(DIRECT, max);
 export const pooled = (max = 10) => kyselyOf(POOLED, max);
 export const rawRoot = () => {
   const c = new pg.Client({ connectionString: ROOT });
@@ -71,7 +71,7 @@ export async function terminateBackendByPid(pid: number): Promise<void> {
 }
 
 // §3.0② evidence: effective PgBouncer config via the admin-console datasource (SHOW only).
-export async function adminShow(command: 'CONFIG' | 'DATABASES' | 'USERS'): Promise<unknown[]> {
+export async function adminShow(command: 'CONFIG' | 'DATABASES' | 'USERS' | 'VERSION'): Promise<unknown[]> {
   const c = new pg.Client({ connectionString: ADMIN });
   await c.connect();
   try {

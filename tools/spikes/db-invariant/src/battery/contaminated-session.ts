@@ -2,16 +2,16 @@
 // tenant GUC, SET ROLE (T2 membership fixture), search_path, a first-use connection, and
 // ALTER ROLE … SET via the superuser credential. Cleanup cost is measured.
 // terminations == injected contaminations, including a warm tail that must add zero.
-// A replayed server login (PgBouncer restores a tracked parameter onto the replacement
-// backend) counts as its own injected contamination: each one is terminated, and a warm
-// client afterwards adds none.
+// Injection counts are fixed at the injection site: 1 for a single session SET, and
+// MAX_RETRY+1 for a class that contaminates every new login. They are not copied
+// from the termination list. A warm client afterwards adds none.
 import { sql } from 'kysely';
-import { kyselyOf, pooled, rawRoot, terminateBackendByPid } from '../client.ts';
+import { adminShow, direct, pooled, rawApp, terminateBackendByPid } from '../client.ts';
 import { MAX_RETRY, withTenant } from '../context.ts';
 import { TENANT_A, TENANT_B } from '../cases/a2-oracle.ts';
 import {
   blankEv, drainAppBackends, rawRoleDefault, rawSearchPath, rawSessionGuc, rawSetRole,
-  readRows, recordProbe, recoverInjected, type Recovery,
+  readRows, recordProbe, recoverInjected, resetAppTenantDefault, setAppTenantDefault, type Recovery,
 } from '../cases/a3-pgbouncer.ts';
 
 async function freshPool() {
@@ -19,21 +19,15 @@ async function freshPool() {
   return pooled(1);
 }
 
-function directOne() {
-  const password = process.env.PLERNI_APP_PASSWORD;
-  if (!password) throw new Error('spike: missing env var PLERNI_APP_PASSWORD');
-  const dsn = process.env.HARNESS_DIRECT_DSN
-    ?? `postgres://plerni_app:${password}@localhost:54320/plerni`;
-  return kyselyOf(dsn, 1);
-}
-
-function detailOf(rec: Recovery): Record<string, unknown> {
+function detailOf(rec: Recovery, injectedLogins: number): Record<string, unknown> {
   return {
     terminations: rec.terminations,
+    injectedLogins,
     retries: rec.retries,
     cleanupMs: rec.cleanupMs,
     deadPid: rec.deadPid,
     deadGone: rec.deadGone,
+    backendGoneMs: rec.backendGoneMs,
     detectedBeforeAccess: rec.detectedBeforeAccess,
     positiveControl: rec.positive,
     absenceOnReplacement: rec.replacementAbsent,
@@ -47,16 +41,26 @@ function asCount(detail: Record<string, unknown>): number {
   return n;
 }
 
-async function setAppTenantDefault(root: ReturnType<typeof rawRoot>, tenant: string): Promise<void> {
-  const built = await root.query(
-    `SELECT format('ALTER ROLE plerni_app SET plerni.tenant_id = %L', $1::text) AS stmt`,
-    [tenant],
-  );
-  const stmt = built.rows[0]?.stmt;
-  if (typeof stmt !== 'string' || !stmt.startsWith('ALTER ROLE plerni_app SET plerni.tenant_id = ')) {
-    throw new Error('refusing unexpected role-default statement');
+async function searchPathConfig(): Promise<Record<string, unknown>> {
+  const config = await adminShow('CONFIG') as Record<string, unknown>[];
+  const value = (key: string) => config.find((row) => row.key === key)?.value ?? null;
+  const pgbouncerVersion = await adminShow('VERSION');
+  const app = rawApp();
+  await app.connect();
+  try {
+    const pg = await app.query(`SELECT current_setting('server_version') AS version`);
+    const raw = String(pg.rows[0]?.version ?? '');
+    const match = /^[0-9]+(?:\.[0-9]+)*/.exec(raw);
+    return {
+      track_extra_parameters: value('track_extra_parameters'),
+      server_reset_query: value('server_reset_query'),
+      server_reset_query_always: value('server_reset_query_always'),
+      pgbouncerVersion,
+      postgresVersion: match?.[0] ?? null,
+    };
+  } finally {
+    await app.end();
   }
-  await root.query(stmt);
 }
 
 export async function contaminatedSession(): Promise<void> {
@@ -74,7 +78,7 @@ export async function contaminatedSession(): Promise<void> {
         const before = ev.terminatedBackendPids.length;
         await sql`SELECT set_config('plerni.tenant_id', ${TENANT_A}, false)`.execute(warm);
         const rec = await recoverInjected(warm, ev, before);
-        return { pass: before === 0 && rec.pass, detail: { ...detailOf(rec), warmTerminations: before } };
+        return { pass: before === 0 && rec.pass, detail: { ...detailOf(rec, 1), warmTerminations: before } };
       },
       rawSessionGuc,
     );
@@ -92,7 +96,7 @@ export async function contaminatedSession(): Promise<void> {
         const ev = blankEv();
         await sql`SET ROLE plerni_plugin_a`.execute(role);
         const rec = await recoverInjected(role, ev, 0);
-        return { pass: rec.pass, detail: detailOf(rec) };
+        return { pass: rec.pass, detail: detailOf(rec, 1) };
       },
       rawSetRole,
     );
@@ -103,7 +107,7 @@ export async function contaminatedSession(): Promise<void> {
   }
 
   // Direct: killing the backend yields a fresh login, so the protocol recovers.
-  const directPath = directOne();
+  const directPath = direct(1);
   try {
     const observed = await recordProbe(
       { case: 'battery contaminated search_path', datasource: 'direct(1)' },
@@ -111,7 +115,7 @@ export async function contaminatedSession(): Promise<void> {
         const ev = blankEv();
         await sql`SET search_path TO pg_catalog`.execute(directPath);
         const rec = await recoverInjected(directPath, ev, 0);
-        return { pass: rec.pass, detail: detailOf(rec) };
+        return { pass: rec.pass, detail: detailOf(rec, 1) };
       },
       rawSearchPath,
     );
@@ -138,7 +142,8 @@ export async function contaminatedSession(): Promise<void> {
         } catch (e) {
           loud = e instanceof Error ? e.message : String(e);
         }
-        const replayed = pathEv.terminatedBackendPids.length === MAX_RETRY + 1
+        const replayInjections = MAX_RETRY + 1;
+        const replayed = pathEv.terminatedBackendPids.length === replayInjections
           && pathEv.alerts.every((a) => a.includes('search_path'));
         const fresh = await freshPool();
         const freshEv = blankEv();
@@ -149,9 +154,12 @@ export async function contaminatedSession(): Promise<void> {
             detail: {
               loud,
               terminations: pathEv.terminatedBackendPids.length,
+              injectedLogins: replayInjections,
               alerts: pathEv.alerts,
               freshClientTerminations: freshEv.terminatedBackendPids.length,
+              config: await searchPathConfig(),
               mechanism: 'PgBouncer restores client-tracked search_path onto each new server connection (PostgreSQL 18 reports it)',
+              wedge: 'terminate-and-retry cannot clear a client-tracked search_path; the client stays wedged until it disconnects',
             },
           };
         } finally {
@@ -160,9 +168,8 @@ export async function contaminatedSession(): Promise<void> {
       },
       rawSearchPath,
     );
-    const replays = asCount(observed.detail);
-    injected += replays;
-    terminated += replays;
+    injected += MAX_RETRY + 1;
+    terminated += asCount(observed.detail);
   } finally {
     await path.destroy();
   }
@@ -176,7 +183,7 @@ export async function contaminatedSession(): Promise<void> {
         const ev = blankEv();
         await sql`SELECT set_config('plerni.tenant_id', ${TENANT_A}, false)`.execute(first);
         const rec = await recoverInjected(first, ev, 0);
-        return { pass: rec.pass, detail: detailOf(rec) };
+        return { pass: rec.pass, detail: detailOf(rec, 1) };
       },
       rawSessionGuc,
     );
@@ -188,11 +195,9 @@ export async function contaminatedSession(): Promise<void> {
 
   // Role default re-applies on every login, so killing the backend cannot clear it.
   // The protocol must fail loud inside the retry budget — one termination per contaminated login.
-  const root = rawRoot();
-  await root.connect();
   let defDb: ReturnType<typeof pooled> | undefined;
   try {
-    await setAppTenantDefault(root, TENANT_A);
+    await setAppTenantDefault(TENANT_A);
     await drainAppBackends();
     const db = pooled(1);
     defDb = db;
@@ -211,19 +216,20 @@ export async function contaminatedSession(): Promise<void> {
         const expected = MAX_RETRY + 1;
         return {
           pass: loud !== null && loud.includes('loud failure') && ev.terminatedBackendPids.length === expected,
-          detail: { loud, terminations: ev.terminatedBackendPids.length, expected, cleanupMs, alerts: ev.alerts },
+          detail: {
+            loud, terminations: ev.terminatedBackendPids.length, injectedLogins: expected,
+            expected, cleanupMs, alerts: ev.alerts,
+          },
         };
       },
       rawRoleDefault,
     );
-    const defaults = asCount(observed.detail);
-    injected += defaults;
-    terminated += defaults;
+    injected += MAX_RETRY + 1;
+    terminated += asCount(observed.detail);
   } finally {
     await defDb?.destroy();
-    await root.query('ALTER ROLE plerni_app RESET plerni.tenant_id');
+    await resetAppTenantDefault();
     await drainAppBackends();
-    await root.end();
   }
 
   const tail = await freshPool();
@@ -236,7 +242,8 @@ export async function contaminatedSession(): Promise<void> {
         await withTenant(tail, TENANT_B, tailEv, terminateBackendByPid, readRows);
         return {
           pass: tailEv.terminatedBackendPids.length === 0 && terminated === injected,
-          detail: { injected, terminated, warmTailTerminations: tailEv.terminatedBackendPids.length },
+          detail: { injected, terminated, warmTailTerminations: tailEv.terminatedBackendPids.length,
+            counting: 'injected is the sum of per-class login budgets; terminated is the measured count' },
         };
       },
       rawSessionGuc,

@@ -34,12 +34,21 @@ export function onlyTenant(rows: TenantRow[], id: string): boolean {
   return rows.length === LABELS.length && rows.every((row, i) => row.tenant_id === id && row.label === LABELS[i]);
 }
 
-export async function backendGone(pid: number): Promise<boolean> {
+const BACKEND_GONE_DEADLINE_MS = 2000;
+
+/** Poll until the pid leaves pg_stat_activity. Termination only signals the process. */
+export async function backendGone(pid: number): Promise<{ gone: boolean; waitedMs: number }> {
+  const started = performance.now();
+  const deadline = started + BACKEND_GONE_DEADLINE_MS;
   const c = rawRoot();
   await c.connect();
   try {
-    const r = await c.query('SELECT 1 FROM pg_stat_activity WHERE pid = $1', [pid]);
-    return r.rows.length === 0;
+    for (;;) {
+      const r = await c.query('SELECT 1 FROM pg_stat_activity WHERE pid = $1', [pid]);
+      if (r.rows.length === 0) return { gone: true, waitedMs: Math.round(performance.now() - started) };
+      if (performance.now() >= deadline) return { gone: false, waitedMs: Math.round(performance.now() - started) };
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
   } finally {
     await c.end();
   }
@@ -204,6 +213,7 @@ export interface Recovery {
   accessPid: number | null;
   followPid: number | null;
   deadGone: boolean;
+  backendGoneMs: number | null;
   detectedBeforeAccess: boolean;
   positive: boolean;
   replacementAbsent: boolean;
@@ -230,7 +240,9 @@ export async function recoverInjected(db: Kysely<Db>, ev: HygieneEvidence, befor
   const cleanupMs = Math.round(performance.now() - t0);
   const terminations = ev.terminatedBackendPids.length - before;
   const deadPid = terminations > 0 ? ev.terminatedBackendPids[ev.terminatedBackendPids.length - 1]! : null;
-  const deadGone = deadPid !== null && await backendGone(deadPid);
+  const gone = deadPid === null ? null : await backendGone(deadPid);
+  const deadGone = gone?.gone === true;
+  const backendGoneMs = gone?.waitedMs ?? null;
   const follow = thrown === null ? await absenceOn(db) : null;
   const detectedBeforeAccess = deadPid !== null && accessPid !== null && accessPid !== deadPid;
   const positive = onlyTenant(rows, TENANT_B);
@@ -242,7 +254,7 @@ export async function recoverInjected(db: Kysely<Db>, ev: HygieneEvidence, befor
     pass: thrown === null && detectedBeforeAccess && deadGone && positive && replacementAbsent
       && retries <= MAX_RETRY && terminations === 1,
     cleanupMs, terminations, attempts: ev.attempts, retries, deadPid, accessPid,
-    followPid: follow?.pid ?? null, deadGone, detectedBeforeAccess, positive, replacementAbsent, thrown,
+    followPid: follow?.pid ?? null, deadGone, backendGoneMs, detectedBeforeAccess, positive, replacementAbsent, thrown,
     alerts: [...ev.alerts],
   };
 }
@@ -345,20 +357,41 @@ export function rawInterleave(): Promise<unknown> {
   ]);
 }
 
-/** Superuser default injection. Always resets the role default before returning. */
-export async function rawRoleDefault(): Promise<unknown> {
+const ROLE_DEFAULT_PREFIX = 'ALTER ROLE plerni_app SET plerni.tenant_id = ';
+
+/** Superuser role default. The statement is built with format('%L') and prefix-checked. */
+export async function setAppTenantDefault(tenant: string): Promise<void> {
   const root = rawRoot();
   await root.connect();
   try {
     const built = await root.query(
       `SELECT format('ALTER ROLE plerni_app SET plerni.tenant_id = %L', $1::text) AS stmt`,
-      [TENANT_A],
+      [tenant],
     );
     const stmt = built.rows[0]?.stmt;
-    if (typeof stmt !== 'string' || !stmt.startsWith('ALTER ROLE plerni_app SET plerni.tenant_id = ')) {
+    if (typeof stmt !== 'string' || !stmt.startsWith(ROLE_DEFAULT_PREFIX)) {
       throw new Error('refusing unexpected role-default statement');
     }
     await root.query(stmt);
+  } finally {
+    await root.end();
+  }
+}
+
+export async function resetAppTenantDefault(): Promise<void> {
+  const root = rawRoot();
+  await root.connect();
+  try {
+    await root.query('ALTER ROLE plerni_app RESET plerni.tenant_id');
+  } finally {
+    await root.end();
+  }
+}
+
+/** Superuser default injection. Always resets the role default before returning. */
+export async function rawRoleDefault(): Promise<unknown> {
+  await setAppTenantDefault(TENANT_A);
+  try {
     const app = rawApp();
     await app.connect();
     try {
@@ -368,8 +401,7 @@ export async function rawRoleDefault(): Promise<unknown> {
       await app.end();
     }
   } finally {
-    await root.query('ALTER ROLE plerni_app RESET plerni.tenant_id');
-    await root.end();
+    await resetAppTenantDefault();
   }
 }
 
@@ -397,6 +429,7 @@ function lifecycleDetail(rec: Recovery): Record<string, unknown> {
     boundedRetry: rec.retries <= MAX_RETRY,
     cleanupMs: rec.cleanupMs,
     deadPid: rec.deadPid,
+    backendGoneMs: rec.backendGoneMs,
     replacementPid: rec.accessPid,
     followPid: rec.followPid,
     alerts: rec.alerts,

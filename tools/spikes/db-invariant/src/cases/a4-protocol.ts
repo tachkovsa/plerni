@@ -2,7 +2,9 @@
 // Outbound statement names are observed by wrapping pg's Query.submit path (parse + bind).
 // pg_prepared_statements is never consulted: it is per-backend and a pool can miss names.
 // Benchmark is unnamed parameterized extended-protocol vs named, on a direct connection.
-// max_prepared_statements does not help unnamed traffic. Overhead >20% opens A4b
+// max_prepared_statements does not help unnamed traffic. Overhead opens A4b
+// (https://github.com/tachkovsa/plerni/issues/34) only when the 95% interval
+// clears 20%. The benchmark alternates ABBA/BAAB across 10 reps.
 // (named-statement branch, max_prepared_statements > 0, rerun A1–A3) — a new experiment.
 import pg from 'pg';
 import { sql } from 'kysely';
@@ -12,8 +14,11 @@ import { TENANT_A, TENANT_B } from './a2-oracle.ts';
 import { blankEv, rawAppSteps, readRows, recordProbe } from './a3-pgbouncer.ts';
 
 const OVERHEAD_LIMIT_PCT = 20;
-const ITERATIONS = 600;
-const REPS = 3;
+const ITERATIONS = 2500;
+const REPS = 10;
+const A4B_ISSUE = 'https://github.com/tachkovsa/plerni/issues/34';
+// Student t, two-sided 95%, df = REPS - 1 = 9.
+const T_CRIT_95_DF9 = 2.262;
 
 export interface ObservedName { name: string; protocol: 'simple' | 'extended' }
 
@@ -47,6 +52,17 @@ export function watchOutboundNames(bucket: ObservedName[]): () => void {
   return () => { proto.submit = original; };
 }
 
+/** Record Query.text at submit time. Composes with nothing else; one wrapper at a time. */
+export function watchOutboundSql(bucket: string[]): () => void {
+  const proto = pg.Query.prototype as unknown as { text?: string; submit(connection: unknown): void };
+  const original = proto.submit;
+  proto.submit = function (this: { text?: string }, connection: unknown) {
+    if (typeof this.text === 'string') bucket.push(this.text);
+    return original.call(this, connection);
+  };
+  return () => { proto.submit = original; };
+}
+
 async function fullLoad(): Promise<void> {
   for (const make of [() => direct(), () => pooled(4)]) {
     const db = make();
@@ -74,34 +90,72 @@ async function fullLoad(): Promise<void> {
   }
 }
 
-function median(xs: number[]): number {
-  const s = [...xs].sort((a, b) => a - b);
-  return s[Math.floor(s.length / 2)]!;
+function round1(n: number): number {
+  return Math.round(n * 10) / 10;
 }
 
-async function benchmark(): Promise<{ unnamedMs: number[]; namedMs: number[]; overheadPct: number }> {
+function overheadStats(xs: number[]): {
+  min: number; median: number; p95: number; stddev: number; mean: number; ci95Low: number; ci95High: number;
+} {
+  const s = [...xs].sort((a, b) => a - b);
+  const n = s.length;
+  const mean = s.reduce((a, b) => a + b, 0) / n;
+  const variance = s.reduce((a, b) => a + (b - mean) ** 2, 0) / (n - 1);
+  const stddev = Math.sqrt(variance);
+  const mid = Math.floor(n / 2);
+  const median = n % 2 === 1 ? s[mid]! : (s[mid - 1]! + s[mid]!) / 2;
+  const p95 = s[Math.min(n - 1, Math.ceil(0.95 * n) - 1)]!;
+  const half = T_CRIT_95_DF9 * stddev / Math.sqrt(n);
+  return {
+    min: round1(s[0]!), median: round1(median), p95: round1(p95), stddev: round1(stddev),
+    mean: round1(mean), ci95Low: round1(mean - half), ci95High: round1(mean + half),
+  };
+}
+
+async function timeBlock(c: ReturnType<typeof rawApp>, named: boolean, text: string): Promise<number> {
+  const t = performance.now();
+  for (let i = 0; i < ITERATIONS; i++) {
+    if (named) await c.query({ name: 'a4_bench', text, values: ['goal'] });
+    else await c.query(text, ['goal']);
+  }
+  return performance.now() - t;
+}
+
+async function benchmark(): Promise<{
+  unnamedMs: number[]; namedMs: number[]; overheadPct: number[];
+  spread: ReturnType<typeof overheadStats>; robust: boolean;
+}> {
   const c = rawApp();
   await c.connect();
   const text = 'SELECT label FROM plerni_tenant WHERE label = $1';
   try {
-    const unnamedMs: number[] = [];
-    const namedMs: number[] = [];
     for (let i = 0; i < 40; i++) await c.query(text, ['goal']);
     await c.query({ name: 'a4_bench', text, values: ['goal'] });
     for (let i = 0; i < 40; i++) await c.query({ name: 'a4_bench', text, values: ['goal'] });
+    const unnamedMs: number[] = [];
+    const namedMs: number[] = [];
+    const overheadPct: number[] = [];
     for (let rep = 0; rep < REPS; rep++) {
-      let t = performance.now();
-      for (let i = 0; i < ITERATIONS; i++) await c.query(text, ['goal']);
-      unnamedMs.push(performance.now() - t);
-      t = performance.now();
-      for (let i = 0; i < ITERATIONS; i++) await c.query({ name: 'a4_bench', text, values: ['goal'] });
-      namedMs.push(performance.now() - t);
+      // Even reps ABBA (unnamed first). Odd reps BAAB (named first). Each rep times both orders.
+      const namedFlags = rep % 2 === 0 ? [false, true, true, false] : [true, false, false, true];
+      let unnamed = 0;
+      let named = 0;
+      for (const namedBlock of namedFlags) {
+        const ms = await timeBlock(c, namedBlock, text);
+        if (namedBlock) named += ms;
+        else unnamed += ms;
+      }
+      unnamedMs.push(unnamed);
+      namedMs.push(named);
+      overheadPct.push(((unnamed - named) / named) * 100);
     }
-    const overheadPct = ((median(unnamedMs) - median(namedMs)) / median(namedMs)) * 100;
+    const spread = overheadStats(overheadPct);
     return {
       unnamedMs: unnamedMs.map((n) => Math.round(n)),
       namedMs: namedMs.map((n) => Math.round(n)),
-      overheadPct: Math.round(overheadPct * 10) / 10,
+      overheadPct: overheadPct.map(round1),
+      spread,
+      robust: spread.ci95Low > OVERHEAD_LIMIT_PCT,
     };
   } finally {
     await c.end();
@@ -154,22 +208,30 @@ export async function a4Protocol(): Promise<void> {
     async () => {
       try {
         const bench = await benchmark();
-        const a4b = bench.overheadPct > OVERHEAD_LIMIT_PCT;
         return {
-          pass: Number.isFinite(bench.overheadPct),
+          pass: Number.isFinite(bench.spread.mean),
           detail: {
-            ...bench,
-            iterations: ITERATIONS,
+            unnamedMs: bench.unnamedMs,
+            namedMs: bench.namedMs,
+            overheadPct: bench.overheadPct,
+            spread: bench.spread,
+            iterationsPerBlock: ITERATIONS,
+            blocksPerRep: 4,
             reps: REPS,
+            order: 'ABBA then BAAB',
             environment: { node: process.version },
             overheadLimitPct: OVERHEAD_LIMIT_PCT,
-            a4bRequired: a4b,
-            a4b: a4b
+            a4bIssue: A4B_ISSUE,
+            a4bRequired: bench.robust,
+            decision: bench.robust ? 'interval-clears-20' : 'not-robust',
+            a4b: bench.robust
               ? {
                 title: 'test(spike): A4b named-statement branch',
+                issue: A4B_ISSUE,
                 runsWith: 'max_prepared_statements > 0',
                 rerun: 'A1–A3 under that config',
-                measuredOverheadPct: bench.overheadPct,
+                ci95Low: bench.spread.ci95Low,
+                median: bench.spread.median,
               }
               : null,
           },
