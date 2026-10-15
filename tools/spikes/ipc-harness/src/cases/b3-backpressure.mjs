@@ -3,7 +3,7 @@
 
 import { fileURLToPath } from 'node:url';
 import { connectPair } from '../supervisor.mjs';
-import { CONTRACT, RSS_GROWTH_LIMIT, delay, measureSeries, preflight, treeRss, waitUntil } from '../measure.mjs';
+import { CONTRACT, RSS_GROWTH_LIMIT, delay, measureSeries, openLoop, preflight, treeRss, waitUntil } from '../measure.mjs';
 
 const floodPath = fileURLToPath(new URL('../children/flood.mjs', import.meta.url));
 const echoPath = fileURLToPath(new URL('../children/echo.mjs', import.meta.url));
@@ -68,9 +68,69 @@ export async function tripCaps() {
     await totalPair.close();
   }
 
+  const kernelPair = await connectPair({
+    sweeper: false,
+    kernel: { pendingCap: 4, byteCap: 64 * 1024 },
+  });
+  try {
+    const echo = kernelPair.sup.spawn({ pluginId: 'echo', script: echoPath });
+    kernelPair.sup.socket.pause();
+    const results = [];
+    for (let i = 0; i < 8; i++) {
+      results.push(kernelPair.stub.call({
+        pluginId: 'echo',
+        credential: echo.credential,
+        correlationId: i + 1,
+        port: 'db',
+        method: 'get',
+        payload: { i },
+      }, 300).catch((err) => err));
+    }
+    const occupied = kernelPair.stub.calls.size + kernelPair.stub.cancels.size;
+    const buffered = kernelPair.stub.bufferedBytes();
+    const settled = await Promise.all(results);
+    const rejected = settled.filter((result) => result.code === 'pending-cap' || result.code === 'total-cap').length;
+    detail.kernel = {
+      tripped: rejected > 0,
+      occupied,
+      buffered,
+      bound: occupied <= kernelPair.stub.pendingCap && buffered <= kernelPair.stub.byteCap && occupied > 0,
+    };
+  } finally {
+    kernelPair.sup.socket.resume();
+    await kernelPair.close();
+  }
+
+  const bytePair = await connectPair({
+    sweeper: false,
+    kernel: { pendingCap: 32, byteCap: 32 },
+  });
+  try {
+    const echo = bytePair.sup.spawn({ pluginId: 'echo', script: echoPath });
+    bytePair.sup.socket.pause();
+    const rejected = await bytePair.stub.call({
+      pluginId: 'echo',
+      credential: echo.credential,
+      correlationId: 1,
+      port: 'db',
+      method: 'get',
+      payload: { n: 1 },
+    }, 300).catch((err) => err);
+    detail.kernelBytes = {
+      tripped: rejected.code === 'total-cap',
+      buffered: bytePair.stub.bufferedBytes(),
+      bound: bytePair.stub.bufferedBytes() <= bytePair.stub.byteCap && bytePair.stub.calls.size === 0,
+    };
+  } finally {
+    bytePair.sup.socket.resume();
+    await bytePair.close();
+  }
+
   const pass = detail.pending.tripped && detail.pending.rejected > 0 && detail.pending.admitted === 4
     && detail.partial.tripped && detail.partial.bound
-    && detail.total.tripped && detail.total.bound;
+    && detail.total.tripped && detail.total.bound
+    && detail.kernel.tripped && detail.kernel.bound
+    && detail.kernelBytes.tripped && detail.kernelBytes.bound;
   return { pass, detail };
 }
 
@@ -78,6 +138,8 @@ const PARTIAL_MARK = 32 * 1024;
 const BYTE_CAP = 16 * 1024;
 const PENDING_CAP = 8;
 const LO_CAP = 32;
+const OFFERED_RATE = 5;
+const FILL_MS = 10_000;
 
 async function holdRep({ warmupMs, windowMs, readRss }) {
   const pair = await connectPair({
@@ -153,7 +215,10 @@ async function holdRep({ warmupMs, windowMs, readRss }) {
       const lo = pair.sup.queueDepth('frames').lo >= LO_CAP;
       const hi = pair.sup.faults.some((fault) => fault.pluginId === 'forger' && fault.code === 'hi-cap');
       return pending && partialBytes && byteBytes && lo && hi;
-    }, Math.max(warmupMs, 5_000));
+    }, FILL_MS);
+    const warmStart = performance.now();
+    if (filled) await delay(warmupMs);
+    const warmedMs = performance.now() - warmStart;
     const rss0 = readRss(pids);
     if (rss0 == null) {
       return {
@@ -163,6 +228,10 @@ async function holdRep({ warmupMs, windowMs, readRss }) {
         maxRss: null,
         arrivals: 0,
         filled,
+        warmedMs,
+        offered: 0,
+        issued: 0,
+        skipped: 0,
         answered: false,
         caps: { ...pair.sup.caps },
         near: { pending: false, partial: false, bytes: false, lo: false },
@@ -171,44 +240,55 @@ async function holdRep({ warmupMs, windowMs, readRss }) {
     }
     let maxRss = rss0;
     const samples = [];
-    const windowDeadline = performance.now() + windowMs;
     let arrivals = 0;
-    while (performance.now() < windowDeadline) {
-      arrivals++;
-      pair.stub.call({
-        pluginId: 'sib',
-        credential: sibling.credential,
-        correlationId: 1000 + arrivals,
-        port: 'db',
-        method: 'get',
-        payload: { n: arrivals },
-      }, 120_000).catch(() => {});
-      const depth = {
-        pending: pair.sup.queueDepth('silent').pending,
-        partial: pair.sup.queueDepth('partial').partial,
-        bytes: pair.sup.queueDepth('bytes').pluginBytes,
-        lo: pair.sup.queueDepth('frames').lo,
-        hi: pair.sup.faults.some((fault) => fault.code === 'hi-cap'),
-        outbound: pair.sup.queueDepth('sib').outbound,
+    let rssLost = false;
+    const loop = await openLoop({
+      ms: windowMs,
+      rate: OFFERED_RATE,
+      tick: () => {
+        if (rssLost) return;
+        arrivals++;
+        pair.stub.call({
+          pluginId: 'sib',
+          credential: sibling.credential,
+          correlationId: 1000 + arrivals,
+          port: 'db',
+          method: 'get',
+          payload: { n: arrivals },
+        }, 120_000).catch(() => {});
+        samples.push({
+          pending: pair.sup.queueDepth('silent').pending,
+          partial: pair.sup.queueDepth('partial').partial,
+          bytes: pair.sup.queueDepth('bytes').pluginBytes,
+          lo: pair.sup.queueDepth('frames').lo,
+          hi: pair.sup.faults.some((fault) => fault.code === 'hi-cap'),
+          outbound: pair.sup.queueDepth('sib').outbound,
+        });
+        const sampleRss = readRss(pids);
+        if (sampleRss == null) {
+          rssLost = true;
+          return;
+        }
+        maxRss = Math.max(maxRss, sampleRss);
+      },
+    });
+    if (rssLost) {
+      return {
+        growth: null,
+        measurable: false,
+        rss0,
+        maxRss: null,
+        arrivals,
+        filled,
+        warmedMs,
+        offered: loop.offered,
+        issued: loop.issued,
+        skipped: loop.skipped,
+        answered: false,
+        caps: { ...pair.sup.caps },
+        near: { pending: false, partial: false, bytes: false, lo: false },
+        samples: samples.length,
       };
-      samples.push(depth);
-      const sampleRss = readRss(pids);
-      if (sampleRss == null) {
-        return {
-          growth: null,
-          measurable: false,
-          rss0,
-          maxRss: null,
-          arrivals,
-          filled,
-          answered: false,
-          caps: { ...pair.sup.caps },
-          near: { pending: false, partial: false, bytes: false, lo: false },
-          samples: samples.length,
-        };
-      }
-      maxRss = Math.max(maxRss, sampleRss);
-      await delay(200);
     }
     pair.stub.socket.resume();
     const answered = await Promise.race([
@@ -222,6 +302,10 @@ async function holdRep({ warmupMs, windowMs, readRss }) {
       maxRss,
       arrivals,
       filled,
+      warmedMs,
+      offered: loop.offered,
+      issued: loop.issued,
+      skipped: loop.skipped,
       answered: answered?.payload?.who === 'sib',
       caps: { ...pair.sup.caps },
       near: {

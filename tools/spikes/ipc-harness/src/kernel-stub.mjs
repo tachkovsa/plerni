@@ -42,8 +42,11 @@ function fail(code) {
   return err;
 }
 
+const KERNEL_PENDING_CAP = 512;
+const KERNEL_BYTE_CAP = 1024 * 1024;
+
 export class KernelStub {
-  constructor(socket) {
+  constructor(socket, opts = {}) {
     this.socket = socket;
     this.framer = new MuxFramer();
     this.calls = new Map();
@@ -52,11 +55,23 @@ export class KernelStub {
     this.floodFrames = 0;
     this.framingFault = null;
     this.shut = false;
+    this.pendingCap = opts.pendingCap ?? KERNEL_PENDING_CAP;
+    this.byteCap = opts.byteCap ?? KERNEL_BYTE_CAP;
+    this.outbound = 0;
+    this.writeQueue = [];
+    this.writeBlocked = false;
     socket.on('data', (chunk) => this.#onData(chunk));
     socket.on('close', () => {
       this.shut = true;
+      this.writeQueue = [];
       this.#rejectAll('closed');
     });
+  }
+
+  bufferedBytes() {
+    let total = this.outbound;
+    for (const buf of this.writeQueue) total += buf.length;
+    return total;
   }
 
   #onData(chunk) {
@@ -120,10 +135,15 @@ export class KernelStub {
     });
   }
 
+  #occupied() {
+    return this.calls.size + this.cancels.size;
+  }
+
   #send(bucket, frame, timeoutMs) {
     if (this.shut || this.socket.destroyed) return Promise.reject(fail('closed'));
     const key = pendingKey(frame.pluginId, frame.correlationId);
     if (bucket.has(key)) return Promise.reject(fail('duplicate-correlation'));
+    if (this.#occupied() >= this.pendingCap) return Promise.reject(fail('pending-cap'));
     const sentKey = `${bucket === this.cancels ? 'cancel' : 'call'}\0${key}`;
     frame.timeoutMs = timeoutMs;
     frame.sendTs = performance.now();
@@ -133,21 +153,39 @@ export class KernelStub {
     } catch (err) {
       return Promise.reject(err);
     }
+    if (this.bufferedBytes() + buf.length > this.byteCap) return Promise.reject(fail('total-cap'));
     this.sentAt.set(sentKey, frame.sendTs);
     const generation = frame.credential?.generation ?? null;
     const pending = this.#track(bucket, frame.pluginId, frame.correlationId, timeoutMs, generation);
-    try {
-      this.socket.write(buf);
-    } catch (err) {
-      const waiter = bucket.get(key);
-      if (waiter) {
-        clearTimeout(waiter.timer);
-        bucket.delete(key);
-        this.sentAt.delete(sentKey);
-        waiter.reject(err);
+    this.writeQueue.push(buf);
+    this.#flush();
+    return pending;
+  }
+
+  #flush() {
+    if (this.writeBlocked || this.shut) return;
+    while (this.writeQueue.length > 0) {
+      const buf = this.writeQueue[0];
+      this.outbound += buf.length;
+      this.writeQueue.shift();
+      let ok = false;
+      try {
+        ok = this.socket.write(buf, () => {
+          this.outbound = Math.max(0, this.outbound - buf.length);
+        });
+      } catch {
+        this.outbound = Math.max(0, this.outbound - buf.length);
+        return;
+      }
+      if (!ok) {
+        this.writeBlocked = true;
+        this.socket.once('drain', () => {
+          this.writeBlocked = false;
+          this.#flush();
+        });
+        return;
       }
     }
-    return pending;
   }
 
   call(req, timeoutMs = 5_000) {
@@ -180,6 +218,7 @@ export class KernelStub {
 
   close() {
     this.shut = true;
+    this.writeQueue = [];
     this.#rejectAll('closed');
     this.socket.destroy();
   }

@@ -109,7 +109,8 @@ export function treeRss(pids) {
   let total = self;
   for (const pid of pids) {
     const rss = readRss(pid);
-    if (rss != null) total += rss;
+    if (rss == null) return null;
+    total += rss;
   }
   return total;
 }

@@ -9,8 +9,9 @@ import { b3, tripCaps } from './cases/b3-backpressure.mjs';
 import { fileURLToPath } from 'node:url';
 import { b1 } from './cases/b1-throughput.mjs';
 import { floodBound, forgedFlood, hostileBattery, starvation } from './cases/b6-mux-identity.mjs';
-import { assessEnvironment, delay, measureSeries, openLoop, preflight, waitUntil } from './measure.mjs';
+import { assessEnvironment, delay, measureSeries, openLoop, preflight, treeRss, waitUntil } from './measure.mjs';
 import { NdjsonFramer, encodeMux } from './framing.mjs';
+import { FencedError } from './authority.mjs';
 import { connectPair, dbConfigured } from './supervisor.mjs';
 
 const echoPath = fileURLToPath(new URL('./children/echo.mjs', import.meta.url));
@@ -526,6 +527,159 @@ test('the global byte ceiling pauses every contributing child', { timeout: 10_00
   } finally {
     await pair.close();
   }
+});
+
+test('treeRss is invalid when a child sample is missing', () => {
+  const missing = 1_000_000_000;
+  assert.equal(treeRss([missing]), null);
+  const self = treeRss([]);
+  if (self != null) assert.ok(self > 0);
+});
+
+test('a non-array grant list is rejected', async () => {
+  const pair = await connectPair({ sweeper: false });
+  try {
+    assert.throws(
+      () => pair.sup.spawn({ pluginId: 'echo', script: echoPath, grants: 'db' }),
+      (err) => err.code === 'invalid-grants',
+    );
+    assert.equal(pair.sup.children.has('echo'), false);
+    const kid = pair.sup.spawn({ pluginId: 'echo', script: echoPath });
+    assert.deepEqual([...pair.sup.children.get('echo').credential.grants], ['*']);
+    const res = await pair.stub.call({
+      pluginId: 'echo',
+      credential: kid.credential,
+      correlationId: 1,
+      port: 'db',
+      method: 'get',
+      payload: { ok: true },
+    }, 1_000);
+    assert.equal(res.payload?.ok, true);
+  } finally {
+    await pair.close();
+  }
+});
+
+test('a spawn error retires the fencing token', async () => {
+  const pair = await connectPair({ sweeper: false });
+  try {
+    const kid = pair.sup.spawn({ pluginId: 'echo', script: echoPath });
+    const rec = pair.sup.children.get('echo');
+    rec.child.kill('SIGSTOP');
+    const callP = pair.stub.call({
+      pluginId: 'echo',
+      credential: kid.credential,
+      correlationId: 1,
+      port: 'db',
+      method: 'get',
+      payload: { ok: true },
+    }, 1_000).catch((err) => err);
+    await delay(40);
+    rec.child.emit('error', Object.assign(new Error('emfile'), { code: 'EMFILE' }));
+    const settled = await callP;
+    assert.equal(settled.code, 'EMFILE');
+    assert.equal(rec.dead, true);
+    assert.equal(pair.sup.retiredTokens.has(kid.token), true);
+    await assert.rejects(
+      () => pair.sup.commitIfLive('id', kid.token, async () => {}),
+      (err) => err instanceof FencedError,
+    );
+  } finally {
+    await pair.close();
+  }
+});
+
+test('kernel writes stop until drain and stay inside the byte cap', async () => {
+  const pair = await connectPair({
+    sweeper: false,
+    kernel: { pendingCap: 8, byteCap: 64 * 1024 },
+  });
+  try {
+    const kid = pair.sup.spawn({ pluginId: 'echo', script: echoPath });
+    const writes = [];
+    pair.stub.socket.write = (buf, cb) => {
+      writes.push(buf);
+      return false;
+    };
+    const first = pair.stub.call({
+      pluginId: 'echo',
+      credential: kid.credential,
+      correlationId: 1,
+      port: 'db',
+      method: 'get',
+      payload: { n: 1 },
+    }, 300).catch((err) => err);
+    const second = pair.stub.call({
+      pluginId: 'echo',
+      credential: kid.credential,
+      correlationId: 2,
+      port: 'db',
+      method: 'get',
+      payload: { n: 2 },
+    }, 300).catch((err) => err);
+    assert.equal(writes.length, 1);
+    assert.equal(pair.stub.writeBlocked, true);
+    assert.ok(pair.stub.bufferedBytes() <= pair.stub.byteCap);
+    pair.stub.socket.emit('drain');
+    assert.equal(writes.length, 2);
+    assert.equal(pair.stub.calls.size, 2);
+    await Promise.all([first, second]);
+  } finally {
+    await pair.close();
+  }
+});
+
+test('a paused child cannot grow the global ceiling through a stashed tail', { timeout: 10_000 }, async () => {
+  const cap = 8 * 1024;
+  const pair = await connectPair({
+    sweeper: false,
+    caps: { total: cap, totalGlobal: cap, partial: 1024 * 1024 },
+    partialHighWater: 1024 * 1024,
+  });
+  try {
+    pair.sup.spawn({
+      pluginId: 'partial',
+      script: floodPath,
+      env: { FLOOD_MODE: 'partial' },
+      total: cap,
+    });
+    const paused = await waitUntil(() => pair.sup.children.get('partial').paused, 3_000);
+    assert.equal(paused, true);
+    await delay(200);
+    assert.ok(pair.sup.bufferedBytes() <= cap + 4_096, String(pair.sup.bufferedBytes()));
+  } finally {
+    await pair.close();
+  }
+});
+
+test('an unfinished mux frame counts toward the global ceiling', async () => {
+  const pair = await connectPair({ sweeper: false, caps: { totalGlobal: 64 } });
+  try {
+    pair.sup.spawn({ pluginId: 'echo', script: echoPath });
+    const prefix = Buffer.alloc(4);
+    prefix.writeUInt32BE(200, 0);
+    pair.stub.socket.write(Buffer.concat([prefix, Buffer.alloc(80, 0x61)]));
+    await delay(30);
+    assert.ok(pair.sup.bufferedBytes() >= 84, String(pair.sup.bufferedBytes()));
+    assert.equal(pair.sup.caps.total, true);
+  } finally {
+    await pair.close();
+  }
+});
+
+test('B3 warm-up finishes before the RSS baseline', { timeout: 40_000 }, async () => {
+  const result = await b3({
+    warmupMs: 300,
+    windowMs: 400,
+    reps: 1,
+    preflight: validEnv,
+  });
+  assert.notEqual(result.outcome, 'invalid', JSON.stringify(result.detail));
+  const row = result.detail.holds[0];
+  assert.equal(row.filled, true);
+  assert.ok(row.warmedMs >= 250, String(row.warmedMs));
+  assert.equal(row.offered, row.issued + row.skipped);
+  assert.ok(row.issued > 0);
 });
 
 test('flood rate counts only the scored window', { timeout: 15_000 }, async () => {

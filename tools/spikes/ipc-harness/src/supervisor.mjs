@@ -72,8 +72,13 @@ function secretMatch(a, b) {
 }
 
 function copyGrants(grants) {
-  const source = Array.isArray(grants) ? grants : ['*'];
-  return Object.freeze(source.map((grant) => String(grant)));
+  if (grants === undefined) return Object.freeze(['*']);
+  if (!Array.isArray(grants)) {
+    const err = new Error('grants must be an array');
+    err.code = 'invalid-grants';
+    throw err;
+  }
+  return Object.freeze(grants.map((grant) => String(grant)));
 }
 
 function detachCredential(credential) {
@@ -139,10 +144,11 @@ export class Supervisor {
       err.code = 'duplicate-plugin';
       throw err;
     }
+    const grants = copyGrants(spec.grants);
     const credential = {
       pluginId: spec.pluginId,
       version: spec.version ?? '0.0.0',
-      grants: copyGrants(spec.grants),
+      grants,
       generation: spec.generation ?? 1,
       secret: randomBytes(16).toString('hex'),
     };
@@ -163,6 +169,7 @@ export class Supervisor {
       },
       framer: new NdjsonFramer(),
       outbound: 0,
+      stash: null,
       hiBytes: 0,
       loBytes: 0,
       callPending: 0,
@@ -178,7 +185,7 @@ export class Supervisor {
     child.stderr.on('data', () => {});
     child.stdin.on('error', () => {});
     child.stdout.on('error', () => {});
-    child.on('error', () => {});
+    child.on('error', (err) => this.#onSpawnError(rec, err));
     child.on('exit', (code, signal) => this.#onExit(rec, code, signal));
     this.children.set(spec.pluginId, rec);
     return { credential: detachCredential(credential), token, pid: child.pid };
@@ -215,10 +222,11 @@ export class Supervisor {
   }
 
   bufferedBytes() {
-    let total = this.queuedBytes;
+    let total = this.queuedBytes + this.bridge.pendingBytes();
     for (const rec of this.children.values()) {
       total += rec.framer.pendingBytes();
       total += rec.outbound;
+      total += rec.stash?.length ?? 0;
     }
     return total;
   }
@@ -250,7 +258,7 @@ export class Supervisor {
   }
 
   #pluginBytes(rec) {
-    return rec.framer.pendingBytes() + rec.outbound + rec.hiBytes + rec.loBytes;
+    return rec.framer.pendingBytes() + rec.outbound + rec.hiBytes + rec.loBytes + (rec.stash?.length ?? 0);
   }
 
   #onSocket(chunk) {
@@ -258,6 +266,7 @@ export class Supervisor {
     try {
       this.bridge.feed(chunk);
       for (const msg of this.bridge.frames()) this.#onMux(msg);
+      if (this.bufferedBytes() > this.capsConfig.totalGlobal) this.#pauseOverGlobal();
     } catch (err) {
       this.framingFault = err.constructor?.name || 'framing-error';
       this.#failAll(this.framingFault);
@@ -433,7 +442,7 @@ export class Supervisor {
     let offset = 0;
     while (offset < incoming.length) {
       if (rec.paused || rec.dead) {
-        rec.stash = Buffer.from(incoming.subarray(offset));
+        this.#retainTail(rec, incoming.subarray(offset));
         return;
       }
       const end = Math.min(incoming.length, offset + 4096);
@@ -450,6 +459,21 @@ export class Supervisor {
       }
       this.#accountCaps(rec);
     }
+  }
+
+  #retainTail(rec, tail) {
+    if (tail.length === 0 || rec.dead) return;
+    const room = Math.min(
+      rec.limits.total - this.#pluginBytes(rec),
+      this.capsConfig.totalGlobal - this.bufferedBytes(),
+    );
+    if (room <= 0 || tail.length > room) {
+      if (room > 0) rec.stash = Buffer.from(tail.subarray(0, room));
+      this.caps.total = true;
+      if (!rec.paused) this.#pause(rec, 'total');
+      return;
+    }
+    rec.stash = Buffer.from(tail);
   }
 
   #accountCaps(rec) {
@@ -647,14 +671,25 @@ export class Supervisor {
     this.#discardQueues(rec.credential.pluginId);
     rec.framer = new NdjsonFramer();
     rec.outbound = 0;
+    rec.stash = null;
     this.retiredTokens.add(rec.token);
     this.#failPending(rec, code);
     if (rec.child.exitCode == null && rec.child.signalCode == null) rec.child.kill();
   }
 
+  #onSpawnError(rec, err) {
+    if (rec.dead) return;
+    rec.dead = true;
+    rec.stash = null;
+    this.retiredTokens.add(rec.token);
+    this.#failPending(rec, err?.code || 'spawn-error');
+    if (rec.child.exitCode == null && rec.child.signalCode == null) rec.child.kill('SIGKILL');
+  }
+
   #onExit(rec, code, signal) {
     rec.exitCode = code;
     rec.signal = signal;
+    rec.stash = null;
     if (rec.dead) return;
     rec.dead = true;
     this.retiredTokens.add(rec.token);
@@ -854,7 +889,7 @@ function normalizeEcho(msg) {
 export async function connectPair(opts = {}) {
   const ends = await socketPair();
   const sup = new Supervisor(ends.supervisor, opts);
-  const stub = new KernelStub(ends.kernel);
+  const stub = new KernelStub(ends.kernel, opts.kernel);
   return {
     sup,
     stub,
