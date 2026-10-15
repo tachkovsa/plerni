@@ -70,8 +70,14 @@ export class KernelStub {
 
   bufferedBytes() {
     let total = this.outbound;
-    for (const buf of this.writeQueue) total += buf.length;
+    for (const entry of this.writeQueue) total += entry.buf.length;
     return total;
+  }
+
+  // A timed-out request must not leave the socket after drain. Bytes already
+  // handed to socket.write are in flight and cannot be recalled.
+  #dropUnsent(sentKey) {
+    this.writeQueue = this.writeQueue.filter((entry) => entry.sentKey !== sentKey);
   }
 
   #onData(chunk) {
@@ -129,6 +135,7 @@ export class KernelStub {
         if (!bucket.has(key)) return;
         bucket.delete(key);
         this.sentAt.delete(sentKey);
+        this.#dropUnsent(sentKey);
         reject(fail('timeout'));
       }, timeoutMs);
       bucket.set(key, { resolve, reject, timer, sentKey, generation });
@@ -157,7 +164,7 @@ export class KernelStub {
     this.sentAt.set(sentKey, frame.sendTs);
     const generation = frame.credential?.generation ?? null;
     const pending = this.#track(bucket, frame.pluginId, frame.correlationId, timeoutMs, generation);
-    this.writeQueue.push(buf);
+    this.writeQueue.push({ buf, sentKey });
     this.#flush();
     return pending;
   }
@@ -165,16 +172,16 @@ export class KernelStub {
   #flush() {
     if (this.writeBlocked || this.shut) return;
     while (this.writeQueue.length > 0) {
-      const buf = this.writeQueue[0];
-      this.outbound += buf.length;
+      const entry = this.writeQueue[0];
+      this.outbound += entry.buf.length;
       this.writeQueue.shift();
       let ok = false;
       try {
-        ok = this.socket.write(buf, () => {
-          this.outbound = Math.max(0, this.outbound - buf.length);
+        ok = this.socket.write(entry.buf, () => {
+          this.outbound = Math.max(0, this.outbound - entry.buf.length);
         });
       } catch {
-        this.outbound = Math.max(0, this.outbound - buf.length);
+        this.outbound = Math.max(0, this.outbound - entry.buf.length);
         return;
       }
       if (!ok) {

@@ -54,6 +54,9 @@ export const DEFAULT_CAPS = Object.freeze({
 });
 
 const DEFAULT_DEADLINE_MS = 5_000;
+// Rejections for a plugin id with no live child share one queue. A peer that
+// invents ids cannot open an unbounded set of high-priority queues.
+const UNBOUND_QUEUE = '\0unbound';
 
 export function dbConfigured() {
   return Boolean(process.env.HARNESS_DIRECT_DSN || process.env.PLERNI_APP_PASSWORD);
@@ -137,6 +140,9 @@ export class Supervisor {
     this.terminal = [];
     this.queuedBytes = 0;
     this.draining = false;
+    this.inputPaused = false;
+    this.unknownRejectQueued = false;
+    this.unknownRejectsCoalesced = 0;
     this.closed = false;
     this.framingFault = null;
     this.bulkSeen = 0;
@@ -506,7 +512,9 @@ export class Supervisor {
     }
     if (rec.framer.pendingBytes() >= this.partialHighWater) {
       this.caps.partial = true;
-      this.#pause(rec, 'partial');
+      // Do not pause. The unfinished frame cannot shrink until more bytes
+      // arrive, and a pause would stall a legal frame or a never-terminated
+      // stream short of the framer's typed oversize error.
     }
     if (this.bufferedBytes() > this.capsConfig.totalGlobal) this.#pauseOverGlobal();
     this.#maybeResumeAll();
@@ -514,10 +522,27 @@ export class Supervisor {
 
   #pauseOverGlobal() {
     this.caps.total = true;
+    this.#pauseInput();
     for (const rec of this.children.values()) {
       if (rec.dead || rec.paused) continue;
       if (this.#pluginBytes(rec) > 0) this.#pause(rec, 'global');
     }
+  }
+
+  // The kernel socket is the shared input. Pausing child stdout does not stop
+  // a partial mux frame from growing in the bridge.
+  #pauseInput() {
+    if (this.inputPaused || this.closed || this.framingFault) return;
+    this.inputPaused = true;
+    this.caps.total = true;
+    this.socket.pause();
+  }
+
+  #resumeInput() {
+    if (!this.inputPaused || this.closed || this.framingFault) return;
+    if (this.bufferedBytes() > this.capsConfig.totalGlobal / 2) return;
+    this.inputPaused = false;
+    this.socket.resume();
   }
 
   #pause(rec, reason) {
@@ -541,6 +566,7 @@ export class Supervisor {
 
   // Resume does not wait for another stdout 'data' event. A paused stream emits none.
   #maybeResumeAll() {
+    this.#resumeInput();
     const buffered = this.bufferedBytes();
     const globalLow = buffered <= this.capsConfig.totalGlobal / 2;
     const globalOpen = buffered <= this.capsConfig.totalGlobal;
@@ -786,12 +812,17 @@ export class Supervisor {
 
   #enqueue(frame, priority, coalesce) {
     const pluginId = frame.pluginId;
-    if (coalesce && priority >= 10) {
-      const rec = this.children.get(pluginId);
-      if (rec?.rejectQueued) {
-        rec.rejectsCoalesced++;
+    const rec = this.children.get(pluginId);
+    const live = Boolean(rec && !rec.dead);
+    const queueId = live ? pluginId : UNBOUND_QUEUE;
+    if (!live && priority >= 10) {
+      if (this.unknownRejectQueued) {
+        this.unknownRejectsCoalesced++;
         return;
       }
+    } else if (coalesce && priority >= 10 && rec?.rejectQueued) {
+      rec.rejectsCoalesced++;
+      return;
     }
     let buf;
     try {
@@ -799,11 +830,17 @@ export class Supervisor {
     } catch {
       return;
     }
-    if (priority >= 10 && !this.#roomHi(pluginId)) return;
-    this.#enqueueBuf(buf, priority, pluginId);
-    if (coalesce && priority >= 10) {
-      const rec = this.children.get(pluginId);
-      if (rec && (this.hi.get(pluginId)?.length ?? 0) > 0) rec.rejectQueued = true;
+    if (!live && this.bufferedBytes() + buf.length > this.capsConfig.totalGlobal) {
+      this.caps.total = true;
+      this.#pauseInput();
+      return;
+    }
+    if (priority >= 10 && !this.#roomHi(queueId)) return;
+    this.#enqueueBuf(buf, priority, queueId);
+    if (!live && priority >= 10 && (this.hi.get(queueId)?.length ?? 0) > 0) {
+      this.unknownRejectQueued = true;
+    } else if (coalesce && priority >= 10 && rec && (this.hi.get(pluginId)?.length ?? 0) > 0) {
+      rec.rejectQueued = true;
     }
   }
 
@@ -855,6 +892,7 @@ export class Supervisor {
         order.splice(idx, 1);
         this[turnField] = order.length === 0 ? 0 : idx % order.length;
         if (rec) rec.rejectQueued = false;
+        if (id === UNBOUND_QUEUE) this.unknownRejectQueued = false;
       } else {
         this[turnField] = (idx + 1) % order.length;
       }

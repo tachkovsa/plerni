@@ -47,9 +47,17 @@ export async function tripCaps() {
   });
   try {
     partialPair.sup.spawn({ pluginId: 'partial', script: floodPath, env: { FLOOD_MODE: 'partial' } });
-    const tripped = await until(() => partialPair.sup.caps.partial, 3_000);
-    const pendingBytes = partialPair.sup.children.get('partial').framer.pendingBytes();
-    detail.partial = { tripped, pendingBytes, bound: pendingBytes <= 32 * 1024 + 3 * 4096 };
+    const tripped = await until(
+      () => partialPair.sup.faults.some((fault) => fault.pluginId === 'partial'),
+      5_000,
+    );
+    const fault = partialPair.sup.faults.find((row) => row.pluginId === 'partial');
+    detail.partial = {
+      tripped: tripped && partialPair.sup.caps.partial === true,
+      pendingBytes: fault?.pendingBytes ?? null,
+      code: fault?.code ?? null,
+      bound: Boolean(fault) && fault.code === 'NdjsonOversizeError' && fault.pendingBytes < 2 * 1024 * 1024,
+    };
   } finally {
     await partialPair.close();
   }
@@ -149,7 +157,7 @@ async function holdRep({ warmupMs, windowMs, readRss }) {
       pendingGlobal: 64,
       partial: PARTIAL_MARK,
       total: 1024 * 1024,
-      totalGlobal: 1024 * 1024,
+      totalGlobal: 4 * 1024 * 1024,
       hi: 8,
       lo: LO_CAP,
     },
@@ -210,12 +218,17 @@ async function holdRep({ warmupMs, windowMs, readRss }) {
     }, 120_000).catch((err) => err);
     const filled = await until(() => {
       const pending = pair.sup.queueDepth('silent').pending >= PENDING_CAP;
-      const partialBytes = pair.sup.queueDepth('partial').partial >= PARTIAL_MARK;
+      const partialBytes = pair.sup.faults.some((fault) => fault.pluginId === 'partial' && fault.code === 'NdjsonOversizeError');
       const byteBytes = pair.sup.queueDepth('bytes').pluginBytes >= BYTE_CAP;
       const lo = pair.sup.queueDepth('frames').lo >= LO_CAP;
       const hi = pair.sup.faults.some((fault) => fault.pluginId === 'forger' && fault.code === 'hi-cap');
       return pending && partialBytes && byteBytes && lo && hi;
     }, FILL_MS);
+    const partialRec = pair.sup.children.get('partial');
+    if (partialRec?.dead) {
+      const partialPid = pids.indexOf(partial.pid);
+      if (partialPid >= 0) pids.splice(partialPid, 1);
+    }
     const warmStart = performance.now();
     if (filled) await delay(warmupMs);
     const warmedMs = performance.now() - warmStart;
@@ -259,6 +272,7 @@ async function holdRep({ warmupMs, windowMs, readRss }) {
         samples.push({
           pending: pair.sup.queueDepth('silent').pending,
           partial: pair.sup.queueDepth('partial').partial,
+          partialFault: pair.sup.faults.some((fault) => fault.pluginId === 'partial' && fault.code === 'NdjsonOversizeError'),
           bytes: pair.sup.queueDepth('bytes').pluginBytes,
           lo: pair.sup.queueDepth('frames').lo,
           hi: pair.sup.faults.some((fault) => fault.code === 'hi-cap'),
@@ -310,7 +324,7 @@ async function holdRep({ warmupMs, windowMs, readRss }) {
       caps: { ...pair.sup.caps },
       near: {
         pending: near((row) => row.pending >= PENDING_CAP),
-        partial: near((row) => row.partial >= PARTIAL_MARK),
+        partial: near((row) => row.partialFault && row.partial === 0),
         bytes: near((row) => row.bytes >= BYTE_CAP && row.bytes <= BYTE_CAP + 3 * 4096),
         lo: near((row) => row.lo >= LO_CAP),
       },

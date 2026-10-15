@@ -60,10 +60,14 @@ function rssReadable() {
 
 // A finite quota below the host CPU count throttles the multi-process cases.
 // Missing RSS or quota data is unreadable, which is not a successful measurement.
-export function assessEnvironment({ cpu, cpus, load, rssOk }) {
+export function assessEnvironment({ cpu, cpus, load, rssOk, hostCpus }) {
+  const host = Number.isFinite(hostCpus) ? hostCpus : cpus;
   const cores = !cpu.unlimited && cpu.period ? cpu.quota / cpu.period : cpus;
   const unreadable = cpu.unreadable === true || rssOk === false;
-  const throttled = !unreadable && cpu.unlimited !== true && cores < cpus;
+  // A cpuset can leave cpu.max at `max` while the process may run on fewer
+  // CPUs than the host. That constraint is a throttle, and it is recorded.
+  const affinityLimited = Number.isFinite(hostCpus) && cpus < hostCpus;
+  const throttled = !unreadable && (affinityLimited || (cpu.unlimited !== true && cores < host));
   const overloaded = Number.isFinite(load) && load > cpus * 1.5;
   return {
     cpus,
@@ -78,9 +82,10 @@ export function assessEnvironment({ cpu, cpus, load, rssOk }) {
 // Records the environment. Does not include cgroup paths or host identifiers.
 export function preflight() {
   const cpu = cpuQuota();
-  const cpus = os.cpus()?.length || 1;
+  const hostCpus = os.cpus()?.length || 1;
+  const cpus = typeof os.availableParallelism === 'function' ? os.availableParallelism() : hostCpus;
   const load = os.loadavg()[0];
-  return assessEnvironment({ cpu, cpus, load, rssOk: rssReadable() });
+  return assessEnvironment({ cpu, cpus, load, rssOk: rssReadable(), hostCpus });
 }
 
 // Nearest-rank percentile. `values` is copied; the caller's array is left intact.

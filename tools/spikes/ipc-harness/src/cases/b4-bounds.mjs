@@ -29,10 +29,11 @@ async function roundTrip(stub, credential) {
 
 export async function b4() {
   const detail = {};
-  // High-water pause disabled so the framer's hard cap is what rejects the stream.
+  // Production partial high-water (64 KiB). Total is above the 1 MiB hard cap
+  // so the framer's typed oversize error, not the per-plugin byte pause, is
+  // what rejects the never-terminated stream.
   const pair = await connectPair({
     sweeper: false,
-    partialHighWater: Number.POSITIVE_INFINITY,
     caps: { total: 8 * 1024 * 1024, totalGlobal: 8 * 1024 * 1024 },
   });
   try {

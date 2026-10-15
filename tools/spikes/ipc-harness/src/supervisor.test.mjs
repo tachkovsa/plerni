@@ -2,6 +2,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import os from 'node:os';
 import { b4, childAlive } from './cases/b4-bounds.mjs';
 import { b5 } from './cases/b5-crash.mjs';
 import { b2 } from './cases/b2-fencing.mjs';
@@ -10,7 +11,7 @@ import { fileURLToPath } from 'node:url';
 import { b1 } from './cases/b1-throughput.mjs';
 import { floodBound, forgedFlood, hostileBattery, starvation } from './cases/b6-mux-identity.mjs';
 import { assessEnvironment, delay, measureSeries, openLoop, preflight, treeRss, waitUntil } from './measure.mjs';
-import { MuxFramer, NdjsonFramer, encodeMux, encodeNdjson } from './framing.mjs';
+import { MuxFramer, encodeMux, encodeNdjson } from './framing.mjs';
 import { FencedError } from './authority.mjs';
 import { connectPair, dbConfigured } from './supervisor.mjs';
 
@@ -264,35 +265,44 @@ test('ignored cancels obey the pending cap and are reclaimed', { timeout: 10_000
   }
 });
 
-test('partial pause resumes after the buffer drops without another stdout event', { timeout: 10_000 }, async () => {
-  const pair = await connectPair({
-    sweeper: false,
-    caps: { partial: 4_096, total: 8 * 1024 * 1024 },
-    partialHighWater: 4_096,
-  });
+test('a frame above the partial high-water still completes', { timeout: 10_000 }, async () => {
+  const pair = await connectPair({ sweeper: false });
   try {
-    pair.sup.spawn({ pluginId: 'partial', script: floodPath, env: { FLOOD_MODE: 'partial' } });
-    const echo = pair.sup.spawn({ pluginId: 'echo', script: echoPath });
-    const rec = pair.sup.children.get('partial');
-    const paused = await waitUntil(() => rec.paused && rec.pauseReason === 'partial', 3_000);
-    assert.equal(paused, true);
-    rec.child.kill('SIGSTOP');
-    rec.child.stdout.removeAllListeners('data');
-    rec.stash = null;
-    rec.framer = new NdjsonFramer();
+    const kid = pair.sup.spawn({ pluginId: 'echo', script: echoPath });
+    const payload = 'q'.repeat(80_000);
     const res = await pair.stub.call({
       pluginId: 'echo',
-      credential: echo.credential,
+      credential: kid.credential,
       correlationId: 1,
       port: 'db',
       method: 'get',
-      payload: { ok: true },
-    }, 1_000);
-    assert.equal(res.payload?.ok, true);
-    assert.equal(rec.paused, false);
+      payload,
+    }, 5_000);
+    assert.equal(res.payload?.length, 80_000);
+    assert.equal(pair.sup.children.get('echo').dead, false);
   } finally {
+    await pair.close();
+  }
+});
+
+test('partial cap exhaustion is a typed oversize error', { timeout: 15_000 }, async () => {
+  const pair = await connectPair({
+    sweeper: false,
+    caps: { partial: 4_096, total: 8 * 1024 * 1024, totalGlobal: 8 * 1024 * 1024 },
+  });
+  try {
+    pair.sup.spawn({ pluginId: 'partial', script: floodPath, env: { FLOOD_MODE: 'partial' } });
     const rec = pair.sup.children.get('partial');
-    if (rec && rec.child.exitCode == null && rec.child.signalCode == null) rec.child.kill('SIGKILL');
+    const faulted = await waitUntil(
+      () => pair.sup.faults.some((fault) => fault.pluginId === 'partial' && fault.code === 'NdjsonOversizeError'),
+      10_000,
+    );
+    assert.equal(faulted, true);
+    const fault = pair.sup.faults.find((row) => row.pluginId === 'partial');
+    assert.ok(fault.pendingBytes < 2 * 1024 * 1024, String(fault.pendingBytes));
+    assert.equal(rec.dead, true);
+    assert.equal(rec.pauseReason, null);
+  } finally {
     await pair.close();
   }
 });
@@ -310,6 +320,22 @@ test('sibling survival is false when the process dies by signal', async () => {
   } finally {
     await pair.close();
   }
+});
+
+test('a cpuset smaller than the host is not a valid measurement', () => {
+  const pinned = assessEnvironment({
+    cpu: { unlimited: true },
+    cpus: 1,
+    hostCpus: 4,
+    load: 0,
+    rssOk: true,
+  });
+  assert.equal(pinned.cpus, 1);
+  assert.equal(pinned.cpuUnlimited, true);
+  assert.equal(pinned.throttled, true);
+  assert.equal(pinned.valid, false);
+  const open = preflight();
+  assert.equal(open.cpus, os.availableParallelism());
 });
 
 test('a one-core quota on a multi-cpu host is not a valid measurement', () => {
@@ -920,7 +946,7 @@ test('grant lists that contain a separator are not joined', async () => {
   }
 });
 
-test('an unfinished mux frame counts toward the global ceiling', async () => {
+test('an unfinished mux frame pauses the shared input at the global ceiling', async () => {
   const pair = await connectPair({ sweeper: false, caps: { totalGlobal: 64 } });
   try {
     pair.sup.spawn({ pluginId: 'echo', script: echoPath });
@@ -928,9 +954,162 @@ test('an unfinished mux frame counts toward the global ceiling', async () => {
     prefix.writeUInt32BE(200, 0);
     pair.stub.socket.write(Buffer.concat([prefix, Buffer.alloc(80, 0x61)]));
     await delay(30);
-    assert.ok(pair.sup.bufferedBytes() >= 84, String(pair.sup.bufferedBytes()));
+    const buffered = pair.sup.bufferedBytes();
+    assert.ok(buffered >= 84, String(buffered));
     assert.equal(pair.sup.caps.total, true);
+    assert.equal(pair.sup.inputPaused, true);
+    pair.stub.socket.write(Buffer.alloc(1_000, 0x62));
+    await delay(40);
+    assert.equal(pair.sup.bufferedBytes(), buffered);
   } finally {
+    await pair.close();
+  }
+});
+
+test('the shared input resumes below the global low water', { timeout: 10_000 }, async () => {
+  const pair = await connectPair({ sweeper: false, caps: { totalGlobal: 200, lo: 32 } });
+  try {
+    pair.sup.spawn({ pluginId: 'frames', script: floodPath });
+    pair.stub.socket.pause();
+    const paused = await waitUntil(() => pair.sup.inputPaused && pair.sup.bufferedBytes() > 200, 3_000);
+    assert.equal(paused, true);
+    const rec = pair.sup.children.get('frames');
+    rec.child.kill('SIGSTOP');
+    pair.stub.socket.resume();
+    pair.sup.socket.emit('drain');
+    const resumed = await waitUntil(
+      () => pair.sup.inputPaused === false && pair.sup.bufferedBytes() <= 100,
+      3_000,
+    );
+    assert.equal(resumed, true, JSON.stringify({
+      paused: pair.sup.inputPaused,
+      buffered: pair.sup.bufferedBytes(),
+    }));
+  } finally {
+    const rec = pair.sup.children.get('frames');
+    if (rec && rec.child.exitCode == null && rec.child.signalCode == null) rec.child.kill('SIGKILL');
+    await pair.close();
+  }
+});
+
+test('a timed-out unsent call is not written after drain', { timeout: 10_000 }, async () => {
+  const pair = await connectPair({ sweeper: false, caps: { pending: 64, total: 8 * 1024 * 1024 } });
+  try {
+    const kid = pair.sup.spawn({ pluginId: 'echo', script: echoPath, pending: 64 });
+    const original = pair.stub.socket.write.bind(pair.stub.socket);
+    pair.stub.socket.write = () => false;
+    pair.stub.call({
+      pluginId: 'echo',
+      credential: kid.credential,
+      correlationId: 1,
+      port: 'db',
+      method: 'get',
+      payload: { n: 1 },
+    }, 2_000).catch(() => {});
+    assert.equal(pair.stub.writeBlocked, true);
+    const late = await pair.stub.call({
+      pluginId: 'echo',
+      credential: kid.credential,
+      correlationId: 9_001,
+      port: 'db',
+      method: 'get',
+      payload: { late: true },
+    }, 40).catch((err) => err);
+    assert.equal(late.code, 'timeout');
+    assert.equal(
+      pair.stub.writeQueue.some((entry) => entry.sentKey === 'call\0echo\u00009001'),
+      false,
+    );
+    pair.stub.socket.write = original;
+    pair.stub.socket.emit('drain');
+    await delay(50);
+    assert.equal(pair.sup.pending.has('echo\u00009001'), false);
+    const again = await pair.stub.call({
+      pluginId: 'echo',
+      credential: kid.credential,
+      correlationId: 9_001,
+      port: 'db',
+      method: 'get',
+      payload: { again: true },
+    }, 1_000);
+    assert.equal(again.payload?.again, true);
+  } finally {
+    await pair.close();
+  }
+});
+
+test('unknown plugin rejections share one bounded queue', async () => {
+  const pair = await connectPair({ sweeper: false, caps: { hi: 4, totalGlobal: 64 * 1024 } });
+  try {
+    const kid = pair.sup.spawn({ pluginId: 'echo', script: echoPath });
+    const original = pair.sup.socket.write.bind(pair.sup.socket);
+    pair.sup.socket.write = () => false;
+    for (let i = 0; i < 40; i++) {
+      const pluginId = `nope-${i}`;
+      pair.stub.call({
+        pluginId,
+        credential: { pluginId, version: '0', grants: ['*'], generation: 1, secret: 'x' },
+        correlationId: 1,
+        port: 'db',
+        method: 'get',
+        payload: { i },
+      }, 200).catch(() => {});
+    }
+    await delay(40);
+    assert.equal(pair.sup.children.get('echo').dead, false);
+    assert.equal(pair.sup.faults.some((fault) => fault.code === 'hi-cap'), false);
+    assert.ok(pair.sup.hi.size <= 1, String(pair.sup.hi.size));
+    const queued = [...pair.sup.hi.values()].reduce((sum, queue) => sum + queue.length, 0);
+    assert.ok(queued <= 1, String(queued));
+    assert.ok(pair.sup.unknownRejectsCoalesced > 0);
+    assert.ok(pair.sup.bufferedBytes() <= pair.sup.capsConfig.totalGlobal);
+    pair.sup.socket.write = original;
+  } finally {
+    const proc = pair.sup.children.get('echo')?.child;
+    if (proc && proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL');
+    await pair.close();
+  }
+});
+
+test('respawn still delivers the retired generation child-exited error', { timeout: 15_000 }, async () => {
+  const pair = await connectPair({ sweeper: false, caps: { hi: 1, pending: 8 } });
+  try {
+    const kid = pair.sup.spawn({ pluginId: 'echo', script: echoPath });
+    const original = pair.sup.socket.write.bind(pair.sup.socket);
+    let block = true;
+    pair.sup.socket.write = (buf, cb) => {
+      if (block) return false;
+      return original(buf, cb);
+    };
+    for (let i = 0; i < 2; i++) {
+      pair.stub.cancel({
+        pluginId: 'echo',
+        credential: kid.credential,
+        correlationId: i + 1,
+      }, 2_000).catch(() => {});
+    }
+    const filled = await waitUntil(() => pair.sup.queueDepth('echo').hi >= 1, 2_000);
+    assert.equal(filled, true);
+    pair.sup.children.get('echo').child.kill('SIGSTOP');
+    const callP = pair.stub.call({
+      pluginId: 'echo',
+      credential: kid.credential,
+      correlationId: 3,
+      port: 'db',
+      method: 'get',
+      payload: { ok: true },
+    }, 8_000).catch((err) => err);
+    await delay(40);
+    const next = await pair.sup.respawn('echo');
+    assert.notEqual(next.credential.generation, kid.credential.generation);
+    block = false;
+    pair.sup.socket.emit('drain');
+    const settled = await callP;
+    assert.equal(settled.code, 'child-exited');
+    assert.equal(pair.sup.children.get('echo').dead, false);
+  } finally {
+    const proc = pair.sup.children.get('echo')?.child;
+    if (proc && proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL');
     await pair.close();
   }
 });
