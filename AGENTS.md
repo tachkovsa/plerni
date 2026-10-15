@@ -32,7 +32,7 @@ Read the spec first: `docs/specs/` is the source of truth. The binding invariant
 
 ## 3. Process
 
-Spec-driven development → plan → tasks; TDD where it pays; role-chain walkthrough per feature; conventional commits + human DCO sign-off + role-only `AI-assisted: yes` trailer. See CONTRIBUTING.md and GOVERNANCE.md.
+Spec-driven development → plan → tasks; TDD where it pays; role-chain walkthrough per feature; conventional commits + role-only `AI-assisted: yes` trailer. Human DCO sign-off is not required at the current stage. An agent may merge a PR once its review is clean, every review thread is replied to and resolved, and CI is green. See CONTRIBUTING.md and GOVERNANCE.md.
 
 ## 4. Review guidelines
 

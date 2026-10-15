@@ -3,7 +3,7 @@
 ## Roles
 
 - **Maintainer** (founder): owns the gate policy, escalation rules, release authority, and periodic audits. Holds final say on ADRs.
-- **Contributors** (human or agent): submit PRs under the rules in CONTRIBUTING.md. Agents may author changes and perform delegated reviews; every contribution has an accountable human sponsor, and agents cannot certify the DCO. The maintainer controls delegation policy and release authority.
+- **Contributors** (human or agent): submit PRs under the rules in CONTRIBUTING.md. Agents may author changes, perform delegated reviews, and merge a PR once its review is clean, every review thread is replied to and resolved, and CI is green. Human DCO sign-off is not required at the current stage. Every contribution has an accountable human sponsor. The maintainer controls delegation policy and release authority.
 
 ## Decision-making
 
@@ -17,7 +17,7 @@ Disagreements escalate to the maintainer. High-risk changes (authorization, tena
 
 ## Branch protection (dev — the default branch)
 
-Configured on the remote and binding on everyone, administrators included: PR required; named checks (`p0-gates`) required and up to date before merge; conversations resolved; no ordinary force pushes or branch deletion. Native GitHub approval votes are **not** required while there is a single maintainer (authors cannot approve their own PRs) — the revision-bound review receipt and the maintainer's recorded merge decision carry the review weight; required approvals are added when a second maintainer joins. Exceptional recovery actions are documented publicly.
+Configured on the remote and binding on everyone, administrators included: PR required; named checks (`p0-gates`) required and up to date before merge; conversations resolved; no ordinary force pushes or branch deletion. Human DCO sign-off is not a merge requirement at the current stage. An agent may merge a PR once its review is clean, every review thread is replied to and resolved, and CI is green. Native GitHub approval votes are **not** required while there is a single maintainer (authors cannot approve their own PRs) — the revision-bound review receipt and the maintainer's recorded merge decision carry the review weight; required approvals are added when a second maintainer joins. Exceptional recovery actions are documented publicly.
 
 ## Amendments
 

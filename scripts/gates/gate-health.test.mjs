@@ -56,10 +56,10 @@ const cases = [
     expectExit: 0,
   },
   {
-    name: "commit-policy blocks bad subjects, missing sign-offs, identity trailers",
+    name: "commit-policy blocks bad subjects and identity trailers",
     cmd: gate("commit-policy.mjs", "--file", join(fixtures, "commit-policy", "bad-messages.txt")),
     expectExit: 1,
-    expectOutput: /non-conventional subject|missing human DCO sign-off|identity-bearing/,
+    expectOutput: /non-conventional subject|identity-bearing/,
   },
   {
     name: "commit-policy accepts compliant messages",

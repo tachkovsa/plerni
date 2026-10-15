@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 /**
  * commit-policy gate (spec §12, CONTRIBUTING.md): every commit offered for
- * merge must have a Conventional Commits subject, a human DCO sign-off, and —
- * if present — a role-only `AI-assisted: yes` trailer (never development-tool
- * or model identities, AGENTS.md §0).
+ * merge must have a Conventional Commits subject and — if present — a
+ * role-only `AI-assisted: yes` trailer (never development-tool or model
+ * identities, AGENTS.md §0). Human DCO sign-off is not required at the
+ * current stage; the CI step in `.github/workflows/p0-gates.yml` runs this
+ * script and therefore does not require `Signed-off-by`.
  *
  * Modes:
  *   (default)     check `git log <base>..HEAD`; base = --base, else origin/dev
@@ -19,7 +21,6 @@ import { parseArgs } from "node:util";
 const { values } = parseArgs({ options: { file: { type: "string" }, base: { type: "string" } } });
 
 const SUBJECT = /^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-z0-9._/-]+\))?!?: \S.*/;
-const SIGNOFF = /^Signed-off-by: .+ <[^<>]+@[^<>]+>$/m;
 const AI_TRAILER = /^AI-assisted:.*$/gim;
 
 const records = [];
@@ -61,7 +62,6 @@ for (const { id, message } of records) {
   if (!SUBJECT.test(subject)) {
     violations.push(`${id}: non-conventional subject "${subject.slice(0, 60)}"`);
   }
-  if (!SIGNOFF.test(message)) violations.push(`${id}: missing human DCO sign-off (Signed-off-by: Name <email>)`);
   for (const m of message.matchAll(AI_TRAILER)) {
     if (m[0].trim() !== "AI-assisted: yes") {
       violations.push(`${id}: identity-bearing trailer "${m[0].trim()}" — role-only \`AI-assisted: yes\` (AGENTS.md §0)`);
