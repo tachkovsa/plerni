@@ -2,15 +2,17 @@
 /**
  * license-audit gate (spec §12): appliance dependencies must be OSI-approved.
  * Walks workspace package.json files and the installed dependency graph,
- * including transitive dependencies and platform-selected optional packages,
- * and fails on missing/unknown/copyleft licenses.
+ * including transitive dependencies, peer dependencies, and platform-selected
+ * optional packages, and fails on missing/unknown/copyleft licenses.
  * Also audits npm packages that sit outside the workspace (assets/brand).
  * A manifest with external dependencies and no package-lock.json fails
  * closed. The locked version of each direct dependency must satisfy the
  * manifest range. Every license is read from the installed package manifest,
  * never from the lockfile's license field. An optional dependency this
  * platform did not install is skipped. A required dependency that is not
- * installed fails closed.
+ * installed fails closed. A required peer that is not installed fails closed.
+ * An optional peer (`peerDependenciesMeta.*.optional`) that is not installed
+ * is skipped; an optional peer that is installed is judged.
  * Usage: node scripts/gates/license-audit.mjs [--root <dir>]
  */
 import { readFileSync, existsSync, readdirSync, realpathSync, statSync } from "node:fs";
@@ -171,6 +173,16 @@ const auditTree = (pkgPath, label) => {
   for (const name of optional) {
     const child = resolveInstalled(dir, name);
     if (!child) continue;
+    auditTree(child, `${name} (dependency of ${label})`);
+  }
+  const peerMeta = pkg.peerDependenciesMeta ?? {};
+  for (const name of Object.keys(pkg.peerDependencies ?? {})) {
+    const child = resolveInstalled(dir, name);
+    if (!child) {
+      if (peerMeta[name]?.optional === true) continue;
+      failures.push(`${name} (peer of ${label}): not installed — fail closed`);
+      continue;
+    }
     auditTree(child, `${name} (dependency of ${label})`);
   }
 };

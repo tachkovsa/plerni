@@ -7,9 +7,12 @@
  * current stage; the CI step in `.github/workflows/p0-gates.yml` runs this
  * script and therefore does not require `Signed-off-by`.
  *
- * The author, the committer, and the full message are all checked. A URL in
- * any of those fields fails, and an `AI-assisted:` line must be exactly
- * `AI-assisted: yes`.
+ * The author, the committer, and the full message are all checked. An
+ * `AI-assisted:` line must be exactly `AI-assisted: yes`. Other URLs are
+ * allowed. A URL or other text fails only when it matches a forbidden
+ * identity pattern: `--identities <file>` and, on a git-history run, the
+ * gitignored `.private-markers.local` at the repository root (one regex
+ * per line, the same shape as the private-markers local file).
  *
  * Modes:
  *   (default)     check `git log <base>..HEAD`; base = --base, else origin/dev
@@ -19,15 +22,36 @@
  *                 containing only `===`. A record may start with `author:`
  *                 and `committer:` lines; the rest is the message.
  */
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { parseArgs } from "node:util";
 
-const { values } = parseArgs({ options: { file: { type: "string" }, base: { type: "string" } } });
+const { values } = parseArgs({
+  options: {
+    file: { type: "string" },
+    base: { type: "string" },
+    identities: { type: "string" },
+  },
+});
 
 const SUBJECT = /^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-z0-9._/-]+\))?!?: \S.*/;
 const AI_TRAILER = /^AI-assisted:.*$/gim;
-const URL = /https?:\/\//i;
+
+const loadIdentityPatterns = (path) => {
+  if (!path || !existsSync(path)) return [];
+  const patterns = [];
+  readFileSync(path, "utf8").split("\n").forEach((raw, i) => {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) return;
+    try {
+      patterns.push(new RegExp(line, "i"));
+    } catch (err) {
+      console.error(`commit-policy: invalid identity pattern at ${path}:${i + 1} (${err.message}) — FAIL CLOSED`);
+      process.exit(1);
+    }
+  });
+  return patterns;
+};
 
 const parseFileRecord = (chunk) => {
   const lines = chunk.trim().split("\n");
@@ -52,6 +76,17 @@ const parseFileRecord = (chunk) => {
   if ((author || committer) && lines[start]?.trim() === "") start++;
   return { author, committer, message: lines.slice(start).join("\n").trim() };
 };
+
+const identityPatterns = loadIdentityPatterns(values.identities);
+if (!values.file) {
+  let top;
+  try {
+    top = execFileSync("git", ["rev-parse", "--show-toplevel"], { encoding: "utf8" }).trim();
+  } catch {
+    top = "";
+  }
+  if (top) identityPatterns.push(...loadIdentityPatterns(`${top}/.private-markers.local`));
+}
 
 const records = [];
 if (values.file) {
@@ -110,7 +145,9 @@ for (const { id, author = "", committer = "", message } of records) {
     ["committer", committer],
     ["message", message],
   ]) {
-    if (URL.test(text)) violations.push(`${id}: ${label} contains a URL`);
+    if (identityPatterns.some((pattern) => pattern.test(text))) {
+      violations.push(`${id}: ${label} matches a forbidden identity`);
+    }
     for (const m of text.matchAll(AI_TRAILER)) {
       if (m[0].trim() !== "AI-assisted: yes") {
         violations.push(

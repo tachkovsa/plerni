@@ -16,4 +16,10 @@ fix: correct RLS policy
 
 AI-assisted: yes
 ===
+docs: cite the public package manifest reference
+
+https://docs.npmjs.com/cli/v7/configuring-npm/package-json
+
+AI-assisted: yes
+===
 Merge 3ba63c7 into dev

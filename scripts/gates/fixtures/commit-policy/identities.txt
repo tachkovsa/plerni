@@ -1,0 +1,2 @@
+# Configured forbidden identity. One regex per line. Not a real provider.
+forbidden-provider\.example

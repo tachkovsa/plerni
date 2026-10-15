@@ -13,7 +13,7 @@
  * Pinned tools, checked on the npm registry on 2026-10-15: opentype.js 2.0.0
  * (MIT) and @napi-rs/canvas 1.0.11 (MIT, including its optional platform
  * packages). The canvas Image constructor rasterizes an SVG buffer at the
- * width and height it is given. Run `npm ci && npm run export` here.
+ * width and height it is given. Run `npm ci --ignore-scripts && npm run export` here.
  */
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
@@ -64,8 +64,12 @@ function glyphAt(font, ch, x) {
     const dot = cmds.findIndex((c, i) => i > 0 && c.type === "M");
     if (dot > 0) cmds = cmds.slice(0, dot);
   }
-  const xs = cmds.filter((c) => c.x != null).map((c) => c.x);
-  const ys = cmds.filter((c) => c.y != null).map((c) => c.y);
+  const xs = [];
+  const ys = [];
+  for (const c of cmds) {
+    for (const key of ["x", "x1", "x2"]) if (c[key] != null) xs.push(c[key]);
+    for (const key of ["y", "y1", "y2"]) if (c[key] != null) ys.push(c[key]);
+  }
   return {
     d: cmdsToD(cmds),
     minX: Math.min(...xs),
@@ -164,10 +168,12 @@ function buildMarks(font) {
 
   const wordTx = iStem.cx;
   const wordTy = iStem.top - gap;
-  const wordMinX = Math.min(glyphs.p.minX, wordTx - sproutW / 2);
-  const wordMaxX = Math.max(glyphs.i.maxX, wordTx + sproutW / 2);
-  const wordMinY = wordTy - sproutH;
-  const wordMaxY = Math.max(..."plerni".split("").map((ch) => glyphs[ch].maxY));
+  // Every glyph, including ascenders taller than the sprout (the l), plus the sprout.
+  const boxes = Object.values(glyphs);
+  const wordMinX = Math.min(...boxes.map((g) => g.minX), wordTx - sproutW / 2);
+  const wordMaxX = Math.max(...boxes.map((g) => g.maxX), wordTx + sproutW / 2);
+  const wordMinY = Math.min(...boxes.map((g) => g.minY), wordTy - sproutH);
+  const wordMaxY = Math.max(...boxes.map((g) => g.maxY), wordTy);
   const wordPad = sproutH * 0.35;
   const wordView = {
     x: wordMinX - wordPad,

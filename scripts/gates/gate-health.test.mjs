@@ -57,6 +57,12 @@ const cases = [
       /fake-lgpl-lib \(dependency of fake-mit-lib \(brand\)\): forbidden license "LGPL-3.0-or-later"(?![\s\S]*fake-other-platform)/,
   },
   {
+    name: "license-audit blocks a forbidden license on an installed peer dependency",
+    cmd: gate("license-audit.mjs", "--root", join(fixtures, "isolated-peer")),
+    expectExit: 1,
+    expectOutput: /fake-gpl-peer \(dependency of fake-mit-lib \(brand\)\): forbidden license "GPL-3.0-only"/,
+  },
+  {
     name: "license-audit blocks an isolated package with no lockfile",
     cmd: gate("license-audit.mjs", "--root", join(fixtures, "isolated-nolock")),
     expectExit: 1,
@@ -97,10 +103,17 @@ const cases = [
     expectExit: 0,
   },
   {
-    name: "commit-policy blocks a URL or identity in the author, committer, or message",
-    cmd: gate("commit-policy.mjs", "--file", join(fixtures, "commit-policy", "bad-metadata.txt")),
+    name: "commit-policy blocks a configured identity in the author, committer, or message",
+    cmd: gate(
+      "commit-policy.mjs",
+      "--file",
+      join(fixtures, "commit-policy", "bad-metadata.txt"),
+      "--identities",
+      join(fixtures, "commit-policy", "identities.txt"),
+    ),
     expectExit: 1,
-    expectOutput: /author contains a URL[\s\S]*committer contains a URL[\s\S]*message contains a URL[\s\S]*identity-bearing author/,
+    expectOutput:
+      /author matches a forbidden identity[\s\S]*committer matches a forbidden identity[\s\S]*message matches a forbidden identity[\s\S]*identity-bearing author/,
   },
 ];
 
