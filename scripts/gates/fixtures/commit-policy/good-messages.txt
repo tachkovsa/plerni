@@ -9,4 +9,8 @@ docs: fix typo in CONTRIBUTING
 
 Signed-off-by: Dev Example <dev@example.com>
 ===
+fix: correct RLS policy
+
+AI-assisted: yes
+===
 Merge 3ba63c7 into dev

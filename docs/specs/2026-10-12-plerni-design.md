@@ -315,7 +315,7 @@ Kernel correlates HTTP → plugin IPC → jobs → events → AI calls; plugin-s
 | Contracts | breaking-change: routes/events/jobs/ports/SDK/event payloads | unversioned break |
 | Plugin proof | black-box tarball install into running kernel | failure |
 | Admission parity | first-party plugins via the identical signed-tarball pipeline, both deploy profiles | divergence |
-| Provenance | commit-policy gate: Conventional Commits subject + human DCO sign-off + role-only `AI-assisted: yes` trailer | non-conventional subject, missing sign-off, identity-bearing trailer |
+| Provenance | commit-policy gate: Conventional Commits subject + role-only `AI-assisted: yes` trailer. Human DCO sign-off is not enforced at the current stage (CONTRIBUTING.md). | non-conventional subject, identity-bearing trailer |
 | Gate health | negative fixtures proving each gate blocks (and fails CLOSED) | fixture passes |
 | File-size ratchet | max-LOC-per-file budget, ratcheting down (god-file prevention) | over budget |
 | Test quality | duplicate-test detection (title/body similarity), assertion-density lint (no `toBeDefined`-only suites), skip/todo budget | violation |
@@ -353,7 +353,7 @@ plerni/
   e2e/  onprem/  docs/adr/  .github/workflows/
 ```
 
-pnpm + Turborepo; eslint-boundaries + dependency-cruiser enforce the import graph. New SDK capability or trust boundary requires an ADR. **Agent-native with configurable gates:** approval authority is policy, not hardcoded humans — the default policy requires a *cross-family* agent review with a signed, recorded approval artifact for migrations and gate-config changes; a human maintainer owns the policy itself, sets escalation rules, and runs periodic audits. Humans keep ideas, features, and criticism; agents carry execution and first-line review (per founder direction), with the audit trail preserving accountability. **The commit trailer is role-only** (`AI-assisted: yes`) — development-tool and model identities are never published (AGENTS.md §0); high-risk work is verified by a human or a different model family than every generator, evidenced by a revision-bound review receipt whose identities stay in the maintainer's private archive (`docs/ai/model-routing.md`); the **convention-heavy-task disqualifier list is a versioned file** (`docs/ai/model-routing.md`), not tribal knowledge. Reviewer agents pin the exact git revision. Automated repo hygiene (temp/ policy, duplicate-test detection, stale-artifact sweeps).
+pnpm + Turborepo; eslint-boundaries + dependency-cruiser enforce the import graph. New SDK capability or trust boundary requires an ADR. **Agent-native with configurable gates:** approval authority is policy, not hardcoded humans — the default policy requires a *cross-family* agent review with a signed, recorded approval artifact for migrations and gate-config changes (the gate-config artifact is waived at the current stage — owner decision, 2026-10-15, `docs/ai/model-routing.md`); a human maintainer owns the policy itself, sets escalation rules, and runs periodic audits. Humans keep ideas, features, and criticism; agents carry execution and first-line review (per founder direction), with the audit trail preserving accountability. **The commit trailer is role-only** (`AI-assisted: yes`) — development-tool and model identities are never published (AGENTS.md §0); high-risk work is verified by a human or a different model family than every generator, evidenced by a revision-bound review receipt whose identities stay in the maintainer's private archive (`docs/ai/model-routing.md`); the **convention-heavy-task disqualifier list is a versioned file** (`docs/ai/model-routing.md`), not tribal knowledge. Reviewer agents pin the exact git revision. Automated repo hygiene (temp/ policy, duplicate-test detection, stale-artifact sweeps).
 
 Contracts vs. SDK: contracts = protocol/schema definitions; SDK = convenience code over them; plugin domain contracts stay plugin-owned and compose into registries.
 
@@ -362,7 +362,7 @@ Contracts vs. SDK: contracts = protocol/schema definitions; SDK = convenience co
 **Development conventions (codified from day one):**
 - **Spec-driven development** — every feature starts as a spec in `docs/specs/` (problem, contract, acceptance criteria), then a plan, then tasks; the spec's acceptance criteria map to executable tests. New capabilities require the spec path; bug fixes, documentation corrections, and maintenance may reference the existing contract and a scoped issue instead.
 - **TDD where it pays** — kernel services, contract logic, and domain rules are written red-green (failing test first); UI work leads with the fixture-gallery state, then implementation; every feature ends with its role-chain walkthrough (§12).
-- **ADR for any decision** a future agent would otherwise reverse-engineer; conventional commits + human DCO sign-off + role-only `AI-assisted: yes` trailer (commit-policy gate, §12); PR template includes the chain-test link and the docs-update checkbox.
+- **ADR for any decision** a future agent would otherwise reverse-engineer; conventional commits + role-only `AI-assisted: yes` trailer (commit-policy gate, §12). Human DCO sign-off is not required at the current stage (CONTRIBUTING.md). PR template includes the chain-test link and the docs-update checkbox.
 
 ---
 

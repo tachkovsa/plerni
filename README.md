@@ -24,7 +24,7 @@ Apache-2.0 (see LICENSE). Plerni was founded by **Sergei Tachkov** (see NOTICE).
 - Multi-tenant from commit #1 (PostgreSQL RLS); one artifact for on-prem appliance and SaaS
 - Compliance lives in code, not in prompts: every convention that can be mechanized is a CI gate
 - "Done" is never taken on faith; nobody is trusted by default — in either direction
-- Apache-2.0, human DCO sign-off, AI-assisted commits disclosed (`AI-assisted: yes`)
+- Apache-2.0; human DCO sign-off is not required at the current stage; AI-assisted commits disclosed (`AI-assisted: yes`)
 
 ## Repository layout
 
