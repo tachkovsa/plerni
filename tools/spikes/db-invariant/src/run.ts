@@ -7,7 +7,7 @@ import { record, evidenceFile, failedCount } from './evidence.ts';
 import { assertTenantContext, MissingTenantContextError } from './context.ts';
 import { a1Pinning } from './cases/a1-pinning.ts';
 import { a2Oracle } from './cases/a2-oracle.ts';
-import { a3Pgbouncer, resetAppTenantDefault } from './cases/a3-pgbouncer.ts';
+import { a3Pgbouncer, drainAppBackends, resetAppTenantDefault } from './cases/a3-pgbouncer.ts';
 import { a4Protocol } from './cases/a4-protocol.ts';
 import { poolAbort } from './battery/pool-abort.ts';
 import { interleave } from './battery/interleave.ts';
@@ -39,8 +39,10 @@ async function vacuityControl(): Promise<void> {
 
 const startedAt = Date.now();
 try {
-  // A killed run can leave ALTER ROLE … SET behind. Clear it before any case.
+  // A killed run can leave ALTER ROLE … SET behind. The default applies only at login,
+  // so existing pooled backends keep the old value until they are replaced.
   await resetAppTenantDefault();
+  await drainAppBackends();
   await a1Pinning();
   await a2Oracle();
   await vacuityControl();

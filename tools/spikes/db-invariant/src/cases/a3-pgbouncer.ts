@@ -60,8 +60,22 @@ export async function drainAppBackends(): Promise<void> {
   const c = rawRoot();
   await c.connect();
   try {
-    await c.query(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity
-      WHERE usename = 'plerni_app' AND pid <> pg_backend_pid()`);
+    const listed = await c.query<{ pid: number }>(
+      `SELECT pid FROM pg_stat_activity WHERE usename = 'plerni_app' AND pid <> pg_backend_pid()`,
+    );
+    const pids = listed.rows.map((row) => Number(row.pid));
+    if (pids.length === 0) return;
+    // The zero-timeout form only delivers the signal. Wait until those pids are gone.
+    await c.query('SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE pid = ANY($1::int[])', [pids]);
+    const deadline = performance.now() + BACKEND_GONE_DEADLINE_MS;
+    for (;;) {
+      const still = await c.query<{ pid: number }>('SELECT pid FROM pg_stat_activity WHERE pid = ANY($1::int[])', [pids]);
+      if (still.rows.length === 0) return;
+      if (performance.now() >= deadline) {
+        throw new Error(`app backends still present after terminate: ${still.rows.map((row) => row.pid).join(',')}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
   } finally {
     await c.end();
   }

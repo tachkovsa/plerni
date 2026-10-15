@@ -4,8 +4,9 @@
 // pg_prepared_statements is never consulted: it is per-backend and a pool can miss names.
 // Benchmark is unnamed parameterized extended-protocol vs named, on a direct connection.
 // max_prepared_statements does not help unnamed traffic. Overhead opens A4b
-// (https://github.com/tachkovsa/plerni/issues/34) only when the 95% interval
-// clears 20%. The benchmark alternates ABBA/BAAB across 10 reps.
+// (https://github.com/tachkovsa/plerni/issues/34) when the mean overhead is
+// above 20% (plan §3.1). Spread is recorded; it does not gate the trigger.
+// The benchmark alternates ABBA/BAAB across 10 reps.
 // (named-statement branch, max_prepared_statements > 0, rerun A1–A3) — a new experiment.
 import pg from 'pg';
 import { sql } from 'kysely';
@@ -124,7 +125,7 @@ async function timeBlock(c: ReturnType<typeof rawApp>, named: boolean, text: str
 
 async function benchmark(): Promise<{
   unnamedMs: number[]; namedMs: number[]; overheadPct: number[];
-  spread: ReturnType<typeof overheadStats>; robust: boolean;
+  spread: ReturnType<typeof overheadStats>; a4bRequired: boolean;
 }> {
   const c = rawApp();
   await c.connect();
@@ -156,7 +157,8 @@ async function benchmark(): Promise<{
       namedMs: namedMs.map((n) => Math.round(n)),
       overheadPct: overheadPct.map(round1),
       spread,
-      robust: spread.ci95Low > OVERHEAD_LIMIT_PCT,
+      // Plan §3.1: overhead > 20% opens A4b. The recorded statistic is the mean.
+      a4bRequired: spread.mean > OVERHEAD_LIMIT_PCT,
     };
   } finally {
     await c.end();
@@ -237,9 +239,9 @@ export async function a4Protocol(): Promise<void> {
             environment: { node: process.version },
             overheadLimitPct: OVERHEAD_LIMIT_PCT,
             a4bIssue: A4B_ISSUE,
-            a4bRequired: bench.robust,
-            decision: bench.robust ? 'interval-clears-20' : 'not-robust',
-            a4b: bench.robust
+            a4bRequired: bench.a4bRequired,
+            decision: bench.a4bRequired ? 'mean-exceeds-20' : 'mean-at-or-below-20',
+            a4b: bench.a4bRequired
               ? {
                 title: 'test(spike): A4b named-statement branch',
                 issue: A4B_ISSUE,
