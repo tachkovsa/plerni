@@ -10,7 +10,7 @@
 //   set_config('plerni.tenant_id', tenant, true) + readback must equal the authorized tenant →
 // ⑤ tenant access.
 import { sql, type Kysely, type Transaction } from 'kysely';
-import type { Db } from './client.ts';
+import { unblockPool, type Db } from './client.ts';
 
 export const CONTEXT_GUCS = ['plerni.tenant_id'] as const;
 export const PINNED_SEARCH_PATH = 'public';
@@ -59,7 +59,6 @@ export async function installTenantContext(trx: Transaction<Db>, tenantId: strin
   const before = await readSessionState(trx);
   const contamination = findContamination(before);
   if (contamination.length > 0) {
-    ev.terminatedBackendPids.push(before.pid);
     ev.alerts.push(`SECURITY contamination on backend ${before.pid}: ${contamination.join('; ')}`);
     // The privileged terminator runs in withTenant before the checkout is released (γ-M1):
     // after a leaked SET ROLE, current_user cannot kill this backend. Self-termination is
@@ -115,25 +114,40 @@ export async function withTenant<T>(
             const pid = Number(JSON.parse(e.message).pid);
             // Kill before this callback returns. transaction().execute releases the
             // checkout in a finally, and a waiter queued on a size-1 pool would otherwise
-            // take the contaminated session.
-            await terminateBackend(pid);
-            let alive = false;
+            // take the contaminated session. The pid is recorded only after the
+            // terminator returns and a follow-up query fails. A terminator error is not
+            // a confirmed kill: drop the sockets and fail, so the retry cannot treat a
+            // still-live checkout as connection death.
+            let confirmed = false;
+            try {
+              await terminateBackend(pid);
+              confirmed = true;
+            } catch (termErr) {
+              unblockPool(db);
+              throw new Error(`contaminated backend ${pid} was not confirmed dead`, { cause: termErr });
+            }
+            let alive = true;
             try {
               await sql`SELECT 1`.execute(trx);
               alive = true;
             } catch {
               alive = false;
             }
-            if (alive) throw new Error(`contaminated backend ${pid} accepted a query after terminate`);
+            if (!confirmed || alive) {
+              unblockPool(db);
+              throw new Error(`contaminated backend ${pid} accepted a query after terminate`);
+            }
+            ev.terminatedBackendPids.push(pid);
           }
           throw e;
         }
         return fn(trx); // ⑤ tenant access
       });
     } catch (e) {
-      // A connection death retries only after this attempt recorded a contaminated backend.
-      // Rollback on that killed backend hides ContaminationError behind the driver's death text.
-      // A clean attempt that loses its connection is an environmental failure and is not rerun.
+      // A connection death retries only after this attempt confirmed the backend was gone.
+      // The pid is appended only then. Rollback on that killed backend hides ContaminationError
+      // behind the driver's death text. A clean attempt, or a terminator that did not confirm
+      // the kill, is not rerun.
       const killedThisAttempt = ev.terminatedBackendPids.length > terminatedBefore;
       if (killedThisAttempt && (e instanceof ContaminationError || isConnectionDeath(e))) {
         if (attempt > MAX_RETRY) {
