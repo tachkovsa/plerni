@@ -6,13 +6,15 @@
 // Injection counts are fixed at the injection site: 1 for a single session SET, and
 // MAX_RETRY+1 for a class that contaminates every new login. They are not copied
 // from the termination list. A warm client afterwards adds none.
+// A probe whose outcome is environmental noise is not folded in as zero. It marks
+// the aggregate invalid, and the equality case records that instead of a stable failure.
 import { sql } from 'kysely';
 import { adminShow, direct, pooled, rawApp, terminateBackendByPid } from '../client.ts';
 import { MAX_RETRY, withTenant } from '../context.ts';
 import { TENANT_A, TENANT_B } from '../cases/a2-oracle.ts';
 import {
   blankEv, drainAppBackends, rawRoleDefault, rawSearchPath, rawSessionGuc, rawSetRole,
-  readRows, recordProbe, recoverInjected, resetAppTenantDefault, setAppTenantDefault, type Recovery,
+  readRows, recordProbe, recoverInjected, resetAppTenantDefault, setAppTenantDefault, type Probe, type Recovery,
 } from '../cases/a3-pgbouncer.ts';
 
 async function freshPool() {
@@ -42,8 +44,22 @@ function detailOf(rec: Recovery, injectedLogins: number): Record<string, unknown
 
 function asCount(detail: Record<string, unknown>): number {
   const n = detail.terminations;
-  // A probe that threw has already been recorded. Keep the later cases running.
+  // An established failure that threw has already been recorded. Keep later cases running.
   return typeof n === 'number' ? n : 0;
+}
+
+/** Fold a probe into the totals. A noisy probe invalidates the aggregate instead of adding zero. */
+function absorb(
+  observed: Probe,
+  budget: number,
+  totals: { injected: number; terminated: number; invalid: boolean },
+): void {
+  if (observed.detail.outcome === 'environmental-noise') {
+    totals.invalid = true;
+    return;
+  }
+  totals.injected += budget;
+  totals.terminated += asCount(observed.detail);
 }
 
 async function searchPathConfig(): Promise<Record<string, unknown>> {
@@ -69,8 +85,7 @@ async function searchPathConfig(): Promise<Record<string, unknown>> {
 }
 
 export async function contaminatedSession(): Promise<void> {
-  let injected = 0;
-  let terminated = 0;
+  const totals = { injected: 0, terminated: 0, invalid: false };
 
   // Reuse path: a clean protocol use, then a session GUC on that same backend.
   const warm = await freshPool();
@@ -87,8 +102,7 @@ export async function contaminatedSession(): Promise<void> {
       },
       rawSessionGuc,
     );
-    injected += 1;
-    terminated += asCount(observed.detail);
+    absorb(observed, 1, totals);
   } finally {
     await warm.destroy();
   }
@@ -105,8 +119,7 @@ export async function contaminatedSession(): Promise<void> {
       },
       rawSetRole,
     );
-    injected += 1;
-    terminated += asCount(observed.detail);
+    absorb(observed, 1, totals);
   } finally {
     await role.destroy();
   }
@@ -124,8 +137,7 @@ export async function contaminatedSession(): Promise<void> {
       },
       rawSearchPath,
     );
-    injected += 1;
-    terminated += asCount(observed.detail);
+    absorb(observed, 1, totals);
   } finally {
     await directPath.destroy();
   }
@@ -155,8 +167,7 @@ export async function contaminatedSession(): Promise<void> {
       },
       rawSearchPath,
     );
-    injected += 1;
-    terminated += asCount(observed.detail);
+    absorb(observed, 1, totals);
   } finally {
     await path.destroy();
   }
@@ -174,8 +185,7 @@ export async function contaminatedSession(): Promise<void> {
       },
       rawSessionGuc,
     );
-    injected += 1;
-    terminated += asCount(observed.detail);
+    absorb(observed, 1, totals);
   } finally {
     await first.destroy();
   }
@@ -211,8 +221,7 @@ export async function contaminatedSession(): Promise<void> {
       },
       rawRoleDefault,
     );
-    injected += MAX_RETRY + 1;
-    terminated += asCount(observed.detail);
+    absorb(observed, MAX_RETRY + 1, totals);
   } finally {
     await defDb?.destroy();
     await resetAppTenantDefault();
@@ -224,13 +233,28 @@ export async function contaminatedSession(): Promise<void> {
     await recordProbe(
       { case: 'battery terminations == injected', datasource: 'pooled(1)' },
       async () => {
+        if (totals.invalid) {
+          return {
+            pass: false,
+            detail: {
+              outcome: 'environmental-noise',
+              injected: totals.injected,
+              terminated: totals.terminated,
+              reason: 'an upstream contamination probe was environmental noise, so the aggregate has no verdict',
+            },
+          };
+        }
         const tailEv = blankEv();
         await withTenant(tail, TENANT_A, tailEv, terminateBackendByPid, readRows);
         await withTenant(tail, TENANT_B, tailEv, terminateBackendByPid, readRows);
         return {
-          pass: tailEv.terminatedBackendPids.length === 0 && terminated === injected,
-          detail: { injected, terminated, warmTailTerminations: tailEv.terminatedBackendPids.length,
-            counting: 'injected is the sum of per-class login budgets; terminated is the measured count' },
+          pass: tailEv.terminatedBackendPids.length === 0 && totals.terminated === totals.injected,
+          detail: {
+            injected: totals.injected,
+            terminated: totals.terminated,
+            warmTailTerminations: tailEv.terminatedBackendPids.length,
+            counting: 'injected is the sum of per-class login budgets; terminated is the measured count',
+          },
         };
       },
       rawSessionGuc,

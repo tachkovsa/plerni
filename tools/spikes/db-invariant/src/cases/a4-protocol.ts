@@ -103,7 +103,8 @@ function round1(n: number): number {
 }
 
 function overheadStats(xs: number[]): {
-  min: number; median: number; p95: number; stddev: number; mean: number; ci95Low: number; ci95High: number;
+  min: number; median: number; p95: number; stddev: number;
+  mean: number; meanUnrounded: number; ci95Low: number; ci95High: number;
 } {
   const s = [...xs].sort((a, b) => a - b);
   const n = s.length;
@@ -117,7 +118,8 @@ function overheadStats(xs: number[]): {
   const half = tCrit95(n - 1) * stddev / Math.sqrt(n);
   return {
     min: round1(s[0]!), median: round1(median), p95: round1(p95), stddev: round1(stddev),
-    mean: round1(mean), ci95Low: round1(mean - half), ci95High: round1(mean + half),
+    mean: round1(mean), meanUnrounded: mean,
+    ci95Low: round1(mean - half), ci95High: round1(mean + half),
   };
 }
 
@@ -164,8 +166,9 @@ async function benchmark(): Promise<{
       namedMs: namedMs.map((n) => Math.round(n)),
       overheadPct: overheadPct.map(round1),
       spread,
-      // Plan §3.1: overhead > 20% opens A4b. The recorded statistic is the mean.
-      a4bRequired: spread.mean > OVERHEAD_LIMIT_PCT,
+      // Plan §3.1: overhead > 20% opens A4b. Compare the unrounded mean.
+      // spread.mean is rounded for display and can hide a value just above 20.
+      a4bRequired: spread.meanUnrounded > OVERHEAD_LIMIT_PCT,
     };
   } finally {
     await c.end();

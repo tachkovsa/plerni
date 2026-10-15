@@ -105,6 +105,7 @@ export async function withTenant<T>(
 ): Promise<T> {
   for (let attempt = 1; ; attempt++) {
     ev.attempts = attempt;
+    const terminatedBefore = ev.terminatedBackendPids.length;
     try {
       return await db.transaction().execute(async (trx) => {
         try {
@@ -130,9 +131,11 @@ export async function withTenant<T>(
         return fn(trx); // ⑤ tenant access
       });
     } catch (e) {
-      // Rollback on the killed backend surfaces as connection death and hides ContaminationError.
-      // Termination already ran while the checkout was held. Either class retries.
-      if (e instanceof ContaminationError || isConnectionDeath(e)) {
+      // A connection death retries only after this attempt recorded a contaminated backend.
+      // Rollback on that killed backend hides ContaminationError behind the driver's death text.
+      // A clean attempt that loses its connection is an environmental failure and is not rerun.
+      const killedThisAttempt = ev.terminatedBackendPids.length > terminatedBefore;
+      if (killedThisAttempt && (e instanceof ContaminationError || isConnectionDeath(e))) {
         if (attempt > MAX_RETRY) {
           const kind = e instanceof ContaminationError ? 'contamination' : 'connection death';
           throw new Error(`loud failure: ${kind} persisted after ${MAX_RETRY} retries`, { cause: e });

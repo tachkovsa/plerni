@@ -171,6 +171,13 @@ export async function recordProbe(
     record({ ...meta, pass: true, detail: first.detail });
     return first;
   }
+  // The caller already knows this run is noise (an upstream probe was invalid).
+  // Three identical failures would be recorded as an established failure.
+  if (first.detail.outcome === 'environmental-noise') {
+    const detail = { ...first.detail, verdict: 'invalid-run-no-verdict' };
+    record({ ...meta, pass: false, detail });
+    return { pass: false, detail };
+  }
   const runs = [false];
   const repeatErrors: string[] = [];
   for (let i = 0; i < 2; i++) {
@@ -179,19 +186,16 @@ export async function recordProbe(
     if (typeof again.detail.thrown === 'string') repeatErrors.push(again.detail.thrown);
   }
   const noise = runs.some(Boolean);
-  record({
-    ...meta,
-    pass: false,
-    detail: {
-      ...first.detail,
-      runs,
-      repeatErrors,
-      outcome: noise ? 'environmental-noise' : 'established-failure',
-      verdict: noise ? 'invalid-run-no-verdict' : 'unlabeled-pending-section-3.0',
-      section30: await section30(raw),
-    },
-  });
-  return first;
+  const detail = {
+    ...first.detail,
+    runs,
+    repeatErrors,
+    outcome: noise ? 'environmental-noise' : 'established-failure',
+    verdict: noise ? 'invalid-run-no-verdict' : 'unlabeled-pending-section-3.0',
+    section30: await section30(raw),
+  };
+  record({ ...meta, pass: false, detail });
+  return { pass: false, detail };
 }
 
 /** Minimal raw-pg script. Each step is a constant; a step error is data, not a thrown miss. */
