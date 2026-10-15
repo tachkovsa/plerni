@@ -23,3 +23,11 @@ https://docs.npmjs.com/cli/v7/configuring-npm/package-json
 AI-assisted: yes
 ===
 Merge 3ba63c7 into dev
+===
+author: Dev Example <dev@example.com>
+committer: Dev Example <dev@example.com>
+
+Merge branch 'dev'
+
+AI-assisted: yes
+

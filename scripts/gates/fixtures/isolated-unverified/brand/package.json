@@ -1,0 +1,7 @@
+{
+  "name": "fixture-isolated-unverified",
+  "private": true,
+  "dependencies": {
+    "fake-mit-lib": "1.0.0"
+  }
+}

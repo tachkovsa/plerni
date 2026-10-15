@@ -65,10 +65,16 @@ const cases = [
     expectOutput: /fake-gpl-peer \(dependency of fake-mit-lib \(brand\)\): forbidden license "GPL-3.0-only"/,
   },
   {
-    name: "license-audit blocks a forbidden lockfile license for another platform",
+    name: "license-audit blocks a forbidden tarball license when the lockfile license field is allowlisted",
     cmd: gate("license-audit.mjs", "--root", join(fixtures, "isolated-foreign")),
     expectExit: 1,
-    expectOutput: /fake-darwin-gpl \(lockfile optional dependency of fake-mit-lib \(brand\)\): forbidden license "GPL-3.0-only"/,
+    expectOutput: /fake-darwin-gpl \(verified optional dependency of fake-mit-lib \(brand\)\): forbidden license "GPL-3.0-only"/,
+  },
+  {
+    name: "license-audit fails closed when an absent optional dependency has no verifiable tarball",
+    cmd: gate("license-audit.mjs", "--root", join(fixtures, "isolated-unverified")),
+    expectExit: 1,
+    expectOutput: /fake-no-tarball \(optional dependency of fake-mit-lib \(brand\)\): not installed and its lockfile entry has no integrity-checked tarball/,
   },
   {
     name: "license-audit blocks an isolated package with no lockfile",
@@ -123,6 +129,12 @@ const cases = [
     expectOutput:
       /author matches a forbidden identity[\s\S]*committer matches a forbidden identity[\s\S]*message matches a forbidden identity[\s\S]*identity-bearing author/,
   },
+  {
+    name: "commit-policy checks identity metadata on merge commits",
+    cmd: gate("commit-policy.mjs", "--file", join(fixtures, "commit-policy", "merge-metadata.txt")),
+    expectExit: 1,
+    expectOutput: /^(?![\s\S]*non-conventional subject)[\s\S]*author matches a forbidden identity/,
+  },
 ];
 
 const historyDir = mkdtempSync(join(tmpdir(), "plerni-commit-policy-"));
@@ -156,6 +168,58 @@ cases.push({
   expectOutput: /author matches a forbidden identity[\s\S]*message matches a forbidden identity/,
 });
 
+// Obfuscated probe. The governed list stores only hashes of this identity.
+const banned = Buffer.from("Q3Vyc29yIEFnZW50IDxjdXJzb3JhZ2VudEBjdXJzb3IuY29tPg==", "base64").toString("utf8");
+const bannedParts = /^(.*) <([^>]+)>$/.exec(banned);
+if (!bannedParts) throw new Error("identity probe is malformed");
+const identityDir = mkdtempSync(join(tmpdir(), "plerni-commit-identity-"));
+writeFileSync(
+  join(identityDir, "probe.txt"),
+  `author: ${banned}\ncommitter: ${banned}\n\nfeat: keep the message clean\n\nAI-assisted: yes\n`,
+);
+cases.push({
+  name: "commit-policy file mode applies governed hashes with no extra identity file",
+  cmd: gate("commit-policy.mjs", "--file", join(identityDir, "probe.txt")),
+  expectExit: 1,
+  expectOutput: /author matches a forbidden identity[\s\S]*committer matches a forbidden identity(?![\s\S]*message matches)/,
+});
+const identityGit = (args) =>
+  execFileSync("git", ["-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", ...args], {
+    cwd: identityDir,
+    encoding: "utf8",
+  });
+identityGit(["init", "-q", "-b", "main"]);
+writeFileSync(join(identityDir, "README.md"), "one\n");
+identityGit(["add", "README.md"]);
+identityGit([
+  "-c", "user.name=Dev Example",
+  "-c", "user.email=dev@example.com",
+  "commit", "-q",
+  "-m", "feat: start\n\nhttps://docs.npmjs.com/cli/v7/configuring-npm/package-json\n\nAI-assisted: yes\n",
+]);
+const identityBase = identityGit(["rev-parse", "HEAD"]).trim();
+identityGit(["checkout", "-q", "-b", "side"]);
+writeFileSync(join(identityDir, "note.md"), "two\n");
+identityGit(["add", "note.md"]);
+identityGit([
+  "-c", "user.name=Dev Example",
+  "-c", "user.email=dev@example.com",
+  "commit", "-q",
+  "-m", "docs: note\n\nAI-assisted: yes\n",
+]);
+identityGit(["checkout", "-q", "main"]);
+identityGit([
+  "-c", `user.name=${bannedParts[1]}`,
+  "-c", `user.email=${bannedParts[2]}`,
+  "merge", "-q", "--no-ff", "-m", "Merge branch 'side'\n\nAI-assisted: yes\n", "side",
+]);
+cases.push({
+  name: "commit-policy history mode applies governed hashes on a clean checkout",
+  cmd: gate("commit-policy.mjs", "--cwd", identityDir, "--base", identityBase),
+  expectExit: 1,
+  expectOutput: /author matches a forbidden identity[\s\S]*committer matches a forbidden identity/,
+});
+
 let failed = 0;
 try {
   for (const c of cases) {
@@ -174,6 +238,7 @@ try {
   }
 } finally {
   rmSync(historyDir, { recursive: true, force: true });
+  rmSync(identityDir, { recursive: true, force: true });
 }
 
 if (failed) {

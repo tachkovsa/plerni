@@ -1,5 +1,12 @@
-# Governed identity patterns for the author, the committer, and the message.
-# One regex per line. These are generic and safe to publish. Real private
-# markers stay in the gitignored .private-markers.local file.
+# Governed identity rules for the author, the committer, and the message.
+# One rule per line:
+#   a JavaScript regex, or
+#   sha256: and 64 hex digits, the digest of a lowercase forbidden substring.
+# Digests do not spell the forbidden text. Real private markers stay in the
+# gitignored .private-markers.local file.
 forbidden-provider\.example
 https?://\S+/(?:dashboard|artifacts?)(?:/|\s|$)
+sha256:cf2baf4dab3ef27e6fbd41908ad62f7494eb351daf1e129a441102c7cab451ff
+sha256:00d7db78ea92db6430e44f4c925706d022d4decfd0a87c78139c9f2bf79f4bd3
+sha256:c4c9cc242c936acbd2b31fee72627ac05d0a1622eda8b1447fede08c3092c06d
+sha256:8855783e9575f052584068cf43496fa1f05ca8b27ef510427fc961c3795580b3

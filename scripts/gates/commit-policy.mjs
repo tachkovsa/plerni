@@ -7,14 +7,16 @@
  * current stage; the CI step in `.github/workflows/p0-gates.yml` runs this
  * script and therefore does not require `Signed-off-by`.
  *
- * The author, the committer, and the full message are all checked. An
- * `AI-assisted:` line must be exactly `AI-assisted: yes`. Other URLs are
+ * The author, the committer, and the full message are all checked, including
+ * merge commits (only the conventional-subject rule is skipped for those).
+ * An `AI-assisted:` line must be exactly `AI-assisted: yes`. Other URLs are
  * allowed. A URL or other text fails when it matches a forbidden identity
- * pattern. CI always loads the committed list `commit-identities.txt` next
- * to this script. `--identities <file>` adds more. A git-history run also
- * loads the gitignored `.private-markers.local` at the repository root.
- * None of those files may contain private vendor or model names; the local
- * file is the only place for maintainer-specific patterns.
+ * rule. CI always loads the committed list `commit-identities.txt` next to
+ * this script. A rule is either a generic regex or `sha256:` plus the hex
+ * digest of a lowercase forbidden substring, so the list can name an identity
+ * without spelling it. `--identities <file>` adds more rules. A git-history
+ * run also loads the gitignored `.private-markers.local` at the repository
+ * root. None of those files may spell private vendor or model names.
  *
  * Modes:
  *   (default)     check `git log <base>..HEAD`; base = --base, else origin/dev
@@ -24,8 +26,9 @@
  *                 containing only `===`. A record may start with `author:`
  *                 and `committer:` lines; the rest is the message.
  */
-import { existsSync, readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
@@ -45,12 +48,22 @@ const GOVERNED_IDENTITIES = join(here, "commit-identities.txt");
 const SUBJECT = /^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-z0-9._/-]+\))?!?: \S.*/;
 const AI_TRAILER = /^AI-assisted:.*$/gim;
 
-const loadIdentityPatterns = (path) => {
-  if (!path || !existsSync(path)) return [];
+const loadIdentityRules = (path) => {
   const patterns = [];
+  const hashes = [];
+  if (!path || !existsSync(path)) return { patterns, hashes };
   readFileSync(path, "utf8").split("\n").forEach((raw, i) => {
     const line = raw.trim();
     if (!line || line.startsWith("#")) return;
+    const hash = /^sha256:([0-9a-f]{64})$/i.exec(line);
+    if (hash) {
+      hashes.push(hash[1].toLowerCase());
+      return;
+    }
+    if (line.toLowerCase().startsWith("sha256:")) {
+      console.error(`commit-policy: invalid identity hash at ${path}:${i + 1} — FAIL CLOSED`);
+      process.exit(1);
+    }
     try {
       patterns.push(new RegExp(line, "i"));
     } catch (err) {
@@ -58,8 +71,13 @@ const loadIdentityPatterns = (path) => {
       process.exit(1);
     }
   });
-  return patterns;
+  return { patterns, hashes };
 };
+
+const digest = (text) => createHash("sha256").update(text).digest("hex");
+
+// Hashes are of short identity fragments. A window cap keeps the scan bounded.
+const HASH_WINDOW = 160;
 
 const parseFileRecord = (chunk) => {
   const lines = chunk.trim().split("\n");
@@ -85,12 +103,19 @@ const parseFileRecord = (chunk) => {
   return { author, committer, message: lines.slice(start).join("\n").trim() };
 };
 
-const identityPatterns = loadIdentityPatterns(GOVERNED_IDENTITIES);
-if (identityPatterns.length === 0) {
+const identityPatterns = [];
+const identityHashes = new Set();
+const addIdentityRules = (path) => {
+  const loaded = loadIdentityRules(path);
+  identityPatterns.push(...loaded.patterns);
+  for (const hash of loaded.hashes) identityHashes.add(hash);
+};
+addIdentityRules(GOVERNED_IDENTITIES);
+if (identityPatterns.length + identityHashes.size === 0) {
   console.error(`commit-policy: governed identity list ${GOVERNED_IDENTITIES} is missing or empty — FAIL CLOSED`);
   process.exit(1);
 }
-identityPatterns.push(...loadIdentityPatterns(values.identities));
+addIdentityRules(values.identities);
 if (!values.file) {
   let top;
   try {
@@ -98,8 +123,22 @@ if (!values.file) {
   } catch {
     top = "";
   }
-  if (top) identityPatterns.push(...loadIdentityPatterns(`${top}/.private-markers.local`));
+  if (top) addIdentityRules(`${top}/.private-markers.local`);
 }
+
+const matchesIdentity = (text) => {
+  if (!text) return false;
+  if (identityPatterns.some((pattern) => pattern.test(text))) return true;
+  if (identityHashes.size === 0) return false;
+  const value = text.toLowerCase();
+  const max = Math.min(value.length, HASH_WINDOW);
+  for (let len = 1; len <= max; len++) {
+    for (let i = 0; i + len <= value.length; i++) {
+      if (identityHashes.has(digest(value.slice(i, i + len)))) return true;
+    }
+  }
+  return false;
+};
 
 const records = [];
 if (values.file) {
@@ -149,8 +188,8 @@ if (values.file) {
 const violations = [];
 for (const { id, author = "", committer = "", message } of records) {
   const subject = message.split("\n")[0];
-  if (subject.startsWith("Merge ")) continue; // transient merge commits (e.g. GitHub's PR merge refs) carry no policy metadata
-  if (!SUBJECT.test(subject)) {
+  // Merge subjects are not Conventional Commits. Identity metadata is still checked.
+  if (!subject.startsWith("Merge ") && !SUBJECT.test(subject)) {
     violations.push(`${id}: non-conventional subject "${subject.slice(0, 60)}"`);
   }
   for (const [label, text] of [
@@ -158,7 +197,7 @@ for (const { id, author = "", committer = "", message } of records) {
     ["committer", committer],
     ["message", message],
   ]) {
-    if (identityPatterns.some((pattern) => pattern.test(text))) {
+    if (matchesIdentity(text)) {
       violations.push(`${id}: ${label} matches a forbidden identity`);
     }
     for (const m of text.matchAll(AI_TRAILER)) {

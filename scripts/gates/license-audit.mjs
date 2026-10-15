@@ -9,17 +9,21 @@
  * closed. The locked version of each direct dependency must satisfy the
  * manifest range. Every license is read from the installed package manifest,
  * never from the lockfile's license field when the package is installed.
- * An optional dependency this platform did not install is still judged from
- * its package-lock.json entry, so other platforms are not approved by
- * absence. A missing lock entry for that optional dependency fails closed.
+ * An optional dependency this platform did not install is still judged.
+ * The lockfile supplies the tarball URL and integrity hash; the license is
+ * read from that tarball's package.json after the hash matches. The lockfile
+ * license field is ignored. A missing tarball, a bad hash, or a name or
+ * version that does not match the lock entry fails closed.
  * A required dependency that is not installed fails closed. A required peer
  * that is not installed fails closed.
  * An optional peer (`peerDependenciesMeta.*.optional`) that is not installed
  * is skipped; an optional peer that is installed is judged.
  * Usage: node scripts/gates/license-audit.mjs [--root <dir>]
  */
+import { createHash } from "node:crypto";
 import { readFileSync, existsSync, readdirSync, realpathSync, statSync } from "node:fs";
-import { dirname, join, relative, sep } from "node:path";
+import { dirname, join, relative, resolve, sep } from "node:path";
+import { gunzipSync } from "node:zlib";
 import { parseArgs } from "node:util";
 
 const { values } = parseArgs({ options: { root: { type: "string", default: "." } } });
@@ -183,9 +187,86 @@ const lockEntries = (lock, name) => {
   return hits;
 };
 
+const fetchCache = new Map();
+
+const integrityMatches = (bytes, integrity) => {
+  const parts = String(integrity ?? "").trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0) return false;
+  return parts.every((part) => {
+    const dash = part.indexOf("-");
+    if (dash <= 0) return false;
+    const algo = part.slice(0, dash);
+    const expected = part.slice(dash + 1);
+    try {
+      return createHash(algo).update(bytes).digest("base64") === expected;
+    } catch {
+      return false;
+    }
+  });
+};
+
+const packageJsonFromTarball = (bytes) => {
+  let tar;
+  try {
+    tar = gunzipSync(bytes);
+  } catch {
+    return null;
+  }
+  let offset = 0;
+  while (offset + 512 <= tar.length) {
+    const header = tar.subarray(offset, offset + 512);
+    if (header.every((b) => b === 0)) break;
+    const name = header.subarray(0, 100).toString("utf8").replace(/\0.*$/, "");
+    const size = parseInt(header.subarray(124, 136).toString("utf8").replace(/\0.*$/, "").trim(), 8);
+    offset += 512;
+    if (!Number.isFinite(size) || size < 0 || offset + size > tar.length) return null;
+    const data = tar.subarray(offset, offset + size);
+    if (name === "package/package.json") {
+      try {
+        return JSON.parse(data.toString("utf8"));
+      } catch {
+        return null;
+      }
+    }
+    offset += Math.ceil(size / 512) * 512;
+  }
+  return null;
+};
+
+// file: paths must stay inside --root. https tarballs are fetched and hashed.
+const readResolvedTarball = async (resolved, lockPath) => {
+  if (typeof resolved !== "string" || resolved.length === 0) return { error: "no integrity-checked tarball" };
+  if (resolved.startsWith("file:")) {
+    let abs;
+    try {
+      const spec = resolved.startsWith("file://")
+        ? new URL(resolved).pathname
+        : resolved.slice("file:".length);
+      abs = resolve(dirname(lockPath), spec);
+    } catch {
+      return { error: "resolved tarball URL is invalid" };
+    }
+    const relToRoot = relative(root, abs);
+    if (relToRoot.startsWith("..") || relToRoot === "") return { error: "resolved tarball is outside the audit root" };
+    if (!existsSync(abs)) return { error: "resolved tarball is missing" };
+    return { bytes: readFileSync(abs) };
+  }
+  if (!/^https:\/\//i.test(resolved)) return { error: "resolved URL is not verifiable" };
+  if (!fetchCache.has(resolved)) {
+    try {
+      const res = await fetch(resolved, { redirect: "follow", signal: AbortSignal.timeout(20000) });
+      if (!res.ok) fetchCache.set(resolved, { error: `tarball download failed (${res.status})` });
+      else fetchCache.set(resolved, { bytes: Buffer.from(await res.arrayBuffer()) });
+    } catch {
+      fetchCache.set(resolved, { error: "tarball download failed" });
+    }
+  }
+  return fetchCache.get(resolved);
+};
+
 // Optional packages for other OS/CPU targets are absent here. Their license
-// still comes from the lockfile, which records every platform.
-const auditLockedOptional = (startDir, name, label) => {
+// comes from the integrity-checked tarball, never from the lockfile license field.
+const auditLockedOptional = async (startDir, name, label) => {
   const found = readLock(startDir);
   if (!found) {
     failures.push(`${name} (optional dependency of ${label}): not installed and no package-lock.json — fail closed`);
@@ -199,22 +280,41 @@ const auditLockedOptional = (startDir, name, label) => {
     return;
   }
   for (const entry of entries) {
-    const id = `${found.lockPath}\0${name}\0${entry.version ?? ""}\0${licenseOf(entry)}`;
+    const id = `${found.lockPath}\0${name}\0${entry.version ?? ""}\0${entry.resolved ?? ""}\0${entry.integrity ?? ""}`;
     if (seenLocked.has(id)) continue;
     seenLocked.add(id);
+    const where = `${name} (optional dependency of ${label})`;
+    if (!entry.resolved || !entry.integrity) {
+      failures.push(`${where}: not installed and its lockfile entry has no integrity-checked tarball — fail closed`);
+      continue;
+    }
+    const loaded = await readResolvedTarball(entry.resolved, found.lockPath);
+    if (loaded.error || !loaded.bytes) {
+      failures.push(`${where}: not installed and its tarball could not be verified (${loaded.error ?? "missing"}) — fail closed`);
+      continue;
+    }
+    if (!integrityMatches(loaded.bytes, entry.integrity)) {
+      failures.push(`${where}: tarball integrity check failed — fail closed`);
+      continue;
+    }
+    const pkg = packageJsonFromTarball(loaded.bytes);
+    if (!pkg || pkg.name !== name || pkg.version !== entry.version) {
+      failures.push(`${where}: verified tarball does not match the locked name and version — fail closed`);
+      continue;
+    }
     checked++;
-    const lockedLabel = `${name} (lockfile optional dependency of ${label})`;
-    const problem = judge(lockedLabel, licenseOf(entry));
+    const lockedLabel = `${name} (verified optional dependency of ${label})`;
+    const problem = judge(lockedLabel, licenseOf(pkg));
     if (problem) failures.push(problem);
-    const nested = { ...entry.dependencies, ...entry.optionalDependencies };
+    const nested = { ...pkg.dependencies, ...pkg.optionalDependencies };
     for (const child of Object.keys(nested)) {
       if (resolveInstalled(startDir, child)) continue;
-      auditLockedOptional(startDir, child, lockedLabel);
+      await auditLockedOptional(startDir, child, lockedLabel);
     }
   }
 };
 
-const auditTree = (pkgPath, label) => {
+const auditTree = async (pkgPath, label) => {
   // Follow the install layout (pnpm's virtual store is behind a symlink).
   const real = realpathSync(pkgPath);
   if (seenPackages.has(real)) return;
@@ -232,15 +332,15 @@ const auditTree = (pkgPath, label) => {
       failures.push(`${name} (required by ${label}): not installed — fail closed`);
       continue;
     }
-    auditTree(child, `${name} (dependency of ${label})`);
+    await auditTree(child, `${name} (dependency of ${label})`);
   }
   for (const name of optional) {
     const child = resolveInstalled(dir, name);
     if (child) {
-      auditTree(child, `${name} (dependency of ${label})`);
+      await auditTree(child, `${name} (dependency of ${label})`);
       continue;
     }
-    auditLockedOptional(dir, name, label);
+    await auditLockedOptional(dir, name, label);
   }
   const peerMeta = pkg.peerDependenciesMeta ?? {};
   for (const name of Object.keys(pkg.peerDependencies ?? {})) {
@@ -250,7 +350,7 @@ const auditTree = (pkgPath, label) => {
       failures.push(`${name} (peer of ${label}): not installed — fail closed`);
       continue;
     }
-    auditTree(child, `${name} (dependency of ${label})`);
+    await auditTree(child, `${name} (dependency of ${label})`);
   }
 };
 
@@ -275,54 +375,61 @@ if (deps.size === 0 && lockDeps.length === 0 && failures.length === 0) {
   process.exit(0);
 }
 
-for (const [name, ownerDir] of deps) {
-  const candidates = [
-    join(ownerDir, "node_modules", ...name.split("/"), "package.json"),
-    join(root, "node_modules", ...name.split("/"), "package.json"),
-  ];
-  const pkgPath = candidates.find((p) => existsSync(p));
-  if (!pkgPath) {
-    failures.push(`${name}: not installed (checked: ${candidates.join(", ")}) — run pnpm install; gate is fail-closed`);
-    continue;
+const main = async () => {
+  for (const [name, ownerDir] of deps) {
+    const candidates = [
+      join(ownerDir, "node_modules", ...name.split("/"), "package.json"),
+      join(root, "node_modules", ...name.split("/"), "package.json"),
+    ];
+    const pkgPath = candidates.find((p) => existsSync(p));
+    if (!pkgPath) {
+      failures.push(`${name}: not installed (checked: ${candidates.join(", ")}) — run pnpm install; gate is fail-closed`);
+      continue;
+    }
+    await auditTree(pkgPath, name);
   }
-  auditTree(pkgPath, name);
-}
 
-for (const { name, range, dir } of lockDeps) {
-  const rel = relative(root, dir) || ".";
-  const label = `${name} (${rel})`;
-  const lock = JSON.parse(readFileSync(join(dir, "package-lock.json"), "utf8"));
-  const rootSpec = lock.packages?.[""]?.dependencies?.[name] ?? lock.packages?.[""]?.optionalDependencies?.[name];
-  if (rootSpec !== range) {
-    failures.push(`${label}: lockfile root specifier "${rootSpec ?? "MISSING"}" does not match manifest "${range}"`);
+  for (const { name, range, dir } of lockDeps) {
+    const rel = relative(root, dir) || ".";
+    const label = `${name} (${rel})`;
+    const lock = JSON.parse(readFileSync(join(dir, "package-lock.json"), "utf8"));
+    const rootSpec = lock.packages?.[""]?.dependencies?.[name] ?? lock.packages?.[""]?.optionalDependencies?.[name];
+    if (rootSpec !== range) {
+      failures.push(`${label}: lockfile root specifier "${rootSpec ?? "MISSING"}" does not match manifest "${range}"`);
+    }
+    const entry = lock.packages?.[`node_modules/${name}`];
+    if (!entry) {
+      failures.push(`${label}: missing from package-lock.json — fail closed`);
+      continue;
+    }
+    const sat = satisfies(entry.version, range);
+    if (sat === null) {
+      failures.push(`${label}: cannot validate manifest range "${range}" — fail closed`);
+    } else if (!sat) {
+      failures.push(`${label}: lockfile version ${entry.version} does not satisfy manifest range ${range}`);
+    }
+    const installedPath = join(dir, "node_modules", ...name.split("/"), "package.json");
+    if (!existsSync(installedPath)) {
+      failures.push(`${label}: not installed — run npm ci --ignore-scripts in ${rel}; gate is fail-closed`);
+      continue;
+    }
+    const installed = JSON.parse(readFileSync(installedPath, "utf8"));
+    if (installed.version && entry.version && installed.version !== entry.version) {
+      failures.push(
+        `${label}: installed version ${installed.version} does not match lockfile version ${entry.version}`,
+      );
+    }
+    await auditTree(installedPath, label);
   }
-  const entry = lock.packages?.[`node_modules/${name}`];
-  if (!entry) {
-    failures.push(`${label}: missing from package-lock.json — fail closed`);
-    continue;
-  }
-  const sat = satisfies(entry.version, range);
-  if (sat === null) {
-    failures.push(`${label}: cannot validate manifest range "${range}" — fail closed`);
-  } else if (!sat) {
-    failures.push(`${label}: lockfile version ${entry.version} does not satisfy manifest range ${range}`);
-  }
-  const installedPath = join(dir, "node_modules", ...name.split("/"), "package.json");
-  if (!existsSync(installedPath)) {
-    failures.push(`${label}: not installed — run npm ci --ignore-scripts in ${rel}; gate is fail-closed`);
-    continue;
-  }
-  const installed = JSON.parse(readFileSync(installedPath, "utf8"));
-  if (installed.version && entry.version && installed.version !== entry.version) {
-    failures.push(
-      `${label}: installed version ${installed.version} does not match lockfile version ${entry.version}`,
-    );
-  }
-  auditTree(installedPath, label);
-}
 
-if (failures.length) {
-  console.error("license-audit: FAIL\n" + failures.map((f) => "  " + f).join("\n"));
+  if (failures.length) {
+    console.error("license-audit: FAIL\n" + failures.map((f) => "  " + f).join("\n"));
+    process.exit(1);
+  }
+  console.log(`license-audit: OK (${checked} dependencies checked)`);
+};
+
+main().catch((err) => {
+  console.error(`license-audit: ${err instanceof Error ? err.message : err} — FAIL CLOSED`);
   process.exit(1);
-}
-console.log(`license-audit: OK (${checked} dependencies checked)`);
+});
