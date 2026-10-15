@@ -1,0 +1,13 @@
+{
+  "name": "plerni-brand-export",
+  "private": true,
+  "type": "module",
+  "description": "Regenerate Plerni brand rasters from the outlined vectors.",
+  "scripts": {
+    "export": "node export.mjs"
+  },
+  "dependencies": {
+    "opentype.js": "2.0.0",
+    "sharp": "0.35.5"
+  }
+}
