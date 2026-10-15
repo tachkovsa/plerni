@@ -1,5 +1,6 @@
 // smoke.mjs — Smoke test: round-trip over stdio framing + authority transitions on harness PG.
 import { spawn } from 'node:child_process';
+import { once } from 'node:events';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { NdjsonFramer, encodeNdjson } from '../framing.mjs';
@@ -16,42 +17,129 @@ import {
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const echoPath = join(__dirname, '../children/echo.mjs');
 
+/**
+ * Round-trip NDJSON through a child. Framing errors are recorded instead of
+ * escaping the stdout handler. After the child closes, a leftover partial
+ * frame and a non-zero exit are both visible to the caller.
+ * @param {object[]} messages
+ * @param {{ command?: string, args?: string[] }} [opts]
+ */
+export async function echoRoundTrip(messages, opts = {}) {
+  const command = opts.command ?? 'node';
+  const args = opts.args ?? [echoPath];
+  const child = spawn(command, args);
+  const framer = new NdjsonFramer();
+  const received = [];
+  let feedError = null;
+
+  child.stdout.on('data', (chunk) => {
+    if (feedError) return;
+    try {
+      framer.feed(chunk);
+      for (const msg of framer.frames()) received.push(msg);
+    } catch (e) {
+      feedError = e;
+    }
+  });
+  child.stderr.on('data', () => {});
+  child.stdin.on('error', () => {});
+
+  for (const msg of messages) {
+    child.stdin.write(encodeNdjson(msg));
+  }
+  child.stdin.end();
+
+  const [exitCode] = await once(child, 'close');
+  let eofError = null;
+  if (!feedError) {
+    try {
+      framer.eof();
+    } catch (e) {
+      eofError = e;
+    }
+  }
+  return { received, exitCode, feedError, eofError };
+}
+
+// Test-only renewal that holds the authority row lock until the COMMITTED
+// update is about to run, then sleeps while still holding it. Production
+// renew() stays a single conditional update.
+function slowRenewal(ms) {
+  const gate = { holding: false, observed: false };
+  async function renew(id, token, reserved, ctl) {
+    await reserved.query('BEGIN');
+    try {
+      const locked = await reserved.query(
+        `SELECT id FROM fencing_authority WHERE id = $1 AND token = $2 AND status = 'ACTIVE' FOR UPDATE`,
+        [id, token],
+      );
+      if (locked.rowCount !== 1) {
+        await reserved.query('ROLLBACK');
+        return null;
+      }
+      gate.holding = true;
+      const deadline = Date.now() + 30_000;
+      while (!gate.observed && !ctl.stop && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      if (ctl.stop) {
+        await reserved.query('ROLLBACK');
+        return null;
+      }
+      await reserved.query('SELECT pg_sleep($1)', [ms / 1000]);
+      const r = await reserved.query(
+        `UPDATE fencing_authority SET heartbeat_at = clock_timestamp() WHERE id = $1 AND token = $2 AND status = 'ACTIVE' RETURNING clock_timestamp() AS renewed_at`,
+        [id, token],
+      );
+      await reserved.query('COMMIT');
+      return r.rowCount === 1 ? r.rows[0].renewed_at : null;
+    } catch (e) {
+      await reserved.query('ROLLBACK').catch(() => {});
+      throw e;
+    } finally {
+      gate.holding = false;
+    }
+  }
+  async function beforeCommit() {
+    const deadline = Date.now() + 20_000;
+    while (!gate.holding && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    gate.observed = true;
+  }
+  return { renew, beforeCommit };
+}
+
 export async function smoke() {
   const evidence = { pass: true, detail: {} };
   // Default to pooled main path (54321); direct only if SPIKE_USE_DIRECT=1
   const useDirect = process.env.SPIKE_USE_DIRECT === '1';
+  evidence.detail.mainPath = useDirect ? 'direct' : 'pooled';
 
   // ================
   // Part 1: Framing
   // ================
-  const child = spawn('node', [echoPath]);
-  const framer = new NdjsonFramer();
-  const received = [];
-
-  child.stdout.on('data', (chunk) => {
-    framer.feed(chunk);
-    for (const msg of framer.frames()) {
-      received.push(msg);
-    }
-  });
-
   const sent = [
     { id: 1, text: 'hello' },
     { id: 2, text: 'world' },
   ];
-
-  for (const msg of sent) {
-    child.stdin.write(encodeNdjson(msg));
-  }
-
-  child.stdin.end();
-
-  await new Promise((resolve) => child.on('close', resolve));
-
+  const round = await echoRoundTrip(sent);
   const expectedEcho = sent.map((m) => ({ ...m, echoed: true }));
-  if (JSON.stringify(received) !== JSON.stringify(expectedEcho)) {
+  if (
+    round.exitCode !== 0 ||
+    round.feedError ||
+    round.eofError ||
+    JSON.stringify(round.received) !== JSON.stringify(expectedEcho)
+  ) {
     evidence.pass = false;
-    evidence.detail.framing = { sent, received, expected: expectedEcho };
+    evidence.detail.framing = {
+      sent,
+      received: round.received,
+      expected: expectedEcho,
+      exitCode: round.exitCode,
+      feedError: round.feedError ? round.feedError.message : null,
+      eofError: round.eofError ? round.eofError.message : null,
+    };
   } else {
     evidence.detail.framing = 'PASS';
   }
@@ -121,6 +209,13 @@ export async function smoke() {
         got: commitResult4.renewals,
       };
     }
+    if (commitResult4.renewals >= 1 && !(commitResult4.lastRenewalToLockMs >= 0)) {
+      evidence.pass = false;
+      evidence.detail.authority_renewal_clock_long = {
+        expected: '>=0',
+        got: commitResult4.lastRenewalToLockMs,
+      };
+    }
     evidence.detail.authority_metrics_long = {
       renewals: commitResult4.renewals,
       lastRenewalToLockMs: commitResult4.lastRenewalToLockMs,
@@ -159,6 +254,13 @@ export async function smoke() {
         got: commitResult5.renewals,
       };
     }
+    if (commitResult5.renewals >= 1 && !(commitResult5.lastRenewalToLockMs >= 0)) {
+      evidence.pass = false;
+      evidence.detail.authority_renewal_clock_verylong = {
+        expected: '>=0',
+        got: commitResult5.lastRenewalToLockMs,
+      };
+    }
     evidence.detail.authority_metrics_verylong = {
       renewals: commitResult5.renewals,
       lastRenewalToLockMs: commitResult5.lastRenewalToLockMs,
@@ -166,14 +268,16 @@ export async function smoke() {
       effectsDuration: '16s',
     };
 
-    // Case 4: Slow in-flight renewal racing the COMMITTED lock (2s renewal injected at ~9s mark)
+    // Case 4: the smoke-only renewal takes the row lock on the first interval
+    // tick (5s; there is no renewal at 0s), waits until the COMMITTED update is
+    // about to run, then sleeps 2s while still holding the lock. Later ticks
+    // are skipped by single-flight.
     console.log('[smoke] starting slow-renewal execution (11s + 2s slow renewal) to test lock collision...');
     const id6 = await createExecution('test-plugin', 'token-6', useDirect);
     await dispatch(id6, useDirect);
     const commitResult6 = await commitExecution(id6, 'token-6', async (c) => {
-      // 11s effects: renewals fire at 0s, 5s, 10s; last renewal starts ~10s, we inject 2s sleep
       await c.query('SELECT pg_sleep(11)');
-    }, useDirect, 2000); // slowRenewalMs=2000
+    }, useDirect, slowRenewal(2000));
     if (!commitResult6.committed) {
       evidence.pass = false;
       evidence.detail.authority_commit_slowrenewal = { expected: 'committed', got: commitResult6 };

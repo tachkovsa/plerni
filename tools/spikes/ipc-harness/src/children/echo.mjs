@@ -1,19 +1,32 @@
 // echo.mjs — Echo child: reads NDJSON from stdin, echoes back over stdout.
 // Demonstrates the stdio framing path.
-// Decodes raw stdin bytes, rejects unterminated frames at EOF, drains stdout.
-// The first framing error stops further reads and lets the process exit.
+// Decodes raw stdin bytes, rejects unterminated frames at EOF.
+// Pauses stdin while stdout is backed up, and stops after the first framing error.
 
 import { NdjsonFramer, encodeNdjson } from '../framing.mjs';
 
 const framer = new NdjsonFramer();
 let framingError = false;
+let stdinPaused = false;
+
+function writeEcho(line) {
+  const ok = process.stdout.write(line);
+  if (!ok && !stdinPaused) {
+    stdinPaused = true;
+    process.stdin.pause();
+    process.stdout.once('drain', () => {
+      stdinPaused = false;
+      if (!framingError) process.stdin.resume();
+    });
+  }
+}
 
 function onData(chunk) {
   if (framingError) return;
   try {
     framer.feed(chunk);
     for (const msg of framer.frames()) {
-      process.stdout.write(encodeNdjson({ ...msg, echoed: true }));
+      writeEcho(encodeNdjson({ ...msg, echoed: true }));
     }
   } catch (e) {
     fail(e.message);

@@ -3,7 +3,9 @@
 // Property tests verify: arbitrary byte streams never corrupt frames; oversize/malformed → typed errors.
 
 const MAX_FRAME_SIZE = 1024 * 1024; // 1 MiB
-const MAX_PARTIAL_BUFFER = 2 * MAX_FRAME_SIZE; // cap on the residual partial frame only
+// A partial line one byte past the maximum frame (plus the extra byte the
+// delimiter would occupy) cannot become a legal frame.
+const MAX_RESIDUAL = MAX_FRAME_SIZE + 1;
 
 // Contiguous buffer with power-of-two growth. Appending a chunk copies only the
 // new bytes into spare capacity; the prefix is copied only when capacity doubles,
@@ -84,8 +86,9 @@ export class NdjsonFramer {
   feed(chunk) {
     this.#bytes.append(asBuffer(chunk));
     this.#scanNew();
-    if (this.#residual() > MAX_PARTIAL_BUFFER) {
-      throw new NdjsonNeverTerminatedError(`partial frame exceeded ${MAX_PARTIAL_BUFFER} bytes without newline`);
+    // No complete frame is waiting, so the caller will not reach frames().
+    if (this.#firstNewline < 0 && this.#residual() > MAX_RESIDUAL) {
+      throw new NdjsonOversizeError(`partial frame exceeded ${MAX_FRAME_SIZE} bytes without newline`);
     }
   }
 
@@ -138,6 +141,9 @@ export class NdjsonFramer {
         throw new NdjsonFramingError(`malformed JSON: ${e.message}`);
       }
     }
+    if (this.#residual() > MAX_RESIDUAL) {
+      throw new NdjsonOversizeError(`partial frame exceeded ${MAX_FRAME_SIZE} bytes without newline`);
+    }
   }
 
   eof() {
@@ -167,6 +173,7 @@ export function encodeNdjson(obj) {
 export class MuxFramingError extends Error {}
 export class MuxOversizeError extends MuxFramingError {}
 export class MuxNeverTerminatedError extends MuxFramingError {}
+export class MuxUnterminatedAtEofError extends MuxFramingError {}
 
 export class MuxFramer {
   #bytes = new ByteBuf();
@@ -174,15 +181,21 @@ export class MuxFramer {
 
   feed(chunk) {
     this.#bytes.append(asBuffer(chunk));
+    this.#rejectLeadingOversize();
     this.#accountComplete();
-    const residual = this.#bytes.length - this.#complete;
-    if (residual > MAX_PARTIAL_BUFFER) {
-      throw new MuxNeverTerminatedError(`partial frame exceeded ${MAX_PARTIAL_BUFFER} bytes without complete length prefix`);
+  }
+
+  // A length prefix at the start of the buffer is visible before frames() runs.
+  #rejectLeadingOversize() {
+    if (this.#bytes.length < 4 || this.#complete !== 0) return;
+    const len = this.#bytes.readUInt32BE(0);
+    if (len > MAX_FRAME_SIZE) {
+      throw new MuxOversizeError(`frame length ${len} > ${MAX_FRAME_SIZE}`);
     }
   }
 
-  // Advance past frames that are fully buffered. An oversize length is left
-  // in place so frames() can raise MuxOversizeError instead of the cap error.
+  // Advance past frames that are fully buffered. An oversize length after
+  // those frames is left for frames() so the earlier frames can still be read.
   #accountComplete() {
     while (this.#bytes.length - this.#complete >= 4) {
       const len = this.#bytes.readUInt32BE(this.#complete);
@@ -215,6 +228,12 @@ export class MuxFramer {
       } catch (e) {
         throw new MuxFramingError(`malformed JSON: ${e.message}`);
       }
+    }
+  }
+
+  eof() {
+    if (this.#bytes.length > 0) {
+      throw new MuxUnterminatedAtEofError(`unterminated frame at EOF: ${this.#bytes.length} bytes`);
     }
   }
 

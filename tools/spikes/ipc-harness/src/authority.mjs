@@ -16,6 +16,11 @@
 
 import pg from 'pg';
 
+function epochMs(value) {
+  if (value == null) return null;
+  const ms = value instanceof Date ? value.getTime() : Date.parse(value);
+  return Number.isNaN(ms) ? null : ms;
+}
 const CADENCE_MS = 5000;
 const LEASE_MS = 20000;
 const SWEEP_INTERVAL_MS = 3000;
@@ -112,59 +117,41 @@ export async function dispatch(id, useDirect = false) {
 
 /**
  * Executor: heartbeat renewal on the reserved path.
- * Returns completion timestamp if exactly 1 ACTIVE row updated (durable renewal), null otherwise.
- * Slow mode holds the authority row lock (SELECT FOR UPDATE) until the caller sets
- * gate.observed, then sleeps while the lock is still held, so a concurrent COMMITTED
- * update actually blocks on this transaction.
+ * Returns the server timestamp if exactly 1 ACTIVE row with this token was updated, null otherwise.
+ * The token is part of the predicate so a stale holder who only knows the id cannot extend the lease.
  */
-async function renew(id, reserved, slowMs = 0, gate = null) {
-  if (slowMs > 0 && gate) {
-    await reserved.query('BEGIN');
-    try {
-      const locked = await reserved.query(
-        `SELECT id FROM fencing_authority WHERE id = $1 AND status = 'ACTIVE' FOR UPDATE`,
-        [id]
-      );
-      if (locked.rowCount !== 1) {
-        await reserved.query('ROLLBACK');
-        return null;
-      }
-      gate.holding = true;
-      const deadline = Date.now() + 30_000;
-      while (!gate.observed && Date.now() < deadline) {
-        await new Promise((resolve) => setTimeout(resolve, 10));
-      }
-      await reserved.query('SELECT pg_sleep($1)', [slowMs / 1000]);
-      const r = await reserved.query(
-        `UPDATE fencing_authority SET heartbeat_at = clock_timestamp() WHERE id = $1 AND status = 'ACTIVE' RETURNING id`,
-        [id]
-      );
-      await reserved.query('COMMIT');
-      return r.rowCount === 1 ? Date.now() : null;
-    } catch (e) {
-      await reserved.query('ROLLBACK').catch(() => {});
-      throw e;
-    } finally {
-      gate.holding = false;
-    }
-  }
+async function renew(id, token, reserved) {
   const r = await reserved.query(
-    `UPDATE fencing_authority SET heartbeat_at = clock_timestamp() WHERE id = $1 AND status = 'ACTIVE' RETURNING id`,
-    [id]
+    `UPDATE fencing_authority SET heartbeat_at = clock_timestamp() WHERE id = $1 AND token = $2 AND status = 'ACTIVE' RETURNING clock_timestamp() AS renewed_at`,
+    [id, token]
   );
-  // Return timestamp only for durable renewals (exactly 1 ACTIVE row updated)
-  return r.rowCount === 1 ? Date.now() : null;
+  return r.rowCount === 1 ? r.rows[0].renewed_at : null;
 }
 
 /**
- * Executor: conditional COMMITTED update. Returns { committed: boolean, rowCount: number }.
+ * One renewal on the reserved path. Returns the server timestamp, or null when the token lost.
+ * Renewals always use the reserved connection; the pooled flag does not apply.
+ */
+export async function renewExecution(id, token) {
+  const reserved = reservedConnection();
+  await reserved.connect();
+  try {
+    return await renew(id, token, reserved);
+  } finally {
+    await reserved.end();
+  }
+}
+
+/**
+ * Executor: conditional COMMITTED update.
+ * Returns { committed, lockedAt } where lockedAt is the server clock at the update.
  */
 async function conditionalCommit(id, token, c) {
   const r = await c.query(
-    `UPDATE fencing_authority SET status = 'COMMITTED' WHERE id = $1 AND token = $2 AND status = 'ACTIVE' RETURNING id`,
+    `UPDATE fencing_authority SET status = 'COMMITTED' WHERE id = $1 AND token = $2 AND status = 'ACTIVE' RETURNING clock_timestamp() AS locked_at`,
     [id, token]
   );
-  return { committed: r.rowCount === 1, rowCount: r.rowCount };
+  return { committed: r.rowCount === 1, lockedAt: r.rowCount === 1 ? r.rows[0].locked_at : null };
 }
 
 /**
@@ -175,9 +162,13 @@ async function conditionalCommit(id, token, c) {
  * 4. Await in-flight renewals.
  * Returns { committed: boolean, renewals: number, lastRenewalToLockMs: number, boundViolation: boolean }.
  * @param {boolean} useDirect - use direct connection for main path (fallback when pooled unavailable)
- * @param {number} slowRenewalMs - inject slow renewal (for testing in-flight collision)
+ * @param {{ renew?: Function, beforeCommit?: Function }} [options]
+ *   renew replaces the heartbeat update (smoke passes the slow-lock override).
+ *   beforeCommit runs after scheduling stops and before the COMMITTED update.
  */
-export async function commitExecution(id, token, effectsFn, useDirect = false, slowRenewalMs = 0) {
+export async function commitExecution(id, token, effectsFn, useDirect = false, options = {}) {
+  const renewFn = options.renew ?? renew;
+  const beforeCommit = options.beforeCommit ?? (async () => {});
   const reserved = reservedConnection();
   await reserved.connect();
 
@@ -185,11 +176,10 @@ export async function commitExecution(id, token, effectsFn, useDirect = false, s
   let renewalsStopped = false;
   let inflightRenewal = null;
   const metrics = { renewals: 0, lastRenewalAt: null };
-  const renewalGate = slowRenewalMs > 0 ? { holding: false, observed: false } : null;
+  const renewalCtl = { stop: false };
 
-  // BOUND: last-renewal→row-lock interval must be < CADENCE_MS (5s) on the fast path.
-  // The slow-renewal test holds the row lock across its delay so this update blocks;
-  // lockWaitMs records that wait. After the lock is released, WHERE status='ACTIVE' is rechecked.
+  // BOUND: last durable renewal and the COMMITTED update are both clock_timestamp()
+  // values from PostgreSQL, so the interval does not depend on which client callback runs first.
   const LAST_RENEWAL_TO_LOCK_BOUND_MS = CADENCE_MS;
 
   // Start renewal loop on the reserved path BEFORE waiting on the pooled connection
@@ -199,7 +189,7 @@ export async function commitExecution(id, token, effectsFn, useDirect = false, s
     if (renewalsStopped || inflightRenewal) return;
     const renewalPromise = (async () => {
       try {
-        const renewalCompletedAt = await renew(id, reserved, slowRenewalMs, renewalGate);
+        const renewalCompletedAt = await renewFn(id, token, reserved, renewalCtl);
         if (renewalCompletedAt) {
           // Count only durable renewals (1-row UPDATEs)
           metrics.renewals++;
@@ -227,21 +217,11 @@ export async function commitExecution(id, token, effectsFn, useDirect = false, s
     renewalsStopped = true;
     clearInterval(renewalHandle);
 
-    // 2. Conditional COMMITTED update (acquires row lock).
-    // When a slow renewal is in use, wait until it holds the row lock, then tell it
-    // to sleep. The UPDATE below blocks until that transaction commits.
-    let lockWaitMs = 0;
-    if (renewalGate) {
-      const deadline = Date.now() + CADENCE_MS + 15_000;
-      while (!renewalGate.holding && Date.now() < deadline) {
-        await new Promise((resolve) => setTimeout(resolve, 10));
-      }
-      renewalGate.observed = true;
-    }
+    // 2. Optional test hook, then the conditional COMMITTED update (acquires row lock).
+    await beforeCommit();
     const commitAttemptAt = Date.now();
-    const { committed } = await conditionalCommit(id, token, c);
-    const lockAcquiredAt = Date.now(); // timestamp after awaited update completes
-    lockWaitMs = lockAcquiredAt - commitAttemptAt;
+    const { committed, lockedAt } = await conditionalCommit(id, token, c);
+    const lockWaitMs = Date.now() - commitAttemptAt;
     if (!committed) {
       await c.query('ROLLBACK');
       // Drain any renewal still blocked on the row lock
@@ -257,7 +237,9 @@ export async function commitExecution(id, token, effectsFn, useDirect = false, s
       await inflightRenewal;
     }
 
-    const lastRenewalToLockMs = metrics.lastRenewalAt ? lockAcquiredAt - metrics.lastRenewalAt : null;
+    const lockMs = epochMs(lockedAt);
+    const renewedMs = epochMs(metrics.lastRenewalAt);
+    const lastRenewalToLockMs = lockMs !== null && renewedMs !== null ? lockMs - renewedMs : null;
     const boundViolation = lastRenewalToLockMs !== null && lastRenewalToLockMs > LAST_RENEWAL_TO_LOCK_BOUND_MS;
 
     return {
@@ -269,8 +251,13 @@ export async function commitExecution(id, token, effectsFn, useDirect = false, s
       lockWaitMs,
     };
   } catch (e) {
-    if (e instanceof FencedError) throw e;
-    await c.query('ROLLBACK').catch(() => {});
+    renewalsStopped = true;
+    if (renewalHandle) clearInterval(renewalHandle);
+    renewalCtl.stop = true;
+    if (!(e instanceof FencedError)) {
+      await c.query('ROLLBACK').catch(() => {});
+    }
+    if (inflightRenewal) await inflightRenewal;
     throw e;
   } finally {
     if (renewalHandle) clearInterval(renewalHandle);
