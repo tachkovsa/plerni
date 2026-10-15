@@ -12,7 +12,7 @@ import { spawn } from 'node:child_process';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { MuxFramer, NdjsonFramer, encodeNdjson, encodeMux } from './framing.mjs';
-import { pendingKey, socketPair, KernelStub } from './kernel-stub.mjs';
+import { PendingTable, socketPair, KernelStub } from './kernel-stub.mjs';
 import { FencedError, commitExecution, startSweeper } from './authority.mjs';
 
 function waitExit(child) {
@@ -110,6 +110,12 @@ function childEnv(extra) {
   };
 }
 
+// Process environment values are strings and cannot carry a NUL. The spawn
+// map key keeps the original plugin id; this text is only the child hint.
+function envText(value) {
+  return String(value).replaceAll('\0', '');
+}
+
 export class Supervisor {
   constructor(socket, opts = {}) {
     this.socket = socket;
@@ -125,7 +131,7 @@ export class Supervisor {
     this.partialHighWater = opts.partialHighWater ?? this.capsConfig.partial;
     this.partialLowWater = opts.partialLowWater ?? Math.floor(this.partialHighWater / 2);
     this.children = new Map();
-    this.pending = new Map();
+    this.pending = new PendingTable();
     this.callPendingTotal = 0;
     this.cancelPendingTotal = 0;
     this.retiredTokens = new Set();
@@ -171,7 +177,7 @@ export class Supervisor {
     const token = randomBytes(16).toString('hex');
     const child = spawn(process.execPath, [spec.script], {
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: childEnv({ ...spec.env, PLERNI_PLUGIN_ID: spec.pluginId }),
+      env: childEnv({ ...spec.env, PLERNI_PLUGIN_ID: envText(spec.pluginId) }),
     });
     const rec = {
       child,
@@ -237,13 +243,25 @@ export class Supervisor {
     return commitExecution(id, token, effects, this.useDirect);
   }
 
-  bufferedBytes() {
+  // Framers and mux queues only. Stdout prefetch is excluded so a drained
+  // low-priority queue can be refilled while that prefetch is still counted
+  // in bufferedBytes().
+  #acceptedBytes() {
     let total = this.queuedBytes + this.bridge.pendingBytes();
     for (const rec of this.children.values()) {
       if (rec.dead) continue;
       total += rec.framer.pendingBytes();
       total += Math.max(0, rec.outbound);
       total += rec.stash?.length ?? 0;
+    }
+    return total;
+  }
+
+  bufferedBytes() {
+    let total = this.#acceptedBytes();
+    for (const rec of this.children.values()) {
+      if (rec.dead) continue;
+      total += this.#stdoutBuffered(rec);
     }
     return total;
   }
@@ -274,8 +292,20 @@ export class Supervisor {
     await Promise.all(waits);
   }
 
+  // Bytes pushed back with stdout.unshift sit in readableLength, not in stash.
+  #stdoutBuffered(rec) {
+    if (rec.dead) return 0;
+    const n = rec.child?.stdout?.readableLength ?? 0;
+    return n > 0 ? n : 0;
+  }
+
   #pluginBytes(rec) {
-    return rec.framer.pendingBytes() + Math.max(0, rec.outbound) + rec.hiBytes + rec.loBytes + (rec.stash?.length ?? 0);
+    return rec.framer.pendingBytes()
+      + Math.max(0, rec.outbound)
+      + rec.hiBytes
+      + rec.loBytes
+      + (rec.stash?.length ?? 0)
+      + this.#stdoutBuffered(rec);
   }
 
   #onSocket(chunk) {
@@ -300,11 +330,8 @@ export class Supervisor {
       return;
     }
     const ingressTs = performance.now();
-    const laneKey = pendingKey(
-      msg.pluginId,
-      msg.kind === 'cancel' ? `cancel\0${msg.correlationId}` : msg.correlationId,
-    );
-    if (this.pending.has(laneKey)) {
+    const lane = msg.kind === 'cancel' ? 'cancel' : 'call';
+    if (this.pending.has(msg.pluginId, msg.correlationId, lane)) {
       this.#reject(msg, 'duplicate-correlation', true);
       return;
     }
@@ -371,10 +398,9 @@ export class Supervisor {
 
   #arm(rec, msg, extra) {
     const timeoutMs = Number.isFinite(msg.timeoutMs) ? msg.timeoutMs : DEFAULT_DEADLINE_MS;
-    const correlationId = extra.cancel ? `cancel\0${msg.correlationId}` : msg.correlationId;
-    const key = pendingKey(msg.pluginId, correlationId);
-    const timer = setTimeout(() => this.#expire(key), timeoutMs);
-    this.pending.set(key, {
+    const lane = extra.cancel ? 'cancel' : 'call';
+    const timer = setTimeout(() => this.#expire(msg.pluginId, msg.correlationId, lane), timeoutMs);
+    this.pending.set(msg.pluginId, msg.correlationId, {
       pluginId: msg.pluginId,
       correlationId: msg.correlationId,
       generation: rec.credential.generation,
@@ -383,7 +409,7 @@ export class Supervisor {
       cancel: extra.cancel,
       bytes: extra.bytes,
       timer,
-    });
+    }, lane);
     if (extra.cancel) {
       rec.cancelPending++;
       this.cancelPendingTotal++;
@@ -394,8 +420,8 @@ export class Supervisor {
     if (this.#pendingFull(rec)) this.caps.pending = true;
   }
 
-  #expire(key) {
-    const pending = this.#take(key);
+  #expire(pluginId, correlationId, lane) {
+    const pending = this.#take(pluginId, correlationId, lane);
     if (!pending || this.closed) return;
     this.#enqueueTerminal({
       kind: 'error',
@@ -407,11 +433,11 @@ export class Supervisor {
     });
   }
 
-  #take(key) {
-    const pending = this.pending.get(key);
+  #take(pluginId, correlationId, lane) {
+    const pending = this.pending.get(pluginId, correlationId, lane);
     if (!pending) return null;
     clearTimeout(pending.timer);
-    this.pending.delete(key);
+    this.pending.delete(pluginId, correlationId, lane);
     const rec = this.children.get(pending.pluginId);
     const same = rec && rec.credential.generation === pending.generation;
     if (pending.cancel) {
@@ -503,6 +529,7 @@ export class Supervisor {
     } catch {
       this.#fault(rec, 'total-cap');
     }
+    if (this.bufferedBytes() > this.capsConfig.totalGlobal) this.#pauseOverGlobal();
   }
 
   #accountCaps(rec) {
@@ -550,6 +577,7 @@ export class Supervisor {
     rec.paused = true;
     rec.pauseReason = reason;
     rec.child.stdout.pause();
+    if (this.bufferedBytes() > this.capsConfig.totalGlobal) this.#pauseOverGlobal();
   }
 
   #unpause(rec) {
@@ -614,11 +642,10 @@ export class Supervisor {
   // A cancel acknowledgement retires the matching call. An unsolicited cancel,
   // or one from an older generation, leaves the call in place.
   #dropCall(rec, pluginId, correlationId) {
-    const key = pendingKey(pluginId, correlationId);
-    const pending = this.pending.get(key);
+    const pending = this.pending.get(pluginId, correlationId, 'call');
     if (!pending || pending.cancel) return;
     if (pending.generation !== rec.credential.generation) return;
-    this.#take(key);
+    this.#take(pluginId, correlationId, 'call');
     this.#enqueue({
       kind: 'cancelled',
       for: 'call',
@@ -629,11 +656,8 @@ export class Supervisor {
   }
 
   #complete(rec, pluginId, msg) {
-    const key = pendingKey(
-      pluginId,
-      msg.kind === 'cancelled' ? `cancel\0${msg.correlationId}` : msg.correlationId,
-    );
-    const pending = this.pending.get(key);
+    const lane = msg.kind === 'cancelled' ? 'cancel' : 'call';
+    const pending = this.pending.get(pluginId, msg.correlationId, lane);
     if (!pending) {
       if (this.#ownedByOther(pluginId, msg.correlationId)) {
         this.#enqueue({
@@ -648,7 +672,6 @@ export class Supervisor {
       return false;
     }
     if (pending.generation !== rec.credential.generation) return false;
-    const lane = msg.kind === 'cancelled' ? 'cancel' : 'call';
     const frame = {
       kind: msg.kind,
       code: msg.code,
@@ -667,7 +690,7 @@ export class Supervisor {
     try {
       buf = encodeMux(frame);
     } catch {
-      this.#take(key);
+      this.#take(pluginId, msg.correlationId, lane);
       this.#enqueueTerminal({
         kind: 'error',
         code: 'result-oversize',
@@ -680,10 +703,10 @@ export class Supervisor {
     }
     const priority = msg.kind === 'cancelled' ? 10 : 1;
     if (priority >= 10 && !this.#roomHi(pluginId)) {
-      this.#take(key);
+      this.#take(pluginId, msg.correlationId, lane);
       return false;
     }
-    if (!this.#take(key)) return false;
+    if (!this.#take(pluginId, msg.correlationId, lane)) return false;
     if (msg.kind === 'result') this.answered++;
     this.#enqueueBuf(buf, priority, pluginId);
     return true;
@@ -691,7 +714,7 @@ export class Supervisor {
 
   #ownedByOther(pluginId, correlationId) {
     for (const pending of this.pending.values()) {
-      if (pending.correlationId === correlationId && pending.pluginId !== pluginId) return true;
+      if (Object.is(pending.correlationId, correlationId) && !Object.is(pending.pluginId, pluginId)) return true;
     }
     return false;
   }
@@ -751,10 +774,10 @@ export class Supervisor {
   }
 
   #failPending(rec, code) {
-    for (const [key, pending] of this.pending) {
-      if (pending.pluginId !== rec.credential.pluginId) continue;
+    for (const [key, pending] of [...this.pending.entries()]) {
+      if (!Object.is(pending.pluginId, rec.credential.pluginId)) continue;
       if (pending.generation !== rec.credential.generation) continue;
-      this.#take(key);
+      this.#take(key.pluginId, key.correlationId, key.lane);
       this.#enqueueTerminal({
         kind: 'error',
         code,
@@ -764,6 +787,7 @@ export class Supervisor {
         generation: pending.generation,
       });
     }
+    this.#maybeResumeAll();
   }
 
   #enqueueTerminal(frame) {
@@ -780,7 +804,7 @@ export class Supervisor {
 
   #failAll(code) {
     for (const [key, pending] of [...this.pending.entries()]) {
-      this.#take(key);
+      this.#take(key.pluginId, key.correlationId, key.lane);
       try {
         const buf = encodeMux({
           kind: 'error',
@@ -955,7 +979,7 @@ export class Supervisor {
 
   #resumeBulk() {
     if (this.#loLength() >= 8) return;
-    if (this.bufferedBytes() > this.capsConfig.totalGlobal) return;
+    if (this.#acceptedBytes() > this.capsConfig.totalGlobal) return;
     for (const rec of this.children.values()) {
       if (rec.paused && rec.pauseReason === 'bulk') this.#unpause(rec);
     }

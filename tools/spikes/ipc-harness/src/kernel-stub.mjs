@@ -7,8 +7,83 @@ import { performance } from 'node:perf_hooks';
 import { MuxFramer, encodeMux } from './framing.mjs';
 import { cancelExecution } from './authority.mjs';
 
-export function pendingKey(pluginId, correlationId) {
-  return `${pluginId}\0${correlationId}`;
+// Nested maps keep plugin id `1` distinct from `"1"`, and a correlation id that
+// contains NUL distinct from a neighbouring id. A joined string aliases both.
+export class PendingTable {
+  #byLane = new Map();
+
+  #ids(lane, pluginId, create) {
+    let byPlugin = this.#byLane.get(lane);
+    if (!byPlugin) {
+      if (!create) return null;
+      byPlugin = new Map();
+      this.#byLane.set(lane, byPlugin);
+    }
+    let byCorr = byPlugin.get(pluginId);
+    if (!byCorr) {
+      if (!create) return null;
+      byCorr = new Map();
+      byPlugin.set(pluginId, byCorr);
+    }
+    return byCorr;
+  }
+
+  has(pluginId, correlationId, lane = 'call') {
+    return this.#ids(lane, pluginId, false)?.has(correlationId) === true;
+  }
+
+  get(pluginId, correlationId, lane = 'call') {
+    const bucket = this.#ids(lane, pluginId, false);
+    if (!bucket || !bucket.has(correlationId)) return undefined;
+    return bucket.get(correlationId);
+  }
+
+  set(pluginId, correlationId, value, lane = 'call') {
+    this.#ids(lane, pluginId, true).set(correlationId, value);
+    return this;
+  }
+
+  delete(pluginId, correlationId, lane = 'call') {
+    const byPlugin = this.#byLane.get(lane);
+    const bucket = byPlugin?.get(pluginId);
+    if (!bucket) return false;
+    const removed = bucket.delete(correlationId);
+    if (bucket.size === 0) byPlugin.delete(pluginId);
+    if (byPlugin.size === 0) this.#byLane.delete(lane);
+    return removed;
+  }
+
+  get size() {
+    let n = 0;
+    for (const byPlugin of this.#byLane.values()) {
+      for (const byCorr of byPlugin.values()) n += byCorr.size;
+    }
+    return n;
+  }
+
+  *values() {
+    for (const byPlugin of this.#byLane.values()) {
+      for (const byCorr of byPlugin.values()) yield* byCorr.values();
+    }
+  }
+
+  *entries() {
+    for (const [lane, byPlugin] of this.#byLane) {
+      for (const [pluginId, byCorr] of byPlugin) {
+        for (const [correlationId, value] of byCorr) {
+          yield [{ pluginId, correlationId, lane }, value];
+        }
+      }
+    }
+  }
+
+  [Symbol.iterator]() {
+    return this.entries();
+  }
+
+  clear() {
+    this.#byLane.clear();
+  }
 }
 
 export function socketPair() {
@@ -49,8 +124,8 @@ export class KernelStub {
   constructor(socket, opts = {}) {
     this.socket = socket;
     this.framer = new MuxFramer();
-    this.calls = new Map();
-    this.cancels = new Map();
+    this.calls = new PendingTable();
+    this.cancels = new PendingTable();
     this.sentAt = new Map();
     this.floodFrames = 0;
     this.framingFault = null;
@@ -76,12 +151,12 @@ export class KernelStub {
 
   // A timed-out request must not leave the socket after drain. Bytes already
   // handed to socket.write are in flight and cannot be recalled.
-  #dropUnsent(sentKey) {
-    this.writeQueue = this.writeQueue.filter((entry) => entry.sentKey !== sentKey);
+  #dropUnsent(sent) {
+    this.writeQueue = this.writeQueue.filter((entry) => entry.sent !== sent);
   }
 
   #onData(chunk) {
-    if (this.framingFault) return;
+    if (this.framingFault || this.shut) return;
     try {
       this.framer.feed(chunk);
       for (const msg of this.framer.frames()) this.#onMsg(msg);
@@ -90,6 +165,9 @@ export class KernelStub {
       const code = err.constructor?.name || 'framing-error';
       this.framingFault = code;
       this.#rejectAll(code);
+      this.shut = true;
+      this.writeQueue = [];
+      this.socket.destroy();
     }
   }
 
@@ -98,19 +176,18 @@ export class KernelStub {
       this.floodFrames++;
       return;
     }
-    const key = pendingKey(msg.pluginId, msg.correlationId);
     const lane = msg.for === 'call' || msg.for === 'cancel'
       ? msg.for
       : (msg.kind === 'cancelled' ? 'cancel' : 'call');
     const bucket = lane === 'cancel' ? this.cancels : this.calls;
-    const waiter = bucket.get(key);
+    const waiter = bucket.get(msg.pluginId, msg.correlationId);
     if (!waiter) return;
     if (waiter.generation != null && msg.generation !== waiter.generation) return;
-    bucket.delete(key);
+    bucket.delete(msg.pluginId, msg.correlationId);
     clearTimeout(waiter.timer);
     const returnedAt = performance.now();
-    const sendTs = this.sentAt.get(waiter.sentKey);
-    this.sentAt.delete(waiter.sentKey);
+    const sendTs = this.sentAt.get(waiter.sent);
+    this.sentAt.delete(waiter.sent);
     const timed = { ...msg, returnedAt, rttMs: sendTs == null ? null : returnedAt - sendTs };
     if (msg.kind === 'result' || msg.kind === 'cancelled') waiter.resolve(timed);
     else waiter.reject(fail(msg.code || 'ipc-error'));
@@ -127,18 +204,16 @@ export class KernelStub {
     this.sentAt.clear();
   }
 
-  #track(bucket, pluginId, correlationId, timeoutMs, generation) {
-    const key = pendingKey(pluginId, correlationId);
-    const sentKey = `${bucket === this.cancels ? 'cancel' : 'call'}\0${key}`;
+  #track(bucket, sent, timeoutMs, generation) {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        if (!bucket.has(key)) return;
-        bucket.delete(key);
-        this.sentAt.delete(sentKey);
-        this.#dropUnsent(sentKey);
+        if (!bucket.has(sent.pluginId, sent.correlationId)) return;
+        bucket.delete(sent.pluginId, sent.correlationId);
+        this.sentAt.delete(sent);
+        this.#dropUnsent(sent);
         reject(fail('timeout'));
       }, timeoutMs);
-      bucket.set(key, { resolve, reject, timer, sentKey, generation });
+      bucket.set(sent.pluginId, sent.correlationId, { resolve, reject, timer, sent, generation });
     });
   }
 
@@ -147,11 +222,11 @@ export class KernelStub {
   }
 
   #send(bucket, frame, timeoutMs) {
+    if (this.framingFault) return Promise.reject(fail(this.framingFault));
     if (this.shut || this.socket.destroyed) return Promise.reject(fail('closed'));
-    const key = pendingKey(frame.pluginId, frame.correlationId);
-    if (bucket.has(key)) return Promise.reject(fail('duplicate-correlation'));
+    const lane = bucket === this.cancels ? 'cancel' : 'call';
+    if (bucket.has(frame.pluginId, frame.correlationId)) return Promise.reject(fail('duplicate-correlation'));
     if (this.#occupied() >= this.pendingCap) return Promise.reject(fail('pending-cap'));
-    const sentKey = `${bucket === this.cancels ? 'cancel' : 'call'}\0${key}`;
     frame.timeoutMs = timeoutMs;
     frame.sendTs = performance.now();
     let buf;
@@ -161,10 +236,11 @@ export class KernelStub {
       return Promise.reject(err);
     }
     if (this.bufferedBytes() + buf.length > this.byteCap) return Promise.reject(fail('total-cap'));
-    this.sentAt.set(sentKey, frame.sendTs);
+    const sent = { lane, pluginId: frame.pluginId, correlationId: frame.correlationId };
+    this.sentAt.set(sent, frame.sendTs);
     const generation = frame.credential?.generation ?? null;
-    const pending = this.#track(bucket, frame.pluginId, frame.correlationId, timeoutMs, generation);
-    this.writeQueue.push({ buf, sentKey });
+    const pending = this.#track(bucket, sent, timeoutMs, generation);
+    this.writeQueue.push({ buf, sent });
     this.#flush();
     return pending;
   }

@@ -548,7 +548,8 @@ test('the global byte ceiling pauses every contributing child', { timeout: 10_00
     assert.equal(paused, true);
     const buffered = pair.sup.bufferedBytes();
     await delay(300);
-    assert.ok(buffered <= cap + 16 * 1024, String(buffered));
+    // Each paused child may already hold a pipe burst in readableLength.
+    assert.ok(buffered <= cap + 256 * 1024, String(buffered));
     assert.ok(pair.sup.bufferedBytes() <= buffered + 4_096);
   } finally {
     await pair.close();
@@ -906,7 +907,7 @@ test('an unsolicited cancelled frame does not retire the call', async () => {
     rec.credential.generation += 1;
     rec.child.stdout.emit('data', Buffer.from(encodeNdjson({ kind: 'cancelled', correlationId: 7 })));
     await delay(30);
-    assert.equal(pair.sup.pending.has('echo\u00007'), true);
+    assert.equal(pair.sup.pending.has('echo', 7, 'call'), true);
     assert.equal(pair.stub.calls.size, 1);
     rec.credential.generation -= 1;
     rec.child.kill('SIGCONT');
@@ -967,27 +968,31 @@ test('an unfinished mux frame pauses the shared input at the global ceiling', as
 });
 
 test('the shared input resumes below the global low water', { timeout: 10_000 }, async () => {
-  const pair = await connectPair({ sweeper: false, caps: { totalGlobal: 200, lo: 32 } });
+  const cap = 64 * 1024;
+  const pair = await connectPair({
+    sweeper: false,
+    caps: { total: 1024 * 1024, totalGlobal: cap, partial: 1024 * 1024 },
+    partialHighWater: 1024 * 1024,
+  });
   try {
-    pair.sup.spawn({ pluginId: 'frames', script: floodPath });
-    pair.stub.socket.pause();
-    const paused = await waitUntil(() => pair.sup.inputPaused && pair.sup.bufferedBytes() > 200, 3_000);
+    pair.sup.spawn({ pluginId: 'a', script: floodPath, env: { FLOOD_MODE: 'partial' }, total: 1024 * 1024 });
+    pair.sup.spawn({ pluginId: 'b', script: floodPath, env: { FLOOD_MODE: 'partial' }, total: 1024 * 1024 });
+    const paused = await waitUntil(() => pair.sup.inputPaused && pair.sup.bufferedBytes() > cap, 3_000);
     assert.equal(paused, true);
-    const rec = pair.sup.children.get('frames');
-    rec.child.kill('SIGSTOP');
-    pair.stub.socket.resume();
-    pair.sup.socket.emit('drain');
+    for (const id of ['a', 'b']) pair.sup.children.get(id).child.kill('SIGKILL');
     const resumed = await waitUntil(
-      () => pair.sup.inputPaused === false && pair.sup.bufferedBytes() <= 100,
+      () => pair.sup.inputPaused === false && pair.sup.bufferedBytes() <= cap / 2,
       3_000,
     );
     assert.equal(resumed, true, JSON.stringify({
       paused: pair.sup.inputPaused,
       buffered: pair.sup.bufferedBytes(),
+      dead: ['a', 'b'].map((id) => pair.sup.children.get(id).dead),
     }));
   } finally {
-    const rec = pair.sup.children.get('frames');
-    if (rec && rec.child.exitCode == null && rec.child.signalCode == null) rec.child.kill('SIGKILL');
+    for (const rec of pair.sup.children.values()) {
+      if (rec.child.exitCode == null && rec.child.signalCode == null) rec.child.kill('SIGKILL');
+    }
     await pair.close();
   }
 });
@@ -1017,13 +1022,15 @@ test('a timed-out unsent call is not written after drain', { timeout: 10_000 }, 
     }, 40).catch((err) => err);
     assert.equal(late.code, 'timeout');
     assert.equal(
-      pair.stub.writeQueue.some((entry) => entry.sentKey === 'call\0echo\u00009001'),
+      pair.stub.writeQueue.some((entry) => entry.sent?.lane === 'call'
+        && entry.sent.pluginId === 'echo'
+        && entry.sent.correlationId === 9_001),
       false,
     );
     pair.stub.socket.write = original;
     pair.stub.socket.emit('drain');
     await delay(50);
-    assert.equal(pair.sup.pending.has('echo\u00009001'), false);
+    assert.equal(pair.sup.pending.has('echo', 9_001, 'call'), false);
     const again = await pair.stub.call({
       pluginId: 'echo',
       credential: kid.credential,
@@ -1143,4 +1150,179 @@ test('flood rate counts only the scored window', { timeout: 15_000 }, async () =
   assert.ok(rep.floodFrames < rep.floodBaseline + rep.floodFrames);
   const lifetime = rep.floodBaseline + rep.floodFrames;
   assert.ok(lifetime > rep.floodFrames);
+});
+
+test('a mux framing fault closes the kernel and rejects later sends', async () => {
+  const pair = await connectPair({ sweeper: false });
+  try {
+    const kid = pair.sup.spawn({ pluginId: 'echo', script: echoPath });
+    const original = pair.stub.socket.write.bind(pair.stub.socket);
+    pair.stub.socket.write = () => false;
+    const first = pair.stub.call({
+      pluginId: 'echo',
+      credential: kid.credential,
+      correlationId: 1,
+      port: 'db',
+      method: 'get',
+      payload: { n: 1 },
+    }, 1_000).catch((err) => err);
+    const queued = pair.stub.call({
+      pluginId: 'echo',
+      credential: kid.credential,
+      correlationId: 2,
+      port: 'db',
+      method: 'get',
+      payload: { n: 2 },
+    }, 1_000).catch((err) => err);
+    assert.equal(pair.stub.writeBlocked, true);
+    assert.ok(pair.stub.writeQueue.length >= 1);
+    const prefix = Buffer.alloc(4);
+    prefix.writeUInt32BE(1024 * 1024 + 8, 0);
+    pair.sup.socket.write(prefix);
+    const settled = await Promise.all([first, queued]);
+    assert.ok(settled.every((err) => err.code === 'MuxOversizeError'), JSON.stringify(settled.map((err) => err.code)));
+    assert.equal(pair.stub.framingFault, 'MuxOversizeError');
+    assert.equal(pair.stub.shut, true);
+    assert.equal(pair.stub.writeQueue.length, 0);
+    assert.equal(pair.stub.socket.destroyed, true);
+    pair.stub.socket.write = original;
+    pair.stub.socket.emit('drain');
+    await delay(30);
+    assert.equal(pair.sup.pending.size, 0);
+    const again = await pair.stub.call({
+      pluginId: 'echo',
+      credential: kid.credential,
+      correlationId: 3,
+      port: 'db',
+      method: 'get',
+      payload: { n: 3 },
+    }, 500).catch((err) => err);
+    assert.equal(again.code, 'MuxOversizeError');
+  } finally {
+    const proc = pair.sup.children.get('echo')?.child;
+    if (proc && proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL');
+    await pair.close();
+  }
+});
+
+test('pushed-back stdout bytes count against the per-plugin and global caps', async () => {
+  const cap = 1024;
+  const pair = await connectPair({
+    sweeper: false,
+    caps: { total: cap, totalGlobal: cap, partial: 1024 * 1024 },
+    partialHighWater: 1024 * 1024,
+  });
+  try {
+    pair.sup.spawn({
+      pluginId: 'partial',
+      script: floodPath,
+      env: { FLOOD_MODE: 'silent' },
+      total: cap,
+    });
+    const rec = pair.sup.children.get('partial');
+    rec.child.stdout.emit('data', Buffer.alloc(20_000, 0x61));
+    const unread = rec.child.stdout.readableLength;
+    assert.ok(unread > cap, String(unread));
+    const pluginBytes = pair.sup.queueDepth('partial').pluginBytes;
+    assert.ok(pluginBytes >= unread, String(pluginBytes));
+    assert.ok(pluginBytes > cap, String(pluginBytes));
+    assert.ok(pair.sup.bufferedBytes() >= unread, String(pair.sup.bufferedBytes()));
+    assert.equal(rec.dead, false);
+    assert.equal(rec.paused, true);
+  } finally {
+    await pair.close();
+  }
+});
+
+test('numeric and NUL identities do not retire each other\'s waiters', async () => {
+  const pair = await connectPair({ sweeper: false });
+  try {
+    const numeric = pair.sup.spawn({ pluginId: 1, script: echoPath });
+    const text = pair.sup.spawn({ pluginId: '1', script: echoPath });
+    const plain = pair.sup.spawn({ pluginId: 'a', script: echoPath });
+    const embedded = pair.sup.spawn({ pluginId: 'a\0b', script: echoPath });
+    for (const id of [1, '1', 'a', 'a\0b']) pair.sup.children.get(id).child.kill('SIGSTOP');
+    const numericCall = pair.stub.call({
+      pluginId: 1,
+      credential: numeric.credential,
+      correlationId: 4,
+      port: 'db',
+      method: 'get',
+      payload: { who: 'number' },
+    }, 1_000).catch((err) => err);
+    const textCall = pair.stub.call({
+      pluginId: '1',
+      credential: text.credential,
+      correlationId: 4,
+      port: 'db',
+      method: 'get',
+      payload: { who: 'text' },
+    }, 1_000).catch((err) => err);
+    const plainCall = pair.stub.call({
+      pluginId: 'a',
+      credential: plain.credential,
+      correlationId: 'b\0c',
+      port: 'db',
+      method: 'get',
+      payload: { who: 'plain' },
+    }, 1_000).catch((err) => err);
+    const embeddedCall = pair.stub.call({
+      pluginId: 'a\0b',
+      credential: embedded.credential,
+      correlationId: 'c',
+      port: 'db',
+      method: 'get',
+      payload: { who: 'embedded' },
+    }, 1_000).catch((err) => err);
+    const separated = pair.stub.call({
+      pluginId: 'a',
+      credential: plain.credential,
+      correlationId: 'cancel\u00005',
+      port: 'db',
+      method: 'get',
+      payload: { who: 'lane' },
+    }, 1_000).catch((err) => err);
+    await delay(40);
+    assert.equal(pair.sup.pending.has(1, 4, 'call'), true);
+    assert.equal(pair.sup.pending.has('1', 4, 'call'), true);
+    assert.equal(pair.stub.calls.has(1, 4), true);
+    assert.equal(pair.stub.calls.has('1', 4), true);
+    pair.sup.children.get('1').child.stdout.emit('data', Buffer.from(encodeNdjson({
+      kind: 'result', correlationId: 4, payload: { who: 'text' },
+    })));
+    pair.sup.children.get('a\0b').child.stdout.emit('data', Buffer.from(encodeNdjson({
+      kind: 'result', correlationId: 'c', payload: { who: 'embedded' },
+    })));
+    pair.sup.children.get('a').child.stdout.emit('data', Buffer.from(encodeNdjson({
+      kind: 'cancelled', correlationId: '5',
+    })));
+    await delay(30);
+    assert.equal(pair.sup.pending.has(1, 4, 'call'), true);
+    assert.equal(pair.sup.pending.has('a', 'b\0c', 'call'), true);
+    assert.equal(pair.sup.pending.has('a', 'cancel\u00005', 'call'), true);
+    assert.equal(pair.stub.calls.has(1, 4), true);
+    const textRes = await textCall;
+    const embeddedRes = await embeddedCall;
+    assert.equal(textRes.payload?.who, 'text');
+    assert.equal(embeddedRes.payload?.who, 'embedded');
+    for (const id of [1, 'a']) pair.sup.children.get(id).child.kill('SIGCONT');
+    pair.sup.children.get(1).child.stdout.emit('data', Buffer.from(encodeNdjson({
+      kind: 'result', correlationId: 4, payload: { who: 'number' },
+    })));
+    pair.sup.children.get('a').child.stdout.emit('data', Buffer.from(encodeNdjson({
+      kind: 'result', correlationId: 'b\0c', payload: { who: 'plain' },
+    })));
+    pair.sup.children.get('a').child.stdout.emit('data', Buffer.from(encodeNdjson({
+      kind: 'result', correlationId: 'cancel\u00005', payload: { who: 'lane' },
+    })));
+    const [numericRes, plainRes, laneRes] = await Promise.all([numericCall, plainCall, separated]);
+    assert.equal(numericRes.payload?.who, 'number');
+    assert.equal(plainRes.payload?.who, 'plain');
+    assert.equal(laneRes.payload?.who, 'lane');
+  } finally {
+    for (const rec of pair.sup.children.values()) {
+      if (rec.child.exitCode == null && rec.child.signalCode == null) rec.child.kill('SIGKILL');
+    }
+    await pair.close();
+  }
 });
