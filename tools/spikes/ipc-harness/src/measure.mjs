@@ -20,7 +20,7 @@ function cpuQuota() {
     const slash = line.indexOf('/');
     rel = slash >= 0 ? line.slice(slash) : '';
   } catch {
-    return { unlimited: true };
+    return { unreadable: true };
   }
   const parts = rel.split('/').filter(Boolean);
   const dirs = [];
@@ -29,9 +29,11 @@ function cpuQuota() {
   }
   // `max` is only "no limit at this level". A parent can still set the quota.
   let tightest = null;
+  let sawQuota = false;
   for (const dir of dirs) {
     try {
       const [quota, periodText] = readFileSync(`${dir}/cpu.max`, 'utf8').trim().split(/\s+/);
+      sawQuota = true;
       if (quota === 'max') continue;
       const period = Number(periodText);
       const limit = Number(quota);
@@ -43,7 +45,34 @@ function cpuQuota() {
       // This level may not expose cpu.max.
     }
   }
+  if (!sawQuota) return { unreadable: true };
   return tightest ? { unlimited: false, ...tightest } : { unlimited: true };
+}
+
+function rssReadable() {
+  try {
+    const status = readFileSync('/proc/self/status', 'utf8');
+    return /^VmRSS:\s+\d+\s+kB/m.test(status);
+  } catch {
+    return false;
+  }
+}
+
+// A finite quota below the host CPU count throttles the multi-process cases.
+// Missing RSS or quota data is unreadable, which is not a successful measurement.
+export function assessEnvironment({ cpu, cpus, load, rssOk }) {
+  const cores = !cpu.unlimited && cpu.period ? cpu.quota / cpu.period : cpus;
+  const unreadable = cpu.unreadable === true || rssOk === false;
+  const throttled = !unreadable && cpu.unlimited !== true && cores < cpus;
+  const overloaded = Number.isFinite(load) && load > cpus * 1.5;
+  return {
+    cpus,
+    load: Number.isFinite(load) ? Math.round(load * 100) / 100 : null,
+    cpuUnlimited: cpu.unlimited === true && cpu.unreadable !== true,
+    throttled,
+    overloaded,
+    valid: !unreadable && !throttled && !overloaded,
+  };
 }
 
 // Records the environment. Does not include cgroup paths or host identifiers.
@@ -51,17 +80,7 @@ export function preflight() {
   const cpu = cpuQuota();
   const cpus = os.cpus()?.length || 1;
   const load = os.loadavg()[0];
-  const cores = !cpu.unlimited && cpu.period ? cpu.quota / cpu.period : cpus;
-  const throttled = !cpu.unlimited && cores < 1;
-  const overloaded = Number.isFinite(load) && load > cpus * 1.5;
-  return {
-    cpus,
-    load: Number.isFinite(load) ? Math.round(load * 100) / 100 : null,
-    cpuUnlimited: cpu.unlimited === true,
-    throttled,
-    overloaded,
-    valid: !throttled && !overloaded,
-  };
+  return assessEnvironment({ cpu, cpus, load, rssOk: rssReadable() });
 }
 
 // Nearest-rank percentile. `values` is copied; the caller's array is left intact.
@@ -73,17 +92,24 @@ export function percentile(values, p) {
   return sorted[idx];
 }
 
+function readRss(pid) {
+  try {
+    const status = readFileSync(`/proc/${pid}/status`, 'utf8');
+    const match = status.match(/^VmRSS:\s+(\d+)\s+kB/m);
+    if (!match) return null;
+    return Number(match[1]) * 1024;
+  } catch {
+    return null;
+  }
+}
+
 export function treeRss(pids) {
-  let total = 0;
-  const ids = [process.pid, ...pids];
-  for (const pid of ids) {
-    try {
-      const status = readFileSync(`/proc/${pid}/status`, 'utf8');
-      const match = status.match(/^VmRSS:\s+(\d+)\s+kB/m);
-      if (match) total += Number(match[1]) * 1024;
-    } catch {
-      // Child already exited.
-    }
+  const self = readRss(process.pid);
+  if (self == null) return null;
+  let total = self;
+  for (const pid of pids) {
+    const rss = readRss(pid);
+    if (rss != null) total += rss;
   }
   return total;
 }

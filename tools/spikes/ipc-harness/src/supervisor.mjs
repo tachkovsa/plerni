@@ -71,6 +71,21 @@ function secretMatch(a, b) {
   return timingSafeEqual(left, right);
 }
 
+function copyGrants(grants) {
+  const source = Array.isArray(grants) ? grants : ['*'];
+  return Object.freeze(source.map((grant) => String(grant)));
+}
+
+function detachCredential(credential) {
+  return {
+    pluginId: credential.pluginId,
+    version: credential.version,
+    grants: [...credential.grants],
+    generation: credential.generation,
+    secret: credential.secret,
+  };
+}
+
 function childEnv(extra) {
   return {
     PATH: process.env.PATH || '',
@@ -91,9 +106,11 @@ export class Supervisor {
       this.capsConfig.totalGlobal = Math.max(this.capsConfig.total, DEFAULT_CAPS.totalGlobal);
     }
     this.partialHighWater = opts.partialHighWater ?? this.capsConfig.partial;
+    this.partialLowWater = opts.partialLowWater ?? Math.floor(this.partialHighWater / 2);
     this.children = new Map();
     this.pending = new Map();
     this.callPendingTotal = 0;
+    this.cancelPendingTotal = 0;
     this.retiredTokens = new Set();
     this.faults = [];
     this.caps = { pending: false, partial: false, total: false, lo: false, hi: false };
@@ -120,7 +137,7 @@ export class Supervisor {
     const credential = {
       pluginId: spec.pluginId,
       version: spec.version ?? '0.0.0',
-      grants: spec.grants ?? ['*'],
+      grants: copyGrants(spec.grants),
       generation: spec.generation ?? 1,
       secret: randomBytes(16).toString('hex'),
     };
@@ -159,7 +176,7 @@ export class Supervisor {
     child.on('error', () => {});
     child.on('exit', (code, signal) => this.#onExit(rec, code, signal));
     this.children.set(spec.pluginId, rec);
-    return { credential, token, pid: child.pid };
+    return { credential: detachCredential(credential), token, pid: child.pid };
   }
 
   async respawn(pluginId) {
@@ -170,13 +187,16 @@ export class Supervisor {
     const script = prev.script;
     const env = prev.env;
     const version = prev.credential.version;
-    const grants = prev.credential.grants;
+    const grants = [...prev.credential.grants];
+    const pending = prev.limits.pending;
+    const total = prev.limits.total;
     if (prev.child.exitCode == null && prev.child.signalCode == null) {
       prev.child.kill();
       await waitExit(prev.child);
     }
+    this.#discardQueues(pluginId);
     this.children.delete(pluginId);
-    return this.spawn({ pluginId, script, env, generation, version, grants });
+    return this.spawn({ pluginId, script, env, generation, version, grants, pending, total });
   }
 
   // Refuses a token the crashed child held, and a token that is not the live spawn token.
@@ -250,7 +270,11 @@ export class Supervisor {
     }
     const ingressTs = performance.now();
     if (msg.kind === 'cancel') {
-      if (rec.cancelPending >= this.capsConfig.cancels) {
+      const occupied = rec.callPending + rec.cancelPending;
+      const globalOccupied = this.callPendingTotal + this.cancelPendingTotal;
+      if (occupied >= rec.limits.pending
+        || globalOccupied >= this.capsConfig.pendingGlobal
+        || rec.cancelPending >= this.capsConfig.cancels) {
         this.caps.pending = true;
         this.#reject(msg, 'pending-cap', true);
         return;
@@ -282,6 +306,7 @@ export class Supervisor {
     rec.outbound += bytes;
     rec.child.stdin.write(line, () => {
       rec.outbound -= bytes;
+      this.#maybeResumeAll();
     });
   }
 
@@ -300,8 +325,14 @@ export class Supervisor {
       bytes: extra.bytes,
       timer,
     });
-    if (extra.cancel) rec.cancelPending++;
-    else {
+    if (extra.cancel) {
+      rec.cancelPending++;
+      this.cancelPendingTotal++;
+      if (rec.callPending + rec.cancelPending >= rec.limits.pending
+        || this.callPendingTotal + this.cancelPendingTotal >= this.capsConfig.pendingGlobal) {
+        this.caps.pending = true;
+      }
+    } else {
       rec.callPending++;
       this.callPendingTotal++;
       if (rec.callPending >= rec.limits.pending || this.callPendingTotal >= this.capsConfig.pendingGlobal) {
@@ -319,6 +350,7 @@ export class Supervisor {
       for: pending.cancel ? 'cancel' : 'call',
       pluginId: pending.pluginId,
       correlationId: pending.correlationId,
+      generation: pending.generation,
     }, 10, false);
   }
 
@@ -330,6 +362,7 @@ export class Supervisor {
     const rec = this.children.get(pending.pluginId);
     const same = rec && rec.credential.generation === pending.generation;
     if (pending.cancel) {
+      this.cancelPendingTotal--;
       if (same) rec.cancelPending--;
     } else if (same) {
       rec.callPending--;
@@ -366,6 +399,7 @@ export class Supervisor {
       for: msg.kind === 'cancel' ? 'cancel' : 'call',
       pluginId: msg.pluginId,
       correlationId: msg.correlationId,
+      generation: msg.credential?.generation,
     }, 10, coalesce);
   }
 
@@ -403,10 +437,9 @@ export class Supervisor {
     if (rec.framer.pendingBytes() >= this.partialHighWater) {
       this.caps.partial = true;
       this.#pause(rec, 'partial');
-    } else if (rec.paused && rec.pauseReason === 'partial') {
-      this.#unpause(rec);
     }
     if (this.bufferedBytes() > this.capsConfig.totalGlobal) this.caps.total = true;
+    this.#maybeResumeAll();
   }
 
   #pause(rec, reason) {
@@ -428,11 +461,16 @@ export class Supervisor {
     }
   }
 
+  // Resume does not wait for another stdout 'data' event. A paused stream emits none.
   #maybeResumeAll() {
     const globalLow = this.bufferedBytes() <= this.capsConfig.totalGlobal / 2;
     for (const rec of this.children.values()) {
-      if (!rec.paused || rec.pauseReason !== 'total') continue;
-      if (globalLow && this.#pluginBytes(rec) <= rec.limits.total / 2) this.#unpause(rec);
+      if (!rec.paused || rec.dead) continue;
+      if (rec.pauseReason === 'partial') {
+        if (rec.framer.pendingBytes() <= this.partialLowWater) this.#unpause(rec);
+      } else if (rec.pauseReason === 'total') {
+        if (globalLow && this.#pluginBytes(rec) <= rec.limits.total / 2) this.#unpause(rec);
+      }
     }
   }
 
@@ -453,6 +491,7 @@ export class Supervisor {
           for: 'call',
           pluginId: rec.credential.pluginId,
           correlationId: msg.correlationId,
+          generation: rec.credential.generation,
         }, 10, false);
         return;
       }
@@ -473,6 +512,7 @@ export class Supervisor {
       for: 'call',
       pluginId,
       correlationId,
+      generation: pending.generation,
     }, 10, false);
   }
 
@@ -490,10 +530,12 @@ export class Supervisor {
           for: 'call',
           pluginId: rec.credential.pluginId,
           correlationId: msg.correlationId,
+          generation: rec.credential.generation,
         }, 10, false);
       }
       return;
     }
+    if (pending.generation !== rec.credential.generation) return;
     const lane = msg.kind === 'cancelled' ? 'cancel' : 'call';
     const frame = {
       kind: msg.kind,
@@ -506,8 +548,8 @@ export class Supervisor {
       ingressTs: pending.ingressTs,
       egressTs: performance.now(),
       version: rec.credential.version,
-      generation: rec.credential.generation,
-      grants: rec.credential.grants,
+      generation: pending.generation,
+      grants: [...rec.credential.grants],
     };
     let buf;
     try {
@@ -520,12 +562,18 @@ export class Supervisor {
         for: lane,
         pluginId: pending.pluginId,
         correlationId: pending.correlationId,
+        generation: pending.generation,
       }, 10, false);
+      return;
+    }
+    const priority = msg.kind === 'cancelled' ? 10 : 1;
+    if (priority >= 10 && !this.#roomHi(pluginId)) {
+      this.#take(key);
       return;
     }
     if (!this.#take(key)) return;
     if (msg.kind === 'result') this.answered++;
-    this.#enqueueBuf(buf, msg.kind === 'cancelled' ? 10 : 1, pluginId);
+    this.#enqueueBuf(buf, priority, pluginId);
   }
 
   #ownedByOther(pluginId, correlationId) {
@@ -589,6 +637,7 @@ export class Supervisor {
         for: pending.cancel ? 'cancel' : 'call',
         pluginId: rec.credential.pluginId,
         correlationId: pending.correlationId,
+        generation: pending.generation,
       }, 10, false);
     }
   }
@@ -603,6 +652,7 @@ export class Supervisor {
           for: pending.cancel ? 'cancel' : 'call',
           pluginId: pending.pluginId,
           correlationId: pending.correlationId,
+          generation: pending.generation,
         });
         this.socket.write(buf);
       } catch {

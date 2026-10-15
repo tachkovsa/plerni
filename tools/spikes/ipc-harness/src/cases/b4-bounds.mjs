@@ -11,6 +11,10 @@ function child(name) {
 
 const echoPath = child('echo');
 
+export function childAlive(proc) {
+  return proc != null && proc.exitCode == null && proc.signalCode == null;
+}
+
 async function roundTrip(stub, credential) {
   const res = await stub.call({
     pluginId: credential.pluginId,
@@ -41,7 +45,7 @@ export async function b4() {
     const badFault = pair.sup.faults.find((f) => f.pluginId === 'bad');
     detail.malformed = {
       code: badFault?.code ?? null,
-      processAlive: pair.sup.children.get('good').exitCode == null,
+      processAlive: childAlive(pair.sup.children.get('good').child),
       siblingRoundTrip: await roundTrip(pair.stub, good.credential),
     };
 
@@ -72,7 +76,7 @@ export async function b4() {
     detail.oversize = {
       code: pair.sup.framingFault,
       limit: HARD_FRAME,
-      processAlive: pair.sup.children.get('good').exitCode == null,
+      processAlive: childAlive(pair.sup.children.get('good').child),
       reachable,
     };
 

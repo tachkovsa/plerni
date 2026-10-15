@@ -90,6 +90,15 @@ async function floodRep({ warmupMs, windowMs }) {
     const sibling = pair.sup.spawn({ pluginId: 'sib', script: echoPath });
     const started = performance.now();
     let seq = 0;
+    let baseline;
+    let markWindow = Promise.resolve();
+    if (warmupMs <= 0) {
+      baseline = { bulk: pair.sup.bulkSeen, flood: pair.stub.floodFrames };
+    } else {
+      markWindow = delay(warmupMs).then(() => {
+        baseline = { bulk: pair.sup.bulkSeen, flood: pair.stub.floodFrames };
+      });
+    }
     const noteDrop = () => samples.push(CANCEL_TIMEOUT);
     await openLoop({
       ms: warmupMs + windowMs,
@@ -117,18 +126,25 @@ async function floodRep({ warmupMs, windowMs }) {
         });
       },
     });
+    await markWindow;
+    const endBulk = pair.sup.bulkSeen;
+    const endFlood = pair.stub.floodFrames;
     await delay(1_100);
     const seconds = windowMs / 1000;
+    const bulk = endBulk - baseline.bulk;
+    const floodFrames = endFlood - baseline.flood;
     return {
       p99: percentile(samples, 99),
       samples: samples.length,
       timeouts,
       offered,
       issued,
-      bulk: pair.sup.bulkSeen,
-      floodFrames: pair.stub.floodFrames,
-      bulkRate: pair.sup.bulkSeen / seconds,
-      floodRate: pair.stub.floodFrames / seconds,
+      bulk,
+      floodFrames,
+      bulkBaseline: baseline.bulk,
+      floodBaseline: baseline.flood,
+      bulkRate: bulk / seconds,
+      floodRate: floodFrames / seconds,
     };
   } finally {
     await pair.close();

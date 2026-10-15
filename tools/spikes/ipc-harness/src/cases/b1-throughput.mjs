@@ -15,11 +15,13 @@ const TARGET_RATE = 5_000;
 const P99_MS = 10;
 const CALL_TIMEOUT = 2_000;
 
-async function rep({ warmupMs, windowMs }) {
+async function rep({ warmupMs, windowMs, script, callTimeout }) {
   const pair = await connectPair({ sweeper: false, caps: { pending: 512, total: 8 * 1024 * 1024 } });
+  const childScript = script ?? echoPath;
+  const timeout = callTimeout ?? CALL_TIMEOUT;
   const kids = [];
   for (let i = 0; i < CHILDREN; i++) {
-    kids.push(pair.sup.spawn({ pluginId: `echo-${i}`, script: echoPath }));
+    kids.push(pair.sup.spawn({ pluginId: `echo-${i}`, script: childScript }));
   }
   const samples = [];
   const ingress = [];
@@ -35,6 +37,7 @@ async function rep({ warmupMs, windowMs }) {
   let seq = 0;
   try {
     const started = performance.now();
+    const windowEnd = started + warmupMs + windowMs;
     const noteDrop = () => {
       drops++;
       samples.push(CALL_TIMEOUT);
@@ -65,11 +68,12 @@ async function rep({ warmupMs, windowMs }) {
           port: 'db',
           method: 'get',
           payload: PAYLOAD,
-        }, CALL_TIMEOUT).then((res) => {
+        }, timeout).then((res) => {
           inFlight--;
           if (!record) return;
-          completions++;
           if (res.payload !== PAYLOAD) corrupt++;
+          if (performance.now() > windowEnd) return;
+          completions++;
           if (res.rttMs != null) samples.push(res.rttMs);
           if (res.ingressTs != null && res.sendTs != null) ingress.push(res.ingressTs - res.sendTs);
           if (res.egressTs != null && res.ingressTs != null) child.push(res.egressTs - res.ingressTs);
@@ -109,7 +113,7 @@ export async function b1(opts = {}) {
   const series = await measureSeries({
     reps: repsN,
     preflightFn,
-    runRep: () => rep({ warmupMs, windowMs }),
+    runRep: () => rep({ warmupMs, windowMs, script: opts.script, callTimeout: opts.callTimeout }),
   });
   if (series.outcome === 'invalid') {
     return { pass: null, outcome: 'invalid', detail: { env: series.env, results: series.rows, rerun: series.rerun } };

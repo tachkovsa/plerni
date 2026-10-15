@@ -7,7 +7,8 @@ import { connectPair, dbConfigured, useDirectFromEnv } from '../supervisor.mjs';
 
 const crashPath = fileURLToPath(new URL('../children/crash-mid-call.mjs', import.meta.url));
 
-export async function b5({ requireDb = true } = {}) {
+export async function b5() {
+  if (!dbConfigured()) return { pass: false, detail: { error: 'no harness database' } };
   const useDirect = useDirectFromEnv();
   const pair = await connectPair({ sweeper: false, useDirect });
   try {
@@ -22,11 +23,6 @@ export async function b5({ requireDb = true } = {}) {
     }).catch((e) => e);
     const crash = { code: err.code ?? null, exitCode: pair.sup.children.get('crash')?.exitCode ?? null };
     const crashOk = crash.code === 'child-exited' && crash.exitCode === 1;
-    if (!dbConfigured()) {
-      const token = 'no harness database';
-      if (requireDb) return { pass: false, detail: { crash, token } };
-      return { pass: crashOk, detail: { crash, token: 'not-run' } };
-    }
     const id = await createExecution('b5', spawned.token, useDirect);
     await dispatch(id, useDirect);
     const next = await pair.sup.respawn('crash');

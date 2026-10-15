@@ -82,6 +82,7 @@ export class KernelStub {
     const bucket = cancelLane ? this.cancels : this.calls;
     const waiter = bucket.get(key);
     if (!waiter) return;
+    if (waiter.generation != null && msg.generation !== waiter.generation) return;
     bucket.delete(key);
     clearTimeout(waiter.timer);
     const returnedAt = performance.now();
@@ -103,7 +104,7 @@ export class KernelStub {
     this.sentAt.clear();
   }
 
-  #track(bucket, pluginId, correlationId, timeoutMs) {
+  #track(bucket, pluginId, correlationId, timeoutMs, generation) {
     const key = pendingKey(pluginId, correlationId);
     const sentKey = `${bucket === this.cancels ? 'cancel' : 'call'}\0${key}`;
     return new Promise((resolve, reject) => {
@@ -113,7 +114,7 @@ export class KernelStub {
         this.sentAt.delete(sentKey);
         reject(fail('timeout'));
       }, timeoutMs);
-      bucket.set(key, { resolve, reject, timer, sentKey });
+      bucket.set(key, { resolve, reject, timer, sentKey, generation });
     });
   }
 
@@ -130,7 +131,8 @@ export class KernelStub {
       return Promise.reject(err);
     }
     this.sentAt.set(sentKey, frame.sendTs);
-    const pending = this.#track(bucket, frame.pluginId, frame.correlationId, timeoutMs);
+    const generation = frame.credential?.generation ?? null;
+    const pending = this.#track(bucket, frame.pluginId, frame.correlationId, timeoutMs, generation);
     try {
       this.socket.write(buf);
     } catch (err) {

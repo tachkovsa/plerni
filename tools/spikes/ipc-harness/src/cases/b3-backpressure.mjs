@@ -79,7 +79,7 @@ const BYTE_CAP = 16 * 1024;
 const PENDING_CAP = 8;
 const LO_CAP = 32;
 
-async function holdRep({ warmupMs, windowMs }) {
+async function holdRep({ warmupMs, windowMs, readRss }) {
   const pair = await connectPair({
     sweeper: false,
     caps: {
@@ -154,7 +154,21 @@ async function holdRep({ warmupMs, windowMs }) {
       const hi = pair.sup.faults.some((fault) => fault.pluginId === 'forger' && fault.code === 'hi-cap');
       return pending && partialBytes && byteBytes && lo && hi;
     }, Math.max(warmupMs, 5_000));
-    const rss0 = treeRss(pids);
+    const rss0 = readRss(pids);
+    if (rss0 == null) {
+      return {
+        growth: null,
+        measurable: false,
+        rss0: null,
+        maxRss: null,
+        arrivals: 0,
+        filled,
+        answered: false,
+        caps: { ...pair.sup.caps },
+        near: { pending: false, partial: false, bytes: false, lo: false },
+        samples: 0,
+      };
+    }
     let maxRss = rss0;
     const samples = [];
     const windowDeadline = performance.now() + windowMs;
@@ -178,7 +192,22 @@ async function holdRep({ warmupMs, windowMs }) {
         outbound: pair.sup.queueDepth('sib').outbound,
       };
       samples.push(depth);
-      maxRss = Math.max(maxRss, treeRss(pids));
+      const sampleRss = readRss(pids);
+      if (sampleRss == null) {
+        return {
+          growth: null,
+          measurable: false,
+          rss0,
+          maxRss: null,
+          arrivals,
+          filled,
+          answered: false,
+          caps: { ...pair.sup.caps },
+          near: { pending: false, partial: false, bytes: false, lo: false },
+          samples: samples.length,
+        };
+      }
+      maxRss = Math.max(maxRss, sampleRss);
       await delay(200);
     }
     pair.stub.socket.resume();
@@ -218,6 +247,10 @@ function holdOk(row) {
 }
 
 export async function b3(opts = {}) {
+  const readRss = opts.readRss ?? treeRss;
+  if (readRss([process.pid]) == null) {
+    return { pass: null, outcome: 'invalid', detail: { reason: 'rss-unreadable', limit: RSS_GROWTH_LIMIT } };
+  }
   const tripped = await tripCaps();
   if (opts.hold === false) return tripped;
   const warmupMs = opts.warmupMs ?? CONTRACT.warmupMs;
@@ -227,12 +260,15 @@ export async function b3(opts = {}) {
   const series = await measureSeries({
     reps: repsN,
     preflightFn,
-    runRep: () => holdRep({ warmupMs, windowMs }),
+    runRep: () => holdRep({ warmupMs, windowMs, readRss }),
   });
   if (series.outcome === 'invalid') {
     return { pass: null, outcome: 'invalid', detail: { env: series.env, caps: tripped, holds: series.rows, rerun: series.rerun } };
   }
   const holds = series.rows;
+  if (holds.some((row) => row.measurable === false || row.growth == null)) {
+    return { pass: null, outcome: 'invalid', detail: { env: series.env, reason: 'rss-unreadable', caps: tripped, holds, limit: RSS_GROWTH_LIMIT } };
+  }
   const pass = tripped.pass && holds.every(holdOk);
   return {
     pass,
