@@ -78,8 +78,10 @@ export class KernelStub {
       return;
     }
     const key = pendingKey(msg.pluginId, msg.correlationId);
-    const cancelLane = msg.for === 'cancel' || msg.kind === 'cancelled';
-    const bucket = cancelLane ? this.cancels : this.calls;
+    const lane = msg.for === 'call' || msg.for === 'cancel'
+      ? msg.for
+      : (msg.kind === 'cancelled' ? 'cancel' : 'call');
+    const bucket = lane === 'cancel' ? this.cancels : this.calls;
     const waiter = bucket.get(key);
     if (!waiter) return;
     if (waiter.generation != null && msg.generation !== waiter.generation) return;
@@ -121,6 +123,7 @@ export class KernelStub {
   #send(bucket, frame, timeoutMs) {
     if (this.shut || this.socket.destroyed) return Promise.reject(fail('closed'));
     const key = pendingKey(frame.pluginId, frame.correlationId);
+    if (bucket.has(key)) return Promise.reject(fail('duplicate-correlation'));
     const sentKey = `${bucket === this.cancels ? 'cancel' : 'call'}\0${key}`;
     frame.timeoutMs = timeoutMs;
     frame.sendTs = performance.now();

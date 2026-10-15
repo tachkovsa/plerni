@@ -88,6 +88,13 @@ async function floodRep({ warmupMs, windowMs }) {
   try {
     pair.sup.spawn({ pluginId: 'flood', script: floodPath });
     const sibling = pair.sup.spawn({ pluginId: 'sib', script: echoPath });
+    const ready = await waitUntil(() => pair.stub.floodFrames > 0, 5_000);
+    if (!ready) {
+      return {
+        p99: null, samples: 0, timeouts: 0, offered: 0, issued: 0,
+        bulk: 0, floodFrames: 0, bulkBaseline: 0, floodBaseline: 0, bulkRate: 0, floodRate: 0,
+      };
+    }
     const started = performance.now();
     let seq = 0;
     let baseline;

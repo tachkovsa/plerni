@@ -358,6 +358,176 @@ test('B1 achieved rate ignores completions that land after the window', { timeou
   assert.equal(rep.achieved, 0);
 });
 
+test('spawn rejects a duplicate live plugin id', async () => {
+  const pair = await connectPair({ sweeper: false });
+  try {
+    const first = pair.sup.spawn({ pluginId: 'echo', script: echoPath });
+    assert.throws(
+      () => pair.sup.spawn({ pluginId: 'echo', script: echoPath }),
+      (err) => err.code === 'duplicate-plugin',
+    );
+    const live = pair.sup.children.get('echo');
+    assert.equal(live.child.pid, first.pid);
+    assert.equal(live.child.exitCode, null);
+    const res = await pair.stub.call({
+      pluginId: 'echo',
+      credential: first.credential,
+      correlationId: 1,
+      port: 'db',
+      method: 'get',
+      payload: { ok: true },
+    }, 1_000);
+    assert.equal(res.payload?.ok, true);
+  } finally {
+    await pair.close();
+  }
+});
+
+test('a second in-flight correlation id does not replace the first waiter', async () => {
+  const pair = await connectPair({ sweeper: false });
+  try {
+    const kid = pair.sup.spawn({ pluginId: 'echo', script: echoPath });
+    const first = pair.stub.call({
+      pluginId: 'echo',
+      credential: kid.credential,
+      correlationId: 7,
+      port: 'db',
+      method: 'get',
+      payload: { who: 'first' },
+    }, 1_000);
+    const second = await pair.stub.call({
+      pluginId: 'echo',
+      credential: kid.credential,
+      correlationId: 7,
+      port: 'db',
+      method: 'get',
+      payload: { who: 'second' },
+    }, 300).catch((err) => err);
+    assert.equal(second.code, 'duplicate-correlation');
+    const res = await first;
+    assert.equal(res.payload?.who, 'first');
+    await delay(20);
+    assert.equal(pair.sup.pending.size, 0);
+    assert.equal(pair.stub.calls.size, 0);
+  } finally {
+    await pair.close();
+  }
+});
+
+test('calls count cancellation slots against the pending cap', async () => {
+  const pair = await connectPair({ sweeper: false, caps: { pending: 2, cancels: 8 } });
+  try {
+    const kid = pair.sup.spawn({ pluginId: 'ig', script: ignorePath, pending: 2 });
+    const cancels = [1, 2].map((id) => pair.stub.cancel({
+      pluginId: 'ig',
+      credential: kid.credential,
+      correlationId: id,
+    }, 800).catch((err) => err));
+    await delay(40);
+    const calls = await Promise.all([3, 4].map((id) => pair.stub.call({
+      pluginId: 'ig',
+      credential: kid.credential,
+      correlationId: id,
+      port: 'db',
+      method: 'get',
+      payload: { id },
+    }, 300).catch((err) => err)));
+    assert.ok(calls.every((row) => row.code === 'pending-cap'));
+    assert.ok(pair.sup.pending.size <= 2);
+    await Promise.all(cancels);
+  } finally {
+    await pair.close();
+  }
+});
+
+test('cancellation writes count against the byte caps', async () => {
+  const pair = await connectPair({
+    sweeper: false,
+    caps: { total: 4_096, totalGlobal: 8_192, pending: 8 },
+  });
+  try {
+    const kid = pair.sup.spawn({
+      pluginId: 'silent',
+      script: floodPath,
+      env: { FLOOD_MODE: 'silent' },
+      total: 4_096,
+    });
+    const big = 'y'.repeat(3_000);
+    const settled = await Promise.all([0, 1, 2, 3].map((n) => pair.stub.cancel({
+      pluginId: 'silent',
+      credential: kid.credential,
+      correlationId: `${big}-${n}`,
+    }, 400).catch((err) => err)));
+    assert.ok(settled.some((row) => row.code === 'total-cap'));
+    assert.ok(pair.sup.bufferedBytes() <= 8_192);
+  } finally {
+    await pair.close();
+  }
+});
+
+test('a cancelled frame with for call retires the call waiter', async () => {
+  const pair = await connectPair({ sweeper: false });
+  try {
+    const kid = pair.sup.spawn({ pluginId: 'echo', script: echoPath });
+    const proc = pair.sup.children.get('echo').child;
+    proc.kill('SIGSTOP');
+    const callP = pair.stub.call({
+      pluginId: 'echo',
+      credential: kid.credential,
+      correlationId: 5,
+      port: 'db',
+      method: 'get',
+      payload: { who: 'call' },
+    }, 1_000);
+    const cancelP = pair.stub.cancel({
+      pluginId: 'echo',
+      credential: kid.credential,
+      correlationId: 5,
+    }, 1_000);
+    await delay(40);
+    const generation = kid.credential.generation;
+    pair.sup.socket.write(encodeMux({
+      kind: 'cancelled', for: 'cancel', pluginId: 'echo', correlationId: 5, generation,
+    }));
+    pair.sup.socket.write(encodeMux({
+      kind: 'cancelled', for: 'call', pluginId: 'echo', correlationId: 5, generation,
+    }));
+    const [callRes, cancelRes] = await Promise.all([callP, cancelP]);
+    assert.equal(cancelRes.kind, 'cancelled');
+    assert.equal(callRes.for, 'call');
+    assert.equal(callRes.kind, 'cancelled');
+  } finally {
+    const proc = pair.sup.children.get('echo')?.child;
+    if (proc && proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL');
+    await pair.close();
+  }
+});
+
+test('the global byte ceiling pauses every contributing child', { timeout: 10_000 }, async () => {
+  const cap = 64 * 1024;
+  const pair = await connectPair({
+    sweeper: false,
+    caps: { total: 1024 * 1024, totalGlobal: cap, partial: 1024 * 1024 },
+    partialHighWater: 1024 * 1024,
+  });
+  try {
+    pair.sup.spawn({ pluginId: 'a', script: floodPath, env: { FLOOD_MODE: 'partial' }, total: 1024 * 1024 });
+    pair.sup.spawn({ pluginId: 'b', script: floodPath, env: { FLOOD_MODE: 'partial' }, total: 1024 * 1024 });
+    const paused = await waitUntil(() => {
+      const a = pair.sup.children.get('a');
+      const b = pair.sup.children.get('b');
+      return a.paused && b.paused && a.pauseReason === 'global' && b.pauseReason === 'global';
+    }, 3_000);
+    assert.equal(paused, true);
+    const buffered = pair.sup.bufferedBytes();
+    await delay(300);
+    assert.ok(buffered <= cap + 16 * 1024, String(buffered));
+    assert.ok(pair.sup.bufferedBytes() <= buffered + 4_096);
+  } finally {
+    await pair.close();
+  }
+});
+
 test('flood rate counts only the scored window', { timeout: 15_000 }, async () => {
   const result = await floodBound({
     warmupMs: 200,

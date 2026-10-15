@@ -134,6 +134,11 @@ export class Supervisor {
   }
 
   spawn(spec) {
+    if (this.children.has(spec.pluginId)) {
+      const err = new Error(`plugin ${spec.pluginId} is already live`);
+      err.code = 'duplicate-plugin';
+      throw err;
+    }
     const credential = {
       pluginId: spec.pluginId,
       version: spec.version ?? '0.0.0',
@@ -269,19 +274,33 @@ export class Supervisor {
       return;
     }
     const ingressTs = performance.now();
+    const laneKey = pendingKey(
+      msg.pluginId,
+      msg.kind === 'cancel' ? `cancel\0${msg.correlationId}` : msg.correlationId,
+    );
+    if (this.pending.has(laneKey)) {
+      this.#reject(msg, 'duplicate-correlation', false);
+      return;
+    }
     if (msg.kind === 'cancel') {
-      const occupied = rec.callPending + rec.cancelPending;
-      const globalOccupied = this.callPendingTotal + this.cancelPendingTotal;
-      if (occupied >= rec.limits.pending
-        || globalOccupied >= this.capsConfig.pendingGlobal
-        || rec.cancelPending >= this.capsConfig.cancels) {
+      if (this.#pendingFull(rec) || rec.cancelPending >= this.capsConfig.cancels) {
         this.caps.pending = true;
         this.#reject(msg, 'pending-cap', true);
         return;
       }
       const line = encodeNdjson({ kind: 'cancel', correlationId: msg.correlationId });
-      this.#arm(rec, msg, { cancel: true, bytes: 0, ingressTs });
-      rec.child.stdin.write(line);
+      const bytes = Buffer.byteLength(line);
+      if (this.#overBytes(rec, bytes)) {
+        this.caps.total = true;
+        this.#reject(msg, 'total-cap', true);
+        return;
+      }
+      this.#arm(rec, msg, { cancel: true, bytes, ingressTs });
+      rec.outbound += bytes;
+      rec.child.stdin.write(line, () => {
+        rec.outbound -= bytes;
+        this.#maybeResumeAll();
+      });
       return;
     }
     const line = encodeNdjson({
@@ -292,12 +311,12 @@ export class Supervisor {
       payload: msg.payload,
     });
     const bytes = Buffer.byteLength(line);
-    if (rec.callPending >= rec.limits.pending || this.callPendingTotal >= this.capsConfig.pendingGlobal) {
+    if (this.#pendingFull(rec)) {
       this.caps.pending = true;
       this.#reject(msg, 'pending-cap', true);
       return;
     }
-    if (this.#pluginBytes(rec) + bytes > rec.limits.total || this.bufferedBytes() + bytes > this.capsConfig.totalGlobal) {
+    if (this.#overBytes(rec, bytes)) {
       this.caps.total = true;
       this.#reject(msg, 'total-cap', true);
       return;
@@ -308,6 +327,16 @@ export class Supervisor {
       rec.outbound -= bytes;
       this.#maybeResumeAll();
     });
+  }
+
+  #pendingFull(rec) {
+    return rec.callPending + rec.cancelPending >= rec.limits.pending
+      || this.callPendingTotal + this.cancelPendingTotal >= this.capsConfig.pendingGlobal;
+  }
+
+  #overBytes(rec, bytes) {
+    return this.#pluginBytes(rec) + bytes > rec.limits.total
+      || this.bufferedBytes() + bytes > this.capsConfig.totalGlobal;
   }
 
   #arm(rec, msg, extra) {
@@ -328,17 +357,11 @@ export class Supervisor {
     if (extra.cancel) {
       rec.cancelPending++;
       this.cancelPendingTotal++;
-      if (rec.callPending + rec.cancelPending >= rec.limits.pending
-        || this.callPendingTotal + this.cancelPendingTotal >= this.capsConfig.pendingGlobal) {
-        this.caps.pending = true;
-      }
     } else {
       rec.callPending++;
       this.callPendingTotal++;
-      if (rec.callPending >= rec.limits.pending || this.callPendingTotal >= this.capsConfig.pendingGlobal) {
-        this.caps.pending = true;
-      }
     }
+    if (this.#pendingFull(rec)) this.caps.pending = true;
   }
 
   #expire(key) {
@@ -438,8 +461,16 @@ export class Supervisor {
       this.caps.partial = true;
       this.#pause(rec, 'partial');
     }
-    if (this.bufferedBytes() > this.capsConfig.totalGlobal) this.caps.total = true;
+    if (this.bufferedBytes() > this.capsConfig.totalGlobal) this.#pauseOverGlobal();
     this.#maybeResumeAll();
+  }
+
+  #pauseOverGlobal() {
+    this.caps.total = true;
+    for (const rec of this.children.values()) {
+      if (rec.dead || rec.paused) continue;
+      if (this.#pluginBytes(rec) > 0) this.#pause(rec, 'global');
+    }
   }
 
   #pause(rec, reason) {
@@ -463,11 +494,15 @@ export class Supervisor {
 
   // Resume does not wait for another stdout 'data' event. A paused stream emits none.
   #maybeResumeAll() {
-    const globalLow = this.bufferedBytes() <= this.capsConfig.totalGlobal / 2;
+    const buffered = this.bufferedBytes();
+    const globalLow = buffered <= this.capsConfig.totalGlobal / 2;
+    const globalOpen = buffered <= this.capsConfig.totalGlobal;
     for (const rec of this.children.values()) {
       if (!rec.paused || rec.dead) continue;
-      if (rec.pauseReason === 'partial') {
-        if (rec.framer.pendingBytes() <= this.partialLowWater) this.#unpause(rec);
+      if (rec.pauseReason === 'global') {
+        if (globalLow) this.#unpause(rec);
+      } else if (rec.pauseReason === 'partial') {
+        if (globalOpen && rec.framer.pendingBytes() <= this.partialLowWater) this.#unpause(rec);
       } else if (rec.pauseReason === 'total') {
         if (globalLow && this.#pluginBytes(rec) <= rec.limits.total / 2) this.#unpause(rec);
       }
@@ -799,6 +834,7 @@ export class Supervisor {
 
   #resumeBulk() {
     if (this.#loLength() >= 8) return;
+    if (this.bufferedBytes() > this.capsConfig.totalGlobal) return;
     for (const rec of this.children.values()) {
       if (rec.paused && rec.pauseReason === 'bulk') this.#unpause(rec);
     }
