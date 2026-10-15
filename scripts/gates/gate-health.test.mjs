@@ -50,6 +50,18 @@ const cases = [
     expectExit: 0,
   },
   {
+    name: "license-audit blocks an isolated package with no lockfile",
+    cmd: gate("license-audit.mjs", "--root", join(fixtures, "isolated-nolock")),
+    expectExit: 1,
+    expectOutput: /package-lock.json is missing/,
+  },
+  {
+    name: "license-audit blocks a lockfile version outside the manifest range",
+    cmd: gate("license-audit.mjs", "--root", join(fixtures, "isolated-stale")),
+    expectExit: 1,
+    expectOutput: /does not satisfy/,
+  },
+  {
     name: "private-markers blocks machine-local paths/IPs",
     cmd: gate("private-markers.mjs", "--root", join(fixtures, "private-path")),
     expectExit: 1,

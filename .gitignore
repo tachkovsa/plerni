@@ -18,5 +18,7 @@ tools/spikes/*/evidence/
 # gate fixtures intentionally track fake node_modules packages (nothing else under fixtures is exempt)
 !scripts/gates/fixtures/*/node_modules/
 !scripts/gates/fixtures/*/node_modules/**
+!scripts/gates/fixtures/*/*/node_modules/
+!scripts/gates/fixtures/*/*/node_modules/**
 # the private-local fixture's patterns file IS the test subject — tracked intentionally
 !scripts/gates/fixtures/private-local/.private-markers.local

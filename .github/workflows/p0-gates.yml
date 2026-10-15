@@ -57,6 +57,9 @@ jobs:
         with:
           node-version-file: .nvmrc
       - run: pnpm install --frozen-lockfile
+      - name: install brand exporter without lifecycle scripts
+        working-directory: assets/brand
+        run: npm ci --ignore-scripts
       - run: node scripts/gates/license-audit.mjs
       - run: node scripts/gates/kernel-purity.mjs
       - run: node scripts/gates/commit-policy.mjs --base "${{ github.event_name == 'push' && github.event.before || format('origin/{0}', github.base_ref || 'dev') }}"

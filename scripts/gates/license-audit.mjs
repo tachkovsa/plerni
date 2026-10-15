@@ -4,11 +4,12 @@
  * Walks workspace package.json files, reads installed dependency licenses from
  * node_modules, and fails on missing/unknown/copyleft licenses.
  * Also audits direct dependencies of npm packages that sit outside the
- * workspace and carry their own package-lock.json (assets/brand). Those
- * licenses are read from the lockfile, and from node_modules when it is
- * present; a missing lockfile entry fails closed. Transitive lockfile
- * entries are not a second policy — the gate checks declared dependencies,
- * the same set it checks for workspace packages.
+ * workspace (assets/brand). A manifest with external dependencies and no
+ * package-lock.json fails closed. The locked version must satisfy the
+ * manifest range. The license is read from the installed package manifest,
+ * never from the lockfile's license field. Transitive lockfile entries are
+ * not a second policy — the gate checks declared dependencies, the same set
+ * it checks for workspace packages.
  * Usage: node scripts/gates/license-audit.mjs [--root <dir>]
  */
 import { readFileSync, existsSync, readdirSync, statSync } from "node:fs";
@@ -56,8 +57,8 @@ for (const dir of pkgDirs) {
 // npm packages outside the workspace (not matched by pnpm-workspace globs).
 // Fixture trees are scanned only when --root points at them.
 const fixtureRoot = join("scripts", "gates", "fixtures");
-const lockDirs = [];
-const walkLockfiles = (dir) => {
+const isolatedDirs = [];
+const walkPackages = (dir) => {
   const rel = relative(root, dir);
   if (rel === fixtureRoot || rel.startsWith(fixtureRoot + sep)) return;
   let entries;
@@ -78,25 +79,11 @@ const walkLockfiles = (dir) => {
     if (!st.isDirectory()) continue;
     const childRel = relative(root, p);
     if (childRel === fixtureRoot || childRel.startsWith(fixtureRoot + sep)) continue;
-    const hasLock = existsSync(join(p, "package.json")) && existsSync(join(p, "package-lock.json"));
-    if (!pkgDirs.includes(p) && hasLock) lockDirs.push(p);
-    walkLockfiles(p);
+    if (!pkgDirs.includes(p) && existsSync(join(p, "package.json"))) isolatedDirs.push(p);
+    walkPackages(p);
   }
 };
-walkLockfiles(root);
-
-const lockDeps = [];
-for (const dir of lockDirs) {
-  const pkg = JSON.parse(readFileSync(join(dir, "package.json"), "utf8"));
-  for (const [name, range] of Object.entries({ ...pkg.dependencies, ...pkg.optionalDependencies })) {
-    if (!range.startsWith("workspace:")) lockDeps.push({ name, range, dir });
-  }
-}
-
-if (deps.size === 0 && lockDeps.length === 0) {
-  console.log("license-audit: no external dependencies declared. OK (vacuous — gate-health covers the negative case).");
-  process.exit(0);
-}
+walkPackages(root);
 
 const licenseOf = (pkg) => {
   const lic = pkg?.license;
@@ -109,7 +96,61 @@ const judge = (label, licStr) => {
   return `${label}: unknown/unlisted license "${licStr || "MISSING"}" — review and allowlist explicitly`;
 };
 
+const parseVer = (value) => {
+  const match = /^(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/.exec(value);
+  if (!match) return null;
+  return [Number(match[1]), Number(match[2]), Number(match[3])];
+};
+
+const cmpVer = (left, right) => {
+  for (let i = 0; i < 3; i++) if (left[i] !== right[i]) return left[i] - right[i];
+  return 0;
+};
+
+// true / false when the range is understood, null when it is not (fail closed).
+const satisfies = (version, range) => {
+  const ver = parseVer(version);
+  const trimmed = range.trim();
+  if (!ver) return false;
+  if (/^\d+\.\d+\.\d+(?:[-+].*)?$/.test(trimmed)) return version === trimmed;
+  const caret = /^\^(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/.exec(trimmed);
+  if (caret) {
+    const floor = [Number(caret[1]), Number(caret[2]), Number(caret[3])];
+    if (cmpVer(ver, floor) < 0) return false;
+    if (floor[0] > 0) return ver[0] === floor[0];
+    if (floor[1] > 0) return ver[0] === 0 && ver[1] === floor[1];
+    return ver[0] === 0 && ver[1] === 0 && ver[2] === floor[2];
+  }
+  const tilde = /^~(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/.exec(trimmed);
+  if (tilde) {
+    const floor = [Number(tilde[1]), Number(tilde[2]), Number(tilde[3])];
+    if (cmpVer(ver, floor) < 0) return false;
+    return ver[0] === floor[0] && ver[1] === floor[1];
+  }
+  return null;
+};
+
+const lockDeps = [];
 let failures = [];
+for (const dir of isolatedDirs) {
+  const pkg = JSON.parse(readFileSync(join(dir, "package.json"), "utf8"));
+  const externals = Object.entries({ ...pkg.dependencies, ...pkg.optionalDependencies }).filter(
+    ([, range]) => !String(range).startsWith("workspace:"),
+  );
+  if (externals.length === 0) continue;
+  const rel = relative(root, dir) || ".";
+  if (!existsSync(join(dir, "package-lock.json"))) {
+    failures.push(`${rel}: dependencies declared but package-lock.json is missing — fail closed`);
+    continue;
+  }
+  for (const [name, range] of externals) lockDeps.push({ name, range, dir });
+}
+
+if (deps.size === 0 && lockDeps.length === 0 && failures.length === 0) {
+  console.log("license-audit: no external dependencies declared. OK (vacuous — gate-health covers the negative case).");
+  process.exit(0);
+}
+
 for (const [name, ownerDir] of deps) {
   const candidates = [
     join(ownerDir, "node_modules", ...name.split("/"), "package.json"),
@@ -124,34 +165,37 @@ for (const [name, ownerDir] of deps) {
   if (problem) failures.push(problem);
 }
 
-const exactVersion = /^\d+\.\d+\.\d+([-+][0-9A-Za-z.-]+)?$/;
 for (const { name, range, dir } of lockDeps) {
   const rel = relative(root, dir) || ".";
   const label = `${name} (${rel})`;
   const lock = JSON.parse(readFileSync(join(dir, "package-lock.json"), "utf8"));
+  const rootSpec = lock.packages?.[""]?.dependencies?.[name] ?? lock.packages?.[""]?.optionalDependencies?.[name];
+  if (rootSpec !== range) {
+    failures.push(`${label}: lockfile root specifier "${rootSpec ?? "MISSING"}" does not match manifest "${range}"`);
+  }
   const entry = lock.packages?.[`node_modules/${name}`];
   if (!entry) {
     failures.push(`${label}: missing from package-lock.json — fail closed`);
     continue;
   }
-  if (exactVersion.test(range) && entry.version !== range) {
-    failures.push(
-      `${label}: lockfile version ${entry.version} does not match declared ${range}`,
-    );
+  const sat = satisfies(entry.version, range);
+  if (sat === null) {
+    failures.push(`${label}: cannot validate manifest range "${range}" — fail closed`);
+  } else if (!sat) {
+    failures.push(`${label}: lockfile version ${entry.version} does not satisfy manifest range ${range}`);
+  }
+  const installedPath = join(dir, "node_modules", ...name.split("/"), "package.json");
+  if (!existsSync(installedPath)) {
+    failures.push(`${label}: not installed — run npm ci --ignore-scripts in ${rel}; gate is fail-closed`);
     continue;
   }
-  const lockLic = typeof entry.license === "string" ? entry.license : "";
-  const installedPath = join(dir, "node_modules", ...name.split("/"), "package.json");
-  if (existsSync(installedPath)) {
-    const installedLic = licenseOf(JSON.parse(readFileSync(installedPath, "utf8")));
-    if (installedLic !== lockLic) {
-      failures.push(
-        `${label}: installed license "${installedLic}" does not match lockfile license "${lockLic}"`,
-      );
-      continue;
-    }
+  const installed = JSON.parse(readFileSync(installedPath, "utf8"));
+  if (installed.version && entry.version && installed.version !== entry.version) {
+    failures.push(
+      `${label}: installed version ${installed.version} does not match lockfile version ${entry.version}`,
+    );
   }
-  const problem = judge(label, lockLic);
+  const problem = judge(label, licenseOf(installed));
   if (problem) failures.push(problem);
 }
 
