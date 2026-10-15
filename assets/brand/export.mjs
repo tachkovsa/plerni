@@ -160,39 +160,45 @@ function buildMarks(font) {
     .map((ch) => glyphs[ch].d)
     .join(" ");
 
+  const wordTx = iStem.cx;
+  const wordTy = iStem.top - gap;
+  const wordMinX = Math.min(glyphs.p.minX, wordTx - sproutW / 2);
+  const wordMaxX = Math.max(glyphs.i.maxX, wordTx + sproutW / 2);
+  const wordMinY = wordTy - sproutH;
+  const wordMaxY = Math.max(..."plerni".split("").map((ch) => glyphs[ch].maxY));
+  const wordPad = sproutH * 0.35;
+  const wordView = {
+    x: wordMinX - wordPad,
+    y: wordMinY - wordPad,
+    w: wordMaxX - wordMinX + wordPad * 2,
+    h: wordMaxY - wordMinY + wordPad * 2,
+  };
   const word = (ink, leaf, background) => {
-    const tx = iStem.cx;
-    const ty = iStem.top - gap;
-    const minX = Math.min(glyphs.p.minX, tx - sproutW / 2);
-    const maxX = Math.max(glyphs.i.maxX, tx + sproutW / 2);
-    const minY = ty - sproutH;
-    const maxY = Math.max(..."plerni".split("").map((ch) => glyphs[ch].maxY));
-    const pad = sproutH * 0.35;
-    const vb = [minX - pad, minY - pad, maxX - minX + pad * 2, maxY - minY + pad * 2].map((v) => n(v));
+    const vb = [wordView.x, wordView.y, wordView.w, wordView.h].map((v) => n(v));
     const bg = background ? `<rect x="${vb[0]}" y="${vb[1]}" width="${vb[2]}" height="${vb[3]}" fill="${background}"/>` : "";
     const body = `${bg}
   <path fill="${ink}" d="${letters}"/>
-  <path fill="${leaf}" transform="translate(${n(tx)} ${n(ty)})" d="${sprout}"/>`;
+  <path fill="${leaf}" transform="translate(${n(wordTx)} ${n(wordTy)})" d="${sprout}"/>`;
     return svgDoc(vb.join(" "), body, "plerni");
   };
 
+  const iconTx = pStem.cx;
+  const iconTy = pStem.top - gap;
+  const iconMinX = Math.min(glyphs.p.minX, iconTx - sproutW / 2);
+  const iconMaxX = Math.max(glyphs.p.maxX, iconTx + sproutW / 2);
+  const iconMinY = iconTy - sproutH;
+  const iconMaxY = glyphs.p.maxY;
+  const tileSize = 512;
+  const fit = tileSize * 0.66;
+  const iconScale = Math.min(fit / (iconMaxX - iconMinX), fit / (iconMaxY - iconMinY));
+  const iconOx = tileSize / 2 - ((iconMinX + iconMaxX) / 2) * iconScale;
+  const iconOy = tileSize / 2 - ((iconMinY + iconMaxY) / 2) * iconScale;
   const icon = (tile, ink, leaf) => {
-    const tx = pStem.cx;
-    const ty = pStem.top - gap;
-    const minX = Math.min(glyphs.p.minX, tx - sproutW / 2);
-    const maxX = Math.max(glyphs.p.maxX, tx + sproutW / 2);
-    const minY = ty - sproutH;
-    const maxY = glyphs.p.maxY;
-    const tileSize = 512;
-    const fit = tileSize * 0.66;
-    const s = Math.min(fit / (maxX - minX), fit / (maxY - minY));
-    const ox = tileSize / 2 - ((minX + maxX) / 2) * s;
-    const oy = tileSize / 2 - ((minY + maxY) / 2) * s;
     const rx = n(tileSize * 0.23);
     const body = `<rect width="${tileSize}" height="${tileSize}" rx="${rx}" fill="${tile}"/>
-  <g transform="translate(${n(ox)} ${n(oy)}) scale(${n(s)})">
+  <g transform="translate(${n(iconOx)} ${n(iconOy)}) scale(${n(iconScale)})">
     <path fill="${ink}" d="${glyphs.p.d}"/>
-    <path fill="${leaf}" transform="translate(${n(tx)} ${n(ty)})" d="${sprout}"/>
+    <path fill="${leaf}" transform="translate(${n(iconTx)} ${n(iconTy)})" d="${sprout}"/>
   </g>`;
     return svgDoc(`0 0 ${tileSize} ${tileSize}`, body, "plerni");
   };
@@ -227,6 +233,18 @@ function buildMarks(font) {
     iconLight: icon(PAPER, INK, PLUM),
     iconDark: icon(GROUND, PAPER, MINT),
     og: og(),
+    // Stem targets are the glyph stems, not the translate used to draw the sprout.
+    wordPlace: { view: wordView, ox: 0, oy: 0, s: 1, stemCx: iStem.cx, stemTop: iStem.top, gap, sproutH },
+    iconPlace: {
+      view: { x: 0, y: 0, w: tileSize, h: tileSize },
+      ox: Number(n(iconOx)),
+      oy: Number(n(iconOy)),
+      s: Number(n(iconScale)),
+      stemCx: pStem.cx,
+      stemTop: pStem.top,
+      gap,
+      sproutH,
+    },
   };
 }
 
@@ -263,49 +281,61 @@ async function raster(svg, width, height, flatten) {
   return pipeline.png({ compressionLevel: 9 }).toBuffer();
 }
 
-function nearest(r, g, b, palette) {
-  let name = null;
-  let best = 3600;
-  for (const [label, c] of palette) {
-    const d = (r - c[0]) ** 2 + (g - c[1]) ** 2 + (b - c[2]) ** 2;
-    if (d < best) {
-      best = d;
-      name = label;
-    }
-  }
-  return name;
-}
+const SAMPLE_W = 180;
+const COLOR_RADIUS = 30;
 
-async function centroid(buffer, palette, label) {
-  const { data, info } = await sharp(buffer)
-    .resize({ width: 180 })
-    .ensureAlpha()
-    .raw()
-    .toBuffer({ resolveWithObject: true });
+async function centroid(buffer, rgb) {
+  const { data, info } = await sharp(buffer).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+  const scale = SAMPLE_W / info.width;
   let sx = 0;
   let sy = 0;
   let sn = 0;
   for (let y = 0; y < info.height; y++) {
     for (let x = 0; x < info.width; x++) {
       const i = (y * info.width + x) * 4;
-      if (nearest(data[i], data[i + 1], data[i + 2], palette) === label) {
-        sx += x;
-        sy += y;
-        sn++;
-      }
+      // Rounded-tile corners are transparent and their RGB is 0. Skip them
+      // before matching, and keep only pixels close to the sprout colour so
+      // antialiased letter edges are not counted as the sprout.
+      if (data[i + 3] < 16) continue;
+      const d = (data[i] - rgb[0]) ** 2 + (data[i + 1] - rgb[1]) ** 2 + (data[i + 2] - rgb[2]) ** 2;
+      if (d > COLOR_RADIUS * COLOR_RADIUS) continue;
+      sx += x;
+      sy += y;
+      sn++;
     }
   }
-  if (sn < 8) throw new Error(`too few ${label} pixels (${sn})`);
-  return { x: sx / sn, y: sy / sn, n: sn };
+  if (sn < 8) throw new Error(`too few sprout pixels (${sn})`);
+  return { x: (sx / sn) * scale, y: (sy / sn) * scale, n: sn };
+}
+
+// Expected sprout centre from the stem, the gap, and the sprout height.
+// This does not read the translate that draws the sprout, so a drifted
+// translate fails the 2px bound on the SAMPLE_W-wide raster.
+function stemTarget(place) {
+  const x = place.ox + place.stemCx * place.s;
+  const y = place.oy + (place.stemTop - place.gap - place.sproutH / 2) * place.s;
+  const view = place.view;
+  const x0 = Number(n(view.x));
+  const y0 = Number(n(view.y));
+  const w = Number(n(view.w));
+  const h = Number(n(view.h));
+  return {
+    x: ((x - x0) / w) * SAMPLE_W,
+    y: ((y - y0) / h) * ((SAMPLE_W * h) / w),
+  };
 }
 
 async function main() {
   const bytes = await readFile(join(root, "source", "Nunito-SemiBold.ttf"));
   const font = opentype.parse(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
-  const fullName = font.names?.windows?.fullName?.en ?? font.names?.windows?.fontFamily?.en;
+  const names = font.names?.windows ?? {};
+  const fullName = names.fullName?.en;
+  const family = names.fontFamily?.en;
   const weight = font.tables.os2?.usWeightClass;
-  if (fullName !== "Nunito SemiBold" || weight !== 600) {
-    throw new Error(`expected Nunito SemiBold 600, got ${fullName} weight ${weight}`);
+  if (fullName !== "Nunito SemiBold" || family !== "Nunito SemiBold" || weight !== 600) {
+    throw new Error(
+      `expected Nunito SemiBold weight 600, got fullName ${fullName} family ${family} weight ${weight}`,
+    );
   }
   const marks = buildMarks(font);
   for (const svg of [marks.wordLight, marks.wordDark, marks.wordMono, marks.iconLight, marks.iconDark, marks.og]) {
@@ -362,40 +392,28 @@ async function main() {
   await writeFile(join(root, "favicon.ico"), icoBuf);
   console.log(`favicon.ico ${icoBuf.length} bytes (16+32+48)`);
 
-  const lightPalette = [
-    ["sprout", [110, 63, 115]],
-    ["ink", [31, 26, 36]],
-    ["paper", [255, 255, 255]],
+  const plum = [110, 63, 115];
+  const mint = [191, 232, 210];
+  const placement = {};
+  const checks = [
+    ["light icon", written["png/icon-light.png"], plum, marks.iconPlace],
+    ["dark icon", written["png/icon-dark.png"], mint, marks.iconPlace],
+    ["light wordmark", written["png/wordmark-light.png"], plum, marks.wordPlace],
   ];
-  const darkPalette = [
-    ["sprout", [191, 232, 210]],
-    ["ink", [255, 255, 255]],
-    ["ground", [63, 31, 68]],
-  ];
-  const iconLight = await Promise.all([
-    centroid(written["png/icon-light.png"], lightPalette, "sprout"),
-    centroid(written["png/icon-light.png"], lightPalette, "ink"),
-  ]);
-  if (!(iconLight[0].x < iconLight[1].x - 8) || !(iconLight[0].y < iconLight[1].y - 8)) {
-    throw new Error(`light icon sprout is not above the p stem: ${JSON.stringify(iconLight)}`);
+  for (const [label, buf, rgb, place] of checks) {
+    const sprout = await centroid(buf, rgb);
+    const target = stemTarget(place);
+    const dx = Math.abs(sprout.x - target.x);
+    const dy = Math.abs(sprout.y - target.y);
+    if (dx > 2 || dy > 2) {
+      throw new Error(
+        `${label} sprout is not centred on the stem ` +
+          `(dx=${dx.toFixed(2)} dy=${dy.toFixed(2)} px, limit 2 on a ${SAMPLE_W}px-wide sample)`,
+      );
+    }
+    placement[label] = { dx: Number(dx.toFixed(2)), dy: Number(dy.toFixed(2)) };
   }
-  const wordLight = await Promise.all([
-    centroid(written["png/wordmark-light.png"], lightPalette, "sprout"),
-    centroid(written["png/wordmark-light.png"], lightPalette, "ink"),
-  ]);
-  if (!(wordLight[0].x > wordLight[1].x) || !(wordLight[0].y < wordLight[1].y)) {
-    throw new Error(`wordmark sprout is not above the i: ${JSON.stringify(wordLight)}`);
-  }
-  const iconDark = await centroid(written["png/icon-dark.png"], darkPalette, "sprout");
-  const iconDarkInk = await centroid(written["png/icon-dark.png"], darkPalette, "ink");
-  if (!(iconDark.x < iconDarkInk.x - 8) || !(iconDark.y < iconDarkInk.y - 8)) {
-    throw new Error(`dark icon sprout is not above the p stem`);
-  }
-  console.log("placement checks ok", {
-    iconSprout: iconLight[0],
-    iconInk: iconLight[1],
-    wordSprout: wordLight[0],
-  });
+  console.log("placement checks ok", placement);
   console.log(`font ${fullName}; shared p path ${marks.pPath.length} chars; shared sprout ${marks.sprout.length} chars`);
 }
 

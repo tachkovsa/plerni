@@ -1,0 +1,7 @@
+{
+  "name": "fixture-isolated-gpl",
+  "private": true,
+  "dependencies": {
+    "fake-gpl-lib": "1.0.0"
+  }
+}

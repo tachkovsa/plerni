@@ -39,6 +39,17 @@ const cases = [
     expectExit: 0,
   },
   {
+    name: "license-audit blocks a GPL dependency declared outside the workspace",
+    cmd: gate("license-audit.mjs", "--root", join(fixtures, "isolated-gpl")),
+    expectExit: 1,
+    expectOutput: /forbidden license "GPL/,
+  },
+  {
+    name: "license-audit accepts an MIT dependency declared outside the workspace",
+    cmd: gate("license-audit.mjs", "--root", join(fixtures, "isolated-mit")),
+    expectExit: 0,
+  },
+  {
     name: "private-markers blocks machine-local paths/IPs",
     cmd: gate("private-markers.mjs", "--root", join(fixtures, "private-path")),
     expectExit: 1,

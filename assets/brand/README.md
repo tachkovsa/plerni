@@ -84,4 +84,4 @@ npm ci
 npm run export
 ```
 
-`export.mjs` rewrites the SVGs and the PNG/ICO files. Dependencies are pinned and were checked against the npm registry: `opentype.js` 2.0.0 (MIT) and `sharp` 0.35.5 (Apache-2.0). They are tools for this directory only, not appliance dependencies. The export checks that every mark still contains the shared `p` path and the shared sprout path, and that the sprout sits above the **i** in the wordmark and above the **p** stem in the icon.
+`export.mjs` rewrites the SVGs and the PNG/ICO files. Dependencies are pinned and were checked against the npm registry: `opentype.js` 2.0.0 (MIT) and `sharp` 0.35.5 (Apache-2.0). They are tools for this directory only, not appliance dependencies. The repository license-audit gate reads these two direct dependencies from `package.json` and `package-lock.json`. The export refuses any Nunito face other than SemiBold weight 600, checks that every mark still contains the shared `p` path and the shared sprout path, and checks that the sprout's raster centre stays within 2px of the **p** stem (icon) or the **i** stem (wordmark) on a 180px-wide sample. Fully transparent pixels are left out of that sample.
