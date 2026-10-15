@@ -1,0 +1,5 @@
+# Governed identity patterns for the author, the committer, and the message.
+# One regex per line. These are generic and safe to publish. Real private
+# markers stay in the gitignored .private-markers.local file.
+forbidden-provider\.example
+https?://\S+/(?:dashboard|artifacts?)(?:/|\s|$)

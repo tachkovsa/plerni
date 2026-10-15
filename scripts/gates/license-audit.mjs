@@ -8,9 +8,12 @@
  * A manifest with external dependencies and no package-lock.json fails
  * closed. The locked version of each direct dependency must satisfy the
  * manifest range. Every license is read from the installed package manifest,
- * never from the lockfile's license field. An optional dependency this
- * platform did not install is skipped. A required dependency that is not
- * installed fails closed. A required peer that is not installed fails closed.
+ * never from the lockfile's license field when the package is installed.
+ * An optional dependency this platform did not install is still judged from
+ * its package-lock.json entry, so other platforms are not approved by
+ * absence. A missing lock entry for that optional dependency fails closed.
+ * A required dependency that is not installed fails closed. A required peer
+ * that is not installed fails closed.
  * An optional peer (`peerDependenciesMeta.*.optional`) that is not installed
  * is skipped; an optional peer that is installed is judged.
  * Usage: node scripts/gates/license-audit.mjs [--root <dir>]
@@ -150,6 +153,67 @@ const resolveInstalled = (pkgDir, name) => {
   }
 };
 
+const lockCache = new Map();
+const seenLocked = new Set();
+
+const findLock = (startDir) => {
+  let dir = startDir;
+  for (;;) {
+    const candidate = join(dir, "package-lock.json");
+    if (existsSync(candidate)) return candidate;
+    const parent = dirname(dir);
+    if (parent === dir || relative(root, parent).startsWith("..")) return null;
+    dir = parent;
+  }
+};
+
+const readLock = (startDir) => {
+  const lockPath = findLock(startDir);
+  if (!lockPath) return null;
+  if (!lockCache.has(lockPath)) lockCache.set(lockPath, { lockPath, lock: JSON.parse(readFileSync(lockPath, "utf8")) });
+  return lockCache.get(lockPath);
+};
+
+const lockEntries = (lock, name) => {
+  const suffix = `node_modules/${name}`;
+  const hits = [];
+  for (const [key, entry] of Object.entries(lock.packages ?? {})) {
+    if (key === suffix || key.endsWith(`/${suffix}`)) hits.push(entry);
+  }
+  return hits;
+};
+
+// Optional packages for other OS/CPU targets are absent here. Their license
+// still comes from the lockfile, which records every platform.
+const auditLockedOptional = (startDir, name, label) => {
+  const found = readLock(startDir);
+  if (!found) {
+    failures.push(`${name} (optional dependency of ${label}): not installed and no package-lock.json — fail closed`);
+    return;
+  }
+  const entries = lockEntries(found.lock, name);
+  if (entries.length === 0) {
+    failures.push(
+      `${name} (optional dependency of ${label}): not installed and missing from package-lock.json — fail closed`,
+    );
+    return;
+  }
+  for (const entry of entries) {
+    const id = `${found.lockPath}\0${name}\0${entry.version ?? ""}\0${licenseOf(entry)}`;
+    if (seenLocked.has(id)) continue;
+    seenLocked.add(id);
+    checked++;
+    const lockedLabel = `${name} (lockfile optional dependency of ${label})`;
+    const problem = judge(lockedLabel, licenseOf(entry));
+    if (problem) failures.push(problem);
+    const nested = { ...entry.dependencies, ...entry.optionalDependencies };
+    for (const child of Object.keys(nested)) {
+      if (resolveInstalled(startDir, child)) continue;
+      auditLockedOptional(startDir, child, lockedLabel);
+    }
+  }
+};
+
 const auditTree = (pkgPath, label) => {
   // Follow the install layout (pnpm's virtual store is behind a symlink).
   const real = realpathSync(pkgPath);
@@ -172,8 +236,11 @@ const auditTree = (pkgPath, label) => {
   }
   for (const name of optional) {
     const child = resolveInstalled(dir, name);
-    if (!child) continue;
-    auditTree(child, `${name} (dependency of ${label})`);
+    if (child) {
+      auditTree(child, `${name} (dependency of ${label})`);
+      continue;
+    }
+    auditLockedOptional(dir, name, label);
   }
   const peerMeta = pkg.peerDependenciesMeta ?? {};
   for (const name of Object.keys(pkg.peerDependencies ?? {})) {

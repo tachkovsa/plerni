@@ -7,8 +7,10 @@
  * against fixtures/gitleaks (see .github/workflows/p0-gates.yml).
  */
 import { execFileSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const fixtures = join(here, "fixtures");
@@ -61,6 +63,12 @@ const cases = [
     cmd: gate("license-audit.mjs", "--root", join(fixtures, "isolated-peer")),
     expectExit: 1,
     expectOutput: /fake-gpl-peer \(dependency of fake-mit-lib \(brand\)\): forbidden license "GPL-3.0-only"/,
+  },
+  {
+    name: "license-audit blocks a forbidden lockfile license for another platform",
+    cmd: gate("license-audit.mjs", "--root", join(fixtures, "isolated-foreign")),
+    expectExit: 1,
+    expectOutput: /fake-darwin-gpl \(lockfile optional dependency of fake-mit-lib \(brand\)\): forbidden license "GPL-3.0-only"/,
   },
   {
     name: "license-audit blocks an isolated package with no lockfile",
@@ -117,20 +125,55 @@ const cases = [
   },
 ];
 
+const historyDir = mkdtempSync(join(tmpdir(), "plerni-commit-policy-"));
+const historyGit = (args) =>
+  execFileSync("git", ["-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", ...args], {
+    cwd: historyDir,
+    encoding: "utf8",
+  });
+historyGit(["init", "-q", "-b", "main"]);
+writeFileSync(join(historyDir, "README.md"), "one\n");
+historyGit(["add", "README.md"]);
+historyGit([
+  "-c", "user.name=Dev Example",
+  "-c", "user.email=dev@example.com",
+  "commit", "-q",
+  "-m", "feat: start\n\nhttps://docs.npmjs.com/cli/v7/configuring-npm/package-json\n\nAI-assisted: yes\n",
+]);
+const historyBase = historyGit(["rev-parse", "HEAD"]).trim();
+writeFileSync(join(historyDir, "note.md"), "two\n");
+historyGit(["add", "note.md"]);
+historyGit([
+  "-c", "user.name=Dev Example",
+  "-c", "user.email=dev@forbidden-provider.example",
+  "commit", "-q",
+  "-m", "feat: record a run\n\nhttps://forbidden-provider.example/dashboard/1\n\nAI-assisted: yes\n",
+]);
+cases.push({
+  name: "commit-policy history mode loads the governed identity list",
+  cmd: gate("commit-policy.mjs", "--cwd", historyDir, "--base", historyBase),
+  expectExit: 1,
+  expectOutput: /author matches a forbidden identity[\s\S]*message matches a forbidden identity/,
+});
+
 let failed = 0;
-for (const c of cases) {
-  let code = 0;
-  let output = "";
-  try {
-    output = execFileSync(c.cmd[0], c.cmd[1], { encoding: "utf8" });
-  } catch (e) {
-    code = e.status ?? 1;
-    output = `${e.stderr ?? ""}${e.stdout ?? ""}`;
+try {
+  for (const c of cases) {
+    let code = 0;
+    let output = "";
+    try {
+      output = execFileSync(c.cmd[0], c.cmd[1], { encoding: "utf8" });
+    } catch (e) {
+      code = e.status ?? 1;
+      output = `${e.stderr ?? ""}${e.stdout ?? ""}`;
+    }
+    let ok = code === c.expectExit;
+    if (ok && c.expectOutput) ok = c.expectOutput.test(output);
+    console.log(`${ok ? "✓" : "✗"} ${c.name} (exit ${code}, expected ${c.expectExit})`);
+    if (!ok) failed++;
   }
-  let ok = code === c.expectExit;
-  if (ok && c.expectOutput) ok = c.expectOutput.test(output);
-  console.log(`${ok ? "✓" : "✗"} ${c.name} (exit ${code}, expected ${c.expectExit})`);
-  if (!ok) failed++;
+} finally {
+  rmSync(historyDir, { recursive: true, force: true });
 }
 
 if (failed) {

@@ -9,10 +9,12 @@
  *
  * The author, the committer, and the full message are all checked. An
  * `AI-assisted:` line must be exactly `AI-assisted: yes`. Other URLs are
- * allowed. A URL or other text fails only when it matches a forbidden
- * identity pattern: `--identities <file>` and, on a git-history run, the
- * gitignored `.private-markers.local` at the repository root (one regex
- * per line, the same shape as the private-markers local file).
+ * allowed. A URL or other text fails when it matches a forbidden identity
+ * pattern. CI always loads the committed list `commit-identities.txt` next
+ * to this script. `--identities <file>` adds more. A git-history run also
+ * loads the gitignored `.private-markers.local` at the repository root.
+ * None of those files may contain private vendor or model names; the local
+ * file is the only place for maintainer-specific patterns.
  *
  * Modes:
  *   (default)     check `git log <base>..HEAD`; base = --base, else origin/dev
@@ -24,6 +26,8 @@
  */
 import { existsSync, readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 
 const { values } = parseArgs({
@@ -31,8 +35,12 @@ const { values } = parseArgs({
     file: { type: "string" },
     base: { type: "string" },
     identities: { type: "string" },
+    cwd: { type: "string" },
   },
 });
+
+const here = dirname(fileURLToPath(import.meta.url));
+const GOVERNED_IDENTITIES = join(here, "commit-identities.txt");
 
 const SUBJECT = /^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-z0-9._/-]+\))?!?: \S.*/;
 const AI_TRAILER = /^AI-assisted:.*$/gim;
@@ -77,11 +85,16 @@ const parseFileRecord = (chunk) => {
   return { author, committer, message: lines.slice(start).join("\n").trim() };
 };
 
-const identityPatterns = loadIdentityPatterns(values.identities);
+const identityPatterns = loadIdentityPatterns(GOVERNED_IDENTITIES);
+if (identityPatterns.length === 0) {
+  console.error(`commit-policy: governed identity list ${GOVERNED_IDENTITIES} is missing or empty — FAIL CLOSED`);
+  process.exit(1);
+}
+identityPatterns.push(...loadIdentityPatterns(values.identities));
 if (!values.file) {
   let top;
   try {
-    top = execFileSync("git", ["rev-parse", "--show-toplevel"], { encoding: "utf8" }).trim();
+    top = execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd: values.cwd, encoding: "utf8" }).trim();
   } catch {
     top = "";
   }
@@ -99,7 +112,7 @@ if (values.file) {
   let base = values.base;
   if (!base) {
     try {
-      execFileSync("git", ["rev-parse", "--verify", "origin/dev"], { stdio: "pipe" });
+      execFileSync("git", ["rev-parse", "--verify", "origin/dev"], { cwd: values.cwd, stdio: "pipe" });
       base = "origin/dev";
     } catch {
       base = "HEAD";
@@ -110,7 +123,7 @@ if (values.file) {
     out = execFileSync(
       "git",
       ["log", "--format=%h%x1f%an%x1f%ae%x1f%cn%x1f%ce%x1f%B%x1e", `${base}..HEAD`],
-      { encoding: "utf8" },
+      { cwd: values.cwd, encoding: "utf8" },
     );
   } catch (err) {
     console.error(`commit-policy: cannot read git history for ${base}..HEAD (${err.message}) — FAIL CLOSED`);
