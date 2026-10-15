@@ -554,6 +554,9 @@ test('echo: exits after the first framing error and drops later frames', async (
   const stderr = [];
   child.stdout.on('data', (chunk) => stdout.push(chunk));
   child.stderr.on('data', (chunk) => stderr.push(chunk));
+  // Subscribe before the child can exit. Attaching after the stderr poll misses
+  // 'close' when the process has already ended, and the test then never settles.
+  const closed = once(child, 'close');
 
   child.stdin.write('{bad\n');
   const deadline = Date.now() + 2000;
@@ -564,7 +567,7 @@ test('echo: exits after the first framing error and drops later frames', async (
 
   child.stdin.write('{"id":1}\n');
   const killTimer = setTimeout(() => child.kill(), 2000);
-  const [code] = await once(child, 'close');
+  const [code] = await closed;
   clearTimeout(killTimer);
   assert.equal(code, 1);
   assert.equal(Buffer.concat(stdout).toString('utf8').includes('"id":1'), false);
