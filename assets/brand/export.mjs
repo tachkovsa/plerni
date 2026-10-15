@@ -10,14 +10,16 @@
  * path and the same sprout path; only the placement of that sprout changes
  * (above the i in the wordmark, above the p stem on the tile).
  *
- * Pinned tools, checked on the npm registry: opentype.js 2.0.0 (MIT),
- * sharp 0.35.5 (Apache-2.0). Run `npm ci && npm run export` in this directory.
+ * Pinned tools, checked on the npm registry on 2026-10-15: opentype.js 2.0.0
+ * (MIT) and @napi-rs/canvas 1.0.11 (MIT, including its optional platform
+ * packages). The canvas Image constructor rasterizes an SVG buffer at the
+ * width and height it is given. Run `npm ci && npm run export` here.
  */
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createCanvas, Image, loadImage } from "@napi-rs/canvas";
 import opentype from "opentype.js";
-import sharp from "sharp";
 
 const root = dirname(fileURLToPath(import.meta.url));
 const FONT_SIZE = 1000;
@@ -271,28 +273,72 @@ function ico(pngs) {
   return Buffer.concat([dir, ...pngs.map((p) => p.buffer)]);
 }
 
-async function raster(svg, width, height, flatten) {
+// Move the viewBox origin to (0, 0). A negative origin (the wordmark) is
+// otherwise cropped by the rasterizer.
+function normalizeSvg(svg) {
+  const match = /viewBox="([^"]+)"/.exec(svg);
+  if (!match) throw new Error("svg is missing a viewBox");
+  const [x, y, w, h] = match[1].split(/\s+/).map(Number);
+  const inner = svg.replace(/^[\s\S]*?<svg[^>]*>/, "").replace(/<\/svg>\s*$/, "");
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">
+  <g transform="translate(${-x} ${-y})">
+  ${inner}
+  </g>
+</svg>
+`;
+}
+
+function pixelSize(svg, width, height) {
   // Height is set only when the SVG viewBox already has that aspect (icons, social).
   // Wordmarks pass height=null so the outlined proportions are not stretched.
-  let pipeline = height
-    ? sharp(Buffer.from(svg)).resize(width, height, { fit: "fill" })
-    : sharp(Buffer.from(svg)).resize({ width });
-  if (flatten) pipeline = pipeline.flatten({ background: flatten });
-  return pipeline.png({ compressionLevel: 9 }).toBuffer();
+  if (height) return { width, height };
+  const [, , vw, vh] = /viewBox="([^"]+)"/.exec(svg)[1].split(/\s+/).map(Number);
+  return { width, height: Math.round(width / (vw / vh)) };
+}
+
+function drawSvg(svg, width, height, flatten) {
+  const img = new Image(width, height);
+  img.src = Buffer.from(normalizeSvg(svg));
+  const canvas = createCanvas(width, height);
+  const ctx = canvas.getContext("2d");
+  if (flatten) {
+    ctx.fillStyle = flatten;
+    ctx.fillRect(0, 0, width, height);
+  }
+  ctx.drawImage(img, 0, 0, width, height);
+  return canvas;
+}
+
+function raster(svg, width, height, flatten) {
+  const size = pixelSize(svg, width, height);
+  return drawSvg(svg, size.width, size.height, flatten).toBuffer("image/png");
+}
+
+async function decodePng(buffer) {
+  // loadImage decodes the encoded PNG. Assigning the buffer to Image.src
+  // reports the size and then draws an empty frame.
+  const img = await loadImage(buffer);
+  if (!img.width || !img.height) throw new Error("could not decode png");
+  const canvas = createCanvas(img.width, img.height);
+  const ctx = canvas.getContext("2d");
+  ctx.drawImage(img, 0, 0);
+  const image = ctx.getImageData(0, 0, img.width, img.height);
+  return { data: image.data, width: img.width, height: img.height };
 }
 
 const SAMPLE_W = 180;
 const COLOR_RADIUS = 30;
 
 async function centroid(buffer, rgb) {
-  const { data, info } = await sharp(buffer).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
-  const scale = SAMPLE_W / info.width;
+  const { data, width, height } = await decodePng(buffer);
+  const scale = SAMPLE_W / width;
   let sx = 0;
   let sy = 0;
   let sn = 0;
-  for (let y = 0; y < info.height; y++) {
-    for (let x = 0; x < info.width; x++) {
-      const i = (y * info.width + x) * 4;
+    for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const i = (y * width + x) * 4;
       // Rounded-tile corners are transparent and their RGB is 0. Skip them
       // before matching, and keep only pixels close to the sprout colour so
       // antialiased letter edges are not counted as the sprout.
@@ -374,9 +420,9 @@ async function main() {
   ];
   const written = {};
   for (const [rel, svg, w, h, flatten] of jobs) {
-    const buf = await raster(svg, w, h, flatten);
+    const buf = raster(svg, w, h, flatten);
     await writeFile(join(root, rel), buf);
-    const meta = await sharp(buf).metadata();
+    const meta = await decodePng(buf);
     if (meta.width !== w || (h && meta.height !== h)) {
       throw new Error(`${rel} is ${meta.width}x${meta.height}`);
     }
@@ -387,7 +433,7 @@ async function main() {
   const icoBuf = ico([
     { size: 16, buffer: written["png/favicon-16.png"] },
     { size: 32, buffer: written["png/favicon-32.png"] },
-    { size: 48, buffer: await raster(marks.iconDark, 48, 48, GROUND) },
+    { size: 48, buffer: raster(marks.iconDark, 48, 48, GROUND) },
   ]);
   await writeFile(join(root, "favicon.ico"), icoBuf);
   console.log(`favicon.ico ${icoBuf.length} bytes (16+32+48)`);

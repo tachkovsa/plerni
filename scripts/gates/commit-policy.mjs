@@ -7,12 +7,17 @@
  * current stage; the CI step in `.github/workflows/p0-gates.yml` runs this
  * script and therefore does not require `Signed-off-by`.
  *
+ * The author, the committer, and the full message are all checked. A URL in
+ * any of those fields fails, and an `AI-assisted:` line must be exactly
+ * `AI-assisted: yes`.
+ *
  * Modes:
  *   (default)     check `git log <base>..HEAD`; base = --base, else origin/dev
  *                 when it exists, else HEAD (an empty range passes vacuously —
  *                 enforcement happens on PRs in CI).
- *   --file <path> check messages from a file; records separated by a line
- *                 containing only `===`.
+ *   --file <path> check records from a file; records separated by a line
+ *                 containing only `===`. A record may start with `author:`
+ *                 and `committer:` lines; the rest is the message.
  */
 import { readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
@@ -22,13 +27,38 @@ const { values } = parseArgs({ options: { file: { type: "string" }, base: { type
 
 const SUBJECT = /^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-z0-9._/-]+\))?!?: \S.*/;
 const AI_TRAILER = /^AI-assisted:.*$/gim;
+const URL = /https?:\/\//i;
+
+const parseFileRecord = (chunk) => {
+  const lines = chunk.trim().split("\n");
+  let author = "";
+  let committer = "";
+  let start = 0;
+  while (start < lines.length) {
+    const authorLine = /^author:\s*(.*)$/i.exec(lines[start]);
+    const committerLine = /^committer:\s*(.*)$/i.exec(lines[start]);
+    if (authorLine) {
+      author = authorLine[1].trim();
+      start++;
+      continue;
+    }
+    if (committerLine) {
+      committer = committerLine[1].trim();
+      start++;
+      continue;
+    }
+    break;
+  }
+  if ((author || committer) && lines[start]?.trim() === "") start++;
+  return { author, committer, message: lines.slice(start).join("\n").trim() };
+};
 
 const records = [];
 if (values.file) {
   const body = readFileSync(values.file, "utf8");
   body.split(/^===$/m).forEach((chunk, i) => {
-    const message = chunk.trim();
-    if (message) records.push({ id: `record-${i + 1}`, message });
+    const rec = parseFileRecord(chunk);
+    if (rec.message || rec.author || rec.committer) records.push({ id: `record-${i + 1}`, ...rec });
   });
 } else {
   let base = values.base;
@@ -42,7 +72,11 @@ if (values.file) {
   }
   let out;
   try {
-    out = execFileSync("git", ["log", "--format=%h%x1f%B%x1e", `${base}..HEAD`], { encoding: "utf8" });
+    out = execFileSync(
+      "git",
+      ["log", "--format=%h%x1f%an%x1f%ae%x1f%cn%x1f%ce%x1f%B%x1e", `${base}..HEAD`],
+      { encoding: "utf8" },
+    );
   } catch (err) {
     console.error(`commit-policy: cannot read git history for ${base}..HEAD (${err.message}) — FAIL CLOSED`);
     process.exit(1);
@@ -50,21 +84,39 @@ if (values.file) {
   for (const rec of out.split("\x1e")) {
     const trimmed = rec.trim();
     if (!trimmed) continue;
-    const sep = trimmed.indexOf("\x1f");
-    records.push({ id: trimmed.slice(0, sep), message: trimmed.slice(sep + 1).trim() });
+    const parts = trimmed.split("\x1f");
+    if (parts.length < 6) {
+      console.error(`commit-policy: malformed git record — FAIL CLOSED`);
+      process.exit(1);
+    }
+    records.push({
+      id: parts[0],
+      author: `${parts[1]} <${parts[2]}>`,
+      committer: `${parts[3]} <${parts[4]}>`,
+      message: parts.slice(5).join("\x1f").trim(),
+    });
   }
 }
 
 const violations = [];
-for (const { id, message } of records) {
+for (const { id, author = "", committer = "", message } of records) {
   const subject = message.split("\n")[0];
   if (subject.startsWith("Merge ")) continue; // transient merge commits (e.g. GitHub's PR merge refs) carry no policy metadata
   if (!SUBJECT.test(subject)) {
     violations.push(`${id}: non-conventional subject "${subject.slice(0, 60)}"`);
   }
-  for (const m of message.matchAll(AI_TRAILER)) {
-    if (m[0].trim() !== "AI-assisted: yes") {
-      violations.push(`${id}: identity-bearing trailer "${m[0].trim()}" — role-only \`AI-assisted: yes\` (AGENTS.md §0)`);
+  for (const [label, text] of [
+    ["author", author],
+    ["committer", committer],
+    ["message", message],
+  ]) {
+    if (URL.test(text)) violations.push(`${id}: ${label} contains a URL`);
+    for (const m of text.matchAll(AI_TRAILER)) {
+      if (m[0].trim() !== "AI-assisted: yes") {
+        violations.push(
+          `${id}: identity-bearing ${label} "${m[0].trim()}" — role-only \`AI-assisted: yes\` (AGENTS.md §0)`,
+        );
+      }
     }
   }
 }

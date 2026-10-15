@@ -1,19 +1,20 @@
 #!/usr/bin/env node
 /**
  * license-audit gate (spec §12): appliance dependencies must be OSI-approved.
- * Walks workspace package.json files, reads installed dependency licenses from
- * node_modules, and fails on missing/unknown/copyleft licenses.
- * Also audits direct dependencies of npm packages that sit outside the
- * workspace (assets/brand). A manifest with external dependencies and no
- * package-lock.json fails closed. The locked version must satisfy the
- * manifest range. The license is read from the installed package manifest,
- * never from the lockfile's license field. Transitive lockfile entries are
- * not a second policy — the gate checks declared dependencies, the same set
- * it checks for workspace packages.
+ * Walks workspace package.json files and the installed dependency graph,
+ * including transitive dependencies and platform-selected optional packages,
+ * and fails on missing/unknown/copyleft licenses.
+ * Also audits npm packages that sit outside the workspace (assets/brand).
+ * A manifest with external dependencies and no package-lock.json fails
+ * closed. The locked version of each direct dependency must satisfy the
+ * manifest range. Every license is read from the installed package manifest,
+ * never from the lockfile's license field. An optional dependency this
+ * platform did not install is skipped. A required dependency that is not
+ * installed fails closed.
  * Usage: node scripts/gates/license-audit.mjs [--root <dir>]
  */
-import { readFileSync, existsSync, readdirSync, statSync } from "node:fs";
-import { join, relative, sep } from "node:path";
+import { readFileSync, existsSync, readdirSync, realpathSync, statSync } from "node:fs";
+import { dirname, join, relative, sep } from "node:path";
 import { parseArgs } from "node:util";
 
 const { values } = parseArgs({ options: { root: { type: "string", default: "." } } });
@@ -85,6 +86,9 @@ const walkPackages = (dir) => {
 };
 walkPackages(root);
 
+let checked = 0;
+const seenPackages = new Set();
+
 const licenseOf = (pkg) => {
   const lic = pkg?.license;
   return typeof lic === "string" ? lic : lic?.type ?? "";
@@ -130,6 +134,47 @@ const satisfies = (version, range) => {
   return null;
 };
 
+// node resolution from pkgDir, never above --root. Scoped names are
+// node_modules/@scope/name. Missing optional packages are skipped by the caller.
+const resolveInstalled = (pkgDir, name) => {
+  let dir = pkgDir;
+  const segments = name.split("/");
+  for (;;) {
+    const candidate = join(dir, "node_modules", ...segments, "package.json");
+    if (existsSync(candidate)) return candidate;
+    const parent = dirname(dir);
+    if (parent === dir || relative(root, parent).startsWith("..")) return null;
+    dir = parent;
+  }
+};
+
+const auditTree = (pkgPath, label) => {
+  // Follow the install layout (pnpm's virtual store is behind a symlink).
+  const real = realpathSync(pkgPath);
+  if (seenPackages.has(real)) return;
+  seenPackages.add(real);
+  const pkg = JSON.parse(readFileSync(real, "utf8"));
+  checked++;
+  const problem = judge(label, licenseOf(pkg));
+  if (problem) failures.push(problem);
+  const dir = dirname(real);
+  const optional = new Set(Object.keys(pkg.optionalDependencies ?? {}));
+  for (const name of Object.keys(pkg.dependencies ?? {})) {
+    if (optional.has(name)) continue;
+    const child = resolveInstalled(dir, name);
+    if (!child) {
+      failures.push(`${name} (required by ${label}): not installed — fail closed`);
+      continue;
+    }
+    auditTree(child, `${name} (dependency of ${label})`);
+  }
+  for (const name of optional) {
+    const child = resolveInstalled(dir, name);
+    if (!child) continue;
+    auditTree(child, `${name} (dependency of ${label})`);
+  }
+};
+
 const lockDeps = [];
 let failures = [];
 for (const dir of isolatedDirs) {
@@ -161,8 +206,7 @@ for (const [name, ownerDir] of deps) {
     failures.push(`${name}: not installed (checked: ${candidates.join(", ")}) — run pnpm install; gate is fail-closed`);
     continue;
   }
-  const problem = judge(name, licenseOf(JSON.parse(readFileSync(pkgPath, "utf8"))));
-  if (problem) failures.push(problem);
+  auditTree(pkgPath, name);
 }
 
 for (const { name, range, dir } of lockDeps) {
@@ -195,12 +239,11 @@ for (const { name, range, dir } of lockDeps) {
       `${label}: installed version ${installed.version} does not match lockfile version ${entry.version}`,
     );
   }
-  const problem = judge(label, licenseOf(installed));
-  if (problem) failures.push(problem);
+  auditTree(installedPath, label);
 }
 
 if (failures.length) {
   console.error("license-audit: FAIL\n" + failures.map((f) => "  " + f).join("\n"));
   process.exit(1);
 }
-console.log(`license-audit: OK (${deps.size + lockDeps.length} dependencies checked)`);
+console.log(`license-audit: OK (${checked} dependencies checked)`);

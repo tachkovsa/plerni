@@ -7,7 +7,7 @@
     "export": "node export.mjs"
   },
   "dependencies": {
-    "opentype.js": "2.0.0",
-    "sharp": "0.35.5"
+    "@napi-rs/canvas": "1.0.11",
+    "opentype.js": "2.0.0"
   }
 }

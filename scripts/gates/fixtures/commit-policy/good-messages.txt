@@ -1,3 +1,6 @@
+author: Dev Example <dev@example.com>
+committer: Dev Example <dev@example.com>
+
 feat(kernel): add tenant guard
 
 Problem, decision, verification evidence.
