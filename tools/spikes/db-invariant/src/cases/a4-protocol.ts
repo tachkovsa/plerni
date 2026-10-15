@@ -4,10 +4,10 @@
 // pg_prepared_statements is never consulted: it is per-backend and a pool can miss names.
 // Benchmark is unnamed parameterized extended-protocol vs named, on a direct connection.
 // max_prepared_statements does not help unnamed traffic. Overhead opens A4b
-// (https://github.com/tachkovsa/plerni/issues/34) when the mean overhead is
-// above 20% (plan §3.1). Spread is recorded; it does not gate the trigger.
+// (https://github.com/tachkovsa/plerni/issues/34) when the mean is above 20%
+// (plan §3.1): a named-statement branch, max_prepared_statements > 0, then rerun A1–A3.
+// Spread is recorded and does not gate the trigger.
 // The benchmark alternates ABBA/BAAB across 10 reps.
-// (named-statement branch, max_prepared_statements > 0, rerun A1–A3) — a new experiment.
 import pg from 'pg';
 import { sql } from 'kysely';
 import { direct, pooled, rawApp, terminateBackendByPid } from '../client.ts';
@@ -19,8 +19,14 @@ const OVERHEAD_LIMIT_PCT = 20;
 const ITERATIONS = 2500;
 const REPS = 10;
 const A4B_ISSUE = 'https://github.com/tachkovsa/plerni/issues/34';
-// Student t, two-sided 95%, df = REPS - 1 = 9.
-const T_CRIT_95_DF9 = 2.262;
+// Two-sided 95% Student t, keyed by degrees of freedom (REPS - 1).
+const T_CRIT_95_BY_DF: Readonly<Record<number, number>> = { 9: 2.262 };
+
+function tCrit95(df: number): number {
+  const value = T_CRIT_95_BY_DF[df];
+  if (value === undefined) throw new Error(`no two-sided 95% t critical value for df ${df}`);
+  return value;
+}
 
 export interface ObservedName { name: string; protocol: 'simple' | 'extended' }
 
@@ -101,13 +107,14 @@ function overheadStats(xs: number[]): {
 } {
   const s = [...xs].sort((a, b) => a - b);
   const n = s.length;
+  if (n !== REPS) throw new Error(`overhead reps ${n} !== ${REPS}`);
   const mean = s.reduce((a, b) => a + b, 0) / n;
   const variance = s.reduce((a, b) => a + (b - mean) ** 2, 0) / (n - 1);
   const stddev = Math.sqrt(variance);
   const mid = Math.floor(n / 2);
   const median = n % 2 === 1 ? s[mid]! : (s[mid - 1]! + s[mid]!) / 2;
   const p95 = s[Math.min(n - 1, Math.ceil(0.95 * n) - 1)]!;
-  const half = T_CRIT_95_DF9 * stddev / Math.sqrt(n);
+  const half = tCrit95(n - 1) * stddev / Math.sqrt(n);
   return {
     min: round1(s[0]!), median: round1(median), p95: round1(p95), stddev: round1(stddev),
     mean: round1(mean), ci95Low: round1(mean - half), ci95High: round1(mean + half),

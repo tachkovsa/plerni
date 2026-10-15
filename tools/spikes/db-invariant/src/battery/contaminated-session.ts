@@ -34,6 +34,7 @@ function detailOf(rec: Recovery, injectedLogins: number): Record<string, unknown
     absenceOnReplacement: rec.replacementAbsent,
     rivalPid: rec.rivalPid,
     rivalGuc: rec.rivalGuc,
+    rivalWaiting: rec.rivalWaiting,
     rivalHeldOff: rec.rivalHeldOff,
     thrown: rec.thrown,
   };

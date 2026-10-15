@@ -8,7 +8,7 @@
 // Shared oracles below are also what the adversarial battery imports.
 import { sql, type Kysely, type Transaction } from 'kysely';
 import {
-  adminShow, direct, pooled, rawApp, rawRoot, terminateBackendByPid, type Db,
+  adminShow, direct, poolWaitingCount, pooled, rawApp, rawRoot, terminateBackendByPid, type Db,
 } from '../client.ts';
 import { record } from '../evidence.ts';
 import {
@@ -240,6 +240,7 @@ export interface Recovery {
   replacementAbsent: boolean;
   rivalPid: number | null;
   rivalGuc: string | null;
+  rivalWaiting: number;
   rivalHeldOff: boolean;
   thrown: string | null;
   alerts: string[];
@@ -257,6 +258,7 @@ export async function recoverInjected(db: Kysely<Db>, ev: HygieneEvidence, befor
   let thrown: string | null = null;
   let rivalPid: number | null = null;
   let rivalGuc: string | null = null;
+  let rivalWaiting = 0;
   let rivalHeldOff = false;
   let rivalPending: Promise<void> | null = null;
   const terminate = async (pid: number): Promise<void> => {
@@ -271,11 +273,17 @@ export async function recoverInjected(db: Kysely<Db>, ev: HygieneEvidence, befor
       (row) => { rivalPid = row.pid; rivalGuc = row.guc; },
       (e: unknown) => { thrown = thrown ?? (e instanceof Error ? e.message : String(e)); },
     );
-    // Let the checkout register on the pending queue. It cannot run until this connection is released.
-    await new Promise((resolve) => setImmediate(resolve));
-    if (entered) rivalHeldOff = false;
+    const deadline = performance.now() + BACKEND_GONE_DEADLINE_MS;
+    for (;;) {
+      rivalWaiting = poolWaitingCount(db);
+      if (rivalWaiting > 0 || entered) break;
+      if (performance.now() >= deadline) break;
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    // Queued, and still not inside the callback, before the backend is killed and released.
+    rivalHeldOff = rivalWaiting > 0 && !entered;
     await terminateBackendByPid(pid);
-    rivalHeldOff = !entered;
+    if (entered) rivalHeldOff = false;
   };
   try {
     const got = await withTenant(db, TENANT_B, ev, terminate, async (trx) => {
@@ -309,7 +317,7 @@ export async function recoverInjected(db: Kysely<Db>, ev: HygieneEvidence, befor
       && retries <= MAX_RETRY && terminations === 1,
     cleanupMs, terminations, attempts: ev.attempts, retries, deadPid, accessPid,
     followPid: follow?.pid ?? null, deadGone, backendGoneMs, detectedBeforeAccess, positive, replacementAbsent,
-    rivalPid, rivalGuc, rivalHeldOff, thrown,
+    rivalPid, rivalGuc, rivalWaiting, rivalHeldOff, thrown,
     alerts: [...ev.alerts],
   };
 }
@@ -489,6 +497,7 @@ function lifecycleDetail(rec: Recovery): Record<string, unknown> {
     followPid: rec.followPid,
     rivalPid: rec.rivalPid,
     rivalGuc: rec.rivalGuc,
+    rivalWaiting: rec.rivalWaiting,
     rivalHeldOff: rec.rivalHeldOff,
     alerts: rec.alerts,
     thrown: rec.thrown,

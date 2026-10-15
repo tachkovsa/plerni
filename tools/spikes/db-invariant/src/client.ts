@@ -35,11 +35,22 @@ const ROOT = process.env.HARNESS_ROOT_DSN
 // client-level 'error' with no active query to absorb it.
 export const idlePoolErrors: string[] = [];
 
+const pools = new WeakMap<Kysely<Db>, pg.Pool>();
+
 export function kyselyOf(dsn: string, max = 10): Kysely<Db> {
   const pool = new pg.Pool({ connectionString: dsn, max });
   pool.on('error', (e) => { idlePoolErrors.push(String(e)); });
   pool.on('connect', (client) => { client.on('error', (e) => { idlePoolErrors.push(String(e)); }); });
-  return new Kysely<Db>({ dialect: new PostgresDialect({ pool }) });
+  const db = new Kysely<Db>({ dialect: new PostgresDialect({ pool }) });
+  pools.set(db, pool);
+  return db;
+}
+
+/** Checkouts queued on this client's pool. The driver does not expose the count. */
+export function poolWaitingCount(db: Kysely<Db>): number {
+  const pool = pools.get(db);
+  if (!pool) throw new Error('spike client has no pool');
+  return pool.waitingCount;
 }
 
 export const direct = (max = 10) => kyselyOf(DIRECT, max);
