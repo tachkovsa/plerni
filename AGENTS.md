@@ -42,8 +42,8 @@ These guidelines apply to any reviewer, human or agent, reviewing pull requests 
 
 Review against the PR's task specification (the plan section or issue) and the spec. Flag deviations as blocking issues:
 
-- **BLOCKER:** **items explicitly on the task's NOT-list or edits to files/areas owned by other tasks** (e.g., a spike modifying the test harness owned by another task).
-- **MAJOR:** missing deliverables or acceptance criteria from the task; **unrequested additions not on the NOT-list** (scope creep).
+- **BLOCKER:** items explicitly on the task's NOT-list, or edits to files/areas owned by other tasks (e.g., a spike modifying the test harness owned by another task); **missing mandatory deliverables or acceptance criteria**.
+- **MAJOR:** unrequested additions not on the NOT-list (scope creep).
 - **MINOR:** incomplete references to the source spec or plan sections.
 
 ### 4.2 Evidence over claims
@@ -59,14 +59,14 @@ Verify every claim in the PR description and commit messages against the diff an
 Focus review effort on codebase-specific risks. When a rule cites a spec section or plan, verify the code against that source; where no citation exists, ask whether the pattern is correct rather than mandating a specific implementation.
 
 **Multi-tenancy and RLS (BLOCKER if violated, spec §5 + plan §2):**
-- Tenant context is transaction-local only via `set_config('plerni.tenant_id', value, true)` inside `BEGIN` (plan §2: ordered hygiene protocol).
+- Ordered hygiene protocol inside the pinned transaction (plan §2), in this order: ① `BEGIN`; ② inspect **before any local override** — named `plerni.*` GUCs via `current_setting(name, true)` (treat `''` as absent), `current_user = session_user`, and `search_path` equal to its pinned value; ③ contamination → `pg_terminate_backend(pg_backend_pid())`, security alert, bounded retry ≤2 on a fresh connection, then loud failure; ④ clean → `set_config('plerni.tenant_id', value, true)` and read back the authorized tenant; ⑤ only then tenant data access. A transaction-local `set_config` must not be used to mask a leaked session role or `search_path`.
 - Never session-level `SET` through the pool (survives transaction-mode reuse).
 - Application-layer tenant guard exists alongside RLS (two-layer fail-closed, spec §5).
 - Tenant-domain tables: `tenant_id NOT NULL` + `ENABLE` **and** `FORCE RLS` + exactly one canonical tenant policy (spec §4.6 boundary checker).
 
 **Connection handling (MAJOR if violated, spec §5 + plan §2):**
 - Pooled connections (via PgBouncer transaction mode) vs. direct/reserved connections are used correctly (spec §5: no session state on pooled connections).
-- No session state (`SET`, `LISTEN`, advisory locks) on pooled connections (spec §5).
+- No session state on pooled connections: session `SET`, `LISTEN`, or **session** advisory locks (spec §5). Transaction-scoped advisory locks (`pg_advisory_xact_lock`) end with the transaction and are not this ban.
 - Heartbeat/renewal traffic uses reserved-capacity paths (plan §4 B2: dedicated connection or separate pool).
 
 **State transitions and fencing (BLOCKER if violated, plan §4 B2):**
@@ -76,8 +76,8 @@ Focus review effort on codebase-specific risks. When a rule cites a spec section
 
 **Concurrency and shutdown (MAJOR if violated, plan §4 B2):**
 - Race conditions are tested with adversarial timing (not assumed away).
-- Shutdown ordering prevents deadlocks (plan B2: stop scheduling renewals before acquiring row locks).
-- Sweeper/recovery logic includes lease expiry checks and doesn't rewrite terminal states (plan B2).
+- Shutdown ordering (plan B2): stop scheduling renewals, then resolve the effects transaction, then drain outstanding renewals. Do not drain a renewal that is blocked on the effects transaction's row lock before that transaction resolves.
+- Sweeper applies lease expiry only to `ACTIVE` rows: never abandon `QUEUED` work (a backlog may outlive the lease), and never rewrite a terminal state (plan B2).
 
 **Kernel purity (BLOCKER if violated, spec §3):**
 - No domain nouns in the kernel (checked by the kernel-purity gate).
@@ -103,16 +103,17 @@ This is a defensive review of the project's own code changes. Report concrete fi
 - MCP/agent credentials never bypass human-only step-up (proof-of-human ceremony for sensitive/destructive actions, spec §8).
 - Tenant isolation: no cross-tenant reads; RLS policies are `ENABLE` **and** `FORCE RLS` (spec §4.6 boundary checker).
 
-**Plugin isolation and IPC (MAJOR if violated, spec §4.4 + plan §4 B6):**
-- Plugin-supplied identity fields are untrusted; identity is stamped by the supervisor from spawn-time credentials (plan B6).
-- Frame size limits are enforced; partial-buffer caps prevent unbounded buffering (plan B4).
-- Malformed input (never-terminated frames, oversize messages) fails with typed errors, not crashes (plan B4).
-- Per-plugin capability credentials bind every IPC call to plugin identity/version/grants (spec §4.4).
+**Plugin isolation and IPC (spec §4.4 + plan §4 B6):**
+- **BLOCKER:** Plugin-supplied identity is trusted, or identity is not stamped by the supervisor from the spawn-time credential before multiplexing (plan B6). A child claiming a sibling's identity is an authorization bypass.
+- **BLOCKER:** An IPC call is not bound to the per-plugin capability credential (plugin identity, version, and grants) (spec §4.4).
+- **MAJOR:** Frame size limits or partial-buffer caps are missing (plan B4; availability, not identity).
+- **MAJOR:** Malformed input (never-terminated frames, oversize messages) crashes instead of a typed error (plan B4).
 
 **Privilege and roles (spec §4.6):**
 - **BLOCKER:** `SUPERUSER` or `BYPASSRLS` in runtime application roles (spec §5).
 - **MAJOR:** Migration roles have `CREATE` on their own schema only; kernel-schema grants prohibited **except** declared read-only `REFERENCES` grants on kernel identity columns (`users(id, tenant_id)` per spec §4.6).
-- **MAJOR:** `GRANT ALL` is rejected by the grant linter (spec §4.6: runtime-DML-only grants).
+- **BLOCKER:** `GRANT ALL` reaches a runtime or plugin role (spec §4.6: the `TRUNCATE`/`TRIGGER` escape past RLS).
+- **MAJOR:** `GRANT ALL` that cannot affect runtime privileges (still a grant-linter violation; spec §4.6). Runtime-DML-only grants otherwise.
 
 **Supply chain (spec §4.1 + §12):**
 - **BLOCKER:** Untrusted PR input interpolated into workflow `run:` context (command injection).
@@ -135,7 +136,7 @@ This is a defensive review of the project's own code changes. Report concrete fi
 
 Every review ends with a verdict and a receipt:
 
-**Verdict:** `ACCEPT` | `ACCEPT-WITH-CHANGES` (non-blocking findings) | `REJECT` (blocking issues must be fixed).
+**Verdict:** `ACCEPT` | `ACCEPT-WITH-CHANGES` (every open finding is non-blocking) | `REJECT` (any open BLOCKER). `ACCEPT-WITH-CHANGES` is unavailable while a BLOCKER is open. Missing mandatory deliverables or acceptance criteria are BLOCKER (§4.1), so an incomplete task cannot take that verdict.
 
 **Findings grouped by severity:**
 - **BLOCKER:** must fix before merge (security, correctness, policy violations).
@@ -173,6 +174,6 @@ Every review comment requires a response in its thread:
 - **Declined or deferred:** Reply with the reason. If deferred, link the tracking issue. Leave the thread unresolved — the reviewer or maintainer decides whether to accept the response.
 - **Questions:** Answer directly. Resolve the thread only when nothing further is needed.
 - **Never resolve without replying** — a silently resolved thread wastes the reviewer's time and hides whether the issue was addressed.
-- **Never resolve BLOCKER or security findings without the fix commit** — severity matters; a response alone doesn't close a blocking issue.
+- **Never resolve a confirmed BLOCKER or security finding without the fix commit.** If the reviewer explicitly retracts the finding, or accepts the author's rationale in the thread, the thread may be resolved without a code change. A finding that still stands needs the fix commit.
 
 A PR is not ready for merge while any review thread remains unresolved.
