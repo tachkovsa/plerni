@@ -29,6 +29,7 @@ export async function b4() {
   const pair = await connectPair({
     sweeper: false,
     partialHighWater: Number.POSITIVE_INFINITY,
+    caps: { total: 8 * 1024 * 1024, totalGlobal: 8 * 1024 * 1024 },
   });
   try {
     const good = pair.sup.spawn({ pluginId: 'good', script: echoPath });
@@ -40,7 +41,7 @@ export async function b4() {
     const badFault = pair.sup.faults.find((f) => f.pluginId === 'bad');
     detail.malformed = {
       code: badFault?.code ?? null,
-      siblingAlive: pair.sup.children.get('good').exitCode == null,
+      processAlive: pair.sup.children.get('good').exitCode == null,
       siblingRoundTrip: await roundTrip(pair.stub, good.credential),
     };
 
@@ -62,20 +63,28 @@ export async function b4() {
     pair.stub.socket.write(len);
     const muxDeadline = Date.now() + 2_000;
     while (!pair.sup.framingFault && Date.now() < muxDeadline) await delay(10);
+    let reachable = true;
+    try {
+      reachable = await roundTrip(pair.stub, good.credential);
+    } catch {
+      reachable = false;
+    }
     detail.oversize = {
       code: pair.sup.framingFault,
       limit: HARD_FRAME,
-      siblingAlive: pair.sup.children.get('good').exitCode == null,
+      processAlive: pair.sup.children.get('good').exitCode == null,
+      reachable,
     };
 
     const pass = detail.malformed.code === 'NdjsonFramingError'
-      && detail.malformed.siblingAlive
+      && detail.malformed.processAlive
       && detail.malformed.siblingRoundTrip
       && detail.neverTerminated.code === 'NdjsonOversizeError'
       && detail.neverTerminated.bounded
       && detail.neverTerminated.siblingRoundTrip
       && detail.oversize.code === 'MuxOversizeError'
-      && detail.oversize.siblingAlive;
+      && detail.oversize.processAlive
+      && detail.oversize.reachable === false;
     return { pass, detail };
   } finally {
     await pair.close();

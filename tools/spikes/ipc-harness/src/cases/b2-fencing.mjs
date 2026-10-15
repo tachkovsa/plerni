@@ -11,7 +11,8 @@ const ignorePath = fileURLToPath(new URL('../children/ignore-cancel.mjs', import
 export async function b2() {
   if (!dbConfigured()) return { pass: false, detail: { error: 'no harness database' } };
   const useDirect = useDirectFromEnv();
-  const pair = await connectPair({ sweeper: true, useDirect });
+  // Smoke owns the ACTIVE→ABANDONED assertion. This case does not claim the sweeper ran.
+  const pair = await connectPair({ sweeper: false, useDirect });
   try {
     const lostId = await createExecution('b2-lost', 'tok-lost', useDirect);
     await dispatch(lostId, useDirect);
@@ -51,7 +52,6 @@ export async function b2() {
     const result = await resultP;
 
     const detail = {
-      sweeper: true,
       lost: lost.outcome,
       lostStatus: lostStatus?.status ?? null,
       ack: ack.outcome,

@@ -38,7 +38,10 @@ async function main() {
   let failed = false;
   for (const [name, fn] of cases) {
     const result = await fn();
-    const pass = name === 'b6-vacuity' ? result.pass === false : result.pass;
+    const pass = name === 'b6-vacuity'
+      ? result.pass === false && result.exploit === true && result.checks?.routing === true
+        && result.checks?.mismatch === true && result.checks?.stale === true
+      : result.pass;
     if (pass === false) failed = true;
     record({
       case: name,

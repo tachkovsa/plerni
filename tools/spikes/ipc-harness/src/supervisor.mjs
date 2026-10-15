@@ -2,6 +2,10 @@
 // before multiplexing, bind the per-plugin capability credential, run the sweeper.
 // Child-supplied plugin ids are untrusted hints (plan §4 B6, spec §4.4).
 // stampIdentity:false is the vacuity variant: it trusts the hint and must fail B6.
+//
+// Caps are per plugin, with a global ceiling. Pending entries expire on a
+// deadline. The high-priority mux queue is per plugin and faults the child
+// that overflows it. Admission rejections are coalesced so they cannot fill it.
 
 import { spawn } from 'node:child_process';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
@@ -16,13 +20,21 @@ function waitExit(child) {
       resolve();
       return;
     }
-    const timer = setTimeout(() => {
-      child.kill('SIGKILL');
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
       resolve();
+    };
+    const killTimer = setTimeout(() => {
+      if (child.exitCode == null && child.signalCode == null) child.kill('SIGKILL');
     }, 2_000);
+    // SIGKILL is not success by itself; wait for exit, then give up.
+    const giveUp = setTimeout(finish, 3_000);
     child.once('exit', () => {
-      clearTimeout(timer);
-      resolve();
+      clearTimeout(killTimer);
+      clearTimeout(giveUp);
+      finish();
     });
   });
 }
@@ -31,9 +43,16 @@ export const HARD_FRAME = 1024 * 1024;
 
 export const DEFAULT_CAPS = Object.freeze({
   pending: 32,
+  pendingGlobal: 256,
+  cancels: 64,
   partial: 64 * 1024,
-  total: 1024 * 1024,
+  total: 256 * 1024,
+  totalGlobal: 1024 * 1024,
+  hi: 32,
+  lo: 32,
 });
+
+const DEFAULT_DEADLINE_MS = 5_000;
 
 export function dbConfigured() {
   return Boolean(process.env.HARNESS_DIRECT_DSN || process.env.PLERNI_APP_PASSWORD);
@@ -65,23 +84,36 @@ export class Supervisor {
     this.stampIdentity = opts.stampIdentity !== false;
     this.useDirect = opts.useDirect ?? useDirectFromEnv();
     this.capsConfig = { ...DEFAULT_CAPS, ...opts.caps };
+    if (opts.caps?.pending != null && opts.caps.pendingGlobal == null) {
+      this.capsConfig.pendingGlobal = Math.max(DEFAULT_CAPS.pendingGlobal, this.capsConfig.pending);
+    }
+    if (opts.caps?.total != null && opts.caps.totalGlobal == null) {
+      this.capsConfig.totalGlobal = Math.max(this.capsConfig.total, DEFAULT_CAPS.totalGlobal);
+    }
     this.partialHighWater = opts.partialHighWater ?? this.capsConfig.partial;
     this.children = new Map();
     this.pending = new Map();
+    this.callPendingTotal = 0;
     this.retiredTokens = new Set();
     this.faults = [];
-    this.caps = { pending: false, partial: false, total: false };
-    this.hi = [];
-    this.lo = [];
+    this.caps = { pending: false, partial: false, total: false, lo: false, hi: false };
+    this.hi = new Map();
+    this.lo = new Map();
+    this.hiOrder = [];
+    this.loOrder = [];
+    this.hiTurn = 0;
+    this.loTurn = 0;
     this.queuedBytes = 0;
     this.draining = false;
     this.closed = false;
     this.framingFault = null;
     this.bulkSeen = 0;
+    this.answered = 0;
     this.bridge = new MuxFramer();
     const sweep = opts.sweeper ?? false;
     this.stopSweeper = sweep ? startSweeper(this.useDirect) : () => {};
     socket.on('data', (chunk) => this.#onSocket(chunk));
+    socket.on('error', () => {});
   }
 
   spawn(spec) {
@@ -103,12 +135,22 @@ export class Supervisor {
       token,
       script: spec.script,
       env: spec.env,
+      limits: {
+        pending: spec.pending ?? this.capsConfig.pending,
+        total: spec.total ?? this.capsConfig.total,
+      },
       framer: new NdjsonFramer(),
       outbound: 0,
+      hiBytes: 0,
+      loBytes: 0,
+      callPending: 0,
+      cancelPending: 0,
       dead: false,
       paused: false,
       pauseReason: null,
       exitCode: null,
+      rejectQueued: false,
+      rejectsCoalesced: 0,
     };
     child.stdout.on('data', (chunk) => this.#onChild(rec, chunk));
     child.stderr.on('data', () => {});
@@ -127,12 +169,14 @@ export class Supervisor {
     const generation = prev.credential.generation + 1;
     const script = prev.script;
     const env = prev.env;
+    const version = prev.credential.version;
+    const grants = prev.credential.grants;
     if (prev.child.exitCode == null && prev.child.signalCode == null) {
       prev.child.kill();
       await waitExit(prev.child);
     }
     this.children.delete(pluginId);
-    return this.spawn({ pluginId, script, env, generation });
+    return this.spawn({ pluginId, script, env, generation, version, grants });
   }
 
   // Refuses a token the crashed child held, and a token that is not the live spawn token.
@@ -154,9 +198,23 @@ export class Supervisor {
     return total;
   }
 
+  queueDepth(pluginId) {
+    const rec = this.children.get(pluginId);
+    return {
+      pending: rec?.callPending ?? 0,
+      partial: rec?.framer.pendingBytes() ?? 0,
+      pluginBytes: rec ? this.#pluginBytes(rec) : 0,
+      hi: this.hi.get(pluginId)?.length ?? 0,
+      lo: this.lo.get(pluginId)?.length ?? 0,
+      outbound: rec?.outbound ?? 0,
+    };
+  }
+
   async close() {
     this.closed = true;
     this.stopSweeper();
+    for (const pending of this.pending.values()) clearTimeout(pending.timer);
+    this.pending.clear();
     const waits = [];
     for (const rec of this.children.values()) {
       if (rec.child.exitCode == null && rec.child.signalCode == null) rec.child.kill();
@@ -166,6 +224,10 @@ export class Supervisor {
     await Promise.all(waits);
   }
 
+  #pluginBytes(rec) {
+    return rec.framer.pendingBytes() + rec.outbound + rec.hiBytes + rec.loBytes;
+  }
+
   #onSocket(chunk) {
     if (this.closed || this.framingFault) return;
     try {
@@ -173,7 +235,8 @@ export class Supervisor {
       for (const msg of this.bridge.frames()) this.#onMux(msg);
     } catch (err) {
       this.framingFault = err.constructor?.name || 'framing-error';
-      this.socket.pause();
+      this.#failAll(this.framingFault);
+      this.socket.destroy();
     }
   }
 
@@ -182,20 +245,19 @@ export class Supervisor {
     const rec = this.children.get(msg.pluginId);
     const reason = this.#authz(rec, msg);
     if (reason) {
-      this.#reject(msg, reason);
+      this.#reject(msg, reason, false);
       return;
     }
     const ingressTs = performance.now();
     if (msg.kind === 'cancel') {
+      if (rec.cancelPending >= this.capsConfig.cancels) {
+        this.caps.pending = true;
+        this.#reject(msg, 'pending-cap', true);
+        return;
+      }
       const line = encodeNdjson({ kind: 'cancel', correlationId: msg.correlationId });
+      this.#arm(rec, msg, { cancel: true, bytes: 0, ingressTs });
       rec.child.stdin.write(line);
-      this.pending.set(pendingKey(msg.pluginId, `cancel\0${msg.correlationId}`), {
-        pluginId: msg.pluginId,
-        correlationId: msg.correlationId,
-        sendTs: msg.sendTs,
-        ingressTs,
-        cancel: true,
-      });
       return;
     }
     const line = encodeNdjson({
@@ -206,26 +268,77 @@ export class Supervisor {
       payload: msg.payload,
     });
     const bytes = Buffer.byteLength(line);
-    if (this.pending.size >= this.capsConfig.pending) {
+    if (rec.callPending >= rec.limits.pending || this.callPendingTotal >= this.capsConfig.pendingGlobal) {
       this.caps.pending = true;
-      this.#reject(msg, 'pending-cap');
+      this.#reject(msg, 'pending-cap', true);
       return;
     }
-    if (this.bufferedBytes() + bytes > this.capsConfig.total) {
+    if (this.#pluginBytes(rec) + bytes > rec.limits.total || this.bufferedBytes() + bytes > this.capsConfig.totalGlobal) {
       this.caps.total = true;
-      this.#reject(msg, 'total-cap');
+      this.#reject(msg, 'total-cap', true);
       return;
     }
-    this.pending.set(pendingKey(msg.pluginId, msg.correlationId), {
-      pluginId: msg.pluginId,
-      correlationId: msg.correlationId,
-      sendTs: msg.sendTs,
-      ingressTs,
-    });
+    this.#arm(rec, msg, { cancel: false, bytes, ingressTs });
     rec.outbound += bytes;
     rec.child.stdin.write(line, () => {
       rec.outbound -= bytes;
     });
+  }
+
+  #arm(rec, msg, extra) {
+    const timeoutMs = Number.isFinite(msg.timeoutMs) ? msg.timeoutMs : DEFAULT_DEADLINE_MS;
+    const correlationId = extra.cancel ? `cancel\0${msg.correlationId}` : msg.correlationId;
+    const key = pendingKey(msg.pluginId, correlationId);
+    const timer = setTimeout(() => this.#expire(key), timeoutMs);
+    this.pending.set(key, {
+      pluginId: msg.pluginId,
+      correlationId: msg.correlationId,
+      generation: rec.credential.generation,
+      sendTs: msg.sendTs,
+      ingressTs: extra.ingressTs,
+      cancel: extra.cancel,
+      bytes: extra.bytes,
+      timer,
+    });
+    if (extra.cancel) rec.cancelPending++;
+    else {
+      rec.callPending++;
+      this.callPendingTotal++;
+      if (rec.callPending >= rec.limits.pending || this.callPendingTotal >= this.capsConfig.pendingGlobal) {
+        this.caps.pending = true;
+      }
+    }
+  }
+
+  #expire(key) {
+    const pending = this.#take(key);
+    if (!pending || this.closed) return;
+    this.#enqueue({
+      kind: 'error',
+      code: 'timeout',
+      for: pending.cancel ? 'cancel' : 'call',
+      pluginId: pending.pluginId,
+      correlationId: pending.correlationId,
+    }, 10, false);
+  }
+
+  #take(key) {
+    const pending = this.pending.get(key);
+    if (!pending) return null;
+    clearTimeout(pending.timer);
+    this.pending.delete(key);
+    const rec = this.children.get(pending.pluginId);
+    const same = rec && rec.credential.generation === pending.generation;
+    if (pending.cancel) {
+      if (same) rec.cancelPending--;
+    } else if (same) {
+      rec.callPending--;
+      this.callPendingTotal--;
+    } else {
+      this.callPendingTotal--;
+    }
+    this.#maybeResumeAll();
+    return pending;
   }
 
   #authz(rec, msg) {
@@ -246,46 +359,85 @@ export class Supervisor {
     return null;
   }
 
-  #reject(msg, code) {
+  #reject(msg, code, coalesce) {
     this.#enqueue({
       kind: 'rejected',
       code,
+      for: msg.kind === 'cancel' ? 'cancel' : 'call',
       pluginId: msg.pluginId,
       correlationId: msg.correlationId,
-    }, 10);
+    }, 10, coalesce);
   }
 
   #onChild(rec, chunk) {
     if (rec.dead || this.closed) return;
-    try {
-      rec.framer.feed(chunk);
-      for (const msg of rec.framer.frames()) this.#fromChild(rec, msg);
-      if (rec.framer.pendingBytes() >= this.partialHighWater) {
-        this.caps.partial = true;
-        this.#pause(rec, 'partial');
-      } else if (rec.paused && rec.pauseReason === 'partial') {
-        rec.paused = false;
-        rec.pauseReason = null;
-        rec.child.stdout.resume();
+    const incoming = rec.stash ? Buffer.concat([rec.stash, chunk]) : chunk;
+    rec.stash = null;
+    let offset = 0;
+    while (offset < incoming.length) {
+      if (rec.paused || rec.dead) {
+        rec.stash = Buffer.from(incoming.subarray(offset));
+        return;
       }
-      if (this.bufferedBytes() > this.capsConfig.total) {
-        this.caps.total = true;
-        this.#pause(rec, 'total');
+      const end = Math.min(incoming.length, offset + 4096);
+      const slice = incoming.subarray(offset, end);
+      offset = end;
+      try {
+        rec.framer.feed(slice);
+        for (const msg of rec.framer.frames()) this.#fromChild(rec, msg);
+      } catch (err) {
+        const code = err.constructor?.name || 'framing-error';
+        if (code === 'NdjsonOversizeError') this.caps.partial = true;
+        this.#fault(rec, code);
+        return;
       }
-    } catch (err) {
-      this.caps.partial = true;
-      this.#fault(rec, err.constructor?.name || 'framing-error');
+      this.#accountCaps(rec);
     }
   }
 
+  #accountCaps(rec) {
+    if (this.#pluginBytes(rec) > rec.limits.total) {
+      this.caps.total = true;
+      this.#pause(rec, 'total');
+    }
+    if (rec.framer.pendingBytes() >= this.partialHighWater) {
+      this.caps.partial = true;
+      this.#pause(rec, 'partial');
+    } else if (rec.paused && rec.pauseReason === 'partial') {
+      this.#unpause(rec);
+    }
+    if (this.bufferedBytes() > this.capsConfig.totalGlobal) this.caps.total = true;
+  }
+
   #pause(rec, reason) {
-    if (rec.paused) return;
+    if (rec.paused || rec.dead) return;
     rec.paused = true;
     rec.pauseReason = reason;
     rec.child.stdout.pause();
   }
 
+  #unpause(rec) {
+    if (!rec.paused || rec.dead) return;
+    rec.paused = false;
+    rec.pauseReason = null;
+    rec.child.stdout.resume();
+    if (rec.stash) {
+      const stash = rec.stash;
+      rec.stash = null;
+      this.#onChild(rec, stash);
+    }
+  }
+
+  #maybeResumeAll() {
+    const globalLow = this.bufferedBytes() <= this.capsConfig.totalGlobal / 2;
+    for (const rec of this.children.values()) {
+      if (!rec.paused || rec.pauseReason !== 'total') continue;
+      if (globalLow && this.#pluginBytes(rec) <= rec.limits.total / 2) this.#unpause(rec);
+    }
+  }
+
   #fromChild(rec, raw) {
+    if (rec.dead) return;
     const msg = normalizeEcho(raw);
     if (msg.kind === 'flood') {
       this.#bulk(rec);
@@ -298,9 +450,10 @@ export class Supervisor {
         this.#enqueue({
           kind: 'rejected',
           code: 'forged-plugin-id',
+          for: 'call',
           pluginId: rec.credential.pluginId,
           correlationId: msg.correlationId,
-        }, 10);
+        }, 10, false);
         return;
       }
     } else {
@@ -308,6 +461,19 @@ export class Supervisor {
     }
     if (msg.kind !== 'result' && msg.kind !== 'cancelled' && msg.kind !== 'error') return;
     this.#complete(rec, pluginId, msg);
+    if (msg.kind === 'cancelled') this.#dropCall(pluginId, msg.correlationId);
+  }
+
+  // A cancel acknowledgement retires the call slot. A timeout does not.
+  #dropCall(pluginId, correlationId) {
+    const pending = this.#take(pendingKey(pluginId, correlationId));
+    if (!pending) return;
+    this.#enqueue({
+      kind: 'cancelled',
+      for: 'call',
+      pluginId,
+      correlationId,
+    }, 10, false);
   }
 
   #complete(rec, pluginId, msg) {
@@ -321,16 +487,18 @@ export class Supervisor {
         this.#enqueue({
           kind: 'rejected',
           code: 'correlation-collision',
+          for: 'call',
           pluginId: rec.credential.pluginId,
           correlationId: msg.correlationId,
-        }, 10);
+        }, 10, false);
       }
       return;
     }
-    this.pending.delete(key);
-    this.#enqueue({
+    const lane = msg.kind === 'cancelled' ? 'cancel' : 'call';
+    const frame = {
       kind: msg.kind,
       code: msg.code,
+      for: lane,
       pluginId,
       correlationId: msg.correlationId,
       payload: msg.payload,
@@ -340,7 +508,24 @@ export class Supervisor {
       version: rec.credential.version,
       generation: rec.credential.generation,
       grants: rec.credential.grants,
-    }, msg.kind === 'cancelled' ? 10 : 1);
+    };
+    let buf;
+    try {
+      buf = encodeMux(frame);
+    } catch {
+      this.#take(key);
+      this.#enqueue({
+        kind: 'error',
+        code: 'result-oversize',
+        for: lane,
+        pluginId: pending.pluginId,
+        correlationId: pending.correlationId,
+      }, 10, false);
+      return;
+    }
+    if (!this.#take(key)) return;
+    if (msg.kind === 'result') this.answered++;
+    this.#enqueueBuf(buf, msg.kind === 'cancelled' ? 10 : 1, pluginId);
   }
 
   #ownedByOther(pluginId, correlationId) {
@@ -352,12 +537,19 @@ export class Supervisor {
 
   #bulk(rec) {
     this.bulkSeen++;
-    if (this.lo.length >= 32) {
-      this.caps.total = true;
+    const q = this.lo.get(rec.credential.pluginId);
+    if (q && q.length >= this.capsConfig.lo) {
+      this.caps.lo = true;
       this.#pause(rec, 'bulk');
       return;
     }
-    this.#enqueue({ kind: 'flood', pluginId: rec.credential.pluginId, correlationId: 0 }, 0);
+    const buf = encodeMux({ kind: 'flood', pluginId: rec.credential.pluginId, correlationId: 0 });
+    this.#enqueueBuf(buf, 0, rec.credential.pluginId);
+    const after = this.lo.get(rec.credential.pluginId);
+    if (after && after.length >= this.capsConfig.lo) {
+      this.caps.lo = true;
+      this.#pause(rec, 'bulk');
+    }
   }
 
   #fault(rec, code) {
@@ -368,6 +560,8 @@ export class Supervisor {
       code,
       pendingBytes: rec.framer.pendingBytes(),
     });
+    if (code === 'hi-cap') this.caps.hi = true;
+    this.#discardQueues(rec.credential.pluginId);
     rec.framer = new NdjsonFramer();
     rec.outbound = 0;
     this.retiredTokens.add(rec.token);
@@ -387,47 +581,157 @@ export class Supervisor {
   #failPending(rec, code) {
     for (const [key, pending] of this.pending) {
       if (pending.pluginId !== rec.credential.pluginId) continue;
-      this.pending.delete(key);
+      if (pending.generation !== rec.credential.generation) continue;
+      this.#take(key);
       this.#enqueue({
         kind: 'error',
         code,
+        for: pending.cancel ? 'cancel' : 'call',
         pluginId: rec.credential.pluginId,
         correlationId: pending.correlationId,
-      }, 10);
+      }, 10, false);
     }
   }
 
-  #enqueue(frame, priority) {
-    const buf = encodeMux(frame);
-    if (priority >= 10) this.hi.push(buf);
-    else {
-      this.lo.push(buf);
-      this.queuedBytes += buf.length;
+  #failAll(code) {
+    for (const [key, pending] of [...this.pending.entries()]) {
+      this.#take(key);
+      try {
+        const buf = encodeMux({
+          kind: 'error',
+          code,
+          for: pending.cancel ? 'cancel' : 'call',
+          pluginId: pending.pluginId,
+          correlationId: pending.correlationId,
+        });
+        this.socket.write(buf);
+      } catch {
+        // The bridge is already unusable.
+      }
+    }
+  }
+
+  #discardQueues(pluginId) {
+    for (const [map, bytesOf] of [[this.hi, 'hiBytes'], [this.lo, 'loBytes']]) {
+      const q = map.get(pluginId);
+      if (!q) continue;
+      for (const buf of q) this.queuedBytes -= buf.length;
+      map.delete(pluginId);
+      const rec = this.children.get(pluginId);
+      if (rec) rec[bytesOf] = 0;
+    }
+    this.hiOrder = this.hiOrder.filter((id) => id !== pluginId);
+    this.loOrder = this.loOrder.filter((id) => id !== pluginId);
+  }
+
+  #enqueue(frame, priority, coalesce) {
+    const pluginId = frame.pluginId;
+    if (coalesce && priority >= 10) {
+      const rec = this.children.get(pluginId);
+      if (rec?.rejectQueued) {
+        rec.rejectsCoalesced++;
+        return;
+      }
+    }
+    let buf;
+    try {
+      buf = encodeMux(frame);
+    } catch {
+      return;
+    }
+    if (priority >= 10 && !this.#roomHi(pluginId)) return;
+    this.#enqueueBuf(buf, priority, pluginId);
+    if (coalesce && priority >= 10) {
+      const rec = this.children.get(pluginId);
+      if (rec && (this.hi.get(pluginId)?.length ?? 0) > 0) rec.rejectQueued = true;
+    }
+  }
+
+  #roomHi(pluginId) {
+    const q = this.hi.get(pluginId);
+    if (!q || q.length < this.capsConfig.hi) return true;
+    const rec = this.children.get(pluginId);
+    if (rec && !rec.dead) this.#fault(rec, 'hi-cap');
+    return false;
+  }
+
+  #enqueueBuf(buf, priority, pluginId) {
+    const high = priority >= 10;
+    const map = high ? this.hi : this.lo;
+    const order = high ? this.hiOrder : this.loOrder;
+    const q = map.get(pluginId) ?? [];
+    if (!map.has(pluginId)) {
+      map.set(pluginId, q);
+      order.push(pluginId);
+    }
+    q.push(buf);
+    this.queuedBytes += buf.length;
+    const rec = this.children.get(pluginId);
+    if (rec) {
+      if (high) rec.hiBytes += buf.length;
+      else rec.loBytes += buf.length;
+    }
+    if (!high && rec && q.length >= this.capsConfig.lo) {
+      this.caps.lo = true;
+      this.#pause(rec, 'bulk');
     }
     this.#drain();
   }
 
+  #shift(map, order, byteField, turnField) {
+    if (order.length === 0) return null;
+    const start = this[turnField] % order.length;
+    for (let n = 0; n < order.length; n++) {
+      const idx = (start + n) % order.length;
+      const id = order[idx];
+      const q = map.get(id);
+      if (!q || q.length === 0) continue;
+      const buf = q.shift();
+      this.queuedBytes -= buf.length;
+      const rec = this.children.get(id);
+      if (rec) rec[byteField] -= buf.length;
+      if (q.length === 0) {
+        map.delete(id);
+        order.splice(idx, 1);
+        this[turnField] = order.length === 0 ? 0 : idx % order.length;
+        if (rec) rec.rejectQueued = false;
+      } else {
+        this[turnField] = (idx + 1) % order.length;
+      }
+      return { id, buf };
+    }
+    return null;
+  }
+
   #drain() {
-    if (this.draining || this.closed) return;
+    if (this.draining || this.closed || this.framingFault) return;
     this.draining = true;
     const step = () => {
-      if (this.closed) {
+      if (this.closed || this.framingFault) {
         this.draining = false;
         return;
       }
       let wrote = 0;
       while (wrote < 64) {
-        const fromHi = this.hi.length > 0;
-        const buf = fromHi ? this.hi.shift() : this.lo.shift();
-        if (!buf) {
-          this.draining = false;
+        const next = this.#shift(this.hi, this.hiOrder, 'hiBytes', 'hiTurn')
+          ?? this.#shift(this.lo, this.loOrder, 'loBytes', 'loTurn');
+        if (!next) {
           this.#resumeBulk();
+          this.#maybeResumeAll();
+          if (this.hiOrder.length > 0 || this.loOrder.length > 0) continue;
+          this.draining = false;
           return;
         }
-        if (!fromHi) this.queuedBytes -= buf.length;
         wrote++;
-        if (this.lo.length < 8) this.#resumeBulk();
-        if (!this.socket.write(buf)) {
+        if (this.#loLength() < 8) this.#resumeBulk();
+        let ok = true;
+        try {
+          ok = this.socket.write(next.buf);
+        } catch {
+          this.draining = false;
+          return;
+        }
+        if (!ok) {
           this.socket.once('drain', step);
           return;
         }
@@ -437,13 +741,16 @@ export class Supervisor {
     step();
   }
 
+  #loLength() {
+    let n = 0;
+    for (const q of this.lo.values()) n += q.length;
+    return n;
+  }
+
   #resumeBulk() {
+    if (this.#loLength() >= 8) return;
     for (const rec of this.children.values()) {
-      if (rec.paused && rec.pauseReason === 'bulk') {
-        rec.paused = false;
-        rec.pauseReason = null;
-        rec.child.stdout.resume();
-      }
+      if (rec.paused && rec.pauseReason === 'bulk') this.#unpause(rec);
     }
   }
 }

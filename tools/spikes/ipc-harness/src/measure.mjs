@@ -85,23 +85,78 @@ export function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+export function waitUntil(fn, ms) {
+  const deadline = Date.now() + ms;
+  return new Promise((resolve) => {
+    const step = () => {
+      if (fn()) {
+        resolve(true);
+        return;
+      }
+      if (Date.now() >= deadline) {
+        resolve(false);
+        return;
+      }
+      setTimeout(step, 10);
+    };
+    step();
+  });
+}
+
 // Fixed-rate open loop. Missed slots are not burst-replayed.
-export async function openLoop({ ms, rate, tick }) {
+// `skipped` counts schedule slots jumped after falling more than 50 ms behind.
+export async function openLoop({ ms, rate, tick, onSkip }) {
   const start = performance.now();
   const period = 1000 / rate;
   let next = start;
-  let sent = 0;
+  let issued = 0;
+  let skipped = 0;
   while (performance.now() - start < ms) {
     const now = performance.now();
     let budget = 0;
     while (next <= now && budget < 128 && performance.now() - start < ms) {
       tick();
       next += period;
-      sent++;
+      issued++;
       budget++;
     }
-    if (now - next > 50) next = performance.now();
+    const lag = performance.now() - next;
+    if (lag > 50) {
+      const missed = Math.floor(lag / period);
+      skipped += missed;
+      if (onSkip) onSkip(missed);
+      next = performance.now();
+    }
     await new Promise((resolve) => setImmediate(resolve));
   }
-  return sent;
+  return { issued, skipped, offered: issued + skipped };
+}
+
+// Rerun once when the environment is invalid. Thresholds are the caller's job
+// and run only on a scored attempt.
+export async function measureSeries({ reps, preflightFn, runRep }) {
+  const attempt = async () => {
+    const rows = [];
+    let invalid = false;
+    const before = preflightFn();
+    if (!before.valid) invalid = true;
+    for (let i = 0; i < reps; i++) {
+      const row = await runRep(i);
+      const after = preflightFn();
+      row.envAfter = after;
+      if (!before.valid || !after.valid) {
+        invalid = true;
+        row.invalid = true;
+      }
+      rows.push(row);
+    }
+    return { before, rows, invalid };
+  };
+  const first = await attempt();
+  if (!first.invalid) return { outcome: 'scored', env: first.before, rows: first.rows };
+  const second = await attempt();
+  if (second.invalid) {
+    return { outcome: 'invalid', pass: null, env: second.before, rows: first.rows, rerun: second.rows };
+  }
+  return { outcome: 'scored', env: second.before, rows: second.rows };
 }

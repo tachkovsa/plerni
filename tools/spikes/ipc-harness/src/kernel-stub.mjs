@@ -51,7 +51,12 @@ export class KernelStub {
     this.sentAt = new Map();
     this.floodFrames = 0;
     this.framingFault = null;
+    this.shut = false;
     socket.on('data', (chunk) => this.#onData(chunk));
+    socket.on('close', () => {
+      this.shut = true;
+      this.#rejectAll('closed');
+    });
   }
 
   #onData(chunk) {
@@ -73,7 +78,8 @@ export class KernelStub {
       return;
     }
     const key = pendingKey(msg.pluginId, msg.correlationId);
-    const bucket = msg.kind === 'cancelled' ? this.cancels : this.calls;
+    const cancelLane = msg.for === 'cancel' || msg.kind === 'cancelled';
+    const bucket = cancelLane ? this.cancels : this.calls;
     const waiter = bucket.get(key);
     if (!waiter) return;
     bucket.delete(key);
@@ -112,10 +118,12 @@ export class KernelStub {
   }
 
   #send(bucket, frame, timeoutMs) {
+    if (this.shut || this.socket.destroyed) return Promise.reject(fail('closed'));
     const key = pendingKey(frame.pluginId, frame.correlationId);
     const sentKey = `${bucket === this.cancels ? 'cancel' : 'call'}\0${key}`;
     this.sentAt.set(sentKey, performance.now());
     frame.sendTs = this.sentAt.get(sentKey);
+    frame.timeoutMs = timeoutMs;
     const pending = this.#track(bucket, frame.pluginId, frame.correlationId, timeoutMs);
     this.socket.write(encodeMux(frame));
     return pending;
@@ -150,7 +158,8 @@ export class KernelStub {
   }
 
   close() {
-    this.socket.destroy();
+    this.shut = true;
     this.#rejectAll('closed');
+    this.socket.destroy();
   }
 }

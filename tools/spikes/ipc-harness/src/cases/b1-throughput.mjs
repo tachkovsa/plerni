@@ -4,7 +4,7 @@
 
 import { fileURLToPath } from 'node:url';
 import { connectPair } from '../supervisor.mjs';
-import { CONTRACT, delay, openLoop, percentile, preflight } from '../measure.mjs';
+import { CONTRACT, delay, measureSeries, openLoop, percentile, preflight } from '../measure.mjs';
 
 const echoPath = fileURLToPath(new URL('../children/echo.mjs', import.meta.url));
 const PAYLOAD = 'x'.repeat(1024);
@@ -13,6 +13,7 @@ const IN_FLIGHT = 128;
 const OFFERED_RATE = 8_000;
 const TARGET_RATE = 5_000;
 const P99_MS = 10;
+const CALL_TIMEOUT = 2_000;
 
 async function rep({ warmupMs, windowMs }) {
   const pair = await connectPair({ sweeper: false, caps: { pending: 512, total: 8 * 1024 * 1024 } });
@@ -28,19 +29,32 @@ async function rep({ warmupMs, windowMs }) {
   let corrupt = 0;
   let errors = 0;
   let drops = 0;
+  let offered = 0;
+  let issued = 0;
   let inFlight = 0;
   let seq = 0;
   try {
     const started = performance.now();
+    const noteDrop = () => {
+      drops++;
+      samples.push(CALL_TIMEOUT);
+    };
     await openLoop({
       ms: warmupMs + windowMs,
       rate: OFFERED_RATE,
+      onSkip: (missed) => {
+        if (performance.now() - started < warmupMs) return;
+        offered += missed;
+        for (let i = 0; i < missed; i++) noteDrop();
+      },
       tick: () => {
         const record = performance.now() - started >= warmupMs;
+        if (record) offered++;
         if (inFlight >= IN_FLIGHT) {
-          if (record) drops++;
+          if (record) noteDrop();
           return;
         }
+        if (record) issued++;
         inFlight++;
         const kid = kids[seq % kids.length];
         const correlationId = ++seq;
@@ -51,7 +65,7 @@ async function rep({ warmupMs, windowMs }) {
           port: 'db',
           method: 'get',
           payload: PAYLOAD,
-        }, 2_000).then((res) => {
+        }, CALL_TIMEOUT).then((res) => {
           inFlight--;
           if (!record) return;
           completions++;
@@ -79,6 +93,8 @@ async function rep({ warmupMs, windowMs }) {
       corrupt,
       errors,
       drops,
+      offered,
+      issued,
     };
   } finally {
     await pair.close();
@@ -89,32 +105,30 @@ export async function b1(opts = {}) {
   const warmupMs = opts.warmupMs ?? CONTRACT.warmupMs;
   const windowMs = opts.windowMs ?? CONTRACT.windowMs;
   const repsN = opts.reps ?? CONTRACT.reps;
-  let env = preflight();
-  const measure = async () => {
-    const out = [];
-    for (let i = 0; i < repsN; i++) out.push(await rep({ warmupMs, windowMs }));
-    return out;
-  };
-  let results = await measure();
-  if (!env.valid) {
-    env = preflight();
-    const rerun = await measure();
-    if (!env.valid) {
-      return { pass: null, outcome: 'invalid', detail: { env, results, rerun } };
-    }
-    results = rerun;
+  const preflightFn = opts.preflight ?? preflight;
+  const series = await measureSeries({
+    reps: repsN,
+    preflightFn,
+    runRep: () => rep({ warmupMs, windowMs }),
+  });
+  if (series.outcome === 'invalid') {
+    return { pass: null, outcome: 'invalid', detail: { env: series.env, results: series.rows, rerun: series.rerun } };
   }
+  const results = series.rows;
   const pass = results.every((row) => row.achieved >= TARGET_RATE && row.p99 != null && row.p99 <= P99_MS && row.corrupt === 0 && row.errors === 0);
   return {
     pass,
     outcome: 'scored',
     detail: {
-      env,
+      env: series.env,
       targetRate: TARGET_RATE,
       p99Ms: P99_MS,
       payloadBytes: PAYLOAD.length,
       achieved: results.map((row) => row.achieved),
       p99s: results.map((row) => row.p99),
+      offered: results.map((row) => row.offered),
+      issued: results.map((row) => row.issued),
+      drops: results.map((row) => row.drops),
       reps: results,
       frozen: { children: CHILDREN, inFlight: IN_FLIGHT, offeredRate: OFFERED_RATE, warmupMs, windowMs, reps: repsN },
       endpoints: 'kernel send → supervisor ingress → child egress → kernel return',

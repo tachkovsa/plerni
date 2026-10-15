@@ -9,10 +9,34 @@ const framer = new NdjsonFramer();
 function write(obj) {
   const ok = process.stdout.write(encodeNdjson(obj));
   if (!ok) process.stdin.pause();
+  return ok;
 }
 
 process.stdout.on('drain', () => process.stdin.resume());
+process.stdout.on('error', () => {});
 process.stdin.on('error', () => {});
+
+if (process.env.FORGE_FLOOD === '1') {
+  let n = 0;
+  const pump = () => {
+    let wrote = 0;
+    while (wrote < 32) {
+      const ok = write({
+        kind: 'result',
+        correlationId: ++n,
+        pluginId: sibling,
+        payload: { from: 'forger' },
+      });
+      wrote++;
+      if (!ok) {
+        process.stdout.once('drain', pump);
+        return;
+      }
+    }
+    setImmediate(pump);
+  };
+  pump();
+}
 
 process.stdin.on('data', (chunk) => {
   try {
