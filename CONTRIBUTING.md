@@ -25,7 +25,7 @@ Commits containing substantial AI-generated or AI-rewritten code, tests, configu
 
 ## Review
 
-High-risk changes (authorization, tenancy, cryptography, plugin admission, migrations, CI/gates, release credentials, policy changes) require verification by a human or an agent of a different model family than every generator, recorded as a revision-bound review receipt — rules in `docs/ai/model-routing.md`. AI review findings elsewhere are advisory; mechanical gates and required approval artifacts block.
+High-risk changes (authorization, tenancy, cryptography, plugin admission, migrations, CI/gates, release credentials, policy changes) require verification by a human or an agent of a different model family than every generator, recorded as a revision-bound review receipt — rules in `docs/ai/model-routing.md`. AI review findings elsewhere are advisory; mechanical gates block. Migration approval artifacts still apply (spec §4.6). The signed approval artifact for gate-config changes is waived at the current stage (owner decision, 2026-10-15; `docs/ai/model-routing.md`).
 
 ## Conduct
 

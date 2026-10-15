@@ -13,7 +13,7 @@
 
 ## Escalation
 
-Disagreements escalate to the maintainer. High-risk changes (authorization, tenancy, cryptography, plugin admission, migrations, CI/gates, release credentials, policy changes) require verification by a human or an agent of a different model family than every generator, evidenced by a revision-bound review receipt (`docs/ai/model-routing.md`, principle 18); identities stay private per AGENTS.md §0. AI review findings elsewhere are advisory; mechanical gates and required approval artifacts block.
+Disagreements escalate to the maintainer. High-risk changes (authorization, tenancy, cryptography, plugin admission, migrations, CI/gates, release credentials, policy changes) require verification by a human or an agent of a different model family than every generator, evidenced by a revision-bound review receipt (`docs/ai/model-routing.md`, principle 18); identities stay private per AGENTS.md §0. AI review findings elsewhere are advisory; mechanical gates block. Migration approval artifacts still apply (spec §4.6). The signed approval artifact for gate-config changes is waived at the current stage (owner decision, 2026-10-15; `docs/ai/model-routing.md`).
 
 ## Branch protection (dev — the default branch)
 
