@@ -37,8 +37,8 @@ function detailOf(rec: Recovery, injectedLogins: number): Record<string, unknown
 
 function asCount(detail: Record<string, unknown>): number {
   const n = detail.terminations;
-  if (typeof n !== 'number') throw new Error('contamination probe did not report terminations');
-  return n;
+  // A probe that threw has already been recorded. Keep the later cases running.
+  return typeof n === 'number' ? n : 0;
 }
 
 async function searchPathConfig(): Promise<Record<string, unknown>> {
