@@ -42,8 +42,8 @@ These guidelines apply to any reviewer, human or agent, reviewing pull requests 
 
 Review against the PR's task specification (the plan section or issue) and the spec. Flag deviations as blocking issues:
 
-- **BLOCKER:** changes not described in the task's scope; **items explicitly on the task's NOT-list or edits to out-of-scope areas** (e.g., a spike modifying the test harness owned by another task).
-- **MAJOR:** missing deliverables or acceptance criteria from the task; **scope creep that adds unrequested features not on the NOT-list**.
+- **BLOCKER:** **items explicitly on the task's NOT-list or edits to files/areas owned by other tasks** (e.g., a spike modifying the test harness owned by another task).
+- **MAJOR:** missing deliverables or acceptance criteria from the task; **unrequested additions not on the NOT-list** (scope creep).
 - **MINOR:** incomplete references to the source spec or plan sections.
 
 ### 4.2 Evidence over claims
@@ -90,7 +90,7 @@ This is a defensive review of the project's own code changes. Report concrete fi
 **Secrets and credentials (BLOCKER if violated, AGENTS.md §0):**
 - No API keys, tokens, passwords, private keys, or "example-shaped" real secrets in commits, logs, error messages, or evidence files.
 - No secrets in compose output (use `--no-interpolate`), screenshots with real data, or PR body text.
-- Environment variables are the only secret entry path; `.env*` files remain gitignored.
+- Secret entry paths: environment variables or the operator's secret store (AGENTS.md §0); the kernel KEK may also come from a key file for air-gap deployments (spec §6). `.env*` files remain gitignored.
 
 **Injection vulnerabilities (BLOCKER if violated, spec §4.3):**
 - No SQL built by string interpolation (intervals, identifiers, dynamic `ORDER BY` columns must use allowlisted/parameterized mechanisms per spec §4.3 bounded grammar).
