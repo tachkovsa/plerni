@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // a4-protocol.ts — A4 (plan §3.1): unnamed extended-protocol discipline, measured honestly.
 // Outbound statement names are observed by wrapping pg's Query.submit path (parse + bind).
 // pg_prepared_statements is never consulted: it is per-backend and a pool can miss names.
@@ -162,11 +163,25 @@ async function benchmark(): Promise<{
   }
 }
 
+/** §3.0 control for the overhead probe: one unnamed extended query and one named statement. */
 async function rawNamedAndUnnamed(): Promise<unknown> {
-  return rawAppSteps([
-    { text: 'SELECT label FROM plerni_tenant WHERE label = $1', values: ['goal'] },
-    { text: 'SELECT label FROM plerni_tenant WHERE label = $1', values: ['goal'] },
-  ]);
+  const seen: ObservedName[] = [];
+  const unwatch = watchOutboundNames(seen);
+  try {
+    const rows = await rawAppSteps([
+      { text: 'SELECT label FROM plerni_tenant WHERE label = $1', values: ['goal'] },
+      { name: 'a4_raw_control', text: 'SELECT label FROM plerni_tenant WHERE label = $1', values: ['goal'] },
+    ]);
+    const extended = seen.filter((s) => s.protocol === 'extended').map((s) => s.name);
+    return {
+      rows,
+      extendedNames: [...new Set(extended)],
+      sawUnnamed: extended.includes(''),
+      sawNamed: extended.includes('a4_raw_control'),
+    };
+  } finally {
+    unwatch();
+  }
 }
 
 async function measureNames(): Promise<{ pass: boolean; detail: Record<string, unknown> }> {

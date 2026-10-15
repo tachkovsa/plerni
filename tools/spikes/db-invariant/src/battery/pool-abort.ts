@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // pool-abort.ts — battery §3.2.1: pool reuse after abort.
 // A transaction installs context and then aborts. The reused backend must show A2(c)
 // (normalized absence) and the two-layer fail-closed pair: RLS returns zero rows, the app guard raises.

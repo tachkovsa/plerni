@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // contaminated-session.ts — battery §3.2.3. Every class that survives transaction-mode reuse:
 // tenant GUC, SET ROLE (T2 membership fixture), search_path, a first-use connection, and
 // ALTER ROLE … SET via the superuser credential. Cleanup cost is measured.
@@ -31,6 +32,9 @@ function detailOf(rec: Recovery, injectedLogins: number): Record<string, unknown
     detectedBeforeAccess: rec.detectedBeforeAccess,
     positiveControl: rec.positive,
     absenceOnReplacement: rec.replacementAbsent,
+    rivalPid: rec.rivalPid,
+    rivalGuc: rec.rivalGuc,
+    rivalHeldOff: rec.rivalHeldOff,
     thrown: rec.thrown,
   };
 }
@@ -125,50 +129,32 @@ export async function contaminatedSession(): Promise<void> {
     await directPath.destroy();
   }
 
-  // Pooled, PostgreSQL 18: the server reports search_path and PgBouncer restores it on every
-  // server connection for this client (pgbouncer.org track_extra_parameters). Terminating the
-  // backend cannot clear it; the same client fails loud inside the retry budget. A new client
-  // does not inherit the tracked value.
+  // Pooled: killing the backend while the checkout is still held makes the driver drop that
+  // client. The retry is a new client, so a client-tracked search_path is not replayed onto it.
+  // Releasing a still-queryable client and killing afterwards is the ordering that leaves the
+  // tracked value in place. Config is recorded on the passing path.
   const path = await freshPool();
   try {
     const observed = await recordProbe(
       { case: 'battery contaminated search_path', datasource: 'pooled(1)' },
       async () => {
-        const pathEv = blankEv();
+        const ev = blankEv();
         await sql`SET search_path TO pg_catalog`.execute(path);
-        let loud: string | null = null;
-        try {
-          await withTenant(path, TENANT_B, pathEv, terminateBackendByPid, readRows);
-        } catch (e) {
-          loud = e instanceof Error ? e.message : String(e);
-        }
-        const replayInjections = MAX_RETRY + 1;
-        const replayed = pathEv.terminatedBackendPids.length === replayInjections
-          && pathEv.alerts.every((a) => a.includes('search_path'));
-        const fresh = await freshPool();
-        const freshEv = blankEv();
-        try {
-          await withTenant(fresh, TENANT_B, freshEv, terminateBackendByPid, readRows);
-          return {
-            pass: loud !== null && loud.includes('loud failure') && replayed && freshEv.terminatedBackendPids.length === 0,
-            detail: {
-              loud,
-              terminations: pathEv.terminatedBackendPids.length,
-              injectedLogins: replayInjections,
-              alerts: pathEv.alerts,
-              freshClientTerminations: freshEv.terminatedBackendPids.length,
-              config: await searchPathConfig(),
-              mechanism: 'PgBouncer restores client-tracked search_path onto each new server connection (PostgreSQL 18 reports it)',
-              wedge: 'terminate-and-retry cannot clear a client-tracked search_path; the client stays wedged until it disconnects',
-            },
-          };
-        } finally {
-          await fresh.destroy();
-        }
+        const rec = await recoverInjected(path, ev, 0);
+        const searchAlerts = ev.alerts.filter((a) => a.includes('search_path')).length;
+        return {
+          pass: rec.pass && searchAlerts === 1,
+          detail: {
+            ...detailOf(rec, 1),
+            searchAlerts,
+            config: await searchPathConfig(),
+            mechanism: 'The driver drops a client whose backend dies during the checkout. The retry is a new client, so client-tracked search_path is not replayed.',
+          },
+        };
       },
       rawSearchPath,
     );
-    injected += MAX_RETRY + 1;
+    injected += 1;
     terminated += asCount(observed.detail);
   } finally {
     await path.destroy();

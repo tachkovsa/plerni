@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // interleave.ts — battery §3.2.2: interleaved tenants on a pool of size 1.
 // Visibility tracks the transaction-local context. Positive controls run both ways (A then B).
 // One backend serves the whole sequence: a fresh server connection would make the oracle vacuous.

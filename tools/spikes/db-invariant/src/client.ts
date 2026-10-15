@@ -60,11 +60,23 @@ export const rawApp = () => {
 
 // The privileged termination path (γ-M1): in the spike, harness root; in production this is the
 // broker's maintenance identity (pg_signal_backend / membership), never the compromised session.
+const TERMINATE_DEADLINE_MS = 2000;
+
 export async function terminateBackendByPid(pid: number): Promise<void> {
   const c = rawRoot();
   await c.connect();
   try {
     await c.query('SELECT pg_terminate_backend($1)', [pid]);
+    // pg_terminate_backend only signals. Do not return while the pid is still queryable.
+    const deadline = performance.now() + TERMINATE_DEADLINE_MS;
+    for (;;) {
+      const r = await c.query('SELECT 1 FROM pg_stat_activity WHERE pid = $1', [pid]);
+      if (r.rows.length === 0) return;
+      if (performance.now() >= deadline) {
+        throw new Error(`backend ${pid} still present after terminate`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
   } finally {
     await c.end();
   }

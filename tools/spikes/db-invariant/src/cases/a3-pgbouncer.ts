@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // a3-pgbouncer.ts — A3 (plan §3.1): the full pinned flow through PgBouncer transaction mode.
 // A1+A2 stay green on the pooled datasource, including mid-transaction error → rollback →
 // context absent. Contamination lifecycle, inside the pinned transaction, before tenant access:
@@ -180,14 +181,20 @@ export async function recordProbe(
 }
 
 /** Minimal raw-pg script. Each step is a constant; a step error is data, not a thrown miss. */
-export async function rawAppSteps(steps: readonly { text: string; values?: unknown[] }[]): Promise<unknown[]> {
+export async function rawAppSteps(
+  steps: readonly { text: string; values?: unknown[]; name?: string }[],
+): Promise<unknown[]> {
   const c = rawApp();
   await c.connect();
   const out: unknown[] = [];
   try {
     for (const step of steps) {
       try {
-        const r = step.values === undefined ? await c.query(step.text) : await c.query(step.text, step.values);
+        const r = step.name !== undefined
+          ? await c.query({ name: step.name, text: step.text, values: step.values ?? [] })
+          : step.values === undefined
+            ? await c.query(step.text)
+            : await c.query(step.text, step.values);
         out.push(r.rows);
       } catch (e) {
         const code = typeof e === 'object' && e !== null && 'code' in e ? e.code : undefined;
@@ -217,18 +224,47 @@ export interface Recovery {
   detectedBeforeAccess: boolean;
   positive: boolean;
   replacementAbsent: boolean;
+  rivalPid: number | null;
+  rivalGuc: string | null;
+  rivalHeldOff: boolean;
   thrown: string | null;
   alerts: string[];
 }
 
-/** One injected contamination → detect, terminate, recover on the replacement, measure cleanup. */
+/**
+ * One injected contamination → detect, terminate, recover on the replacement, measure cleanup.
+ * The pool must be size 1. A competing checkout is queued inside the terminator, while the
+ * contaminated checkout is still held, and must not observe that backend.
+ */
 export async function recoverInjected(db: Kysely<Db>, ev: HygieneEvidence, before: number): Promise<Recovery> {
   const t0 = performance.now();
   let accessPid: number | null = null;
   let rows: TenantRow[] = [];
   let thrown: string | null = null;
+  let rivalPid: number | null = null;
+  let rivalGuc: string | null = null;
+  let rivalHeldOff = false;
+  let rivalPending: Promise<void> | null = null;
+  const terminate = async (pid: number): Promise<void> => {
+    let entered = false;
+    const pending = db.transaction().execute(async (trx) => {
+      entered = true;
+      const seen = await pidOf(trx);
+      const g = await sql<{ g: string | null }>`SELECT current_setting('plerni.tenant_id', true) AS g`.execute(trx);
+      return { pid: seen, guc: g.rows[0]?.g ?? null };
+    });
+    rivalPending = pending.then(
+      (row) => { rivalPid = row.pid; rivalGuc = row.guc; },
+      (e: unknown) => { thrown = thrown ?? (e instanceof Error ? e.message : String(e)); },
+    );
+    // Let the checkout register on the pending queue. It cannot run until this connection is released.
+    await new Promise((resolve) => setImmediate(resolve));
+    if (entered) rivalHeldOff = false;
+    await terminateBackendByPid(pid);
+    rivalHeldOff = !entered;
+  };
   try {
-    const got = await withTenant(db, TENANT_B, ev, terminateBackendByPid, async (trx) => {
+    const got = await withTenant(db, TENANT_B, ev, terminate, async (trx) => {
       const pid = await pidOf(trx);
       return { pid, rows: await readRows(trx) };
     });
@@ -237,6 +273,7 @@ export async function recoverInjected(db: Kysely<Db>, ev: HygieneEvidence, befor
   } catch (e) {
     thrown = e instanceof Error ? e.message : String(e);
   }
+  if (rivalPending) await rivalPending;
   const cleanupMs = Math.round(performance.now() - t0);
   const terminations = ev.terminatedBackendPids.length - before;
   const deadPid = terminations > 0 ? ev.terminatedBackendPids[ev.terminatedBackendPids.length - 1]! : null;
@@ -246,15 +283,19 @@ export async function recoverInjected(db: Kysely<Db>, ev: HygieneEvidence, befor
   const follow = thrown === null ? await absenceOn(db) : null;
   const detectedBeforeAccess = deadPid !== null && accessPid !== null && accessPid !== deadPid;
   const positive = onlyTenant(rows, TENANT_B);
+  const rivalClean = rivalPid !== null && deadPid !== null && rivalPid !== deadPid
+    && (rivalGuc === null || rivalGuc === '');
   const replacementAbsent = follow !== null
     && follow.absent && follow.rows === 0 && follow.guard
     && follow.pid === accessPid && follow.pid !== deadPid;
   const retries = Math.max(0, ev.attempts - 1);
   return {
     pass: thrown === null && detectedBeforeAccess && deadGone && positive && replacementAbsent
+      && rivalHeldOff && rivalClean
       && retries <= MAX_RETRY && terminations === 1,
     cleanupMs, terminations, attempts: ev.attempts, retries, deadPid, accessPid,
-    followPid: follow?.pid ?? null, deadGone, backendGoneMs, detectedBeforeAccess, positive, replacementAbsent, thrown,
+    followPid: follow?.pid ?? null, deadGone, backendGoneMs, detectedBeforeAccess, positive, replacementAbsent,
+    rivalPid, rivalGuc, rivalHeldOff, thrown,
     alerts: [...ev.alerts],
   };
 }
@@ -432,6 +473,9 @@ function lifecycleDetail(rec: Recovery): Record<string, unknown> {
     backendGoneMs: rec.backendGoneMs,
     replacementPid: rec.accessPid,
     followPid: rec.followPid,
+    rivalPid: rec.rivalPid,
+    rivalGuc: rec.rivalGuc,
+    rivalHeldOff: rec.rivalHeldOff,
     alerts: rec.alerts,
     thrown: rec.thrown,
   };

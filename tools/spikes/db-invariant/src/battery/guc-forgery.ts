@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // guc-forgery.ts — battery §3.2.4. Prototype evidence, scope "classifier shape" only.
 // Phase attribution (plan §3.2.4 / γ-N6): admission-parser machinery is P2 (spec §4.3);
 // the tenancy-gate GUC-forgery suite is spec §12 / P1; the §16.13 acceptance test is P3.
