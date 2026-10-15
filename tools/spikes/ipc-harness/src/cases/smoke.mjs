@@ -1,0 +1,359 @@
+// smoke.mjs — Smoke test: round-trip over stdio framing + authority transitions on harness PG.
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+import { NdjsonFramer, encodeNdjson } from '../framing.mjs';
+import {
+  createExecution,
+  dispatch,
+  commitExecution,
+  cancelExecution,
+  getStatus,
+  startSweeper,
+  sweepAbandoned,
+} from '../authority.mjs';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const echoPath = join(__dirname, '../children/echo.mjs');
+
+/**
+ * Round-trip NDJSON through a child. Framing errors are recorded instead of
+ * escaping the stdout handler. After the child closes, a leftover partial
+ * frame and a non-zero exit are both visible to the caller.
+ * @param {object[]} messages
+ * @param {{ command?: string, args?: string[] }} [opts]
+ */
+export async function echoRoundTrip(messages, opts = {}) {
+  const command = opts.command ?? 'node';
+  const args = opts.args ?? [echoPath];
+  const child = spawn(command, args);
+  const framer = new NdjsonFramer();
+  const received = [];
+  let feedError = null;
+
+  child.stdout.on('data', (chunk) => {
+    if (feedError) return;
+    try {
+      framer.feed(chunk);
+      for (const msg of framer.frames()) received.push(msg);
+    } catch (e) {
+      feedError = e;
+    }
+  });
+  child.stderr.on('data', () => {});
+  child.stdin.on('error', () => {});
+
+  for (const msg of messages) {
+    child.stdin.write(encodeNdjson(msg));
+  }
+  child.stdin.end();
+
+  const [exitCode] = await once(child, 'close');
+  let eofError = null;
+  if (!feedError) {
+    try {
+      framer.eof();
+    } catch (e) {
+      eofError = e;
+    }
+  }
+  return { received, exitCode, feedError, eofError };
+}
+
+// Test-only renewal that holds the authority row lock until the COMMITTED
+// update is about to run, then sleeps while still holding it. Production
+// renew() stays a single conditional update.
+function slowRenewal(ms) {
+  const gate = { holding: false, observed: false };
+  async function renew(id, token, reserved, ctl) {
+    await reserved.query('BEGIN');
+    try {
+      const locked = await reserved.query(
+        `SELECT id FROM fencing_authority WHERE id = $1 AND token = $2 AND status = 'ACTIVE' FOR UPDATE`,
+        [id, token],
+      );
+      if (locked.rowCount !== 1) {
+        await reserved.query('ROLLBACK');
+        return null;
+      }
+      gate.holding = true;
+      const deadline = Date.now() + 30_000;
+      while (!gate.observed && !ctl.stop && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      if (ctl.stop) {
+        await reserved.query('ROLLBACK');
+        return null;
+      }
+      await reserved.query('SELECT pg_sleep($1)', [ms / 1000]);
+      const r = await reserved.query(
+        `UPDATE fencing_authority SET heartbeat_at = clock_timestamp() WHERE id = $1 AND token = $2 AND status = 'ACTIVE' RETURNING clock_timestamp() AS renewed_at`,
+        [id, token],
+      );
+      await reserved.query('COMMIT');
+      return r.rowCount === 1 ? r.rows[0].renewed_at : null;
+    } catch (e) {
+      await reserved.query('ROLLBACK').catch(() => {});
+      throw e;
+    } finally {
+      gate.holding = false;
+    }
+  }
+  async function beforeCommit() {
+    const deadline = Date.now() + 20_000;
+    while (!gate.holding && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    gate.observed = true;
+  }
+  return { renew, beforeCommit };
+}
+
+export async function smoke() {
+  const evidence = { pass: true, detail: {} };
+  // Default to pooled main path (54321); direct only if SPIKE_USE_DIRECT=1
+  const useDirect = process.env.SPIKE_USE_DIRECT === '1';
+  evidence.detail.mainPath = useDirect ? 'direct' : 'pooled';
+
+  // ================
+  // Part 1: Framing
+  // ================
+  const sent = [
+    { id: 1, text: 'hello' },
+    { id: 2, text: 'world' },
+  ];
+  const round = await echoRoundTrip(sent);
+  const expectedEcho = sent.map((m) => ({ ...m, echoed: true }));
+  if (
+    round.exitCode !== 0 ||
+    round.feedError ||
+    round.eofError ||
+    JSON.stringify(round.received) !== JSON.stringify(expectedEcho)
+  ) {
+    evidence.pass = false;
+    evidence.detail.framing = {
+      sent,
+      received: round.received,
+      expected: expectedEcho,
+      exitCode: round.exitCode,
+      feedError: round.feedError ? round.feedError.message : null,
+      eofError: round.eofError ? round.eofError.message : null,
+    };
+  } else {
+    evidence.detail.framing = 'PASS';
+  }
+
+  // ==================
+  // Part 2: Authority - Basic lifecycle
+  // ==================
+  const stopSweeper = startSweeper(useDirect);
+
+  try {
+    // Case 1: Fast commit (no renewals)
+    const id1 = await createExecution('test-plugin', 'token-1', useDirect);
+    let status = await getStatus(id1, useDirect);
+    if (status.status !== 'QUEUED') {
+      evidence.pass = false;
+      evidence.detail.authority_queued = { expected: 'QUEUED', got: status.status };
+    }
+
+    await dispatch(id1, useDirect);
+    status = await getStatus(id1, useDirect);
+    if (status.status !== 'ACTIVE' || !status.heartbeat_at) {
+      evidence.pass = false;
+      evidence.detail.authority_active = { expected: 'ACTIVE', got: status };
+    }
+
+    const commitResult1 = await commitExecution(id1, 'token-1', async (c) => {
+      await c.query('SELECT pg_sleep(0.5)');
+    }, useDirect);
+    if (!commitResult1.committed) {
+      evidence.pass = false;
+      evidence.detail.authority_commit_fast = { expected: 'committed', got: commitResult1 };
+    }
+    status = await getStatus(id1, useDirect);
+    if (status.status !== 'COMMITTED') {
+      evidence.pass = false;
+      evidence.detail.authority_committed_fast = { expected: 'COMMITTED', got: status.status };
+    }
+
+    // Case 2: Long commit with multiple renewals (12s > 2× cadence of 5s)
+    console.log('[smoke] starting long execution (12s) to exercise renewals...');
+    const id4 = await createExecution('test-plugin', 'token-4', useDirect);
+    await dispatch(id4, useDirect);
+    const commitResult4 = await commitExecution(id4, 'token-4', async (c) => {
+      await c.query('SELECT pg_sleep(12)');
+    }, useDirect);
+    if (!commitResult4.committed) {
+      evidence.pass = false;
+      evidence.detail.authority_commit_long = { expected: 'committed', got: commitResult4 };
+    }
+    if (commitResult4.boundViolation) {
+      evidence.pass = false;
+      evidence.detail.authority_bound_violation_long = {
+        lastRenewalToLockMs: commitResult4.lastRenewalToLockMs,
+        bound: commitResult4.bound,
+      };
+    }
+    status = await getStatus(id4, useDirect);
+    if (status.status !== 'COMMITTED') {
+      evidence.pass = false;
+      evidence.detail.authority_committed_long = { expected: 'COMMITTED', got: status.status };
+    }
+    // Assert that renewals actually fired (heartbeat path required)
+    if (commitResult4.renewals < 1) {
+      evidence.pass = false;
+      evidence.detail.authority_no_renewals_long = {
+        expected: '>=1',
+        got: commitResult4.renewals,
+      };
+    }
+    if (commitResult4.renewals >= 1 && !(commitResult4.lastRenewalToLockMs >= 0)) {
+      evidence.pass = false;
+      evidence.detail.authority_renewal_clock_long = {
+        expected: '>=0',
+        got: commitResult4.lastRenewalToLockMs,
+      };
+    }
+    evidence.detail.authority_metrics_long = {
+      renewals: commitResult4.renewals,
+      lastRenewalToLockMs: commitResult4.lastRenewalToLockMs,
+      bound: commitResult4.bound,
+      effectsDuration: '12s',
+    };
+
+    // Case 3: Very long commit with renewal in-flight when lock acquired (16s > 3× cadence)
+    console.log('[smoke] starting very long execution (16s) to test in-flight renewal...');
+    const id5 = await createExecution('test-plugin', 'token-5', useDirect);
+    await dispatch(id5, useDirect);
+    const commitResult5 = await commitExecution(id5, 'token-5', async (c) => {
+      await c.query('SELECT pg_sleep(16)');
+    }, useDirect);
+    if (!commitResult5.committed) {
+      evidence.pass = false;
+      evidence.detail.authority_commit_verylong = { expected: 'committed', got: commitResult5 };
+    }
+    if (commitResult5.boundViolation) {
+      evidence.pass = false;
+      evidence.detail.authority_bound_violation_verylong = {
+        lastRenewalToLockMs: commitResult5.lastRenewalToLockMs,
+        bound: commitResult5.bound,
+      };
+    }
+    status = await getStatus(id5, useDirect);
+    if (status.status !== 'COMMITTED') {
+      evidence.pass = false;
+      evidence.detail.authority_committed_verylong = { expected: 'COMMITTED', got: status.status };
+    }
+    // Assert that renewals actually fired
+    if (commitResult5.renewals < 1) {
+      evidence.pass = false;
+      evidence.detail.authority_no_renewals_verylong = {
+        expected: '>=1',
+        got: commitResult5.renewals,
+      };
+    }
+    if (commitResult5.renewals >= 1 && !(commitResult5.lastRenewalToLockMs >= 0)) {
+      evidence.pass = false;
+      evidence.detail.authority_renewal_clock_verylong = {
+        expected: '>=0',
+        got: commitResult5.lastRenewalToLockMs,
+      };
+    }
+    evidence.detail.authority_metrics_verylong = {
+      renewals: commitResult5.renewals,
+      lastRenewalToLockMs: commitResult5.lastRenewalToLockMs,
+      bound: commitResult5.bound,
+      effectsDuration: '16s',
+    };
+
+    // Case 4: the smoke-only renewal takes the row lock on the first interval
+    // tick (5s; there is no renewal at 0s), waits until the COMMITTED update is
+    // about to run, then sleeps 2s while still holding the lock. Later ticks
+    // are skipped by single-flight.
+    console.log('[smoke] starting slow-renewal execution (11s + 2s slow renewal) to test lock collision...');
+    const id6 = await createExecution('test-plugin', 'token-6', useDirect);
+    await dispatch(id6, useDirect);
+    const commitResult6 = await commitExecution(id6, 'token-6', async (c) => {
+      await c.query('SELECT pg_sleep(11)');
+    }, useDirect, slowRenewal(2000));
+    if (!commitResult6.committed) {
+      evidence.pass = false;
+      evidence.detail.authority_commit_slowrenewal = { expected: 'committed', got: commitResult6 };
+    }
+    status = await getStatus(id6, useDirect);
+    if (status.status !== 'COMMITTED') {
+      evidence.pass = false;
+      evidence.detail.authority_committed_slowrenewal = { expected: 'COMMITTED', got: status.status };
+    }
+    // The slow renewal takes the row lock, waits until this commit is issued, then sleeps
+    // while still holding it. lockWaitMs is how long the COMMITTED update blocked on that lock.
+    if (commitResult6.renewals < 1) {
+      evidence.pass = false;
+      evidence.detail.authority_slowrenewal_not_durable = {
+        expected: '>=1',
+        got: commitResult6.renewals,
+      };
+    }
+    if (commitResult6.lockWaitMs < 1000) {
+      evidence.pass = false;
+      evidence.detail.authority_slowrenewal_no_lock_wait = {
+        expected: '>=1000',
+        got: commitResult6.lockWaitMs,
+      };
+    }
+    evidence.detail.authority_metrics_slowrenewal = {
+      renewals: commitResult6.renewals,
+      lastRenewalToLockMs: commitResult6.lastRenewalToLockMs,
+      lockWaitMs: commitResult6.lockWaitMs,
+      bound: commitResult6.bound,
+      boundViolation: commitResult6.boundViolation,
+      effectsDuration: '11s',
+      injectedSlowRenewalMs: 2000,
+      note: 'Slow renewal holds the authority row lock across a 2s sleep after the COMMITTED update is issued',
+    };
+
+    // Case 5: Cancellation path
+    const id2 = await createExecution('test-plugin', 'token-2', useDirect);
+    await dispatch(id2, useDirect);
+    const cancelled = await cancelExecution(id2, useDirect);
+    if (!cancelled) {
+      evidence.pass = false;
+      evidence.detail.authority_cancel = { expected: true, got: cancelled };
+    }
+    status = await getStatus(id2, useDirect);
+    if (status.status !== 'CANCELLED') {
+      evidence.pass = false;
+      evidence.detail.authority_cancelled = { expected: 'CANCELLED', got: status.status };
+    }
+
+    // Case 6: Sweeper abandonment (create ACTIVE, wait for lease expiry)
+    const id3 = await createExecution('test-plugin', 'token-3', useDirect);
+    await dispatch(id3, useDirect);
+    const statusBefore = await getStatus(id3, useDirect);
+    console.log('[smoke] waiting 22s for lease expiry (lease=20s)...');
+    await new Promise((resolve) => setTimeout(resolve, 22000));
+    // Trigger manual sweep to ensure it processes
+    await sweepAbandoned(useDirect);
+    status = await getStatus(id3, useDirect);
+    if (status.status !== 'ABANDONED') {
+      evidence.pass = false;
+      evidence.detail.authority_abandoned = {
+        expected: 'ABANDONED',
+        got: status.status,
+        heartbeat_at: status.heartbeat_at,
+        created_at: status.created_at,
+        statusBefore: statusBefore.status,
+      };
+    }
+
+    if (evidence.pass) {
+      evidence.detail.authority = 'PASS';
+    }
+  } finally {
+    stopSweeper();
+  }
+
+  return evidence;
+}
