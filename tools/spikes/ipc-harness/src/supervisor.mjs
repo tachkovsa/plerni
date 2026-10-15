@@ -5,7 +5,8 @@
 //
 // Caps are per plugin, with a global ceiling. Pending entries expire on a
 // deadline. The high-priority mux queue is per plugin and faults the child
-// that overflows it. Admission rejections are coalesced so they cannot fill it.
+// that overflows it with frames the child itself produced. Kernel-side
+// admission rejections are coalesced so they cannot fill that queue.
 
 import { spawn } from 'node:child_process';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
@@ -71,6 +72,14 @@ function secretMatch(a, b) {
   return timingSafeEqual(left, right);
 }
 
+function sameGrants(left, right) {
+  if (left.length !== right.length) return false;
+  for (let i = 0; i < left.length; i++) {
+    if (left[i] !== right[i]) return false;
+  }
+  return true;
+}
+
 function copyGrants(grants) {
   if (grants === undefined) return Object.freeze(['*']);
   if (!Array.isArray(grants)) {
@@ -125,6 +134,7 @@ export class Supervisor {
     this.loOrder = [];
     this.hiTurn = 0;
     this.loTurn = 0;
+    this.terminal = [];
     this.queuedBytes = 0;
     this.draining = false;
     this.closed = false;
@@ -224,8 +234,9 @@ export class Supervisor {
   bufferedBytes() {
     let total = this.queuedBytes + this.bridge.pendingBytes();
     for (const rec of this.children.values()) {
+      if (rec.dead) continue;
       total += rec.framer.pendingBytes();
-      total += rec.outbound;
+      total += Math.max(0, rec.outbound);
       total += rec.stash?.length ?? 0;
     }
     return total;
@@ -258,7 +269,7 @@ export class Supervisor {
   }
 
   #pluginBytes(rec) {
-    return rec.framer.pendingBytes() + rec.outbound + rec.hiBytes + rec.loBytes + (rec.stash?.length ?? 0);
+    return rec.framer.pendingBytes() + Math.max(0, rec.outbound) + rec.hiBytes + rec.loBytes + (rec.stash?.length ?? 0);
   }
 
   #onSocket(chunk) {
@@ -279,7 +290,7 @@ export class Supervisor {
     const rec = this.children.get(msg.pluginId);
     const reason = this.#authz(rec, msg);
     if (reason) {
-      this.#reject(msg, reason, false);
+      this.#reject(msg, reason, true);
       return;
     }
     const ingressTs = performance.now();
@@ -288,7 +299,7 @@ export class Supervisor {
       msg.kind === 'cancel' ? `cancel\0${msg.correlationId}` : msg.correlationId,
     );
     if (this.pending.has(laneKey)) {
-      this.#reject(msg, 'duplicate-correlation', false);
+      this.#reject(msg, 'duplicate-correlation', true);
       return;
     }
     if (msg.kind === 'cancel') {
@@ -307,8 +318,7 @@ export class Supervisor {
       this.#arm(rec, msg, { cancel: true, bytes, ingressTs });
       rec.outbound += bytes;
       rec.child.stdin.write(line, () => {
-        rec.outbound -= bytes;
-        this.#maybeResumeAll();
+        this.#releaseOutbound(rec, bytes);
       });
       return;
     }
@@ -333,9 +343,14 @@ export class Supervisor {
     this.#arm(rec, msg, { cancel: false, bytes, ingressTs });
     rec.outbound += bytes;
     rec.child.stdin.write(line, () => {
-      rec.outbound -= bytes;
-      this.#maybeResumeAll();
+      this.#releaseOutbound(rec, bytes);
     });
+  }
+
+  #releaseOutbound(rec, bytes) {
+    if (rec.dead) return;
+    rec.outbound = Math.max(0, rec.outbound - bytes);
+    this.#maybeResumeAll();
   }
 
   #pendingFull(rec) {
@@ -376,14 +391,14 @@ export class Supervisor {
   #expire(key) {
     const pending = this.#take(key);
     if (!pending || this.closed) return;
-    this.#enqueue({
+    this.#enqueueTerminal({
       kind: 'error',
       code: 'timeout',
       for: pending.cancel ? 'cancel' : 'call',
       pluginId: pending.pluginId,
       correlationId: pending.correlationId,
       generation: pending.generation,
-    }, 10, false);
+    });
   }
 
   #take(key) {
@@ -416,7 +431,7 @@ export class Supervisor {
     if (credential.generation !== rec.credential.generation) return 'stale-credential';
     if (credential.version !== rec.credential.version) return 'credential-mismatch';
     const grants = Array.isArray(credential.grants) ? credential.grants : [];
-    if (grants.join('\0') !== rec.credential.grants.join('\0')) return 'credential-mismatch';
+    if (!sameGrants(grants, rec.credential.grants)) return 'credential-mismatch';
     if (!secretMatch(credential.secret, rec.credential.secret)) return 'credential-mismatch';
     if (msg.kind === 'call' && !rec.credential.grants.includes('*') && !rec.credential.grants.includes(msg.port)) {
       return 'credential-mismatch';
@@ -461,19 +476,27 @@ export class Supervisor {
     }
   }
 
+  // Never discard unread bytes. A tail that fits stays in `stash`. A tail that
+  // would pass the cap is pushed back onto the child's stdout and the child
+  // stays paused, so the next resume sees the same bytes in order.
   #retainTail(rec, tail) {
     if (tail.length === 0 || rec.dead) return;
     const room = Math.min(
-      rec.limits.total - this.#pluginBytes(rec),
-      this.capsConfig.totalGlobal - this.bufferedBytes(),
+      Math.max(0, rec.limits.total - this.#pluginBytes(rec)),
+      Math.max(0, this.capsConfig.totalGlobal - this.bufferedBytes()),
     );
-    if (room <= 0 || tail.length > room) {
-      if (room > 0) rec.stash = Buffer.from(tail.subarray(0, room));
-      this.caps.total = true;
-      if (!rec.paused) this.#pause(rec, 'total');
+    if (tail.length <= room) {
+      rec.stash = Buffer.from(tail);
       return;
     }
-    rec.stash = Buffer.from(tail);
+    this.caps.total = true;
+    if (!rec.paused) this.#pause(rec, 'total');
+    else rec.child.stdout.pause();
+    try {
+      rec.child.stdout.unshift(Buffer.from(tail));
+    } catch {
+      this.#fault(rec, 'total-cap');
+    }
   }
 
   #accountCaps(rec) {
@@ -558,14 +581,18 @@ export class Supervisor {
       pluginId = claimed ?? rec.credential.pluginId;
     }
     if (msg.kind !== 'result' && msg.kind !== 'cancelled' && msg.kind !== 'error') return;
-    this.#complete(rec, pluginId, msg);
-    if (msg.kind === 'cancelled') this.#dropCall(pluginId, msg.correlationId);
+    const completed = this.#complete(rec, pluginId, msg);
+    if (msg.kind === 'cancelled' && completed) this.#dropCall(rec, pluginId, msg.correlationId);
   }
 
-  // A cancel acknowledgement retires the call slot. A timeout does not.
-  #dropCall(pluginId, correlationId) {
-    const pending = this.#take(pendingKey(pluginId, correlationId));
-    if (!pending) return;
+  // A cancel acknowledgement retires the matching call. An unsolicited cancel,
+  // or one from an older generation, leaves the call in place.
+  #dropCall(rec, pluginId, correlationId) {
+    const key = pendingKey(pluginId, correlationId);
+    const pending = this.pending.get(key);
+    if (!pending || pending.cancel) return;
+    if (pending.generation !== rec.credential.generation) return;
+    this.#take(key);
     this.#enqueue({
       kind: 'cancelled',
       for: 'call',
@@ -592,9 +619,9 @@ export class Supervisor {
           generation: rec.credential.generation,
         }, 10, false);
       }
-      return;
+      return false;
     }
-    if (pending.generation !== rec.credential.generation) return;
+    if (pending.generation !== rec.credential.generation) return false;
     const lane = msg.kind === 'cancelled' ? 'cancel' : 'call';
     const frame = {
       kind: msg.kind,
@@ -615,24 +642,25 @@ export class Supervisor {
       buf = encodeMux(frame);
     } catch {
       this.#take(key);
-      this.#enqueue({
+      this.#enqueueTerminal({
         kind: 'error',
         code: 'result-oversize',
         for: lane,
         pluginId: pending.pluginId,
         correlationId: pending.correlationId,
         generation: pending.generation,
-      }, 10, false);
-      return;
+      });
+      return false;
     }
     const priority = msg.kind === 'cancelled' ? 10 : 1;
     if (priority >= 10 && !this.#roomHi(pluginId)) {
       this.#take(key);
-      return;
+      return false;
     }
-    if (!this.#take(key)) return;
+    if (!this.#take(key)) return false;
     if (msg.kind === 'result') this.answered++;
     this.#enqueueBuf(buf, priority, pluginId);
+    return true;
   }
 
   #ownedByOther(pluginId, correlationId) {
@@ -670,8 +698,8 @@ export class Supervisor {
     if (code === 'hi-cap') this.caps.hi = true;
     this.#discardQueues(rec.credential.pluginId);
     rec.framer = new NdjsonFramer();
-    rec.outbound = 0;
     rec.stash = null;
+    rec.outbound = 0;
     this.retiredTokens.add(rec.token);
     this.#failPending(rec, code);
     if (rec.child.exitCode == null && rec.child.signalCode == null) rec.child.kill();
@@ -701,15 +729,27 @@ export class Supervisor {
       if (pending.pluginId !== rec.credential.pluginId) continue;
       if (pending.generation !== rec.credential.generation) continue;
       this.#take(key);
-      this.#enqueue({
+      this.#enqueueTerminal({
         kind: 'error',
         code,
         for: pending.cancel ? 'cancel' : 'call',
         pluginId: rec.credential.pluginId,
         correlationId: pending.correlationId,
         generation: pending.generation,
-      }, 10, false);
+      });
     }
+  }
+
+  #enqueueTerminal(frame) {
+    let buf;
+    try {
+      buf = encodeMux(frame);
+    } catch {
+      return;
+    }
+    this.terminal.push(buf);
+    this.queuedBytes += buf.length;
+    this.#drain();
   }
 
   #failAll(code) {
@@ -833,7 +873,8 @@ export class Supervisor {
       }
       let wrote = 0;
       while (wrote < 64) {
-        const next = this.#shift(this.hi, this.hiOrder, 'hiBytes', 'hiTurn')
+        const next = this.#shiftTerminal()
+          ?? this.#shift(this.hi, this.hiOrder, 'hiBytes', 'hiTurn')
           ?? this.#shift(this.lo, this.loOrder, 'loBytes', 'loTurn');
         if (!next) {
           this.#resumeBulk();
@@ -859,6 +900,13 @@ export class Supervisor {
       setImmediate(step);
     };
     step();
+  }
+
+  #shiftTerminal() {
+    const buf = this.terminal.shift();
+    if (!buf) return null;
+    this.queuedBytes -= buf.length;
+    return { id: null, buf };
   }
 
   #loLength() {
