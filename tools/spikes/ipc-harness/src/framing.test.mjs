@@ -4,6 +4,10 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 import {
   NdjsonFramer, encodeNdjson, NdjsonOversizeError, NdjsonNeverTerminatedError, NdjsonFramingError,
   MuxFramer, encodeMux, MuxOversizeError, MuxNeverTerminatedError, MuxFramingError,
@@ -258,4 +262,109 @@ test('Mux: byte-length limits (not UTF-16)', () => {
   const emoji = '😀';
   const payload = { text: emoji.repeat(300000) };
   assert.throws(() => encodeMux(payload), MuxOversizeError);
+});
+
+test('NDJSON: frames() after every byte does not recopy the prefix', () => {
+  const framer = new NdjsonFramer();
+  const msg = { text: 'a'.repeat(20000) };
+  const wire = Buffer.from(encodeNdjson(msg));
+  const out = [];
+  const started = performance.now();
+  for (let i = 0; i < wire.length; i++) {
+    framer.feed(wire.subarray(i, i + 1));
+    for (const frame of framer.frames()) out.push(frame);
+  }
+  const elapsed = performance.now() - started;
+  framer.eof();
+  assert.deepEqual(out, [msg]);
+  // A full prefix copy on every byte is quadratic (~2e8 byte-copies here) and
+  // takes seconds. Linear scanning finishes well under this bound.
+  assert.ok(elapsed < 1500, `byte-at-a-time parse took ${elapsed.toFixed(0)}ms`);
+});
+
+test('NDJSON: invalid UTF-8 inside a finished line is rejected', () => {
+  const framer = new NdjsonFramer();
+  // '1', dangling 0xC3, newline, then a valid second line. stream:true would
+  // accept JSON value 1 and leave the dangling byte for the next frame.
+  framer.feed(Buffer.from([0x31, 0xc3, 0x0a, 0x32, 0x0a]));
+  const frames = framer.frames();
+  assert.throws(() => frames.next(), NdjsonFramingError);
+});
+
+test('NDJSON: multibyte character split across chunks round-trips', () => {
+  const framer = new NdjsonFramer();
+  const line = Buffer.from('{"t":"é"}\n');
+  const split = line.indexOf(0xc3);
+  framer.feed(line.subarray(0, split + 1));
+  assert.equal([...framer.frames()].length, 0);
+  framer.feed(line.subarray(split + 1));
+  assert.deepEqual([...framer.frames()], [{ t: 'é' }]);
+});
+
+test('NDJSON: complete frames may exceed the partial-buffer cap in one feed', () => {
+  const framer = new NdjsonFramer();
+  const line = JSON.stringify({ n: 'x'.repeat(100_000) }) + '\n';
+  const blob = line.repeat(22);
+  assert.ok(Buffer.byteLength(blob) > 2 * 1024 * 1024);
+  framer.feed(blob);
+  assert.equal([...framer.frames()].length, 22);
+  framer.eof();
+});
+
+test('Mux: frames() after every byte does not recopy the prefix', () => {
+  const framer = new MuxFramer();
+  const msg = { text: 'b'.repeat(20000) };
+  const wire = encodeMux(msg);
+  const out = [];
+  const started = performance.now();
+  for (let i = 0; i < wire.length; i++) {
+    framer.feed(wire.subarray(i, i + 1));
+    for (const frame of framer.frames()) out.push(frame);
+  }
+  const elapsed = performance.now() - started;
+  assert.deepEqual(out, [msg]);
+  assert.ok(elapsed < 1500, `byte-at-a-time parse took ${elapsed.toFixed(0)}ms`);
+});
+
+test('Mux: invalid UTF-8 is a typed framing error', () => {
+  const framer = new MuxFramer();
+  const payload = Buffer.from([0xc3, 0x28]);
+  const len = Buffer.alloc(4);
+  len.writeUInt32BE(payload.length, 0);
+  framer.feed(Buffer.concat([len, payload]));
+  const frames = framer.frames();
+  assert.throws(() => frames.next(), MuxFramingError);
+});
+
+test('Mux: complete frames may exceed the partial-buffer cap in one feed', () => {
+  const framer = new MuxFramer();
+  const frame = encodeMux({ n: 'y'.repeat(100_000) });
+  const blob = Buffer.concat(Array.from({ length: 22 }, () => frame));
+  assert.ok(blob.length > 2 * 1024 * 1024);
+  framer.feed(blob);
+  assert.equal([...framer.frames()].length, 22);
+});
+
+test('echo: exits after the first framing error and drops later frames', async () => {
+  const echoPath = join(dirname(fileURLToPath(import.meta.url)), 'children', 'echo.mjs');
+  const child = spawn(process.execPath, [echoPath], { stdio: ['pipe', 'pipe', 'pipe'] });
+  child.stdin.on('error', () => {});
+  const stdout = [];
+  const stderr = [];
+  child.stdout.on('data', (chunk) => stdout.push(chunk));
+  child.stderr.on('data', (chunk) => stderr.push(chunk));
+
+  child.stdin.write('{bad\n');
+  const deadline = Date.now() + 2000;
+  while (Date.now() < deadline && !Buffer.concat(stderr).toString('utf8').includes('framing error')) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.match(Buffer.concat(stderr).toString('utf8'), /framing error/);
+
+  child.stdin.write('{"id":1}\n');
+  const killTimer = setTimeout(() => child.kill(), 2000);
+  const [code] = await once(child, 'close');
+  clearTimeout(killTimer);
+  assert.equal(code, 1);
+  assert.equal(Buffer.concat(stdout).toString('utf8').includes('"id":1'), false);
 });

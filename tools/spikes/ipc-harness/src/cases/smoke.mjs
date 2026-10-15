@@ -29,7 +29,7 @@ export async function smoke() {
   const received = [];
 
   child.stdout.on('data', (chunk) => {
-    framer.feed(chunk.toString('utf8'));
+    framer.feed(chunk);
     for (const msg of framer.frames()) {
       received.push(msg);
     }
@@ -178,21 +178,36 @@ export async function smoke() {
       evidence.pass = false;
       evidence.detail.authority_commit_slowrenewal = { expected: 'committed', got: commitResult6 };
     }
-    // Slow renewal case: bound may be violated (renewal starts before lock, completes during drain)
-    // The drain awaits it, so outcome stays correct even if lastRenewalToLockMs > CADENCE
     status = await getStatus(id6, useDirect);
     if (status.status !== 'COMMITTED') {
       evidence.pass = false;
       evidence.detail.authority_committed_slowrenewal = { expected: 'COMMITTED', got: status.status };
     }
+    // The slow renewal takes the row lock, waits until this commit is issued, then sleeps
+    // while still holding it. lockWaitMs is how long the COMMITTED update blocked on that lock.
+    if (commitResult6.renewals < 1) {
+      evidence.pass = false;
+      evidence.detail.authority_slowrenewal_not_durable = {
+        expected: '>=1',
+        got: commitResult6.renewals,
+      };
+    }
+    if (commitResult6.lockWaitMs < 1000) {
+      evidence.pass = false;
+      evidence.detail.authority_slowrenewal_no_lock_wait = {
+        expected: '>=1000',
+        got: commitResult6.lockWaitMs,
+      };
+    }
     evidence.detail.authority_metrics_slowrenewal = {
       renewals: commitResult6.renewals,
       lastRenewalToLockMs: commitResult6.lastRenewalToLockMs,
+      lockWaitMs: commitResult6.lockWaitMs,
       bound: commitResult6.bound,
       boundViolation: commitResult6.boundViolation,
       effectsDuration: '11s',
       injectedSlowRenewalMs: 2000,
-      note: 'Slow renewal (2s) races lock; drained after COMMIT; lastRenewalToLockMs measured at actual lock boundary',
+      note: 'Slow renewal holds the authority row lock across a 2s sleep after the COMMITTED update is issued',
     };
 
     // Case 5: Cancellation path

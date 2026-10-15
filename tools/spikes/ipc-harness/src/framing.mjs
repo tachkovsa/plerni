@@ -3,7 +3,68 @@
 // Property tests verify: arbitrary byte streams never corrupt frames; oversize/malformed → typed errors.
 
 const MAX_FRAME_SIZE = 1024 * 1024; // 1 MiB
-const MAX_PARTIAL_BUFFER = 2 * MAX_FRAME_SIZE; // per-connection buffer cap
+const MAX_PARTIAL_BUFFER = 2 * MAX_FRAME_SIZE; // cap on the residual partial frame only
+
+// Contiguous buffer with power-of-two growth. Appending a chunk copies only the
+// new bytes into spare capacity; the prefix is copied only when capacity doubles,
+// so a byte-at-a-time peer costs linear work. Offsets are logical (relative to #start).
+class ByteBuf {
+  #buf = Buffer.alloc(256);
+  #start = 0;
+  #end = 0;
+
+  get length() {
+    return this.#end - this.#start;
+  }
+
+  append(chunk) {
+    if (chunk.length === 0) return;
+    const used = this.#end - this.#start;
+    if (this.#end + chunk.length > this.#buf.length) {
+      let cap = this.#buf.length;
+      while (cap < used + chunk.length) cap *= 2;
+      const next = Buffer.alloc(cap);
+      this.#buf.copy(next, 0, this.#start, this.#end);
+      this.#buf = next;
+      this.#start = 0;
+      this.#end = used;
+    }
+    chunk.copy(this.#buf, this.#end);
+    this.#end += chunk.length;
+  }
+
+  indexOf(byte, logicalFrom = 0) {
+    if (logicalFrom < 0 || logicalFrom >= this.length) return -1;
+    const found = this.#buf.indexOf(byte, this.#start + logicalFrom);
+    if (found < 0 || found >= this.#end) return -1;
+    return found - this.#start;
+  }
+
+  subarray(logicalStart, logicalEnd) {
+    return this.#buf.subarray(this.#start + logicalStart, this.#start + logicalEnd);
+  }
+
+  readUInt32BE(logicalOffset) {
+    return this.#buf.readUInt32BE(this.#start + logicalOffset);
+  }
+
+  drop(n) {
+    if (n >= this.length) {
+      this.#start = 0;
+      this.#end = 0;
+      return;
+    }
+    this.#start += n;
+  }
+}
+
+function asBuffer(chunk) {
+  return Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+}
+
+function decodeUtf8(bytes) {
+  return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+}
 
 // =====================
 // (1) NDJSON over stdio
@@ -15,58 +76,78 @@ export class NdjsonNeverTerminatedError extends NdjsonFramingError {}
 export class NdjsonUnterminatedAtEofError extends NdjsonFramingError {}
 
 export class NdjsonFramer {
-  #chunks = [];
-  #totalBytes = 0;
-  #decoder = new TextDecoder('utf-8', { fatal: true });
+  #bytes = new ByteBuf();
+  #scanned = 0;
+  #firstNewline = -1;
+  #lastNewline = -1;
 
   feed(chunk) {
-    const chunkBuf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, 'utf8');
-    if (this.#totalBytes + chunkBuf.length > MAX_PARTIAL_BUFFER) {
+    this.#bytes.append(asBuffer(chunk));
+    this.#scanNew();
+    if (this.#residual() > MAX_PARTIAL_BUFFER) {
       throw new NdjsonNeverTerminatedError(`partial frame exceeded ${MAX_PARTIAL_BUFFER} bytes without newline`);
     }
-    this.#chunks.push(chunkBuf);
-    this.#totalBytes += chunkBuf.length;
+  }
+
+  // Bytes already known to contain no newline are not scanned again.
+  #scanNew() {
+    let from = this.#scanned;
+    while (from < this.#bytes.length) {
+      const idx = this.#bytes.indexOf(0x0a, from);
+      if (idx === -1) break;
+      if (this.#firstNewline < 0) this.#firstNewline = idx;
+      this.#lastNewline = idx;
+      from = idx + 1;
+    }
+    this.#scanned = this.#bytes.length;
+  }
+
+  #residual() {
+    if (this.#lastNewline < 0) return this.#bytes.length;
+    return this.#bytes.length - (this.#lastNewline + 1);
   }
 
   *frames() {
-    while (this.#totalBytes > 0) {
-      // Coalesce chunks only once when needed
-      const buf = this.#chunks.length === 1 ? this.#chunks[0] : Buffer.concat(this.#chunks, this.#totalBytes);
-      const idx = buf.indexOf('\n');
-      if (idx === -1) {
-        // No complete frame; save the buffer for next call
-        if (this.#chunks.length > 1) {
-          this.#chunks = [buf];
-        }
-        break;
+    while (this.#firstNewline >= 0) {
+      const idx = this.#firstNewline;
+      const line = this.#bytes.subarray(0, idx);
+      const n = idx + 1;
+      this.#bytes.drop(n);
+      this.#scanned -= n;
+      this.#lastNewline -= n;
+      if (this.#lastNewline < 0) {
+        this.#firstNewline = -1;
+      } else {
+        this.#firstNewline = this.#bytes.indexOf(0x0a, 0);
       }
-      const line = buf.slice(0, idx);
-      const remainder = buf.slice(idx + 1);
-      this.#chunks = remainder.length > 0 ? [remainder] : [];
-      this.#totalBytes = remainder.length;
-      
       if (line.length > MAX_FRAME_SIZE) {
         throw new NdjsonOversizeError(`frame ${line.length} bytes > ${MAX_FRAME_SIZE}`);
       }
-      const lineStr = this.#decoder.decode(line, { stream: true }).trim();
-      if (lineStr) {
-        try {
-          yield JSON.parse(lineStr);
-        } catch (e) {
-          throw new NdjsonFramingError(`malformed JSON: ${e.message}`);
-        }
+      let lineStr;
+      try {
+        // stream:false — a finished line must not retain a dangling UTF-8 sequence.
+        lineStr = decodeUtf8(line);
+      } catch (e) {
+        throw new NdjsonFramingError(`invalid utf-8: ${e.message}`);
+      }
+      lineStr = lineStr.trim();
+      if (!lineStr) continue;
+      try {
+        yield JSON.parse(lineStr);
+      } catch (e) {
+        throw new NdjsonFramingError(`malformed JSON: ${e.message}`);
       }
     }
   }
 
   eof() {
-    if (this.#totalBytes > 0) {
-      throw new NdjsonUnterminatedAtEofError(`unterminated frame at EOF: ${this.#totalBytes} bytes`);
+    if (this.#bytes.length > 0) {
+      throw new NdjsonUnterminatedAtEofError(`unterminated frame at EOF: ${this.#bytes.length} bytes`);
     }
   }
 
   pendingBytes() {
-    return this.#totalBytes;
+    return this.#bytes.length;
   }
 }
 
@@ -88,38 +169,47 @@ export class MuxOversizeError extends MuxFramingError {}
 export class MuxNeverTerminatedError extends MuxFramingError {}
 
 export class MuxFramer {
-  #chunks = [];
-  #totalBytes = 0;
-  #coalesced = null;
-  #decoder = new TextDecoder('utf-8', { fatal: true });
+  #bytes = new ByteBuf();
+  #complete = 0;
 
   feed(chunk) {
-    if (this.#totalBytes + chunk.length > MAX_PARTIAL_BUFFER) {
+    this.#bytes.append(asBuffer(chunk));
+    this.#accountComplete();
+    const residual = this.#bytes.length - this.#complete;
+    if (residual > MAX_PARTIAL_BUFFER) {
       throw new MuxNeverTerminatedError(`partial frame exceeded ${MAX_PARTIAL_BUFFER} bytes without complete length prefix`);
     }
-    this.#chunks.push(chunk);
-    this.#totalBytes += chunk.length;
-    this.#coalesced = null; // invalidate cached buffer
+  }
+
+  // Advance past frames that are fully buffered. An oversize length is left
+  // in place so frames() can raise MuxOversizeError instead of the cap error.
+  #accountComplete() {
+    while (this.#bytes.length - this.#complete >= 4) {
+      const len = this.#bytes.readUInt32BE(this.#complete);
+      if (len > MAX_FRAME_SIZE) return;
+      if (this.#bytes.length - this.#complete < 4 + len) return;
+      this.#complete += 4 + len;
+    }
   }
 
   *frames() {
-    while (this.#totalBytes >= 4) {
-      // Coalesce once and reuse until we consume a frame
-      if (!this.#coalesced) {
-        this.#coalesced = this.#chunks.length === 1 ? this.#chunks[0] : Buffer.concat(this.#chunks, this.#totalBytes);
-      }
-      const buf = this.#coalesced;
-      const len = buf.readUInt32BE(0);
+    while (this.#bytes.length >= 4) {
+      const len = this.#bytes.readUInt32BE(0);
       if (len > MAX_FRAME_SIZE) {
         throw new MuxOversizeError(`frame length ${len} > ${MAX_FRAME_SIZE}`);
       }
-      if (this.#totalBytes < 4 + len) break; // incomplete
-      const payload = buf.slice(4, 4 + len);
-      const remainder = buf.slice(4 + len);
-      this.#chunks = remainder.length > 0 ? [remainder] : [];
-      this.#totalBytes = remainder.length;
-      this.#coalesced = remainder.length > 0 ? remainder : null;
-      const payloadStr = this.#decoder.decode(payload, { stream: false });
+      if (this.#bytes.length < 4 + len) break;
+      const payload = this.#bytes.subarray(4, 4 + len);
+      let payloadStr;
+      try {
+        payloadStr = decodeUtf8(payload);
+      } catch (e) {
+        this.#bytes.drop(4 + len);
+        this.#complete -= 4 + len;
+        throw new MuxFramingError(`invalid utf-8: ${e.message}`);
+      }
+      this.#bytes.drop(4 + len);
+      this.#complete -= 4 + len;
       try {
         yield JSON.parse(payloadStr);
       } catch (e) {
@@ -129,7 +219,7 @@ export class MuxFramer {
   }
 
   pendingBytes() {
-    return this.#totalBytes;
+    return this.#bytes.length;
   }
 }
 

@@ -113,12 +113,40 @@ export async function dispatch(id, useDirect = false) {
 /**
  * Executor: heartbeat renewal on the reserved path.
  * Returns completion timestamp if exactly 1 ACTIVE row updated (durable renewal), null otherwise.
- * Optional slow mode (pg_sleep before UPDATE) for testing in-flight renewal collision.
+ * Slow mode holds the authority row lock (SELECT FOR UPDATE) until the caller sets
+ * gate.observed, then sleeps while the lock is still held, so a concurrent COMMITTED
+ * update actually blocks on this transaction.
  */
-async function renew(id, reserved, slowMs = 0) {
-  if (slowMs > 0) {
-    // Two separate queries: sleep, then update
-    await reserved.query(`SELECT pg_sleep(${slowMs / 1000})`);
+async function renew(id, reserved, slowMs = 0, gate = null) {
+  if (slowMs > 0 && gate) {
+    await reserved.query('BEGIN');
+    try {
+      const locked = await reserved.query(
+        `SELECT id FROM fencing_authority WHERE id = $1 AND status = 'ACTIVE' FOR UPDATE`,
+        [id]
+      );
+      if (locked.rowCount !== 1) {
+        await reserved.query('ROLLBACK');
+        return null;
+      }
+      gate.holding = true;
+      const deadline = Date.now() + 30_000;
+      while (!gate.observed && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      await reserved.query('SELECT pg_sleep($1)', [slowMs / 1000]);
+      const r = await reserved.query(
+        `UPDATE fencing_authority SET heartbeat_at = clock_timestamp() WHERE id = $1 AND status = 'ACTIVE' RETURNING id`,
+        [id]
+      );
+      await reserved.query('COMMIT');
+      return r.rowCount === 1 ? Date.now() : null;
+    } catch (e) {
+      await reserved.query('ROLLBACK').catch(() => {});
+      throw e;
+    } finally {
+      gate.holding = false;
+    }
   }
   const r = await reserved.query(
     `UPDATE fencing_authority SET heartbeat_at = clock_timestamp() WHERE id = $1 AND status = 'ACTIVE' RETURNING id`,
@@ -157,12 +185,11 @@ export async function commitExecution(id, token, effectsFn, useDirect = false, s
   let renewalsStopped = false;
   let inflightRenewal = null;
   const metrics = { renewals: 0, lastRenewalAt: null };
+  const renewalGate = slowRenewalMs > 0 ? { holding: false, observed: false } : null;
 
-  // BOUND: last-renewal→row-lock interval must be < CADENCE_MS (5s). If a renewal ran within
-  // the cadence window, it cannot still be in flight when we take the lock (renewal queries
-  // are fast, O(10ms)). A slow renewal racing the lock would block our COMMITTED update, but
-  // PG serializes: one waits, then the predicate rechecks. Our WHERE status='ACTIVE' ensures
-  // correctness even if the renewal is delayed.
+  // BOUND: last-renewal→row-lock interval must be < CADENCE_MS (5s) on the fast path.
+  // The slow-renewal test holds the row lock across its delay so this update blocks;
+  // lockWaitMs records that wait. After the lock is released, WHERE status='ACTIVE' is rechecked.
   const LAST_RENEWAL_TO_LOCK_BOUND_MS = CADENCE_MS;
 
   // Start renewal loop on the reserved path BEFORE waiting on the pooled connection
@@ -172,7 +199,7 @@ export async function commitExecution(id, token, effectsFn, useDirect = false, s
     if (renewalsStopped || inflightRenewal) return;
     const renewalPromise = (async () => {
       try {
-        const renewalCompletedAt = await renew(id, reserved, slowRenewalMs);
+        const renewalCompletedAt = await renew(id, reserved, slowRenewalMs, renewalGate);
         if (renewalCompletedAt) {
           // Count only durable renewals (1-row UPDATEs)
           metrics.renewals++;
@@ -200,14 +227,26 @@ export async function commitExecution(id, token, effectsFn, useDirect = false, s
     renewalsStopped = true;
     clearInterval(renewalHandle);
 
-    // 2. Conditional COMMITTED update (acquires row lock)
-    const { committed, rowCount } = await conditionalCommit(id, token, c);
+    // 2. Conditional COMMITTED update (acquires row lock).
+    // When a slow renewal is in use, wait until it holds the row lock, then tell it
+    // to sleep. The UPDATE below blocks until that transaction commits.
+    let lockWaitMs = 0;
+    if (renewalGate) {
+      const deadline = Date.now() + CADENCE_MS + 15_000;
+      while (!renewalGate.holding && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      renewalGate.observed = true;
+    }
+    const commitAttemptAt = Date.now();
+    const { committed } = await conditionalCommit(id, token, c);
     const lockAcquiredAt = Date.now(); // timestamp after awaited update completes
+    lockWaitMs = lockAcquiredAt - commitAttemptAt;
     if (!committed) {
       await c.query('ROLLBACK');
       // Drain any renewal still blocked on the row lock
       if (inflightRenewal) await inflightRenewal;
-      throw new FencedError(`conditional COMMITTED failed: 0 rows (id=${id}, token=${token})`);
+      throw new FencedError(`conditional COMMITTED failed: 0 rows (id=${id})`);
     }
 
     // 3. Resolve (COMMIT) the effects transaction
@@ -227,6 +266,7 @@ export async function commitExecution(id, token, effectsFn, useDirect = false, s
       lastRenewalToLockMs,
       boundViolation,
       bound: LAST_RENEWAL_TO_LOCK_BOUND_MS,
+      lockWaitMs,
     };
   } catch (e) {
     if (e instanceof FencedError) throw e;
@@ -272,9 +312,11 @@ export async function sweepAbandoned(useDirect = false) {
   const c = useDirect ? directConnection() : mainConnection();
   await c.connect();
   try {
+    // make_interval's duration argument is secs (double precision). PostgreSQL 18
+    // has no msecs parameter: https://www.postgresql.org/docs/18/functions-datetime.html
     const r = await c.query(
-      `UPDATE fencing_authority SET status = 'ABANDONED' WHERE status = 'ACTIVE' AND heartbeat_at < now() - interval '${LEASE_MS} milliseconds' RETURNING id`,
-      []
+      `UPDATE fencing_authority SET status = 'ABANDONED' WHERE status = 'ACTIVE' AND heartbeat_at < now() - make_interval(secs => $1) RETURNING id`,
+      [LEASE_MS / 1000]
     );
     return r.rows.map((row) => row.id);
   } finally {
