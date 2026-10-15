@@ -1,4 +1,4 @@
-// run.ts — Spike A first part: A1 pinning + A2 oracle, both datasources, JSONL evidence.
+// run.ts — Spike A: A1–A4 and the adversarial battery, both datasources, JSONL evidence.
 // Vacuity control (mandatory): a context variant skipping the install step must FAIL A2 —
 // both outcomes recorded. Exit non-zero if any required case fails.
 import { sql } from 'kysely';
@@ -7,6 +7,12 @@ import { record, evidenceFile, failedCount } from './evidence.ts';
 import { assertTenantContext, MissingTenantContextError } from './context.ts';
 import { a1Pinning } from './cases/a1-pinning.ts';
 import { a2Oracle } from './cases/a2-oracle.ts';
+import { a3Pgbouncer, drainAppBackends, resetAppTenantDefault } from './cases/a3-pgbouncer.ts';
+import { a4Protocol } from './cases/a4-protocol.ts';
+import { poolAbort } from './battery/pool-abort.ts';
+import { interleave } from './battery/interleave.ts';
+import { contaminatedSession } from './battery/contaminated-session.ts';
+import { gucForgery } from './battery/guc-forgery.ts';
 
 async function vacuityControl(): Promise<void> {
   // The designed FAIL (T3a step 5): a protocol variant that skips the context install must FAIL
@@ -33,9 +39,19 @@ async function vacuityControl(): Promise<void> {
 
 const startedAt = Date.now();
 try {
+  // A killed run can leave ALTER ROLE … SET behind. The default applies only at login,
+  // so existing pooled backends keep the old value until they are replaced.
+  await resetAppTenantDefault();
+  await drainAppBackends();
   await a1Pinning();
   await a2Oracle();
   await vacuityControl();
+  await a3Pgbouncer();
+  await a4Protocol();
+  await poolAbort();
+  await interleave();
+  await contaminatedSession();
+  await gucForgery();
 } finally {
   const failed = failedCount();
   console.log(`evidence: ${evidenceFile} (${Date.now() - startedAt}ms) — ${failed} failing case(s)`);
