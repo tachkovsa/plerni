@@ -6,10 +6,33 @@ import { b4 } from './cases/b4-bounds.mjs';
 import { b5 } from './cases/b5-crash.mjs';
 import { b2 } from './cases/b2-fencing.mjs';
 import { tripCaps } from './cases/b3-backpressure.mjs';
+import { fileURLToPath } from 'node:url';
 import { b1 } from './cases/b1-throughput.mjs';
 import { forgedFlood, hostileBattery, starvation } from './cases/b6-mux-identity.mjs';
 import { measureSeries, openLoop, preflight } from './measure.mjs';
-import { dbConfigured } from './supervisor.mjs';
+import { connectPair, dbConfigured } from './supervisor.mjs';
+
+const echoPath = fileURLToPath(new URL('./children/echo.mjs', import.meta.url));
+
+test('oversize mux call rejects before a waiter is armed', async () => {
+  const pair = await connectPair({ sweeper: false });
+  try {
+    const kid = pair.sup.spawn({ pluginId: 'echo', script: echoPath });
+    const err = await pair.stub.call({
+      pluginId: 'echo',
+      credential: kid.credential,
+      correlationId: 1,
+      port: 'db',
+      method: 'get',
+      payload: 'x'.repeat(1024 * 1024),
+    }, 300).catch((e) => e);
+    assert.equal(err.constructor.name, 'MuxOversizeError');
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    assert.equal(pair.stub.calls.size, 0);
+  } finally {
+    await pair.close();
+  }
+});
 
 test('preflight records a validity bit', () => {
   const env = preflight();

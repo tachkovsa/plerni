@@ -27,16 +27,23 @@ function cpuQuota() {
   for (let i = parts.length; i >= 0; i--) {
     dirs.push(`/sys/fs/cgroup/${parts.slice(0, i).join('/')}`);
   }
+  // `max` is only "no limit at this level". A parent can still set the quota.
+  let tightest = null;
   for (const dir of dirs) {
     try {
-      const [quota, period] = readFileSync(`${dir}/cpu.max`, 'utf8').trim().split(/\s+/);
-      if (quota === 'max') return { unlimited: true, period: Number(period) };
-      return { unlimited: false, quota: Number(quota), period: Number(period) };
+      const [quota, periodText] = readFileSync(`${dir}/cpu.max`, 'utf8').trim().split(/\s+/);
+      if (quota === 'max') continue;
+      const period = Number(periodText);
+      const limit = Number(quota);
+      if (!Number.isFinite(limit) || !Number.isFinite(period) || period <= 0) continue;
+      if (!tightest || limit / period < tightest.quota / tightest.period) {
+        tightest = { quota: limit, period };
+      }
     } catch {
-      // Parent cgroup may be the one that carries the quota.
+      // This level may not expose cpu.max.
     }
   }
-  return { unlimited: true };
+  return tightest ? { unlimited: false, ...tightest } : { unlimited: true };
 }
 
 // Records the environment. Does not include cgroup paths or host identifiers.

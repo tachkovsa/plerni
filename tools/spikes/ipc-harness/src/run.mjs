@@ -36,6 +36,7 @@ async function main() {
     ['smoke', smoke],
   ];
   let failed = false;
+  let unscored = false;
   for (const [name, fn] of cases) {
     const result = await fn();
     const pass = name === 'b6-vacuity'
@@ -43,16 +44,17 @@ async function main() {
         && result.checks?.mismatch === true && result.checks?.stale === true
       : result.pass;
     if (pass === false) failed = true;
+    else if (pass !== true) unscored = true;
     record({
       case: name,
       pass,
-      outcome: result.outcome ?? (pass ? 'pass' : 'fail'),
+      outcome: result.outcome ?? (pass === true ? 'pass' : pass === false ? 'fail' : 'invalid'),
       detail: result.detail ?? result,
     });
   }
 
   console.log(`[run] Spike complete. Evidence: tools/spikes/ipc-harness/evidence/${basename(evidenceFile)}`);
-  process.exit(failed ? 1 : 0);
+  process.exit(failed || unscored ? 1 : 0);
 }
 
 main().catch((e) => {

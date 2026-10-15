@@ -121,11 +121,27 @@ export class KernelStub {
     if (this.shut || this.socket.destroyed) return Promise.reject(fail('closed'));
     const key = pendingKey(frame.pluginId, frame.correlationId);
     const sentKey = `${bucket === this.cancels ? 'cancel' : 'call'}\0${key}`;
-    this.sentAt.set(sentKey, performance.now());
-    frame.sendTs = this.sentAt.get(sentKey);
     frame.timeoutMs = timeoutMs;
+    frame.sendTs = performance.now();
+    let buf;
+    try {
+      buf = encodeMux(frame);
+    } catch (err) {
+      return Promise.reject(err);
+    }
+    this.sentAt.set(sentKey, frame.sendTs);
     const pending = this.#track(bucket, frame.pluginId, frame.correlationId, timeoutMs);
-    this.socket.write(encodeMux(frame));
+    try {
+      this.socket.write(buf);
+    } catch (err) {
+      const waiter = bucket.get(key);
+      if (waiter) {
+        clearTimeout(waiter.timer);
+        bucket.delete(key);
+        this.sentAt.delete(sentKey);
+        waiter.reject(err);
+      }
+    }
     return pending;
   }
 
