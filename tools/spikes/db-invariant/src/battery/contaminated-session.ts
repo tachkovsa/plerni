@@ -38,6 +38,7 @@ function detailOf(rec: Recovery, injectedLogins: number): Record<string, unknown
     rivalGuc: rec.rivalGuc,
     rivalWaiting: rec.rivalWaiting,
     rivalHeldOff: rec.rivalHeldOff,
+    rivalTimedOut: rec.rivalTimedOut,
     thrown: rec.thrown,
   };
 }

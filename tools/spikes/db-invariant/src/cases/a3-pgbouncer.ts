@@ -8,7 +8,7 @@
 // Shared oracles below are also what the adversarial battery imports.
 import { sql, type Kysely, type Transaction } from 'kysely';
 import {
-  adminShow, direct, poolWaitingCount, pooled, rawApp, rawRoot, terminateBackendByPid, type Db,
+  adminShow, direct, poolWaitingCount, pooled, rawApp, rawRoot, terminateBackendByPid, unblockPool, type Db,
 } from '../client.ts';
 import { record } from '../evidence.ts';
 import {
@@ -36,6 +36,7 @@ export function onlyTenant(rows: TenantRow[], id: string): boolean {
 }
 
 const BACKEND_GONE_DEADLINE_MS = 2000;
+const RIVAL_SETTLE_MS = 2000;
 
 /** Poll until the pid leaves pg_stat_activity. Termination only signals the process. */
 export async function backendGone(pid: number): Promise<{ gone: boolean; waitedMs: number }> {
@@ -246,6 +247,7 @@ export interface Recovery {
   rivalGuc: string | null;
   rivalWaiting: number;
   rivalHeldOff: boolean;
+  rivalTimedOut: boolean;
   thrown: string | null;
   alerts: string[];
 }
@@ -264,7 +266,9 @@ export async function recoverInjected(db: Kysely<Db>, ev: HygieneEvidence, befor
   let rivalGuc: string | null = null;
   let rivalWaiting = 0;
   let rivalHeldOff = false;
-  let rivalPending: Promise<void> | null = null;
+  let rivalTimedOut = false;
+  let rivalAbandoned = false;
+  const rival = { pending: null as Promise<void> | null };
   const terminate = async (pid: number): Promise<void> => {
     let entered = false;
     const pending = db.transaction().execute(async (trx) => {
@@ -273,9 +277,16 @@ export async function recoverInjected(db: Kysely<Db>, ev: HygieneEvidence, befor
       const g = await sql<{ g: string | null }>`SELECT current_setting('plerni.tenant_id', true) AS g`.execute(trx);
       return { pid: seen, guc: g.rows[0]?.g ?? null };
     });
-    rivalPending = pending.then(
-      (row) => { rivalPid = row.pid; rivalGuc = row.guc; },
-      (e: unknown) => { thrown = thrown ?? (e instanceof Error ? e.message : String(e)); },
+    rival.pending = pending.then(
+      (row) => {
+        if (rivalAbandoned) return;
+        rivalPid = row.pid;
+        rivalGuc = row.guc;
+      },
+      (e: unknown) => {
+        if (rivalAbandoned) return;
+        thrown = thrown ?? (e instanceof Error ? e.message : String(e));
+      },
     );
     const deadline = performance.now() + BACKEND_GONE_DEADLINE_MS;
     for (;;) {
@@ -299,7 +310,24 @@ export async function recoverInjected(db: Kysely<Db>, ev: HygieneEvidence, befor
   } catch (e) {
     thrown = e instanceof Error ? e.message : String(e);
   }
-  if (rivalPending) await rivalPending;
+  const rivalWait = rival.pending;
+  if (rivalWait !== null) {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = new Promise<boolean>((resolve) => {
+      timer = setTimeout(() => resolve(true), RIVAL_SETTLE_MS);
+    });
+    // Errors are already stored on `thrown`. A settle is not a timeout.
+    const settled = rivalWait.then(() => false, () => false);
+    rivalTimedOut = await Promise.race([settled, timedOut]);
+    if (timer !== undefined) clearTimeout(timer);
+    if (rivalTimedOut) {
+      rivalAbandoned = true;
+      thrown = thrown ?? `rival checkout timed out after ${RIVAL_SETTLE_MS}ms`;
+      // The queued checkout may never be serviced. Drop the sockets so the
+      // runner, and recordProbe's later runs, are not held by this promise.
+      unblockPool(db);
+    }
+  }
   const cleanupMs = Math.round(performance.now() - t0);
   const terminations = ev.terminatedBackendPids.length - before;
   const deadPid = terminations > 0 ? ev.terminatedBackendPids[ev.terminatedBackendPids.length - 1]! : null;
@@ -316,12 +344,12 @@ export async function recoverInjected(db: Kysely<Db>, ev: HygieneEvidence, befor
     && follow.pid === accessPid && follow.pid !== deadPid;
   const retries = Math.max(0, ev.attempts - 1);
   return {
-    pass: thrown === null && detectedBeforeAccess && deadGone && positive && replacementAbsent
+    pass: thrown === null && !rivalTimedOut && detectedBeforeAccess && deadGone && positive && replacementAbsent
       && rivalHeldOff && rivalClean
       && retries <= MAX_RETRY && terminations === 1,
     cleanupMs, terminations, attempts: ev.attempts, retries, deadPid, accessPid,
     followPid: follow?.pid ?? null, deadGone, backendGoneMs, detectedBeforeAccess, positive, replacementAbsent,
-    rivalPid, rivalGuc, rivalWaiting, rivalHeldOff, thrown,
+    rivalPid, rivalGuc, rivalWaiting, rivalHeldOff, rivalTimedOut, thrown,
     alerts: [...ev.alerts],
   };
 }
@@ -503,6 +531,7 @@ function lifecycleDetail(rec: Recovery): Record<string, unknown> {
     rivalGuc: rec.rivalGuc,
     rivalWaiting: rec.rivalWaiting,
     rivalHeldOff: rec.rivalHeldOff,
+    rivalTimedOut: rec.rivalTimedOut,
     alerts: rec.alerts,
     thrown: rec.thrown,
   };

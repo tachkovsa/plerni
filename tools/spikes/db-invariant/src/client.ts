@@ -53,6 +53,16 @@ export function poolWaitingCount(db: Kysely<Db>): number {
   return pool.waitingCount;
 }
 
+/** Drop sockets on this pool so a wedged checkout cannot hold the process open. */
+export function unblockPool(db: Kysely<Db>): void {
+  const pool = pools.get(db);
+  if (!pool) return;
+  const clients = (pool as unknown as {
+    _clients?: Array<{ connection?: { stream?: { destroy: () => void } } }>;
+  })._clients ?? [];
+  for (const client of clients) client.connection?.stream?.destroy();
+}
+
 export const direct = (max = 10) => kyselyOf(DIRECT, max);
 export const pooled = (max = 10) => kyselyOf(POOLED, max);
 export const rawRoot = () => {
