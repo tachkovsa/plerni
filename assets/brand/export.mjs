@@ -2,10 +2,10 @@
 /**
  * SPDX-License-Identifier: Apache-2.0
  *
- * Rebuild the Plerni brand SVGs from Nunito ExtraBold outlines plus one shared
+ * Rebuild the Plerni brand SVGs from Nunito SemiBold outlines plus one shared
  * sprout, then rasterize the favicon, avatar, and social files.
  *
- * Letterforms come from assets/brand/source/Nunito-ExtraBold.ttf (SIL OFL 1.1).
+ * Letterforms come from assets/brand/source/Nunito-SemiBold.ttf (SIL OFL 1.1).
  * The sprout is original geometry. The square icons reuse the wordmark's `p`
  * path and the same sprout path; only the placement of that sprout changes
  * (above the i in the wordmark, above the p stem on the tile).
@@ -300,11 +300,12 @@ async function centroid(buffer, palette, label) {
 }
 
 async function main() {
-  const bytes = await readFile(join(root, "source", "Nunito-ExtraBold.ttf"));
+  const bytes = await readFile(join(root, "source", "Nunito-SemiBold.ttf"));
   const font = opentype.parse(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
   const fullName = font.names?.windows?.fullName?.en ?? font.names?.windows?.fontFamily?.en;
-  if (!String(fullName).includes("Nunito")) {
-    throw new Error(`expected Nunito ExtraBold, name table says ${fullName}`);
+  const weight = font.tables.os2?.usWeightClass;
+  if (fullName !== "Nunito SemiBold" || weight !== 600) {
+    throw new Error(`expected Nunito SemiBold 600, got ${fullName} weight ${weight}`);
   }
   const marks = buildMarks(font);
   for (const svg of [marks.wordLight, marks.wordDark, marks.wordMono, marks.iconLight, marks.iconDark, marks.og]) {

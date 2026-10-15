@@ -2,7 +2,7 @@
 
 The mark is the lowercase word **plerni** in a rounded sans. The dot of the **i** is a two-leaf sprout. The square icon is the same **p** and the same sprout, with the sprout sitting above the left stem the way a tittle sits above an **i**.
 
-Letterforms are outlines of **Nunito ExtraBold** (Copyright 2014 The Nunito Project Authors), licensed under the SIL Open Font License 1.1. The licence is [`source/OFL.txt`](source/OFL.txt). The font file is only for rebuilding the outlines. Every shipped SVG is paths, so nothing needs the font at runtime. The sprout is original geometry, and the icon SVGs reuse the wordmark's `p` path and sprout path unchanged.
+Letterforms are outlines of **Nunito SemiBold** (weight 600; Copyright 2014 The Nunito Project Authors), licensed under the SIL Open Font License 1.1. The licence is [`source/OFL.txt`](source/OFL.txt). The font file is only for rebuilding the outlines. Every shipped SVG is paths, so nothing needs the font at runtime. The sprout is original geometry, and the icon SVGs reuse the wordmark's `p` path and sprout path unchanged.
 
 ## Colour
 
