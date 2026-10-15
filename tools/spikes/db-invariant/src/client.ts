@@ -35,14 +35,35 @@ const ROOT = process.env.HARNESS_ROOT_DSN
 // client-level 'error' with no active query to absorb it.
 export const idlePoolErrors: string[] = [];
 
+const pools = new WeakMap<Kysely<Db>, pg.Pool>();
+
 export function kyselyOf(dsn: string, max = 10): Kysely<Db> {
   const pool = new pg.Pool({ connectionString: dsn, max });
   pool.on('error', (e) => { idlePoolErrors.push(String(e)); });
   pool.on('connect', (client) => { client.on('error', (e) => { idlePoolErrors.push(String(e)); }); });
-  return new Kysely<Db>({ dialect: new PostgresDialect({ pool }) });
+  const db = new Kysely<Db>({ dialect: new PostgresDialect({ pool }) });
+  pools.set(db, pool);
+  return db;
 }
 
-export const direct = () => kyselyOf(DIRECT);
+/** Checkouts queued on this client's pool. The driver does not expose the count. */
+export function poolWaitingCount(db: Kysely<Db>): number {
+  const pool = pools.get(db);
+  if (!pool) throw new Error('spike client has no pool');
+  return pool.waitingCount;
+}
+
+/** Drop sockets on this pool so a wedged checkout cannot hold the process open. */
+export function unblockPool(db: Kysely<Db>): void {
+  const pool = pools.get(db);
+  if (!pool) return;
+  const clients = (pool as unknown as {
+    _clients?: Array<{ connection?: { stream?: { destroy: () => void } } }>;
+  })._clients ?? [];
+  for (const client of clients) client.connection?.stream?.destroy();
+}
+
+export const direct = (max = 10) => kyselyOf(DIRECT, max);
 export const pooled = (max = 10) => kyselyOf(POOLED, max);
 export const rawRoot = () => {
   const c = new pg.Client({ connectionString: ROOT });
@@ -60,18 +81,30 @@ export const rawApp = () => {
 
 // The privileged termination path (γ-M1): in the spike, harness root; in production this is the
 // broker's maintenance identity (pg_signal_backend / membership), never the compromised session.
+const TERMINATE_DEADLINE_MS = 2000;
+
 export async function terminateBackendByPid(pid: number): Promise<void> {
   const c = rawRoot();
   await c.connect();
   try {
     await c.query('SELECT pg_terminate_backend($1)', [pid]);
+    // pg_terminate_backend only signals. Do not return while the pid is still queryable.
+    const deadline = performance.now() + TERMINATE_DEADLINE_MS;
+    for (;;) {
+      const r = await c.query('SELECT 1 FROM pg_stat_activity WHERE pid = $1', [pid]);
+      if (r.rows.length === 0) return;
+      if (performance.now() >= deadline) {
+        throw new Error(`backend ${pid} still present after terminate`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
   } finally {
     await c.end();
   }
 }
 
 // §3.0② evidence: effective PgBouncer config via the admin-console datasource (SHOW only).
-export async function adminShow(command: 'CONFIG' | 'DATABASES' | 'USERS'): Promise<unknown[]> {
+export async function adminShow(command: 'CONFIG' | 'DATABASES' | 'USERS' | 'VERSION'): Promise<unknown[]> {
   const c = new pg.Client({ connectionString: ADMIN });
   await c.connect();
   try {
