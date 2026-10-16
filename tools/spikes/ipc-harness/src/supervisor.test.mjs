@@ -9,7 +9,7 @@ import { b2 } from './cases/b2-fencing.mjs';
 import { b3, tripCaps } from './cases/b3-backpressure.mjs';
 import { fileURLToPath } from 'node:url';
 import { b1 } from './cases/b1-throughput.mjs';
-import { floodBound, forgedFlood, hostileBattery, starvation } from './cases/b6-mux-identity.mjs';
+import { applyScoredSkip, floodBound, floodScore, forgedFlood, hostileBattery, starvation } from './cases/b6-mux-identity.mjs';
 import { assessEnvironment, delay, measureSeries, openLoop, preflight, treeRss, waitUntil } from './measure.mjs';
 import { MuxFramer, encodeMux, encodeNdjson } from './framing.mjs';
 import { FencedError } from './authority.mjs';
@@ -607,7 +607,7 @@ test('a spawn error retires the fencing token', async () => {
     const settled = await callP;
     assert.equal(settled.code, 'EMFILE');
     assert.equal(rec.dead, true);
-    assert.equal(pair.sup.retiredTokens.has(kid.token), true);
+    assert.equal(pair.sup.retiredTokens.has(kid.token), false);
     await assert.rejects(
       () => pair.sup.commitIfLive('id', kid.token, async () => {}),
       (err) => err instanceof FencedError,
@@ -1418,9 +1418,11 @@ test('socket writes stay in the global byte count until flushed', async () => {
       lines.push(encodeNdjson({ kind: 'result', correlationId: i + 1, payload: { n: 'x'.repeat(2000) } }));
     }
     rec.child.stdout.emit('data', Buffer.from(lines.join('')));
-    assert.ok(held > cap, String(held));
+    assert.ok(held > 0, String(held));
+    assert.ok(held <= cap, String(held));
+    assert.ok(pair.sup.socketOutbound <= cap, String(pair.sup.socketOutbound));
     assert.ok(pair.sup.bufferedBytes() >= held, `${pair.sup.bufferedBytes()} vs ${held}`);
-    assert.ok(held < 40 * 2000, String(held));
+    assert.ok(pair.sup.queueDepth('echo').lo > 0);
     await Promise.all(calls);
   } finally {
     const proc = pair.sup.children.get('echo')?.child;
@@ -1470,7 +1472,7 @@ test('overlapping respawns do not leave a duplicate generation running', { timeo
   }
 });
 
-test('one stdout chunk cannot enqueue results past the low-priority cap', async () => {
+test('one stdout chunk cannot enqueue results past the low-priority cap', { timeout: 10_000 }, async () => {
   const pair = await connectPair({
     sweeper: false,
     caps: {
@@ -1500,11 +1502,17 @@ test('one stdout chunk cannot enqueue results past the low-priority cap', async 
         port: 'db',
         method: 'get',
         payload: { i },
-      }, 1_000).catch((err) => err));
+      }, 3_000).catch((err) => err));
     }
     const armed = await waitUntil(() => pair.sup.pending.size >= 40, 2_000);
     assert.equal(armed, true);
-    pair.sup.socket.write = () => false;
+    const original = pair.sup.socket.write.bind(pair.sup.socket);
+    const held = [];
+    pair.sup.socket.write = (buf, cb) => {
+      held.push(Buffer.from(buf));
+      if (cb) cb();
+      return false;
+    };
     const lines = [];
     for (let i = 0; i < 40; i++) {
       lines.push(encodeNdjson({ kind: 'result', correlationId: i + 1, payload: { i } }));
@@ -1512,7 +1520,15 @@ test('one stdout chunk cannot enqueue results past the low-priority cap', async 
     rec.child.stdout.emit('data', Buffer.from(lines.join('')));
     assert.ok(pair.sup.queueDepth('echo').lo <= 4, String(pair.sup.queueDepth('echo').lo));
     assert.equal(pair.sup.caps.lo, true);
-    await Promise.all(calls);
+    assert.ok(pair.sup.pending.size > 0);
+    pair.sup.socket.write = original;
+    for (const buf of held) original(buf);
+    pair.sup.socket.emit('drain');
+    const settled = await Promise.all(calls);
+    const byId = new Map(settled.map((row) => [row.correlationId, row]));
+    for (let i = 0; i < 40; i++) {
+      assert.equal(byId.get(i + 1)?.payload?.i, i, JSON.stringify(settled));
+    }
   } finally {
     const proc = pair.sup.children.get('echo')?.child;
     if (proc && proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL');
@@ -1633,4 +1649,163 @@ test('an unknown rejection does not hi-cap a plugin id outside the unbound key',
     await pair.close();
     await Promise.all(pending);
   }
+});
+
+test('a socket write does not start when it would pass the global cap', async () => {
+  const cap = 8 * 1024;
+  const pair = await connectPair({
+    sweeper: false,
+    caps: {
+      total: 1024 * 1024,
+      totalGlobal: cap,
+      partial: 1024 * 1024,
+      lo: 8,
+      pending: 8,
+      pendingGlobal: 8,
+    },
+    partialHighWater: 1024 * 1024,
+  });
+  try {
+    const kid = pair.sup.spawn({
+      pluginId: 'echo',
+      script: echoPath,
+      total: 1024 * 1024,
+      pending: 8,
+    });
+    const rec = pair.sup.children.get('echo');
+    rec.child.kill('SIGSTOP');
+    const calls = [];
+    for (let i = 0; i < 3; i++) {
+      calls.push(pair.stub.call({
+        pluginId: 'echo',
+        credential: kid.credential,
+        correlationId: i + 1,
+        port: 'db',
+        method: 'get',
+        payload: { i },
+      }, 1_000).catch((err) => err));
+    }
+    const armed = await waitUntil(() => pair.sup.pending.size >= 3, 2_000);
+    assert.equal(armed, true);
+    const writes = [];
+    pair.sup.socket.write = (buf) => {
+      writes.push(buf.length);
+      return true;
+    };
+    const body = 'z'.repeat(3_000);
+    rec.child.stdout.emit('data', Buffer.from([1, 2, 3].map((id) => encodeNdjson({
+      kind: 'result',
+      correlationId: id,
+      payload: { blob: body },
+    })).join('')));
+    assert.ok(writes.length >= 1, writes.join(','));
+    assert.ok(writes.every((n) => n <= cap), writes.join(','));
+    assert.ok(writes.reduce((sum, n) => sum + n, 0) <= cap, writes.join(','));
+    assert.ok(pair.sup.socketOutbound <= cap, String(pair.sup.socketOutbound));
+    assert.ok(pair.sup.bufferedBytes() > pair.sup.socketOutbound);
+    assert.equal(pair.sup.pending.size, 1);
+    assert.equal(rec.dead, false);
+    await Promise.all(calls);
+  } finally {
+    const proc = pair.sup.children.get('echo')?.child;
+    if (proc && proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL');
+    await pair.close();
+  }
+});
+
+test('a completed reply survives respawn', { timeout: 15_000 }, async () => {
+  const pair = await connectPair({ sweeper: false, caps: { lo: 8, hi: 8, pending: 8 } });
+  try {
+    const kid = pair.sup.spawn({ pluginId: 'echo', script: echoPath });
+    const original = pair.sup.socket.write.bind(pair.sup.socket);
+    const held = [];
+    let block = true;
+    pair.sup.socket.write = (buf, cb) => {
+      if (block) {
+        held.push(Buffer.from(buf));
+        if (cb) cb();
+        return false;
+      }
+      return original(buf, cb);
+    };
+    const rec = pair.sup.children.get('echo');
+    rec.child.kill('SIGSTOP');
+    const calls = [1, 2].map((id) => pair.stub.call({
+      pluginId: 'echo',
+      credential: kid.credential,
+      correlationId: id,
+      port: 'db',
+      method: 'get',
+      payload: { who: id },
+    }, 8_000).catch((err) => err));
+    const armed = await waitUntil(() => pair.sup.pending.size >= 2, 2_000);
+    assert.equal(armed, true);
+    rec.child.stdout.emit('data', Buffer.from([1, 2].map((id) => encodeNdjson({
+      kind: 'result',
+      correlationId: id,
+      payload: { who: id },
+    })).join('')));
+    const queued = await waitUntil(() => pair.sup.queueDepth('echo').lo >= 1, 2_000);
+    assert.equal(queued, true);
+    assert.equal(pair.sup.pending.size, 0);
+    const next = await pair.sup.respawn('echo');
+    assert.ok(pair.sup.queueDepth('echo').lo >= 1, String(pair.sup.queueDepth('echo').lo));
+    block = false;
+    for (const buf of held) original(buf);
+    pair.sup.socket.emit('drain');
+    const settled = await Promise.all(calls);
+    const byId = new Map(settled.map((row) => [row.correlationId, row]));
+    assert.equal(byId.get(1)?.payload?.who, 1, JSON.stringify(settled));
+    assert.equal(byId.get(2)?.payload?.who, 2, JSON.stringify(settled));
+    const fresh = await pair.stub.call({
+      pluginId: 'echo',
+      credential: next.credential,
+      correlationId: 3,
+      port: 'db',
+      method: 'get',
+      payload: { who: 'live' },
+    }, 2_000);
+    assert.equal(fresh.payload?.who, 'live');
+    assert.equal(fresh.generation, next.credential.generation);
+  } finally {
+    const proc = pair.sup.children.get('echo')?.child;
+    if (proc && proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL');
+    await pair.close();
+  }
+});
+
+test('retired tokens do not accumulate across respawns', async () => {
+  const pair = await connectPair({ sweeper: false });
+  try {
+    const first = pair.sup.spawn({ pluginId: 'echo', script: echoPath });
+    const old = first.token;
+    for (let i = 0; i < 12; i++) await pair.sup.respawn('echo');
+    assert.equal(pair.sup.retiredTokens.size, 0);
+    await assert.rejects(
+      () => pair.sup.commitIfLive('id', old, async () => {}),
+      (err) => err instanceof FencedError,
+    );
+  } finally {
+    await pair.close();
+  }
+});
+
+test('B6 counts skipped scored cancellations as failures', () => {
+  const clean = {
+    p99: 40,
+    samples: 2,
+    timeouts: 0,
+    offered: 2,
+    issued: 2,
+    skipped: 0,
+    bulkRate: 20_000,
+    floodRate: 20_000,
+  };
+  assert.equal(floodScore(clean), true);
+  const tally = { samples: [], timeouts: 0, offered: 2, issued: 2, skipped: 0 };
+  applyScoredSkip(tally, 1);
+  assert.equal(tally.timeouts, 1);
+  assert.equal(tally.skipped, 1);
+  assert.equal(tally.offered, tally.issued + tally.skipped);
+  assert.equal(floodScore({ ...clean, ...tally, p99: 40, samples: 3 }), false);
 });

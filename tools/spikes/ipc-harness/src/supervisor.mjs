@@ -210,6 +210,7 @@ export class Supervisor {
       callPending: 0,
       cancelPending: 0,
       idBytes: 0,
+      deferred: [],
       dead: false,
       paused: false,
       pauseReason: null,
@@ -255,13 +256,34 @@ export class Supervisor {
     const grants = [...prev.credential.grants];
     const pending = prev.limits.pending;
     const total = prev.limits.total;
-    if (prev.child.exitCode == null && prev.child.signalCode == null) {
-      prev.child.kill();
-      await waitExit(prev.child);
+    try {
+      if (prev.child.exitCode == null && prev.child.signalCode == null) {
+        prev.child.kill();
+        await waitExit(prev.child);
+      }
+      // Completed replies already left the pending table. Discarding them
+      // here leaves the kernel waiter with nothing but a later timeout.
+      const hiBytes = prev.hiBytes;
+      const loBytes = prev.loBytes;
+      this.children.delete(pluginId);
+      const spawned = this.spawn({ pluginId, script, env, generation, version, grants, pending, total });
+      const rec = this.children.get(pluginId);
+      rec.hiBytes = hiBytes;
+      rec.loBytes = loBytes;
+      return spawned;
+    } finally {
+      // Once the old record is gone or dead, commitIfLive fences the token
+      // because it is not a live spawn credential. Keeping every generation
+      // would grow without a bound.
+      if (!this.#tokenLive(prev.token)) this.retiredTokens.delete(prev.token);
     }
-    this.#discardQueues(pluginId);
-    this.children.delete(pluginId);
-    return this.spawn({ pluginId, script, env, generation, version, grants, pending, total });
+  }
+
+  #tokenLive(token) {
+    for (const rec of this.children.values()) {
+      if (rec.token === token && !rec.dead) return true;
+    }
+    return false;
   }
 
   // Refuses a token the crashed child held, and a token that is not the live spawn token.
@@ -533,9 +555,10 @@ export class Supervisor {
       const end = Math.min(incoming.length, offset + 4096);
       const slice = incoming.subarray(offset, end);
       offset = end;
+      let stopped = false;
       try {
         rec.framer.feed(slice);
-        for (const msg of rec.framer.frames()) this.#fromChild(rec, msg);
+        stopped = this.#pullFrames(rec);
       } catch (err) {
         const code = err.constructor?.name || 'framing-error';
         if (code === 'NdjsonOversizeError') this.caps.partial = true;
@@ -543,7 +566,31 @@ export class Supervisor {
         return;
       }
       this.#accountCaps(rec);
+      if (stopped || rec.paused || rec.dead) {
+        this.#retainTail(rec, incoming.subarray(offset));
+        return;
+      }
     }
+  }
+
+  // A parsed result that did not fit the low-priority queue stays on
+  // `deferred`. Later complete lines stay in the framer. Both are retried
+  // once the queue has room, in the order they arrived.
+  #pullFrames(rec) {
+    while (rec.deferred.length > 0) {
+      const msg = rec.deferred.shift();
+      if (this.#fromChild(rec, msg) === 'defer') {
+        rec.deferred.unshift(msg);
+        return true;
+      }
+    }
+    for (const msg of rec.framer.frames()) {
+      if (this.#fromChild(rec, msg) === 'defer') {
+        rec.deferred.push(msg);
+        return true;
+      }
+    }
+    return false;
   }
 
   // Never discard unread bytes. A tail that fits stays in `stash`. A tail that
@@ -632,6 +679,16 @@ export class Supervisor {
     rec.paused = false;
     rec.pauseReason = null;
     rec.child.stdout.resume();
+    let stopped = false;
+    try {
+      stopped = this.#pullFrames(rec);
+    } catch (err) {
+      const code = err.constructor?.name || 'framing-error';
+      if (code === 'NdjsonOversizeError') this.caps.partial = true;
+      this.#fault(rec, code);
+      return;
+    }
+    if (stopped || rec.paused || rec.dead) return;
     if (rec.stash) {
       const stash = rec.stash;
       rec.stash = null;
@@ -683,6 +740,7 @@ export class Supervisor {
     }
     if (msg.kind !== 'result' && msg.kind !== 'cancelled' && msg.kind !== 'error') return;
     const completed = this.#complete(rec, pluginId, msg);
+    if (completed === 'defer') return 'defer';
     if (msg.kind === 'cancelled' && completed) this.#dropCall(rec, pluginId, msg.correlationId);
   }
 
@@ -725,7 +783,10 @@ export class Supervisor {
     if (priority < 10 && (this.lo.get(pluginId)?.length ?? 0) >= this.capsConfig.lo) {
       this.caps.lo = true;
       this.#pause(rec, 'bulk');
-      return false;
+      // The line has already left the framer. The caller keeps this message
+      // and replays it after the queue drains. Taking the pending entry here
+      // would turn the reply into a timeout.
+      return 'defer';
     }
     const frame = {
       kind: msg.kind,
@@ -802,8 +863,8 @@ export class Supervisor {
     this.#discardQueues(rec.credential.pluginId);
     rec.framer = new NdjsonFramer();
     rec.stash = null;
+    rec.deferred = [];
     rec.outbound = 0;
-    this.retiredTokens.add(rec.token);
     this.#failPending(rec, code);
     if (rec.child.exitCode == null && rec.child.signalCode == null) rec.child.kill();
   }
@@ -812,7 +873,7 @@ export class Supervisor {
     if (rec.dead) return;
     rec.dead = true;
     rec.stash = null;
-    this.retiredTokens.add(rec.token);
+    rec.deferred = [];
     this.#failPending(rec, err?.code || 'spawn-error');
     if (rec.child.exitCode == null && rec.child.signalCode == null) rec.child.kill('SIGKILL');
   }
@@ -823,7 +884,7 @@ export class Supervisor {
     rec.stash = null;
     if (rec.dead) return;
     rec.dead = true;
-    this.retiredTokens.add(rec.token);
+    rec.deferred = [];
     this.#failPending(rec, 'child-exited');
   }
 
@@ -993,13 +1054,33 @@ export class Supervisor {
       }
       let wrote = 0;
       while (wrote < 64) {
-        const next = this.#shiftTerminal()
-          ?? this.#shift(this.hi, this.hiOrder, 'hiBytes', 'hiTurn')
-          ?? this.#shift(this.lo, this.loOrder, 'loBytes', 'loTurn');
-        if (!next) {
+        const nextLen = this.#peekLength();
+        if (nextLen == null) {
           this.#resumeBulk();
           this.#maybeResumeAll();
           if (this.hiOrder.length > 0 || this.loOrder.length > 0) continue;
+          this.draining = false;
+          return;
+        }
+        // A frame larger than the ceiling can never be written without
+        // exceeding it. Settle the waiter with a small error instead.
+        if (nextLen > this.capsConfig.totalGlobal) {
+          const next = this.#shiftNext();
+          const replacement = next ? this.#rejectOversized(next.buf) : null;
+          this.caps.total = true;
+          if (replacement && replacement.length <= this.capsConfig.totalGlobal) {
+            this.terminal.unshift(replacement);
+            this.queuedBytes += replacement.length;
+          }
+          continue;
+        }
+        if (this.socketOutbound + nextLen > this.capsConfig.totalGlobal) {
+          this.#pauseOverGlobal();
+          this.draining = false;
+          return;
+        }
+        const next = this.#shiftNext();
+        if (!next) {
           this.draining = false;
           return;
         }
@@ -1032,6 +1113,50 @@ export class Supervisor {
       setImmediate(step);
     };
     step();
+  }
+
+  #peekLength() {
+    if (this.terminal.length > 0) return this.terminal[0].length;
+    const hi = this.#peekMap(this.hi, this.hiOrder, this.hiTurn);
+    if (hi != null) return hi;
+    return this.#peekMap(this.lo, this.loOrder, this.loTurn);
+  }
+
+  #peekMap(map, order, turn) {
+    if (order.length === 0) return null;
+    const start = turn % order.length;
+    for (let n = 0; n < order.length; n++) {
+      const q = map.get(order[(start + n) % order.length]);
+      if (q && q.length > 0) return q[0].length;
+    }
+    return null;
+  }
+
+  #shiftNext() {
+    return this.#shiftTerminal()
+      ?? this.#shift(this.hi, this.hiOrder, 'hiBytes', 'hiTurn')
+      ?? this.#shift(this.lo, this.loOrder, 'loBytes', 'loTurn');
+  }
+
+  #rejectOversized(buf) {
+    let msg;
+    try {
+      msg = JSON.parse(buf.subarray(4).toString('utf8'));
+    } catch {
+      return null;
+    }
+    try {
+      return encodeMux({
+        kind: 'error',
+        code: 'total-cap',
+        for: msg.for || (msg.kind === 'cancelled' ? 'cancel' : 'call'),
+        pluginId: msg.pluginId,
+        correlationId: msg.correlationId,
+        generation: msg.generation,
+      });
+    } catch {
+      return null;
+    }
   }
 
   #shiftTerminal() {

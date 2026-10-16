@@ -19,6 +19,21 @@ const CANCEL_BOUND_MS = 500;
 const CANCEL_TIMEOUT = 1_000;
 const MIN_FLOOD_RATE = 10_000;
 
+// A scored slot that was never issued is a missed cancellation, not a latency sample.
+export function applyScoredSkip(tally, missed) {
+  tally.skipped += missed;
+  tally.timeouts += missed;
+  tally.offered += missed;
+  for (let i = 0; i < missed; i++) tally.samples.push(CANCEL_TIMEOUT);
+}
+
+export function floodScore(rep) {
+  return rep.p99 != null && rep.p99 <= CANCEL_BOUND_MS && rep.timeouts === 0 && rep.samples > 0
+    && rep.skipped === 0
+    && rep.offered === rep.issued + rep.skipped
+    && rep.bulkRate >= MIN_FLOOD_RATE && rep.floodRate >= MIN_FLOOD_RATE;
+}
+
 async function call(stub, credential, correlationId, payload, timeoutMs = 1_500) {
   return stub.call({
     pluginId: credential.pluginId,
@@ -81,10 +96,7 @@ export async function hostileBattery({ stampIdentity = true } = {}) {
 
 async function floodRep({ warmupMs, windowMs }) {
   const pair = await connectPair({ sweeper: false });
-  const samples = [];
-  let timeouts = 0;
-  let offered = 0;
-  let issued = 0;
+  const tally = { samples: [], timeouts: 0, offered: 0, issued: 0, skipped: 0 };
   try {
     pair.sup.spawn({ pluginId: 'flood', script: floodPath });
     const sibling = pair.sup.spawn({ pluginId: 'sib', script: echoPath });
@@ -106,20 +118,18 @@ async function floodRep({ warmupMs, windowMs }) {
         baseline = { bulk: pair.sup.bulkSeen, flood: pair.stub.floodFrames };
       });
     }
-    const noteDrop = () => samples.push(CANCEL_TIMEOUT);
     await openLoop({
       ms: warmupMs + windowMs,
       rate: CANCEL_RATE,
       onSkip: (missed) => {
         if (performance.now() - started < warmupMs) return;
-        offered += missed;
-        for (let i = 0; i < missed; i++) noteDrop();
+        applyScoredSkip(tally, missed);
       },
       tick: () => {
         const record = performance.now() - started >= warmupMs;
         if (record) {
-          offered++;
-          issued++;
+          tally.offered++;
+          tally.issued++;
         }
         const correlationId = ++seq;
         pair.stub.cancel({
@@ -127,9 +137,9 @@ async function floodRep({ warmupMs, windowMs }) {
           credential: sibling.credential,
           correlationId,
         }, CANCEL_TIMEOUT).then((res) => {
-          if (record && res.rttMs != null) samples.push(res.rttMs);
+          if (record && res.rttMs != null) tally.samples.push(res.rttMs);
         }, () => {
-          if (record) timeouts++;
+          if (record) tally.timeouts++;
         });
       },
     });
@@ -141,11 +151,12 @@ async function floodRep({ warmupMs, windowMs }) {
     const bulk = endBulk - baseline.bulk;
     const floodFrames = endFlood - baseline.flood;
     return {
-      p99: percentile(samples, 99),
-      samples: samples.length,
-      timeouts,
-      offered,
-      issued,
+      p99: percentile(tally.samples, 99),
+      samples: tally.samples.length,
+      timeouts: tally.timeouts,
+      offered: tally.offered,
+      issued: tally.issued,
+      skipped: tally.skipped,
       bulk,
       floodFrames,
       bulkBaseline: baseline.bulk,
@@ -172,8 +183,7 @@ export async function floodBound(opts = {}) {
     return { pass: null, outcome: 'invalid', detail: { env: series.env, results: series.rows, rerun: series.rerun, boundMs: CANCEL_BOUND_MS } };
   }
   const results = series.rows;
-  const pass = results.every((rep) => rep.p99 != null && rep.p99 <= CANCEL_BOUND_MS && rep.timeouts === 0 && rep.samples > 0
-    && rep.bulkRate >= MIN_FLOOD_RATE && rep.floodRate >= MIN_FLOOD_RATE);
+  const pass = results.every((rep) => floodScore(rep));
   return {
     pass,
     outcome: 'scored',
