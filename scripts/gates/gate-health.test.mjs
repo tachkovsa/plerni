@@ -65,6 +65,13 @@ const cases = [
     expectOutput: /fake-gpl-peer \(dependency of fake-mit-lib \(brand\)\): forbidden license "GPL-3.0-only"/,
   },
   {
+    name: "license-audit blocks a required root peer when the package has no other dependencies",
+    cmd: gate("license-audit.mjs", "--root", join(fixtures, "isolated-root-peer")),
+    expectExit: 1,
+    expectOutput:
+      /fake-gpl-peer \(brand\): forbidden license "GPL-3.0-only"(?![\s\S]*fake-optional-peer)/,
+  },
+  {
     name: "license-audit blocks a forbidden tarball license when the lockfile license field is allowlisted",
     cmd: gate("license-audit.mjs", "--root", join(fixtures, "isolated-foreign")),
     expectExit: 1,
@@ -146,11 +153,54 @@ const cases = [
     expectOutput: /^(?![\s\S]*non-conventional subject)[\s\S]*author matches a forbidden identity/,
   },
   {
-    name: "commit-policy skips identity checks when COMMIT_IDENTITY_PATTERNS is unset",
+    name: "commit-policy skips identity checks on a fork pull request when the secret is unset",
     cmd: gate("commit-policy.mjs", "--file", join(fixtures, "commit-policy", "merge-metadata.txt")),
-    env: { COMMIT_IDENTITY_PATTERNS: "" },
+    env: {
+      COMMIT_IDENTITY_PATTERNS: "",
+      GITHUB_EVENT_NAME: "pull_request",
+      GITHUB_REPOSITORY: "example/plerni",
+      PR_HEAD_REPO: "other/plerni",
+    },
     expectExit: 0,
-    expectOutput: /COMMIT_IDENTITY_PATTERNS is not set — skipping forbidden-identity checks/,
+    expectOutput:
+      /COMMIT_IDENTITY_PATTERNS is not set — skipping forbidden-identity checks \(pull request from a fork; repository secrets are not available\)/,
+  },
+  {
+    name: "commit-policy fails closed on a push when COMMIT_IDENTITY_PATTERNS is unset",
+    cmd: gate("commit-policy.mjs", "--file", join(fixtures, "commit-policy", "merge-metadata.txt")),
+    env: {
+      COMMIT_IDENTITY_PATTERNS: "",
+      GITHUB_EVENT_NAME: "push",
+      GITHUB_REPOSITORY: "example/plerni",
+    },
+    expectExit: 1,
+    expectOutput: /COMMIT_IDENTITY_PATTERNS is not set on this repository \(push\) — FAIL CLOSED(?![\s\S]*skipping forbidden-identity checks)/,
+  },
+  {
+    name: "commit-policy fails closed on a same-repo pull request when COMMIT_IDENTITY_PATTERNS is unset",
+    cmd: gate("commit-policy.mjs", "--file", join(fixtures, "commit-policy", "merge-metadata.txt")),
+    env: {
+      COMMIT_IDENTITY_PATTERNS: "",
+      GITHUB_EVENT_NAME: "pull_request",
+      GITHUB_REPOSITORY: "example/plerni",
+      PR_HEAD_REPO: "example/plerni",
+    },
+    expectExit: 1,
+    expectOutput:
+      /COMMIT_IDENTITY_PATTERNS is not set on this repository \(pull_request\) — FAIL CLOSED(?![\s\S]*skipping forbidden-identity checks)/,
+  },
+  {
+    name: "commit-policy fails closed on a pull request when the head repository is not identified",
+    cmd: gate("commit-policy.mjs", "--file", join(fixtures, "commit-policy", "merge-metadata.txt")),
+    env: {
+      COMMIT_IDENTITY_PATTERNS: "",
+      GITHUB_EVENT_NAME: "pull_request",
+      GITHUB_REPOSITORY: "example/plerni",
+      PR_HEAD_REPO: "",
+    },
+    expectExit: 1,
+    expectOutput:
+      /COMMIT_IDENTITY_PATTERNS is not set on this repository \(pull_request\) — FAIL CLOSED(?![\s\S]*skipping forbidden-identity checks)/,
   },
 ];
 
@@ -244,7 +294,7 @@ cases.push({
   cmd: gate("commit-policy.mjs", "--cwd", identityDir, "--base", identityBase),
   env: { COMMIT_IDENTITY_PATTERNS: "" },
   expectExit: 1,
-  expectOutput: /author matches a forbidden identity[\s\S]*COMMIT_IDENTITY_PATTERNS is not set/,
+  expectOutput: /author matches a forbidden identity(?![\s\S]*skipping forbidden-identity checks)/,
 });
 
 let failed = 0;
@@ -253,6 +303,9 @@ try {
     let code = 0;
     let output = "";
     const env = { ...process.env };
+    for (const key of ["COMMIT_IDENTITY_PATTERNS", "GITHUB_EVENT_NAME", "GITHUB_REPOSITORY", "PR_HEAD_REPO"]) {
+      delete env[key];
+    }
     if (c.env) {
       for (const [key, value] of Object.entries(c.env)) {
         if (value == null) delete env[key];

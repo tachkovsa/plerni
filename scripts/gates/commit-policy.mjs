@@ -13,10 +13,14 @@
  * allowed. A URL or other text fails when it matches a forbidden identity
  * regex. CI reads those regexes from the `COMMIT_IDENTITY_PATTERNS`
  * environment variable, one per line. Nothing in the repository stores the
- * patterns or their digests. When the variable is unset or blank — a fork,
- * or a pull request from outside the repository — the gate logs a skip
- * notice and does not fail. A git-history run also loads the gitignored
- * `.private-markers.local` at the repository root.
+ * patterns or their digests. A push, or a pull request whose head repository
+ * is this repository (or is not identified), fails closed when the variable
+ * is unset or blank. A pull request from a fork — `GITHUB_EVENT_NAME` is
+ * `pull_request` and `PR_HEAD_REPO` differs from `GITHUB_REPOSITORY` — logs
+ * a skip notice and does not fail, because Actions does not pass repository
+ * secrets to that event. A run outside GitHub Actions still checks subjects
+ * and the gitignored `.private-markers.local` file. A git-history run loads
+ * that file from the repository root. The secret value is never printed.
  *
  * Modes:
  *   (default)     check `git log <base>..HEAD`; base = --base, else origin/dev
@@ -59,12 +63,25 @@ const addPatterns = (text, origin) => {
 };
 
 const secret = process.env[IDENTITY_SECRET];
-if (typeof secret !== "string" || secret.trim() === "") {
-  console.log(
-    `commit-policy: ${IDENTITY_SECRET} is not set — skipping forbidden-identity checks from the repository secret`,
-  );
-} else {
+const secretMissing = typeof secret !== "string" || secret.trim() === "";
+const eventName = process.env.GITHUB_EVENT_NAME ?? "";
+const baseRepo = process.env.GITHUB_REPOSITORY ?? "";
+const headRepo = process.env.PR_HEAD_REPO ?? "";
+const forkPullRequest =
+  eventName === "pull_request" && headRepo !== "" && baseRepo !== "" && headRepo !== baseRepo;
+const upstreamEvent = eventName === "push" || eventName === "pull_request";
+
+if (!secretMissing) {
   addPatterns(secret, IDENTITY_SECRET);
+} else if (forkPullRequest) {
+  console.log(
+    `commit-policy: ${IDENTITY_SECRET} is not set — skipping forbidden-identity checks (pull request from a fork; repository secrets are not available)`,
+  );
+} else if (upstreamEvent) {
+  console.error(
+    `commit-policy: ${IDENTITY_SECRET} is not set on this repository (${eventName}) — FAIL CLOSED`,
+  );
+  process.exit(1);
 }
 
 const parseFileRecord = (chunk) => {

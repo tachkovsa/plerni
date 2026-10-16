@@ -20,7 +20,9 @@
  * in for that child.
  * A required dependency that is not installed fails closed. A required peer
  * that is not installed fails closed, including a required peer declared by
- * an absent optional package's verified tarball.
+ * an absent optional package's verified tarball. A required peer declared on
+ * the package itself is audited even when it is the only external
+ * declaration. An optional root peer is not seeded into that walk.
  * An optional peer (`peerDependenciesMeta.*.optional`) that is not installed
  * is skipped; an optional peer that is installed is judged.
  * Usage: node scripts/gates/license-audit.mjs [--root <dir>]
@@ -61,11 +63,19 @@ if (existsSync(wsPath)) {
   pkgDirs.push(root);
 }
 
+const requiredPeerEntries = (pkg) => {
+  const meta = pkg.peerDependenciesMeta ?? {};
+  return Object.entries(pkg.peerDependencies ?? {}).filter(([name]) => meta[name]?.optional !== true);
+};
+
 const deps = new Map(); // name -> owning package dir
 for (const dir of pkgDirs) {
   const pkg = JSON.parse(readFileSync(join(dir, "package.json"), "utf8"));
-  for (const [name, range] of Object.entries({ ...pkg.dependencies, ...pkg.optionalDependencies })) {
-    if (!range.startsWith("workspace:")) deps.set(name, dir);
+  for (const [name, range] of [
+    ...Object.entries({ ...pkg.dependencies, ...pkg.optionalDependencies }),
+    ...requiredPeerEntries(pkg),
+  ]) {
+    if (!String(range).startsWith("workspace:")) deps.set(name, dir);
   }
 }
 
@@ -409,9 +419,10 @@ const lockDeps = [];
 let failures = [];
 for (const dir of isolatedDirs) {
   const pkg = JSON.parse(readFileSync(join(dir, "package.json"), "utf8"));
-  const externals = Object.entries({ ...pkg.dependencies, ...pkg.optionalDependencies }).filter(
-    ([, range]) => !String(range).startsWith("workspace:"),
-  );
+  const externals = [
+    ...Object.entries({ ...pkg.dependencies, ...pkg.optionalDependencies }),
+    ...requiredPeerEntries(pkg),
+  ].filter(([, range]) => !String(range).startsWith("workspace:"));
   if (externals.length === 0) continue;
   const rel = relative(root, dir) || ".";
   if (!existsSync(join(dir, "package-lock.json"))) {
@@ -444,7 +455,9 @@ const main = async () => {
     const rel = relative(root, dir) || ".";
     const label = `${name} (${rel})`;
     const lock = JSON.parse(readFileSync(join(dir, "package-lock.json"), "utf8"));
-    const rootSpec = lock.packages?.[""]?.dependencies?.[name] ?? lock.packages?.[""]?.optionalDependencies?.[name];
+    const rootPkg = lock.packages?.[""] ?? {};
+    const rootSpec =
+      rootPkg.dependencies?.[name] ?? rootPkg.optionalDependencies?.[name] ?? rootPkg.peerDependencies?.[name];
     if (rootSpec !== range) {
       failures.push(`${label}: lockfile root specifier "${rootSpec ?? "MISSING"}" does not match manifest "${range}"`);
     }
