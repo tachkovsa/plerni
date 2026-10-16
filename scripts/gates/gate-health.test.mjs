@@ -7,6 +7,7 @@
  * against fixtures/gitleaks (see .github/workflows/p0-gates.yml).
  */
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -69,6 +70,13 @@ const cases = [
     cmd: gate("license-audit.mjs", "--root", join(fixtures, "isolated-foreign")),
     expectExit: 1,
     expectOutput: /fake-darwin-gpl \(verified optional dependency of fake-mit-lib \(brand\)\): forbidden license "GPL-3.0-only"/,
+  },
+  {
+    name: "license-audit blocks a required peer of an absent optional package",
+    cmd: gate("license-audit.mjs", "--root", join(fixtures, "isolated-absent-peer")),
+    expectExit: 1,
+    expectOutput:
+      /fake-gpl-peer \(verified peer of fake-darwin-mit \(verified optional dependency of fake-mit-lib \(brand\)\)\): forbidden license "GPL-3.0-only"(?![\s\S]*fake-optional-peer)/,
   },
   {
     name: "license-audit fails closed when an absent optional dependency has no verifiable tarball",
@@ -168,18 +176,28 @@ cases.push({
   expectOutput: /author matches a forbidden identity[\s\S]*message matches a forbidden identity/,
 });
 
-// Obfuscated probe. The governed list stores only hashes of this identity.
-const banned = Buffer.from("Q3Vyc29yIEFnZW50IDxjdXJzb3JhZ2VudEBjdXJzb3IuY29tPg==", "base64").toString("utf8");
-const bannedParts = /^(.*) <([^>]+)>$/.exec(banned);
-if (!bannedParts) throw new Error("identity probe is malformed");
+// Synthetic stand-in. Digests are computed here and are not a published preimage.
+const standIn = "Marker Example <marker@synthetic-standin.example>";
+const standInParts = /^(.*) <([^>]+)>$/.exec(standIn);
+if (!standInParts) throw new Error("identity stand-in is malformed");
 const identityDir = mkdtempSync(join(tmpdir(), "plerni-commit-identity-"));
+const standInRules = [standIn.toLowerCase(), standInParts[1].toLowerCase(), standInParts[2].toLowerCase()]
+  .map((text) => `sha256:${createHash("sha256").update(text).digest("hex")}`)
+  .join("\n");
+writeFileSync(join(identityDir, "identities.txt"), `${standInRules}\n`);
 writeFileSync(
   join(identityDir, "probe.txt"),
-  `author: ${banned}\ncommitter: ${banned}\n\nfeat: keep the message clean\n\nAI-assisted: yes\n`,
+  `author: ${standIn}\ncommitter: ${standIn}\n\nfeat: keep the message clean\n\nAI-assisted: yes\n`,
 );
 cases.push({
-  name: "commit-policy file mode applies governed hashes with no extra identity file",
-  cmd: gate("commit-policy.mjs", "--file", join(identityDir, "probe.txt")),
+  name: "commit-policy file mode applies a digest generated in the test",
+  cmd: gate(
+    "commit-policy.mjs",
+    "--file",
+    join(identityDir, "probe.txt"),
+    "--identities",
+    join(identityDir, "identities.txt"),
+  ),
   expectExit: 1,
   expectOutput: /author matches a forbidden identity[\s\S]*committer matches a forbidden identity(?![\s\S]*message matches)/,
 });
@@ -209,13 +227,21 @@ identityGit([
 ]);
 identityGit(["checkout", "-q", "main"]);
 identityGit([
-  "-c", `user.name=${bannedParts[1]}`,
-  "-c", `user.email=${bannedParts[2]}`,
+  "-c", `user.name=${standInParts[1]}`,
+  "-c", `user.email=${standInParts[2]}`,
   "merge", "-q", "--no-ff", "-m", "Merge branch 'side'\n\nAI-assisted: yes\n", "side",
 ]);
 cases.push({
-  name: "commit-policy history mode applies governed hashes on a clean checkout",
-  cmd: gate("commit-policy.mjs", "--cwd", identityDir, "--base", identityBase),
+  name: "commit-policy history mode applies a digest generated in the test",
+  cmd: gate(
+    "commit-policy.mjs",
+    "--cwd",
+    identityDir,
+    "--base",
+    identityBase,
+    "--identities",
+    join(identityDir, "identities.txt"),
+  ),
   expectExit: 1,
   expectOutput: /author matches a forbidden identity[\s\S]*committer matches a forbidden identity/,
 });

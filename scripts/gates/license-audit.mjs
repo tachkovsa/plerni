@@ -15,7 +15,8 @@
  * license field is ignored. A missing tarball, a bad hash, or a name or
  * version that does not match the lock entry fails closed.
  * A required dependency that is not installed fails closed. A required peer
- * that is not installed fails closed.
+ * that is not installed fails closed, including a required peer declared by
+ * an absent optional package's verified tarball.
  * An optional peer (`peerDependenciesMeta.*.optional`) that is not installed
  * is skipped; an optional peer that is installed is judged.
  * Usage: node scripts/gates/license-audit.mjs [--root <dir>]
@@ -266,7 +267,7 @@ const readResolvedTarball = async (resolved, lockPath) => {
 
 // Optional packages for other OS/CPU targets are absent here. Their license
 // comes from the integrity-checked tarball, never from the lockfile license field.
-const auditLockedOptional = async (startDir, name, label) => {
+const auditLockedOptional = async (startDir, name, label, relation = "verified optional dependency") => {
   const found = readLock(startDir);
   if (!found) {
     failures.push(`${name} (optional dependency of ${label}): not installed and no package-lock.json — fail closed`);
@@ -303,13 +304,23 @@ const auditLockedOptional = async (startDir, name, label) => {
       continue;
     }
     checked++;
-    const lockedLabel = `${name} (verified optional dependency of ${label})`;
+    const lockedLabel = `${name} (${relation} of ${label})`;
     const problem = judge(lockedLabel, licenseOf(pkg));
     if (problem) failures.push(problem);
     const nested = { ...pkg.dependencies, ...pkg.optionalDependencies };
     for (const child of Object.keys(nested)) {
       if (resolveInstalled(startDir, child)) continue;
       await auditLockedOptional(startDir, child, lockedLabel);
+    }
+    const peerMeta = pkg.peerDependenciesMeta ?? {};
+    for (const child of Object.keys(pkg.peerDependencies ?? {})) {
+      const childPath = resolveInstalled(startDir, child);
+      if (childPath) {
+        await auditTree(childPath, `${child} (dependency of ${lockedLabel})`);
+        continue;
+      }
+      if (peerMeta[child]?.optional === true) continue;
+      await auditLockedOptional(startDir, child, lockedLabel, "verified peer");
     }
   }
 };
