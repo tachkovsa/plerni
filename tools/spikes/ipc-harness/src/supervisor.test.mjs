@@ -383,6 +383,7 @@ test('B1 achieved rate ignores completions that land after the window', { timeou
   const rep = result.detail.reps[0];
   assert.ok(rep.issued > 0);
   assert.equal(rep.achieved, 0);
+  assert.ok(rep.p99 != null && rep.p99 >= 40, String(rep.p99));
 });
 
 test('spawn rejects a duplicate live plugin id', async () => {
@@ -1550,5 +1551,86 @@ test('one plugin cannot fill the kernel ahead of a sibling cancel', async () => 
     await Promise.all(burst);
   } finally {
     await pair.close();
+  }
+});
+
+test('pending identifiers stay charged after the child reads them', async () => {
+  const pair = await connectPair({
+    sweeper: false,
+    caps: { total: 20_000, totalGlobal: 40_000, pending: 8 },
+    kernel: { pendingCap: 32, byteCap: 200_000 },
+  });
+  let first;
+  try {
+    const kid = pair.sup.spawn({ pluginId: 'ig', script: ignorePath, total: 20_000 });
+    const id = 'z'.repeat(6_000);
+    const floor = Buffer.byteLength(JSON.stringify(id));
+    first = pair.stub.cancel({
+      pluginId: 'ig',
+      credential: kid.credential,
+      correlationId: id,
+    }, 2_000).catch((err) => err);
+    const held = await waitUntil(() => {
+      const rec = pair.sup.children.get('ig');
+      return Boolean(rec)
+        && rec.outbound === 0
+        && pair.sup.pending.size === 1
+        && pair.stub.outbound === 0
+        && pair.sup.bufferedBytes() >= floor
+        && pair.stub.bufferedBytes() >= floor;
+    }, 2_000);
+    assert.equal(held, true);
+    assert.ok(pair.sup.bufferedBytes() <= 40_000, String(pair.sup.bufferedBytes()));
+    assert.ok(pair.stub.bufferedBytes() <= 40_000, String(pair.stub.bufferedBytes()));
+    // The stdin line alone fits the remaining per-plugin room. The retained id does not.
+    const again = await pair.stub.cancel({
+      pluginId: 'ig',
+      credential: kid.credential,
+      correlationId: 'q'.repeat(8_000),
+    }, 1_000).catch((err) => err);
+    assert.equal(again.code, 'total-cap');
+    assert.equal(pair.sup.pending.size, 1);
+    assert.ok(pair.sup.bufferedBytes() >= floor, String(pair.sup.bufferedBytes()));
+    assert.ok(pair.stub.bufferedBytes() >= floor, String(pair.stub.bufferedBytes()));
+    assert.ok(pair.sup.bufferedBytes() <= 40_000, String(pair.sup.bufferedBytes()));
+    assert.ok(pair.stub.bufferedBytes() <= 40_000, String(pair.stub.bufferedBytes()));
+  } finally {
+    await pair.close();
+    if (first) await first;
+  }
+});
+
+test('an unknown rejection does not hi-cap a plugin id outside the unbound key', async () => {
+  const pair = await connectPair({ sweeper: false, caps: { hi: 1, pending: 8 } });
+  const id = '\0unbound';
+  const pending = [];
+  try {
+    const kid = pair.sup.spawn({ pluginId: id, script: echoPath });
+    pair.sup.socket.write = () => false;
+    for (let n = 1; n <= 2; n++) {
+      pending.push(pair.stub.cancel({
+        pluginId: id,
+        credential: kid.credential,
+        correlationId: n,
+      }, 2_000).catch((err) => err));
+    }
+    const filled = await waitUntil(() => pair.sup.queueDepth(id).hi >= 1, 2_000);
+    assert.equal(filled, true);
+    pending.push(pair.stub.call({
+      pluginId: 'no-such',
+      credential: kid.credential,
+      correlationId: 3,
+      port: 'db',
+      method: 'get',
+      payload: { ok: true },
+    }, 1_000).catch((err) => err));
+    const queued = await waitUntil(() => pair.sup.unknownRejectQueued === true, 2_000);
+    assert.equal(queued, true);
+    assert.equal(pair.sup.children.get(id).dead, false);
+    assert.equal(pair.sup.faults.some((fault) => fault.code === 'hi-cap'), false);
+    assert.ok(pair.sup.queueDepth(id).hi >= 1);
+  } finally {
+    await pair.close();
+    await Promise.all(pending);
   }
 });

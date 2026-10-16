@@ -34,6 +34,8 @@ async function rep({ warmupMs, windowMs, script, callTimeout }) {
   let offered = 0;
   let issued = 0;
   let inFlight = 0;
+  let pendingScored = 0;
+  let latencyClosed = false;
   let seq = 0;
   try {
     const started = performance.now();
@@ -57,7 +59,10 @@ async function rep({ warmupMs, windowMs, script, callTimeout }) {
           if (record) noteDrop();
           return;
         }
-        if (record) issued++;
+        if (record) {
+          issued++;
+          pendingScored++;
+        }
         inFlight++;
         const kid = kids[seq % kids.length];
         const correlationId = ++seq;
@@ -70,22 +75,30 @@ async function rep({ warmupMs, windowMs, script, callTimeout }) {
           payload: PAYLOAD,
         }, timeout).then((res) => {
           inFlight--;
-          if (!record) return;
+          if (!record || latencyClosed) return;
+          pendingScored--;
           if (res.payload !== PAYLOAD) corrupt++;
-          if (performance.now() > windowEnd) return;
-          completions++;
+          // A response issued in the window still counts in p99 when it lands
+          // after windowEnd. It does not count as a completion.
+          if (performance.now() <= windowEnd) completions++;
           if (res.rttMs != null) samples.push(res.rttMs);
           if (res.ingressTs != null && res.sendTs != null) ingress.push(res.ingressTs - res.sendTs);
           if (res.egressTs != null && res.ingressTs != null) child.push(res.egressTs - res.ingressTs);
           if (res.returnedAt != null && res.egressTs != null) ret.push(res.returnedAt - res.egressTs);
         }, () => {
           inFlight--;
-          if (record) errors++;
+          if (!record || latencyClosed) return;
+          pendingScored--;
+          errors++;
+          samples.push(timeout);
         });
       },
     });
     const drainDeadline = Date.now() + 3_000;
     while (inFlight > 0 && Date.now() < drainDeadline) await delay(10);
+    latencyClosed = true;
+    for (let i = 0; i < pendingScored; i++) samples.push(timeout);
+    pendingScored = 0;
     const seconds = windowMs / 1000;
     return {
       achieved: completions / seconds,

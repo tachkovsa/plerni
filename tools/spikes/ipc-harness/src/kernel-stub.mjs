@@ -121,6 +121,12 @@ function fail(code) {
   return err;
 }
 
+function retainedIdBytes(pluginId, correlationId) {
+  const left = JSON.stringify(pluginId);
+  const right = JSON.stringify(correlationId);
+  return Buffer.byteLength(left ?? '') + Buffer.byteLength(right ?? '');
+}
+
 const KERNEL_PENDING_CAP = 512;
 const KERNEL_BYTE_CAP = 1024 * 1024;
 
@@ -142,6 +148,7 @@ export class KernelStub {
     this.pendingPerPlugin = opts.pendingPerPlugin ?? Math.max(1, Math.floor(callRoom / 2));
     this.byteCap = opts.byteCap ?? KERNEL_BYTE_CAP;
     this.outbound = 0;
+    this.retained = 0;
     this.writeQueue = [];
     this.writeBlocked = false;
     socket.on('data', (chunk) => this.#onData(chunk));
@@ -153,7 +160,7 @@ export class KernelStub {
   }
 
   bufferedBytes() {
-    let total = this.outbound;
+    let total = this.outbound + this.retained;
     for (const entry of this.writeQueue) total += entry.buf.length;
     return total;
   }
@@ -192,6 +199,7 @@ export class KernelStub {
     const waiter = bucket.get(msg.pluginId, msg.correlationId);
     if (!waiter) return;
     if (waiter.generation != null && msg.generation !== waiter.generation) return;
+    this.retained = Math.max(0, this.retained - (waiter.idBytes ?? 0));
     bucket.delete(msg.pluginId, msg.correlationId);
     clearTimeout(waiter.timer);
     const returnedAt = performance.now();
@@ -210,19 +218,24 @@ export class KernelStub {
       }
       bucket.clear();
     }
+    this.retained = 0;
     this.sentAt.clear();
   }
 
   #track(bucket, sent, timeoutMs, generation) {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        if (!bucket.has(sent.pluginId, sent.correlationId)) return;
+        const waiter = bucket.get(sent.pluginId, sent.correlationId);
+        if (!waiter) return;
+        this.retained = Math.max(0, this.retained - (waiter.idBytes ?? 0));
         bucket.delete(sent.pluginId, sent.correlationId);
         this.sentAt.delete(sent);
         this.#dropUnsent(sent);
         reject(fail('timeout'));
       }, timeoutMs);
-      bucket.set(sent.pluginId, sent.correlationId, { resolve, reject, timer, sent, generation });
+      const idBytes = retainedIdBytes(sent.pluginId, sent.correlationId);
+      this.retained += idBytes;
+      bucket.set(sent.pluginId, sent.correlationId, { resolve, reject, timer, sent, generation, idBytes });
     });
   }
 
@@ -250,7 +263,8 @@ export class KernelStub {
     } catch (err) {
       return Promise.reject(err);
     }
-    if (this.bufferedBytes() + buf.length > this.byteCap) return Promise.reject(fail('total-cap'));
+    const idBytes = retainedIdBytes(frame.pluginId, frame.correlationId);
+    if (this.bufferedBytes() + buf.length + idBytes > this.byteCap) return Promise.reject(fail('total-cap'));
     const sent = { lane, pluginId: frame.pluginId, correlationId: frame.correlationId };
     this.sentAt.set(sent, frame.sendTs);
     const generation = frame.credential?.generation ?? null;

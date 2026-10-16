@@ -55,8 +55,17 @@ export const DEFAULT_CAPS = Object.freeze({
 
 const DEFAULT_DEADLINE_MS = 5_000;
 // Rejections for a plugin id with no live child share one queue. A peer that
-// invents ids cannot open an unbounded set of high-priority queues.
-const UNBOUND_QUEUE = '\0unbound';
+// invents ids cannot open an unbounded set of high-priority queues. A Symbol
+// cannot be a plugin id, so it cannot collide with one that contains NUL.
+const UNBOUND_QUEUE = Symbol('unbound');
+
+// Bytes retained for a plugin id and correlation id until the pending entry
+// leaves. The stdin write that carried them is released when the child reads.
+function identifierBytes(pluginId, correlationId) {
+  const left = JSON.stringify(pluginId);
+  const right = JSON.stringify(correlationId);
+  return Buffer.byteLength(left ?? '') + Buffer.byteLength(right ?? '');
+}
 
 export function dbConfigured() {
   return Boolean(process.env.HARNESS_DIRECT_DSN || process.env.PLERNI_APP_PASSWORD);
@@ -200,6 +209,7 @@ export class Supervisor {
       loBytes: 0,
       callPending: 0,
       cancelPending: 0,
+      idBytes: 0,
       dead: false,
       paused: false,
       pauseReason: null,
@@ -273,6 +283,7 @@ export class Supervisor {
       if (rec.dead) continue;
       total += rec.framer.pendingBytes();
       total += Math.max(0, rec.outbound);
+      total += rec.idBytes;
       total += rec.stash?.length ?? 0;
     }
     return total;
@@ -325,6 +336,7 @@ export class Supervisor {
       + Math.max(0, rec.outbound)
       + rec.hiBytes
       + rec.loBytes
+      + rec.idBytes
       + (rec.stash?.length ?? 0)
       + this.#stdoutBuffered(rec);
   }
@@ -364,12 +376,13 @@ export class Supervisor {
       }
       const line = encodeNdjson({ kind: 'cancel', correlationId: msg.correlationId });
       const bytes = Buffer.byteLength(line);
-      if (this.#overBytes(rec, bytes)) {
+      const idBytes = identifierBytes(msg.pluginId, msg.correlationId);
+      if (this.#overBytes(rec, bytes + idBytes)) {
         this.caps.total = true;
         this.#reject(msg, 'total-cap', true);
         return;
       }
-      this.#arm(rec, msg, { cancel: true, bytes, ingressTs });
+      this.#arm(rec, msg, { cancel: true, bytes, idBytes, ingressTs });
       rec.outbound += bytes;
       rec.child.stdin.write(line, () => {
         this.#releaseOutbound(rec, bytes);
@@ -384,17 +397,18 @@ export class Supervisor {
       payload: msg.payload,
     });
     const bytes = Buffer.byteLength(line);
+    const idBytes = identifierBytes(msg.pluginId, msg.correlationId);
     if (this.#pendingFull(rec)) {
       this.caps.pending = true;
       this.#reject(msg, 'pending-cap', true);
       return;
     }
-    if (this.#overBytes(rec, bytes)) {
+    if (this.#overBytes(rec, bytes + idBytes)) {
       this.caps.total = true;
       this.#reject(msg, 'total-cap', true);
       return;
     }
-    this.#arm(rec, msg, { cancel: false, bytes, ingressTs });
+    this.#arm(rec, msg, { cancel: false, bytes, idBytes, ingressTs });
     rec.outbound += bytes;
     rec.child.stdin.write(line, () => {
       this.#releaseOutbound(rec, bytes);
@@ -429,8 +443,10 @@ export class Supervisor {
       ingressTs: extra.ingressTs,
       cancel: extra.cancel,
       bytes: extra.bytes,
+      idBytes: extra.idBytes,
       timer,
     }, lane);
+    rec.idBytes += extra.idBytes;
     if (extra.cancel) {
       rec.cancelPending++;
       this.cancelPendingTotal++;
@@ -461,6 +477,7 @@ export class Supervisor {
     this.pending.delete(pluginId, correlationId, lane);
     const rec = this.children.get(pending.pluginId);
     const same = rec && rec.credential.generation === pending.generation;
+    if (same && pending.idBytes) rec.idBytes = Math.max(0, rec.idBytes - pending.idBytes);
     if (pending.cancel) {
       this.cancelPendingTotal--;
       if (same) rec.cancelPending--;
@@ -555,8 +572,10 @@ export class Supervisor {
 
   #accountCaps(rec) {
     // An unfinished frame cannot shrink while stdout is paused, so crossing
-    // the total cap with one is a typed fault rather than a permanent pause.
-    if (!rec.dead && rec.framer.pendingBytes() > rec.limits.total) {
+    // the room left beside the retained ids is a typed fault. Pausing instead
+    // would wait for bytes that make the frame larger.
+    const frameRoom = Math.max(0, rec.limits.total - rec.idBytes);
+    if (!rec.dead && rec.framer.pendingBytes() > frameRoom) {
       this.caps.total = true;
       this.#fault(rec, 'total-cap');
       return;
