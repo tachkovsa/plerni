@@ -24,6 +24,9 @@
  * an absent optional package's verified tarball. A required peer declared on
  * the package itself is audited even when it is the only external
  * declaration. An optional root peer is not seeded into that walk.
+ * Each (owning package directory, dependency name) is an independent root.
+ * A required peer in one workspace package does not replace a dependency
+ * of the same name installed for another package.
  * An optional peer (`peerDependenciesMeta.*.optional`) that is not installed
  * is skipped. An optional peer that is installed is judged from the same
  * source as its parent: the verified tarball when the parent was verified
@@ -65,20 +68,28 @@ if (existsSync(wsPath)) {
 } else {
   pkgDirs.push(root);
 }
+pkgDirs.sort();
 
 const requiredPeerEntries = (pkg) => {
   const meta = pkg.peerDependenciesMeta ?? {};
   return Object.entries(pkg.peerDependencies ?? {}).filter(([name]) => meta[name]?.optional !== true);
 };
 
-const deps = new Map(); // name -> owning package dir
+// One root per owning directory and name. A later peer must not replace an
+// earlier install of the same name in another package.
+const deps = [];
+const seenRoots = new Set();
 for (const dir of pkgDirs) {
   const pkg = JSON.parse(readFileSync(join(dir, "package.json"), "utf8"));
   for (const [name, range] of [
     ...Object.entries({ ...pkg.dependencies, ...pkg.optionalDependencies }),
     ...requiredPeerEntries(pkg),
   ]) {
-    if (!String(range).startsWith("workspace:")) deps.set(name, dir);
+    if (String(range).startsWith("workspace:")) continue;
+    const key = `${dir}\0${name}`;
+    if (seenRoots.has(key)) continue;
+    seenRoots.add(key);
+    deps.push({ name, dir });
   }
 }
 
@@ -489,13 +500,13 @@ for (const dir of isolatedDirs) {
   }
 }
 
-if (deps.size === 0 && lockDeps.length === 0 && failures.length === 0) {
+if (deps.length === 0 && lockDeps.length === 0 && failures.length === 0) {
   console.log("license-audit: no external dependencies declared. OK (vacuous — gate-health covers the negative case).");
   process.exit(0);
 }
 
 const main = async () => {
-  for (const [name, ownerDir] of deps) {
+  for (const { name, dir: ownerDir } of deps) {
     const candidates = [
       join(ownerDir, "node_modules", ...name.split("/"), "package.json"),
       join(root, "node_modules", ...name.split("/"), "package.json"),

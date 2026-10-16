@@ -36,6 +36,12 @@ const cases = [
     expectOutput: /forbidden license "GPL/,
   },
   {
+    name: "license-audit keeps a dependency install when a later peer reuses the name",
+    cmd: gate("license-audit.mjs", "--root", join(fixtures, "peer-overwrites-dep")),
+    expectExit: 1,
+    expectOutput: /shared-lib: forbidden license "GPL/,
+  },
+  {
     name: "license-audit accepts an MIT dependency",
     cmd: gate("license-audit.mjs", "--root", join(fixtures, "mit-dep")),
     expectExit: 0,
@@ -366,6 +372,13 @@ cases.push({
   env: { COMMIT_IDENTITY_PATTERNS: "" },
   expectExit: 1,
   expectOutput: /author matches a forbidden identity(?![\s\S]*skipping forbidden-identity checks)/,
+});
+cases.push({
+  name: "commit-policy fails closed when COMMIT_IDENTITY_PATTERNS compiles no patterns",
+  cmd: gate("commit-policy.mjs", "--cwd", identityDir, "--base", identityBase),
+  env: { COMMIT_IDENTITY_PATTERNS: "# comment only\n" },
+  expectExit: 1,
+  expectOutput: /contains no effective patterns — FAIL CLOSED(?![\s\S]*author matches a forbidden identity)/,
 });
 
 let failed = 0;

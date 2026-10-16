@@ -1,0 +1,8 @@
+{
+  "name": "aaa-dep",
+  "version": "0.0.0",
+  "private": true,
+  "dependencies": {
+    "shared-lib": "1.0.0"
+  }
+}

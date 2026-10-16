@@ -16,10 +16,14 @@
  * environment variable, one per line. Nothing in the repository stores the
  * patterns or their digests. A push, or a pull request whose head repository
  * is this repository (or is not identified), fails closed when the variable
- * is unset or blank. A pull request from a fork — the event is
- * `pull_request` or `pull_request_target`, and `PR_HEAD_REPO` differs from
- * `GITHUB_REPOSITORY` — logs a skip notice and does not fail. A run outside
- * GitHub Actions still checks subjects and the gitignored
+ * is unset or blank. A nonblank value that compiles no patterns — blank
+ * lines and `#` comments only — fails closed as well, including outside
+ * GitHub Actions, so `.private-markers.local` cannot stand in for an empty
+ * secret. A pull request from a fork — the event is `pull_request` or
+ * `pull_request_target`, and `PR_HEAD_REPO` differs from
+ * `GITHUB_REPOSITORY` — logs a skip notice and does not fail, and only when
+ * the variable is unset or blank. A run outside GitHub Actions with the
+ * variable unset still checks subjects and the gitignored
  * `.private-markers.local` file. A git-history run loads that file from the
  * repository root. `--head` selects a fetched commit without checking it
  * out. History records are separated by NUL (`git log -z` and `%x00`);
@@ -79,7 +83,12 @@ const forkPullRequest =
 const upstreamEvent = eventName === "push" || pullRequestEvent;
 
 if (!secretMissing) {
+  const patternsBeforeSecret = identityPatterns.length;
   addPatterns(secret, IDENTITY_SECRET);
+  if (identityPatterns.length === patternsBeforeSecret) {
+    console.error(`commit-policy: ${IDENTITY_SECRET} contains no effective patterns — FAIL CLOSED`);
+    process.exit(1);
+  }
 } else if (forkPullRequest) {
   console.log(
     `commit-policy: ${IDENTITY_SECRET} is not set — skipping forbidden-identity checks (pull request from a fork; repository secrets are not available)`,
