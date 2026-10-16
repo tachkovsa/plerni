@@ -141,6 +141,10 @@ export class Supervisor {
     this.partialLowWater = opts.partialLowWater ?? Math.floor(this.partialHighWater / 2);
     this.children = new Map();
     this.pending = new PendingTable();
+    // Correlation ids that already timed out in this generation. A late reply
+    // must not satisfy a newer waiter that reused the id. Cleared when the
+    // generation is retired.
+    this.stale = new PendingTable();
     this.callPendingTotal = 0;
     this.cancelPendingTotal = 0;
     this.retiredTokens = new Set();
@@ -211,6 +215,7 @@ export class Supervisor {
       cancelPending: 0,
       idBytes: 0,
       deferred: [],
+      deferredBytes: 0,
       dead: false,
       paused: false,
       pauseReason: null,
@@ -265,6 +270,7 @@ export class Supervisor {
       // here leaves the kernel waiter with nothing but a later timeout.
       const hiBytes = prev.hiBytes;
       const loBytes = prev.loBytes;
+      this.#dropStale(pluginId, prev.credential.generation);
       this.children.delete(pluginId);
       const spawned = this.spawn({ pluginId, script, env, generation, version, grants, pending, total });
       const rec = this.children.get(pluginId);
@@ -306,6 +312,7 @@ export class Supervisor {
       total += rec.framer.pendingBytes();
       total += Math.max(0, rec.outbound);
       total += rec.idBytes;
+      total += rec.deferredBytes;
       total += rec.stash?.length ?? 0;
     }
     return total;
@@ -359,6 +366,7 @@ export class Supervisor {
       + rec.hiBytes
       + rec.loBytes
       + rec.idBytes
+      + rec.deferredBytes
       + (rec.stash?.length ?? 0)
       + this.#stdoutBuffered(rec);
   }
@@ -389,6 +397,14 @@ export class Supervisor {
     if (this.pending.has(msg.pluginId, msg.correlationId, lane)) {
       this.#reject(msg, 'duplicate-correlation', true);
       return;
+    }
+    const staleGen = this.stale.get(msg.pluginId, msg.correlationId, lane);
+    if (staleGen != null) {
+      if (staleGen === rec.credential.generation) {
+        this.#reject(msg, 'stale-correlation', true);
+        return;
+      }
+      this.stale.delete(msg.pluginId, msg.correlationId, lane);
     }
     if (msg.kind === 'cancel') {
       if (this.#pendingFull(rec) || rec.cancelPending >= this.capsConfig.cancels) {
@@ -482,6 +498,9 @@ export class Supervisor {
   #expire(pluginId, correlationId, lane) {
     const pending = this.#take(pluginId, correlationId, lane);
     if (!pending || this.closed) return;
+    // The id stays quarantined for this generation so a reuse cannot arm a
+    // waiter that a late reply would satisfy.
+    this.stale.set(pending.pluginId, pending.correlationId, pending.generation, lane);
     this.#enqueueTerminal({
       kind: 'error',
       code: 'timeout',
@@ -490,6 +509,14 @@ export class Supervisor {
       correlationId: pending.correlationId,
       generation: pending.generation,
     });
+  }
+
+  #dropStale(pluginId, generation) {
+    for (const [key, gen] of [...this.stale.entries()]) {
+      if (Object.is(key.pluginId, pluginId) && gen === generation) {
+        this.stale.delete(key.pluginId, key.correlationId, key.lane);
+      }
+    }
   }
 
   #take(pluginId, correlationId, lane) {
@@ -573,24 +600,50 @@ export class Supervisor {
     }
   }
 
-  // A parsed result that did not fit the low-priority queue stays on
-  // `deferred`. Later complete lines stay in the framer. Both are retried
-  // once the queue has room, in the order they arrived.
+  // A parsed reply that did not fit stays on `deferred` as an encoded buffer.
+  // Its bytes are charged until it is queued or the generation is retired.
+  // Later complete lines stay in the framer. Both are retried in order.
   #pullFrames(rec) {
     while (rec.deferred.length > 0) {
-      const msg = rec.deferred.shift();
-      if (this.#fromChild(rec, msg) === 'defer') {
-        rec.deferred.unshift(msg);
+      const held = rec.deferred.shift();
+      this.#unhold(rec, held);
+      const outcome = this.#fromChild(rec, held.msg, held.buf);
+      if (outcome?.defer) {
+        this.#park(rec, held.msg, outcome.buf, true);
         return true;
       }
     }
     for (const msg of rec.framer.frames()) {
-      if (this.#fromChild(rec, msg) === 'defer') {
-        rec.deferred.push(msg);
+      const outcome = this.#fromChild(rec, msg, null);
+      if (outcome?.defer) {
+        this.#park(rec, msg, outcome.buf, false);
         return true;
       }
     }
     return false;
+  }
+
+  // `front` keeps a replayed hold ahead of anything parked in the same pass.
+  #park(rec, msg, buf, front) {
+    const held = { msg, buf, bytes: buf.length };
+    if (front) rec.deferred.unshift(held);
+    else rec.deferred.push(held);
+    rec.deferredBytes += held.bytes;
+    if (this.bufferedBytes() > this.capsConfig.totalGlobal) this.#pauseOverGlobal();
+  }
+
+  #unhold(rec, held) {
+    rec.deferredBytes = Math.max(0, rec.deferredBytes - (held?.bytes ?? 0));
+  }
+
+  // A held reply can move onto a queue once it fits. Unpausing earlier would
+  // parse more stdout; unpausing when it still does not fit spins.
+  #holdFits(rec) {
+    const held = rec.deferred[0];
+    if (!held || rec.dead) return false;
+    const loFull = (this.lo.get(rec.credential.pluginId)?.length ?? 0) >= this.capsConfig.lo;
+    if (loFull && held.msg?.kind !== 'cancelled') return false;
+    return this.bufferedBytes() <= this.capsConfig.totalGlobal;
   }
 
   // Never discard unread bytes. A tail that fits stays in `stash`. A tail that
@@ -705,7 +758,7 @@ export class Supervisor {
     for (const rec of this.children.values()) {
       if (!rec.paused || rec.dead) continue;
       if (rec.pauseReason === 'global') {
-        if (globalLow) this.#unpause(rec);
+        if (globalLow || this.#holdFits(rec)) this.#unpause(rec);
       } else if (rec.pauseReason === 'partial') {
         if (globalOpen && rec.framer.pendingBytes() <= this.partialLowWater) this.#unpause(rec);
       } else if (rec.pauseReason === 'total') {
@@ -714,7 +767,7 @@ export class Supervisor {
     }
   }
 
-  #fromChild(rec, raw) {
+  #fromChild(rec, raw, prepared = null) {
     if (rec.dead) return;
     const msg = normalizeEcho(raw);
     if (msg.kind === 'flood') {
@@ -725,23 +778,34 @@ export class Supervisor {
     let pluginId = rec.credential.pluginId;
     if (this.stampIdentity) {
       if (claimed != null && claimed !== rec.credential.pluginId) {
-        this.#enqueue({
-          kind: 'rejected',
-          code: 'forged-plugin-id',
-          for: 'call',
-          pluginId: rec.credential.pluginId,
-          correlationId: msg.correlationId,
-          generation: rec.credential.generation,
-        }, 10, false);
+        this.#retireForged(rec, msg);
         return;
       }
     } else {
       pluginId = claimed ?? rec.credential.pluginId;
     }
     if (msg.kind !== 'result' && msg.kind !== 'cancelled' && msg.kind !== 'error') return;
-    const completed = this.#complete(rec, pluginId, msg);
-    if (completed === 'defer') return 'defer';
-    if (msg.kind === 'cancelled' && completed) this.#dropCall(rec, pluginId, msg.correlationId);
+    const completed = this.#complete(rec, pluginId, msg, prepared);
+    if (completed?.defer) return completed;
+    if (msg.kind === 'cancelled' && completed === true) this.#dropCall(rec, pluginId, msg.correlationId);
+  }
+
+  // A forged child reply settles the waiter on the lane it claimed, under the
+  // supervisor-stamped plugin id. Leaving that entry pending would occupy a
+  // slot until the deadline after the kernel had already been rejected.
+  #retireForged(rec, msg) {
+    const lane = msg.kind === 'cancelled' ? 'cancel' : 'call';
+    const pluginId = rec.credential.pluginId;
+    if (!this.#roomHi(pluginId)) return;
+    const pending = this.#take(pluginId, msg.correlationId, lane);
+    this.#enqueue({
+      kind: 'rejected',
+      code: 'forged-plugin-id',
+      for: lane,
+      pluginId,
+      correlationId: msg.correlationId,
+      generation: pending?.generation ?? rec.credential.generation,
+    }, 10, false);
   }
 
   // A cancel acknowledgement retires the matching call. An unsolicited cancel,
@@ -760,7 +824,7 @@ export class Supervisor {
     }, 10, false);
   }
 
-  #complete(rec, pluginId, msg) {
+  #complete(rec, pluginId, msg, prepared) {
     const lane = msg.kind === 'cancelled' ? 'cancel' : 'call';
     const pending = this.pending.get(pluginId, msg.correlationId, lane);
     if (!pending) {
@@ -778,47 +842,61 @@ export class Supervisor {
     }
     if (pending.generation !== rec.credential.generation) return false;
     const priority = msg.kind === 'cancelled' ? 10 : 1;
-    // One stdout chunk can carry many results. Pause does not stop this loop,
-    // so the cap is checked before each result is queued.
+    let buf = prepared ?? null;
+    if (!buf) {
+      try {
+        buf = encodeMux({
+          kind: msg.kind,
+          code: msg.code,
+          for: lane,
+          pluginId,
+          correlationId: msg.correlationId,
+          payload: msg.payload,
+          sendTs: pending.sendTs,
+          ingressTs: pending.ingressTs,
+          egressTs: performance.now(),
+          version: rec.credential.version,
+          generation: pending.generation,
+          grants: [...rec.credential.grants],
+        });
+      } catch {
+        this.#take(pluginId, msg.correlationId, lane);
+        this.#enqueueTerminal({
+          kind: 'error',
+          code: 'result-oversize',
+          for: lane,
+          pluginId: pending.pluginId,
+          correlationId: pending.correlationId,
+          generation: pending.generation,
+        });
+        return false;
+      }
+    }
+    // One stdout chunk can carry many results. Pause does not stop this loop.
+    // A reply that does not fit stays with its waiter and is charged; taking
+    // it here would leave the kernel with a timeout and the bytes uncounted.
     if (priority < 10 && (this.lo.get(pluginId)?.length ?? 0) >= this.capsConfig.lo) {
       this.caps.lo = true;
       this.#pause(rec, 'bulk');
-      // The line has already left the framer. The caller keeps this message
-      // and replays it after the queue drains. Taking the pending entry here
-      // would turn the reply into a timeout.
-      return 'defer';
+      return { defer: true, buf };
     }
-    const frame = {
-      kind: msg.kind,
-      code: msg.code,
-      for: lane,
-      pluginId,
-      correlationId: msg.correlationId,
-      payload: msg.payload,
-      sendTs: pending.sendTs,
-      ingressTs: pending.ingressTs,
-      egressTs: performance.now(),
-      version: rec.credential.version,
-      generation: pending.generation,
-      grants: [...rec.credential.grants],
-    };
-    let buf;
-    try {
-      buf = encodeMux(frame);
-    } catch {
-      this.#take(pluginId, msg.correlationId, lane);
-      this.#enqueueTerminal({
-        kind: 'error',
-        code: 'result-oversize',
-        for: lane,
-        pluginId: pending.pluginId,
-        correlationId: pending.correlationId,
-        generation: pending.generation,
-      });
-      return false;
+    if (this.bufferedBytes() + buf.length > this.capsConfig.totalGlobal) {
+      this.caps.total = true;
+      this.#pause(rec, 'global');
+      return { defer: true, buf };
     }
     if (priority >= 10 && !this.#roomHi(pluginId)) {
-      this.#take(pluginId, msg.correlationId, lane);
+      const still = this.#take(pluginId, msg.correlationId, lane);
+      if (still) {
+        this.#enqueueTerminal({
+          kind: 'error',
+          code: 'hi-cap',
+          for: lane,
+          pluginId: still.pluginId,
+          correlationId: still.correlationId,
+          generation: still.generation,
+        });
+      }
       return false;
     }
     if (!this.#take(pluginId, msg.correlationId, lane)) return false;
@@ -860,11 +938,15 @@ export class Supervisor {
       pendingBytes: rec.framer.pendingBytes(),
     });
     if (code === 'hi-cap') this.caps.hi = true;
-    this.#discardQueues(rec.credential.pluginId);
+    // Queued frames already left the pending table. Dropping them here strands
+    // the kernel waiter. Frames with no waiter (floods) are bounded by the
+    // queue cap. Unparsed input and held replies still have waiters.
     rec.framer = new NdjsonFramer();
     rec.stash = null;
     rec.deferred = [];
+    rec.deferredBytes = 0;
     rec.outbound = 0;
+    this.#dropStale(rec.credential.pluginId, rec.credential.generation);
     this.#failPending(rec, code);
     if (rec.child.exitCode == null && rec.child.signalCode == null) rec.child.kill();
   }
@@ -874,6 +956,8 @@ export class Supervisor {
     rec.dead = true;
     rec.stash = null;
     rec.deferred = [];
+    rec.deferredBytes = 0;
+    this.#dropStale(rec.credential.pluginId, rec.credential.generation);
     this.#failPending(rec, err?.code || 'spawn-error');
     if (rec.child.exitCode == null && rec.child.signalCode == null) rec.child.kill('SIGKILL');
   }
@@ -885,6 +969,8 @@ export class Supervisor {
     if (rec.dead) return;
     rec.dead = true;
     rec.deferred = [];
+    rec.deferredBytes = 0;
+    this.#dropStale(rec.credential.pluginId, rec.credential.generation);
     this.#failPending(rec, 'child-exited');
   }
 
@@ -934,19 +1020,6 @@ export class Supervisor {
         // The bridge is already unusable.
       }
     }
-  }
-
-  #discardQueues(pluginId) {
-    for (const [map, bytesOf] of [[this.hi, 'hiBytes'], [this.lo, 'loBytes']]) {
-      const q = map.get(pluginId);
-      if (!q) continue;
-      for (const buf of q) this.queuedBytes -= buf.length;
-      map.delete(pluginId);
-      const rec = this.children.get(pluginId);
-      if (rec) rec[bytesOf] = 0;
-    }
-    this.hiOrder = this.hiOrder.filter((id) => id !== pluginId);
-    this.loOrder = this.loOrder.filter((id) => id !== pluginId);
   }
 
   #enqueue(frame, priority, coalesce) {
@@ -1174,9 +1247,20 @@ export class Supervisor {
 
   #resumeBulk() {
     if (this.#loLength() >= 8) return;
-    if (this.#acceptedBytes() > this.capsConfig.totalGlobal) return;
+    if (this.#acceptedBytes() > this.capsConfig.totalGlobal) {
+      this.#releaseFittingHolds('bulk');
+      return;
+    }
     for (const rec of this.children.values()) {
       if (rec.paused && rec.pauseReason === 'bulk') this.#unpause(rec);
+    }
+  }
+
+  #releaseFittingHolds(reason) {
+    for (const rec of this.children.values()) {
+      if (!rec.paused || rec.dead || rec.pauseReason !== reason) continue;
+      if (!this.#holdFits(rec)) continue;
+      this.#unpause(rec);
     }
   }
 }

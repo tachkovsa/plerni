@@ -602,7 +602,8 @@ test('a spawn error retires the fencing token', async () => {
       method: 'get',
       payload: { ok: true },
     }, 1_000).catch((err) => err);
-    await delay(40);
+    const armed = await waitUntil(() => pair.sup.pending.size >= 1, 2_000);
+    assert.equal(armed, true);
     rec.child.emit('error', Object.assign(new Error('emfile'), { code: 'EMFILE' }));
     const settled = await callP;
     assert.equal(settled.code, 'EMFILE');
@@ -1422,7 +1423,9 @@ test('socket writes stay in the global byte count until flushed', async () => {
     assert.ok(held <= cap, String(held));
     assert.ok(pair.sup.socketOutbound <= cap, String(pair.sup.socketOutbound));
     assert.ok(pair.sup.bufferedBytes() >= held, `${pair.sup.bufferedBytes()} vs ${held}`);
-    assert.ok(pair.sup.queueDepth('echo').lo > 0);
+    const mux = pair.sup.queuedBytes + pair.sup.socketOutbound;
+    assert.ok(mux <= cap, `queued+outbound ${mux}`);
+    assert.ok(pair.sup.queueDepth('echo').lo > 0 || rec.deferredBytes > 0);
     await Promise.all(calls);
   } finally {
     const proc = pair.sup.children.get('echo')?.child;
@@ -1702,8 +1705,13 @@ test('a socket write does not start when it would pass the global cap', async ()
     assert.ok(writes.every((n) => n <= cap), writes.join(','));
     assert.ok(writes.reduce((sum, n) => sum + n, 0) <= cap, writes.join(','));
     assert.ok(pair.sup.socketOutbound <= cap, String(pair.sup.socketOutbound));
+    const accepted = pair.sup.queuedBytes + pair.sup.socketOutbound;
+    assert.ok(accepted <= cap, `queued+outbound ${accepted}`);
     assert.ok(pair.sup.bufferedBytes() > pair.sup.socketOutbound);
-    assert.equal(pair.sup.pending.size, 1);
+    if (rec.deferredBytes > 0) {
+      assert.ok(pair.sup.bufferedBytes() >= rec.deferredBytes, String(pair.sup.bufferedBytes()));
+    }
+    assert.ok(pair.sup.pending.size >= 1);
     assert.equal(rec.dead, false);
     await Promise.all(calls);
   } finally {
@@ -1785,6 +1793,324 @@ test('retired tokens do not accumulate across respawns', async () => {
       () => pair.sup.commitIfLive('id', old, async () => {}),
       (err) => err instanceof FencedError,
     );
+  } finally {
+    await pair.close();
+  }
+});
+
+test('a deferred reply stays inside the byte caps', async () => {
+  const cap = 30_000;
+  const pair = await connectPair({
+    sweeper: false,
+    caps: {
+      lo: 1,
+      hi: 8,
+      pending: 8,
+      pendingGlobal: 8,
+      total: 2 * 1024 * 1024,
+      totalGlobal: cap,
+      partial: 2 * 1024 * 1024,
+    },
+    partialHighWater: 2 * 1024 * 1024,
+  });
+  try {
+    const a = pair.sup.spawn({
+      pluginId: 'a',
+      script: echoPath,
+      pending: 8,
+      total: 2 * 1024 * 1024,
+    });
+    const b = pair.sup.spawn({
+      pluginId: 'b',
+      script: echoPath,
+      pending: 8,
+      total: 2 * 1024 * 1024,
+    });
+    const recA = pair.sup.children.get('a');
+    recA.child.kill('SIGSTOP');
+    const pending = [];
+    for (const id of [1, 2]) {
+      pending.push(pair.stub.call({
+        pluginId: 'a',
+        credential: a.credential,
+        correlationId: id,
+        port: 'db',
+        method: 'get',
+        payload: { id },
+      }, 1_000).catch((err) => err));
+    }
+    const armed = await waitUntil(() => pair.sup.pending.size >= 2, 2_000);
+    assert.equal(armed, true);
+    pair.sup.draining = true;
+    recA.child.stdout.emit('data', Buffer.from(encodeNdjson({
+      kind: 'result',
+      correlationId: 1,
+      payload: { n: 1 },
+    })));
+    const filled = await waitUntil(() => pair.sup.queueDepth('a').lo >= 1 && recA.paused, 2_000);
+    assert.equal(filled, true);
+    // The low-priority queue is full. Parse the next result anyway so it is
+    // parked, which is the path whose bytes used to leave the framer uncounted.
+    recA.paused = false;
+    recA.pauseReason = null;
+    recA.child.stdout.emit('data', Buffer.from(encodeNdjson({
+      kind: 'result',
+      correlationId: 2,
+      payload: { blob: 'z'.repeat(20_000) },
+    })));
+    assert.ok(recA.deferredBytes >= 20_000, String(recA.deferredBytes));
+    assert.ok(pair.sup.bufferedBytes() >= recA.deferredBytes, String(pair.sup.bufferedBytes()));
+    assert.equal(pair.sup.pending.has('a', 2, 'call'), true);
+    const mux = pair.sup.queuedBytes + pair.sup.socketOutbound;
+    assert.ok(mux <= cap, `queued+outbound ${mux}`);
+    pair.sup.draining = false;
+    const denied = await pair.stub.call({
+      pluginId: 'b',
+      credential: b.credential,
+      correlationId: 1,
+      port: 'db',
+      method: 'get',
+      payload: { blob: 'y'.repeat(12_000) },
+    }, 1_000).catch((err) => err);
+    assert.equal(denied.code, 'total-cap');
+    assert.equal(pair.sup.pending.has('b', 1, 'call'), false);
+    assert.ok(pair.sup.bufferedBytes() <= cap + recA.deferredBytes);
+    await Promise.all(pending);
+  } finally {
+    for (const rec of pair.sup.children.values()) {
+      if (rec.child.exitCode == null && rec.child.signalCode == null) rec.child.kill('SIGKILL');
+    }
+    await pair.close();
+  }
+});
+
+test('a timed-out correlation is not reused in the same generation', async () => {
+  const pair = await connectPair({ sweeper: false });
+  try {
+    const kid = pair.sup.spawn({ pluginId: 'echo', script: echoPath });
+    const rec = pair.sup.children.get('echo');
+    rec.child.kill('SIGSTOP');
+    const first = await pair.stub.call({
+      pluginId: 'echo',
+      credential: kid.credential,
+      correlationId: 7,
+      port: 'db',
+      method: 'get',
+      payload: { who: 'first' },
+    }, 80).catch((err) => err);
+    assert.equal(first.code, 'timeout');
+    const quarantined = await waitUntil(
+      () => pair.sup.stale.has('echo', 7, 'call') && pair.sup.pending.size === 0,
+      2_000,
+    );
+    assert.equal(quarantined, true);
+    await delay(30);
+    assert.equal(pair.stub.calls.size, 0);
+    const reused = await pair.stub.call({
+      pluginId: 'echo',
+      credential: kid.credential,
+      correlationId: 7,
+      port: 'db',
+      method: 'get',
+      payload: { who: 'second' },
+    }, 500).catch((err) => err);
+    assert.equal(reused.code, 'stale-correlation');
+    assert.equal(pair.sup.pending.size, 0);
+    rec.child.stdout.emit('data', Buffer.from(encodeNdjson({
+      kind: 'result',
+      correlationId: 7,
+      payload: { who: 'first' },
+    })));
+    await delay(30);
+    assert.equal(pair.sup.pending.size, 0);
+    const freshP = pair.stub.call({
+      pluginId: 'echo',
+      credential: kid.credential,
+      correlationId: 8,
+      port: 'db',
+      method: 'get',
+      payload: { who: 'fresh' },
+    }, 1_000);
+    const armed = await waitUntil(() => pair.sup.pending.has('echo', 8, 'call'), 2_000);
+    assert.equal(armed, true);
+    rec.child.stdout.emit('data', Buffer.from(encodeNdjson({
+      kind: 'result',
+      correlationId: 8,
+      payload: { who: 'fresh' },
+    })));
+    const fresh = await freshP;
+    assert.equal(fresh.payload?.who, 'fresh');
+    rec.child.kill('SIGCONT');
+    const next = await pair.sup.respawn('echo');
+    const again = await pair.stub.call({
+      pluginId: 'echo',
+      credential: next.credential,
+      correlationId: 7,
+      port: 'db',
+      method: 'get',
+      payload: { who: 'again' },
+    }, 2_000);
+    assert.equal(again.payload?.who, 'again');
+    assert.equal(again.generation, next.credential.generation);
+  } finally {
+    const proc = pair.sup.children.get('echo')?.child;
+    if (proc && proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL');
+    await pair.close();
+  }
+});
+
+test('a forged reply retires the waiter on its lane', async () => {
+  const pair = await connectPair({
+    sweeper: false,
+    caps: { pending: 2, pendingGlobal: 4, hi: 8 },
+  });
+  try {
+    const kid = pair.sup.spawn({ pluginId: 'echo', script: echoPath, pending: 2 });
+    const rec = pair.sup.children.get('echo');
+    rec.child.kill('SIGSTOP');
+    const callP = pair.stub.call({
+      pluginId: 'echo',
+      credential: kid.credential,
+      correlationId: 4,
+      port: 'db',
+      method: 'get',
+      payload: { who: 'call' },
+    }, 1_000).catch((err) => err);
+    const cancelP = pair.stub.cancel({
+      pluginId: 'echo',
+      credential: kid.credential,
+      correlationId: 5,
+    }, 1_000).catch((err) => err);
+    const armed = await waitUntil(() => pair.sup.pending.size >= 2, 2_000);
+    assert.equal(armed, true);
+    rec.child.stdout.emit('data', Buffer.from(encodeNdjson({
+      kind: 'result',
+      correlationId: 4,
+      pluginId: 'sib',
+      payload: { who: 'forged' },
+    })));
+    rec.child.stdout.emit('data', Buffer.from(encodeNdjson({
+      kind: 'cancelled',
+      correlationId: 5,
+      pluginId: 'sib',
+    })));
+    const [callR, cancelR] = await Promise.all([callP, cancelP]);
+    assert.equal(callR.code, 'forged-plugin-id');
+    assert.equal(cancelR.code, 'forged-plugin-id');
+    assert.equal(pair.sup.pending.size, 0);
+    rec.child.kill('SIGCONT');
+    const next = await pair.stub.call({
+      pluginId: 'echo',
+      credential: kid.credential,
+      correlationId: 6,
+      port: 'db',
+      method: 'get',
+      payload: { who: 'admitted' },
+    }, 2_000);
+    assert.equal(next.payload?.who, 'admitted');
+    assert.notEqual(next.code, 'pending-cap');
+  } finally {
+    const proc = pair.sup.children.get('echo')?.child;
+    if (proc && proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL');
+    await pair.close();
+  }
+});
+
+test('a completed reply survives a later child fault', async () => {
+  const pair = await connectPair({ sweeper: false });
+  try {
+    const kid = pair.sup.spawn({ pluginId: 'echo', script: echoPath });
+    const rec = pair.sup.children.get('echo');
+    rec.child.kill('SIGSTOP');
+    const calls = [1, 2].map((id) => pair.stub.call({
+      pluginId: 'echo',
+      credential: kid.credential,
+      correlationId: id,
+      port: 'db',
+      method: 'get',
+      payload: { who: id },
+    }, 2_000).catch((err) => err));
+    const armed = await waitUntil(() => pair.sup.pending.size === 2, 2_000);
+    assert.equal(armed, true);
+    const original = pair.sup.socket.write.bind(pair.sup.socket);
+    const held = [];
+    let block = true;
+    pair.sup.socket.write = (buf, cb) => {
+      if (block) {
+        held.push(Buffer.from(buf));
+        if (cb) cb();
+        return false;
+      }
+      return original(buf, cb);
+    };
+    rec.child.stdout.emit('data', Buffer.concat([
+      Buffer.from(encodeNdjson({ kind: 'result', correlationId: 1, payload: { who: 1 } })),
+      Buffer.from(encodeNdjson({ kind: 'result', correlationId: 2, payload: { who: 2 } })),
+      Buffer.from('{bad\n'),
+    ]));
+    const faulted = await waitUntil(() => rec.dead === true, 2_000);
+    assert.equal(faulted, true);
+    assert.ok(pair.sup.queueDepth('echo').lo >= 1, String(pair.sup.queueDepth('echo').lo));
+    block = false;
+    for (const buf of held) original(buf);
+    pair.sup.socket.emit('drain');
+    const settled = await Promise.all(calls);
+    const byId = new Map(settled.map((row) => [row.correlationId, row]));
+    assert.equal(byId.get(1)?.payload?.who, 1, JSON.stringify(settled));
+    assert.equal(byId.get(2)?.payload?.who, 2, JSON.stringify(settled));
+  } finally {
+    const proc = pair.sup.children.get('echo')?.child;
+    if (proc && proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL');
+    await pair.close();
+  }
+});
+
+test('an inbound mux partial counts against the kernel byte cap', async () => {
+  const cap = 600;
+  const pair = await connectPair({
+    sweeper: false,
+    kernel: { byteCap: cap, pendingCap: 8 },
+  });
+  try {
+    const kid = pair.sup.spawn({ pluginId: 'echo', script: echoPath });
+    const prefix = Buffer.alloc(4);
+    prefix.writeUInt32BE(2_000, 0);
+    pair.sup.socket.write(Buffer.concat([prefix, Buffer.alloc(500, 0x61)]));
+    const counted = await waitUntil(
+      () => pair.stub.framer.pendingBytes() >= 504 && pair.stub.bufferedBytes() >= 504,
+      2_000,
+    );
+    assert.equal(counted, true, String(pair.stub.bufferedBytes()));
+    assert.equal(pair.stub.framingFault, null);
+    const denied = await pair.stub.call({
+      pluginId: 'echo',
+      credential: kid.credential,
+      correlationId: 1,
+      port: 'db',
+      method: 'get',
+      payload: { n: 1 },
+    }, 500).catch((err) => err);
+    assert.equal(denied.code, 'total-cap');
+    assert.equal(pair.stub.calls.size, 0);
+  } finally {
+    await pair.close();
+  }
+});
+
+test('an inbound mux partial past the kernel byte cap is a typed fault', async () => {
+  const cap = 1024;
+  const pair = await connectPair({
+    sweeper: false,
+    kernel: { byteCap: cap, pendingCap: 4 },
+  });
+  try {
+    const prefix = Buffer.alloc(4);
+    prefix.writeUInt32BE(8_000, 0);
+    pair.sup.socket.write(Buffer.concat([prefix, Buffer.alloc(8_000, 0x62)]));
+    const faulted = await waitUntil(() => pair.stub.framingFault === 'total-cap', 2_000);
+    assert.equal(faulted, true, String(pair.stub.framingFault));
+    assert.ok(pair.stub.framer.pendingBytes() <= cap, String(pair.stub.framer.pendingBytes()));
+    assert.equal(pair.stub.calls.size, 0);
   } finally {
     await pair.close();
   }

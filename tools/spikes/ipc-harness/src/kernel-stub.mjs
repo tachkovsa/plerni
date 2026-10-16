@@ -160,7 +160,7 @@ export class KernelStub {
   }
 
   bufferedBytes() {
-    let total = this.outbound + this.retained;
+    let total = this.outbound + this.retained + this.framer.pendingBytes();
     for (const entry of this.writeQueue) total += entry.buf.length;
     return total;
   }
@@ -174,8 +174,20 @@ export class KernelStub {
   #onData(chunk) {
     if (this.framingFault || this.shut) return;
     try {
-      this.framer.feed(chunk);
-      for (const msg of this.framer.frames()) this.#onMsg(msg);
+      let offset = 0;
+      while (offset < chunk.length) {
+        const pending = this.framer.pendingBytes();
+        // An unfinished frame cannot shrink. Stop at the cap instead of
+        // retaining another full window of outbound on top of it.
+        if (pending >= this.byteCap) {
+          this.#faultInbound();
+          return;
+        }
+        const end = Math.min(chunk.length, offset + (this.byteCap - pending));
+        this.framer.feed(chunk.subarray(offset, end));
+        offset = end;
+        for (const msg of this.framer.frames()) this.#onMsg(msg);
+      }
     } catch (err) {
       // Name only — parser text can echo peer bytes (deferred framer cleanup).
       const code = err.constructor?.name || 'framing-error';
@@ -185,6 +197,15 @@ export class KernelStub {
       this.writeQueue = [];
       this.socket.destroy();
     }
+  }
+
+  #faultInbound() {
+    if (this.framingFault) return;
+    this.framingFault = 'total-cap';
+    this.#rejectAll('total-cap');
+    this.shut = true;
+    this.writeQueue = [];
+    this.socket.destroy();
   }
 
   #onMsg(msg) {
