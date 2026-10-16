@@ -71,5 +71,8 @@ jobs:
           fi
       - run: node scripts/gates/license-audit.mjs
       - run: node scripts/gates/kernel-purity.mjs
-      - run: node scripts/gates/commit-policy.mjs --base "${{ github.event_name == 'push' && github.event.before || format('origin/{0}', github.base_ref || 'dev') }}"
+      - name: commit policy
+        env:
+          COMMIT_IDENTITY_PATTERNS: ${{ secrets.COMMIT_IDENTITY_PATTERNS }}
+        run: node scripts/gates/commit-policy.mjs --base "${{ github.event_name == 'push' && github.event.before || format('origin/{0}', github.base_ref || 'dev') }}"
       - run: node scripts/gates/gate-health.test.mjs

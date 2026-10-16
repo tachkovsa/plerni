@@ -7,7 +7,6 @@
  * against fixtures/gitleaks (see .github/workflows/p0-gates.yml).
  */
 import { execFileSync } from "node:child_process";
-import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -79,10 +78,17 @@ const cases = [
       /fake-gpl-peer \(verified peer of fake-darwin-mit \(verified optional dependency of fake-mit-lib \(brand\)\)\): forbidden license "GPL-3.0-only"(?![\s\S]*fake-optional-peer)/,
   },
   {
+    name: "license-audit blocks the locked child version when another version is installed",
+    cmd: gate("license-audit.mjs", "--root", join(fixtures, "isolated-locked-child")),
+    expectExit: 1,
+    expectOutput:
+      /shared-child \(verified dependency of fake-darwin-app \(verified optional dependency of fake-mit-lib \(brand\)\)\): forbidden license "GPL-3.0-only"/,
+  },
+  {
     name: "license-audit fails closed when an absent optional dependency has no verifiable tarball",
     cmd: gate("license-audit.mjs", "--root", join(fixtures, "isolated-unverified")),
     expectExit: 1,
-    expectOutput: /fake-no-tarball \(optional dependency of fake-mit-lib \(brand\)\): not installed and its lockfile entry has no integrity-checked tarball/,
+    expectOutput: /fake-no-tarball \(verified optional dependency of fake-mit-lib \(brand\)\): lockfile entry has no integrity-checked tarball/,
   },
   {
     name: "license-audit blocks an isolated package with no lockfile",
@@ -126,13 +132,8 @@ const cases = [
   },
   {
     name: "commit-policy blocks a configured identity in the author, committer, or message",
-    cmd: gate(
-      "commit-policy.mjs",
-      "--file",
-      join(fixtures, "commit-policy", "bad-metadata.txt"),
-      "--identities",
-      join(fixtures, "commit-policy", "identities.txt"),
-    ),
+    cmd: gate("commit-policy.mjs", "--file", join(fixtures, "commit-policy", "bad-metadata.txt")),
+    env: { COMMIT_IDENTITY_PATTERNS: "forbidden-provider\\.example" },
     expectExit: 1,
     expectOutput:
       /author matches a forbidden identity[\s\S]*committer matches a forbidden identity[\s\S]*message matches a forbidden identity[\s\S]*identity-bearing author/,
@@ -140,8 +141,16 @@ const cases = [
   {
     name: "commit-policy checks identity metadata on merge commits",
     cmd: gate("commit-policy.mjs", "--file", join(fixtures, "commit-policy", "merge-metadata.txt")),
+    env: { COMMIT_IDENTITY_PATTERNS: "forbidden-provider\\.example" },
     expectExit: 1,
     expectOutput: /^(?![\s\S]*non-conventional subject)[\s\S]*author matches a forbidden identity/,
+  },
+  {
+    name: "commit-policy skips identity checks when COMMIT_IDENTITY_PATTERNS is unset",
+    cmd: gate("commit-policy.mjs", "--file", join(fixtures, "commit-policy", "merge-metadata.txt")),
+    env: { COMMIT_IDENTITY_PATTERNS: "" },
+    expectExit: 0,
+    expectOutput: /COMMIT_IDENTITY_PATTERNS is not set — skipping forbidden-identity checks/,
   },
 ];
 
@@ -170,34 +179,25 @@ historyGit([
   "-m", "feat: record a run\n\nhttps://forbidden-provider.example/dashboard/1\n\nAI-assisted: yes\n",
 ]);
 cases.push({
-  name: "commit-policy history mode loads the governed identity list",
+  name: "commit-policy history mode applies patterns from the environment",
   cmd: gate("commit-policy.mjs", "--cwd", historyDir, "--base", historyBase),
+  env: { COMMIT_IDENTITY_PATTERNS: "forbidden-provider\\.example" },
   expectExit: 1,
   expectOutput: /author matches a forbidden identity[\s\S]*message matches a forbidden identity/,
 });
 
-// Synthetic stand-in. Digests are computed here and are not a published preimage.
 const standIn = "Marker Example <marker@synthetic-standin.example>";
 const standInParts = /^(.*) <([^>]+)>$/.exec(standIn);
 if (!standInParts) throw new Error("identity stand-in is malformed");
 const identityDir = mkdtempSync(join(tmpdir(), "plerni-commit-identity-"));
-const standInRules = [standIn.toLowerCase(), standInParts[1].toLowerCase(), standInParts[2].toLowerCase()]
-  .map((text) => `sha256:${createHash("sha256").update(text).digest("hex")}`)
-  .join("\n");
-writeFileSync(join(identityDir, "identities.txt"), `${standInRules}\n`);
 writeFileSync(
   join(identityDir, "probe.txt"),
   `author: ${standIn}\ncommitter: ${standIn}\n\nfeat: keep the message clean\n\nAI-assisted: yes\n`,
 );
 cases.push({
-  name: "commit-policy file mode applies a digest generated in the test",
-  cmd: gate(
-    "commit-policy.mjs",
-    "--file",
-    join(identityDir, "probe.txt"),
-    "--identities",
-    join(identityDir, "identities.txt"),
-  ),
+  name: "commit-policy file mode applies a synthetic pattern from the environment",
+  cmd: gate("commit-policy.mjs", "--file", join(identityDir, "probe.txt")),
+  env: { COMMIT_IDENTITY_PATTERNS: "synthetic-standin\\.example" },
   expectExit: 1,
   expectOutput: /author matches a forbidden identity[\s\S]*committer matches a forbidden identity(?![\s\S]*message matches)/,
 });
@@ -231,19 +231,20 @@ identityGit([
   "-c", `user.email=${standInParts[2]}`,
   "merge", "-q", "--no-ff", "-m", "Merge branch 'side'\n\nAI-assisted: yes\n", "side",
 ]);
+writeFileSync(join(identityDir, ".private-markers.local"), "synthetic-standin\\.example\n");
 cases.push({
-  name: "commit-policy history mode applies a digest generated in the test",
-  cmd: gate(
-    "commit-policy.mjs",
-    "--cwd",
-    identityDir,
-    "--base",
-    identityBase,
-    "--identities",
-    join(identityDir, "identities.txt"),
-  ),
+  name: "commit-policy history mode applies a synthetic pattern from the environment",
+  cmd: gate("commit-policy.mjs", "--cwd", identityDir, "--base", identityBase),
+  env: { COMMIT_IDENTITY_PATTERNS: "synthetic-standin\\.example" },
   expectExit: 1,
   expectOutput: /author matches a forbidden identity[\s\S]*committer matches a forbidden identity/,
+});
+cases.push({
+  name: "commit-policy history mode still loads .private-markers.local when the secret is absent",
+  cmd: gate("commit-policy.mjs", "--cwd", identityDir, "--base", identityBase),
+  env: { COMMIT_IDENTITY_PATTERNS: "" },
+  expectExit: 1,
+  expectOutput: /author matches a forbidden identity[\s\S]*COMMIT_IDENTITY_PATTERNS is not set/,
 });
 
 let failed = 0;
@@ -251,8 +252,15 @@ try {
   for (const c of cases) {
     let code = 0;
     let output = "";
+    const env = { ...process.env };
+    if (c.env) {
+      for (const [key, value] of Object.entries(c.env)) {
+        if (value == null) delete env[key];
+        else env[key] = value;
+      }
+    }
     try {
-      output = execFileSync(c.cmd[0], c.cmd[1], { encoding: "utf8" });
+      output = execFileSync(c.cmd[0], c.cmd[1], { encoding: "utf8", env });
     } catch (e) {
       code = e.status ?? 1;
       output = `${e.stderr ?? ""}${e.stdout ?? ""}`;

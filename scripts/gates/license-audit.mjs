@@ -14,6 +14,10 @@
  * read from that tarball's package.json after the hash matches. The lockfile
  * license field is ignored. A missing tarball, a bad hash, or a name or
  * version that does not match the lock entry fails closed.
+ * A dependency of that tarball is resolved from the lock entry nested under
+ * its parent, and the locked version must satisfy the parent's range. An
+ * installed package of the same name at a different version does not stand
+ * in for that child.
  * A required dependency that is not installed fails closed. A required peer
  * that is not installed fails closed, including a required peer declared by
  * an absent optional package's verified tarball.
@@ -179,13 +183,32 @@ const readLock = (startDir) => {
   return lockCache.get(lockPath);
 };
 
-const lockEntries = (lock, name) => {
-  const suffix = `node_modules/${name}`;
-  const hits = [];
+const lockKeyForInstalled = (lock, pkg) => {
+  const suffix = `node_modules/${pkg.name}`;
+  let best = null;
   for (const [key, entry] of Object.entries(lock.packages ?? {})) {
-    if (key === suffix || key.endsWith(`/${suffix}`)) hits.push(entry);
+    if (entry?.version !== pkg.version) continue;
+    if (key !== suffix && !key.endsWith(`/${suffix}`)) continue;
+    if (!best || key.length < best.length) best = key;
   }
-  return hits;
+  return best;
+};
+
+// npm resolves a child from the parent path, nearest node_modules first.
+const entryFor = (lock, parentKey, name) => {
+  const packages = lock.packages ?? {};
+  let cursor = parentKey ?? "";
+  const seen = new Set();
+  while (!seen.has(cursor)) {
+    seen.add(cursor);
+    const key = cursor ? `${cursor}/node_modules/${name}` : `node_modules/${name}`;
+    if (packages[key]) return { key, entry: packages[key] };
+    if (!cursor) return null;
+    const marker = "/node_modules/";
+    const idx = cursor.lastIndexOf(marker);
+    cursor = idx === -1 ? "" : cursor.slice(0, idx);
+  }
+  return null;
 };
 
 const fetchCache = new Map();
@@ -267,61 +290,69 @@ const readResolvedTarball = async (resolved, lockPath) => {
 
 // Optional packages for other OS/CPU targets are absent here. Their license
 // comes from the integrity-checked tarball, never from the lockfile license field.
-const auditLockedOptional = async (startDir, name, label, relation = "verified optional dependency") => {
+const auditLockedOptional = async (startDir, name, label, relation = "verified optional dependency", spec = {}) => {
   const found = readLock(startDir);
+  const where = `${name} (${relation} of ${label})`;
   if (!found) {
     failures.push(`${name} (optional dependency of ${label}): not installed and no package-lock.json — fail closed`);
     return;
   }
-  const entries = lockEntries(found.lock, name);
-  if (entries.length === 0) {
+  if (!spec.parentKey || typeof spec.range !== "string" || spec.range.trim() === "") {
+    failures.push(`${where}: parent lock entry or dependency range is missing — fail closed`);
+    return;
+  }
+  const resolved = entryFor(found.lock, spec.parentKey, name);
+  if (!resolved) {
+    failures.push(`${where}: missing from package-lock.json under ${spec.parentKey} — fail closed`);
+    return;
+  }
+  const { key, entry } = resolved;
+  const sat = typeof entry.version === "string" ? satisfies(entry.version, spec.range) : false;
+  if (sat !== true) {
     failures.push(
-      `${name} (optional dependency of ${label}): not installed and missing from package-lock.json — fail closed`,
+      `${where}: lockfile version ${entry.version ?? "MISSING"} does not satisfy range ${spec.range} — fail closed`,
     );
     return;
   }
-  for (const entry of entries) {
-    const id = `${found.lockPath}\0${name}\0${entry.version ?? ""}\0${entry.resolved ?? ""}\0${entry.integrity ?? ""}`;
-    if (seenLocked.has(id)) continue;
-    seenLocked.add(id);
-    const where = `${name} (optional dependency of ${label})`;
-    if (!entry.resolved || !entry.integrity) {
-      failures.push(`${where}: not installed and its lockfile entry has no integrity-checked tarball — fail closed`);
-      continue;
-    }
-    const loaded = await readResolvedTarball(entry.resolved, found.lockPath);
-    if (loaded.error || !loaded.bytes) {
-      failures.push(`${where}: not installed and its tarball could not be verified (${loaded.error ?? "missing"}) — fail closed`);
-      continue;
-    }
-    if (!integrityMatches(loaded.bytes, entry.integrity)) {
-      failures.push(`${where}: tarball integrity check failed — fail closed`);
-      continue;
-    }
-    const pkg = packageJsonFromTarball(loaded.bytes);
-    if (!pkg || pkg.name !== name || pkg.version !== entry.version) {
-      failures.push(`${where}: verified tarball does not match the locked name and version — fail closed`);
-      continue;
-    }
-    checked++;
-    const lockedLabel = `${name} (${relation} of ${label})`;
-    const problem = judge(lockedLabel, licenseOf(pkg));
-    if (problem) failures.push(problem);
-    const nested = { ...pkg.dependencies, ...pkg.optionalDependencies };
-    for (const child of Object.keys(nested)) {
-      if (resolveInstalled(startDir, child)) continue;
-      await auditLockedOptional(startDir, child, lockedLabel);
-    }
-    const peerMeta = pkg.peerDependenciesMeta ?? {};
-    for (const child of Object.keys(pkg.peerDependencies ?? {})) {
+  const id = `${found.lockPath}\0${key}\0${entry.version ?? ""}\0${entry.resolved ?? ""}\0${entry.integrity ?? ""}`;
+  if (seenLocked.has(id)) return;
+  seenLocked.add(id);
+  if (!entry.resolved || !entry.integrity) {
+    failures.push(`${where}: lockfile entry has no integrity-checked tarball — fail closed`);
+    return;
+  }
+  const loaded = await readResolvedTarball(entry.resolved, found.lockPath);
+  if (loaded.error || !loaded.bytes) {
+    failures.push(`${where}: tarball could not be verified (${loaded.error ?? "missing"}) — fail closed`);
+    return;
+  }
+  if (!integrityMatches(loaded.bytes, entry.integrity)) {
+    failures.push(`${where}: tarball integrity check failed — fail closed`);
+    return;
+  }
+  const pkg = packageJsonFromTarball(loaded.bytes);
+  if (!pkg || pkg.name !== name || pkg.version !== entry.version) {
+    failures.push(`${where}: verified tarball does not match the locked name and version — fail closed`);
+    return;
+  }
+  checked++;
+  const problem = judge(where, licenseOf(pkg));
+  if (problem) failures.push(problem);
+  const nested = { ...pkg.dependencies, ...pkg.optionalDependencies };
+  for (const [child, childRange] of Object.entries(nested)) {
+    await auditLockedOptional(startDir, child, where, "verified dependency", { parentKey: key, range: childRange });
+  }
+  const peerMeta = pkg.peerDependenciesMeta ?? {};
+  for (const [child, childRange] of Object.entries(pkg.peerDependencies ?? {})) {
+    if (peerMeta[child]?.optional === true) {
       const childPath = resolveInstalled(startDir, child);
-      if (childPath) {
-        await auditTree(childPath, `${child} (dependency of ${lockedLabel})`);
-        continue;
-      }
-      if (peerMeta[child]?.optional === true) continue;
-      await auditLockedOptional(startDir, child, lockedLabel, "verified peer");
+      if (!childPath) continue;
+      const installed = JSON.parse(readFileSync(childPath, "utf8"));
+      if (satisfies(installed.version, String(childRange)) !== true) continue;
+      await auditTree(childPath, `${child} (dependency of ${where})`);
+      continue;
     }
+    await auditLockedOptional(startDir, child, where, "verified peer", { parentKey: key, range: String(childRange) });
   }
 };
 
@@ -335,6 +366,8 @@ const auditTree = async (pkgPath, label) => {
   const problem = judge(label, licenseOf(pkg));
   if (problem) failures.push(problem);
   const dir = dirname(real);
+  const lockFound = readLock(dir);
+  const parentKey = lockFound ? lockKeyForInstalled(lockFound.lock, pkg) : null;
   const optional = new Set(Object.keys(pkg.optionalDependencies ?? {}));
   for (const name of Object.keys(pkg.dependencies ?? {})) {
     if (optional.has(name)) continue;
@@ -351,7 +384,14 @@ const auditTree = async (pkgPath, label) => {
       await auditTree(child, `${name} (dependency of ${label})`);
       continue;
     }
-    await auditLockedOptional(dir, name, label);
+    if (!parentKey) {
+      failures.push(`${name} (optional dependency of ${label}): installed parent is not in package-lock.json — fail closed`);
+      continue;
+    }
+    await auditLockedOptional(dir, name, label, "verified optional dependency", {
+      parentKey,
+      range: pkg.optionalDependencies?.[name] ?? "",
+    });
   }
   const peerMeta = pkg.peerDependenciesMeta ?? {};
   for (const name of Object.keys(pkg.peerDependencies ?? {})) {

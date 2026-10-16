@@ -11,12 +11,12 @@
  * merge commits (only the conventional-subject rule is skipped for those).
  * An `AI-assisted:` line must be exactly `AI-assisted: yes`. Other URLs are
  * allowed. A URL or other text fails when it matches a forbidden identity
- * rule. CI always loads the committed list `commit-identities.txt` next to
- * this script. A rule is either a generic regex or `sha256:` plus the hex
- * digest of a lowercase forbidden substring, so the list can name an identity
- * without spelling it. `--identities <file>` adds more rules. A git-history
- * run also loads the gitignored `.private-markers.local` at the repository
- * root. None of those files may spell private vendor or model names.
+ * regex. CI reads those regexes from the `COMMIT_IDENTITY_PATTERNS`
+ * environment variable, one per line. Nothing in the repository stores the
+ * patterns or their digests. When the variable is unset or blank — a fork,
+ * or a pull request from outside the repository — the gate logs a skip
+ * notice and does not fail. A git-history run also loads the gitignored
+ * `.private-markers.local` at the repository root.
  *
  * Modes:
  *   (default)     check `git log <base>..HEAD`; base = --base, else origin/dev
@@ -27,57 +27,45 @@
  *                 and `committer:` lines; the rest is the message.
  */
 import { execFileSync } from "node:child_process";
-import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 
 const { values } = parseArgs({
   options: {
     file: { type: "string" },
     base: { type: "string" },
-    identities: { type: "string" },
     cwd: { type: "string" },
   },
 });
 
-const here = dirname(fileURLToPath(import.meta.url));
-const GOVERNED_IDENTITIES = join(here, "commit-identities.txt");
+const IDENTITY_SECRET = "COMMIT_IDENTITY_PATTERNS";
 
 const SUBJECT = /^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-z0-9._/-]+\))?!?: \S.*/;
 const AI_TRAILER = /^AI-assisted:.*$/gim;
 
-const loadIdentityRules = (path) => {
-  const patterns = [];
-  const hashes = [];
-  if (!path || !existsSync(path)) return { patterns, hashes };
-  readFileSync(path, "utf8").split("\n").forEach((raw, i) => {
+const identityPatterns = [];
+
+const addPatterns = (text, origin) => {
+  text.split("\n").forEach((raw, i) => {
     const line = raw.trim();
     if (!line || line.startsWith("#")) return;
-    const hash = /^sha256:([0-9a-f]{64})$/i.exec(line);
-    if (hash) {
-      hashes.push(hash[1].toLowerCase());
-      return;
-    }
-    if (line.toLowerCase().startsWith("sha256:")) {
-      console.error(`commit-policy: invalid identity hash at ${path}:${i + 1} — FAIL CLOSED`);
-      process.exit(1);
-    }
     try {
-      patterns.push(new RegExp(line, "i"));
-    } catch (err) {
-      console.error(`commit-policy: invalid identity pattern at ${path}:${i + 1} (${err.message}) — FAIL CLOSED`);
+      identityPatterns.push(new RegExp(line, "i"));
+    } catch {
+      console.error(`commit-policy: invalid identity pattern in ${origin} at line ${i + 1} — FAIL CLOSED`);
       process.exit(1);
     }
   });
-  return { patterns, hashes };
 };
 
-const digest = (text) => createHash("sha256").update(text).digest("hex");
-
-// Hashes are of short identity fragments. A window cap keeps the scan bounded.
-const HASH_WINDOW = 160;
+const secret = process.env[IDENTITY_SECRET];
+if (typeof secret !== "string" || secret.trim() === "") {
+  console.log(
+    `commit-policy: ${IDENTITY_SECRET} is not set — skipping forbidden-identity checks from the repository secret`,
+  );
+} else {
+  addPatterns(secret, IDENTITY_SECRET);
+}
 
 const parseFileRecord = (chunk) => {
   const lines = chunk.trim().split("\n");
@@ -103,19 +91,6 @@ const parseFileRecord = (chunk) => {
   return { author, committer, message: lines.slice(start).join("\n").trim() };
 };
 
-const identityPatterns = [];
-const identityHashes = new Set();
-const addIdentityRules = (path) => {
-  const loaded = loadIdentityRules(path);
-  identityPatterns.push(...loaded.patterns);
-  for (const hash of loaded.hashes) identityHashes.add(hash);
-};
-addIdentityRules(GOVERNED_IDENTITIES);
-if (identityPatterns.length + identityHashes.size === 0) {
-  console.error(`commit-policy: governed identity list ${GOVERNED_IDENTITIES} is missing or empty — FAIL CLOSED`);
-  process.exit(1);
-}
-addIdentityRules(values.identities);
 if (!values.file) {
   let top;
   try {
@@ -123,22 +98,12 @@ if (!values.file) {
   } catch {
     top = "";
   }
-  if (top) addIdentityRules(`${top}/.private-markers.local`);
+  if (top && existsSync(`${top}/.private-markers.local`)) {
+    addPatterns(readFileSync(`${top}/.private-markers.local`, "utf8"), ".private-markers.local");
+  }
 }
 
-const matchesIdentity = (text) => {
-  if (!text) return false;
-  if (identityPatterns.some((pattern) => pattern.test(text))) return true;
-  if (identityHashes.size === 0) return false;
-  const value = text.toLowerCase();
-  const max = Math.min(value.length, HASH_WINDOW);
-  for (let len = 1; len <= max; len++) {
-    for (let i = 0; i + len <= value.length; i++) {
-      if (identityHashes.has(digest(value.slice(i, i + len)))) return true;
-    }
-  }
-  return false;
-};
+const matchesIdentity = (text) => Boolean(text) && identityPatterns.some((pattern) => pattern.test(text));
 
 const records = [];
 if (values.file) {
