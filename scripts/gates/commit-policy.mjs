@@ -22,7 +22,9 @@
  * GitHub Actions still checks subjects and the gitignored
  * `.private-markers.local` file. A git-history run loads that file from the
  * repository root. `--head` selects a fetched commit without checking it
- * out. The secret value is never printed.
+ * out. History records are separated by NUL (`git log -z` and `%x00`);
+ * commit objects cannot contain that byte, so a message cannot split a
+ * record. The secret value is never printed.
  *
  * Modes:
  *   (default)     check `git log <base>..<head>`; head = --head, else HEAD.
@@ -149,26 +151,25 @@ if (values.file) {
   try {
     out = execFileSync(
       "git",
-      ["log", "--format=%h%x1f%an%x1f%ae%x1f%cn%x1f%ce%x1f%B%x1e", `${base}..${headRev}`],
+      ["log", "-z", "--format=%h%x00%an%x00%ae%x00%cn%x00%ce%x00%B", `${base}..${headRev}`],
       { cwd: values.cwd, encoding: "utf8" },
     );
   } catch (err) {
     console.error(`commit-policy: cannot read git history for ${base}..${headRev} (${err.message}) — FAIL CLOSED`);
     process.exit(1);
   }
-  for (const rec of out.split("\x1e")) {
-    const trimmed = rec.trim();
-    if (!trimmed) continue;
-    const parts = trimmed.split("\x1f");
-    if (parts.length < 6) {
-      console.error(`commit-policy: malformed git record — FAIL CLOSED`);
-      process.exit(1);
-    }
+  const parts = out.split("\0");
+  if (parts.length > 0 && parts[parts.length - 1] === "") parts.pop();
+  if (parts.length % 6 !== 0) {
+    console.error("commit-policy: malformed git record — FAIL CLOSED");
+    process.exit(1);
+  }
+  for (let i = 0; i < parts.length; i += 6) {
     records.push({
-      id: parts[0],
-      author: `${parts[1]} <${parts[2]}>`,
-      committer: `${parts[3]} <${parts[4]}>`,
-      message: parts.slice(5).join("\x1f").trim(),
+      id: parts[i],
+      author: `${parts[i + 1]} <${parts[i + 2]}>`,
+      committer: `${parts[i + 3]} <${parts[i + 4]}>`,
+      message: parts[i + 5].trim(),
     });
   }
 }

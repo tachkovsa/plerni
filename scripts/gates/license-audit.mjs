@@ -12,8 +12,9 @@
  * judged from its integrity-checked lockfile tarball. A tracked
  * node_modules manifest is not the license authority for an isolated
  * package, even when the version matches. The lockfile license field is
- * ignored. A missing tarball, a bad hash, or a name or version that does
- * not match the lock entry fails closed.
+ * ignored. A missing tarball, a bad hash, a name or version that does
+ * not match the lock entry, or more than one package/package.json in the
+ * tarball fails closed.
  * A dependency of that tarball is resolved from the lock entry nested under
  * its parent, and the locked version must satisfy the parent's range. An
  * installed package of the same name at a different version does not stand
@@ -241,32 +242,73 @@ const integrityMatches = (bytes, integrity) => {
   });
 };
 
+const readCString = (buf) => buf.toString("utf8").replace(/\0.*$/, "");
+
+const paxPath = (data) => {
+  const text = data.toString("utf8");
+  let i = 0;
+  let path = null;
+  while (i < text.length) {
+    const space = text.indexOf(" ", i);
+    if (space <= i) break;
+    const len = Number(text.slice(i, space));
+    if (!Number.isInteger(len) || len <= 0 || i + len > text.length) break;
+    const body = text.slice(space + 1, i + len);
+    if (body.startsWith("path=")) path = body.slice("path=".length).replace(/\n$/, "");
+    i += len;
+  }
+  return path;
+};
+
+// npm keeps the last regular-file package/package.json when an archive repeats
+// that path. Exactly one such entry is accepted; zero or two is fail-closed.
 const packageJsonFromTarball = (bytes) => {
   let tar;
   try {
     tar = gunzipSync(bytes);
   } catch {
-    return null;
+    return { error: "tarball is not gzip" };
   }
   let offset = 0;
+  let pendingName = null;
+  const manifests = [];
   while (offset + 512 <= tar.length) {
     const header = tar.subarray(offset, offset + 512);
     if (header.every((b) => b === 0)) break;
-    const name = header.subarray(0, 100).toString("utf8").replace(/\0.*$/, "");
-    const size = parseInt(header.subarray(124, 136).toString("utf8").replace(/\0.*$/, "").trim(), 8);
+    const size = parseInt(readCString(header.subarray(124, 136)).trim(), 8);
+    const typeflag = header[156];
     offset += 512;
-    if (!Number.isFinite(size) || size < 0 || offset + size > tar.length) return null;
+    if (!Number.isFinite(size) || size < 0 || offset + size > tar.length) return { error: "tarball is truncated" };
     const data = tar.subarray(offset, offset + size);
-    if (name === "package/package.json") {
-      try {
-        return JSON.parse(data.toString("utf8"));
-      } catch {
-        return null;
-      }
-    }
     offset += Math.ceil(size / 512) * 512;
+    if (typeflag === 76) { // GNU long name for the next entry
+      pendingName = readCString(data);
+      continue;
+    }
+    if (typeflag === 120) { // pax extended header for the next entry
+      pendingName = paxPath(data) ?? pendingName;
+      continue;
+    }
+    const prefix = readCString(header.subarray(345, 500));
+    const shortName = readCString(header.subarray(0, 100));
+    const rawName = pendingName ?? (prefix ? `${prefix.replace(/\/$/, "")}/${shortName.replace(/^\//, "")}` : shortName);
+    pendingName = null;
+    const name = rawName.replace(/^\.\//, "");
+    const regular = typeflag === 0 || typeflag === 48;
+    if (regular && name === "package/package.json") manifests.push(data);
   }
-  return null;
+  if (manifests.length !== 1) {
+    return {
+      error: manifests.length === 0
+        ? "tarball has no package/package.json"
+        : "tarball contains more than one package/package.json",
+    };
+  }
+  try {
+    return { pkg: JSON.parse(manifests[0].toString("utf8")) };
+  } catch {
+    return { error: "tarball package manifest is not JSON" };
+  }
 };
 
 // file: paths must stay inside --root. https tarballs are fetched and hashed.
@@ -342,8 +384,13 @@ const auditLockedOptional = async (startDir, name, label, relation = "verified o
     failures.push(`${where}: tarball integrity check failed — fail closed`);
     return;
   }
-  const pkg = packageJsonFromTarball(loaded.bytes);
-  if (!pkg || pkg.name !== name || pkg.version !== entry.version) {
+  const parsed = packageJsonFromTarball(loaded.bytes);
+  if (!parsed.pkg) {
+    failures.push(`${where}: ${parsed.error ?? "tarball has no readable package manifest"} — fail closed`);
+    return;
+  }
+  const pkg = parsed.pkg;
+  if (pkg.name !== name || pkg.version !== entry.version) {
     failures.push(`${where}: verified tarball does not match the locked name and version — fail closed`);
     return;
   }

@@ -47,6 +47,12 @@ const cases = [
     expectOutput: /forbidden license "GPL/,
   },
   {
+    name: "license-audit rejects a tarball that repeats package/package.json",
+    cmd: gate("license-audit.mjs", "--root", join(fixtures, "isolated-duplicate")),
+    expectExit: 1,
+    expectOutput: /tarball contains more than one package\/package.json/,
+  },
+  {
     name: "license-audit accepts an MIT dependency declared outside the workspace",
     cmd: gate("license-audit.mjs", "--root", join(fixtures, "isolated-mit")),
     expectExit: 0,
@@ -265,6 +271,40 @@ cases.push({
   env: { COMMIT_IDENTITY_PATTERNS: "forbidden-provider\\.example" },
   expectExit: 1,
   expectOutput: /author matches a forbidden identity[\s\S]*message matches a forbidden identity/,
+});
+historyGit(["checkout", "-q", "-b", "delimiters"]);
+writeFileSync(join(historyDir, "delim.md"), "three\n");
+historyGit(["add", "delim.md"]);
+historyGit([
+  "-c", "user.name=Dev Example",
+  "-c", "user.email=dev@example.com",
+  "commit", "-q",
+  "-m", "feat: keep record separators in the message\n\nline\x1emore\x1fstill\n\nAI-assisted: yes\n",
+]);
+const delimClean = historyGit(["rev-parse", "HEAD"]).trim();
+writeFileSync(join(historyDir, "inject.md"), "four\n");
+historyGit(["add", "inject.md"]);
+historyGit([
+  "-c", "user.name=Dev Example",
+  "-c", "user.email=dev@example.com",
+  "commit", "-q",
+  "-m", "feat: hide a marker past a record separator\n\nAI-assisted: yes\n\x1eforbidden-provider.example\x1f\x1f\x1f\x1f\x1f\n",
+]);
+const delimBad = historyGit(["rev-parse", "HEAD"]).trim();
+historyGit(["checkout", "-q", historyBase]);
+cases.push({
+  name: "commit-policy history mode keeps a message intact when it contains record separators",
+  cmd: gate("commit-policy.mjs", "--cwd", historyDir, "--base", historyBase, "--head", delimClean),
+  env: { COMMIT_IDENTITY_PATTERNS: "forbidden-provider\\.example" },
+  expectExit: 0,
+  expectOutput: /OK \(1 commit message/,
+});
+cases.push({
+  name: "commit-policy history mode still sees an identity placed after an injected record separator",
+  cmd: gate("commit-policy.mjs", "--cwd", historyDir, "--base", delimClean, "--head", delimBad),
+  env: { COMMIT_IDENTITY_PATTERNS: "forbidden-provider\\.example" },
+  expectExit: 1,
+  expectOutput: /message matches a forbidden identity/,
 });
 
 const standIn = "Marker Example <marker@synthetic-standin.example>";
