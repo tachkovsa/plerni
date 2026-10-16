@@ -4,8 +4,9 @@
  * merge must have a Conventional Commits subject and — if present — a
  * role-only `AI-assisted: yes` trailer (never development-tool or model
  * identities, AGENTS.md §0). Human DCO sign-off is not required at the
- * current stage; the CI step in `.github/workflows/p0-gates.yml` runs this
- * script and therefore does not require `Signed-off-by`.
+ * current stage. `.github/workflows/commit-policy.yml` runs this script from
+ * the base revision and therefore does not require `Signed-off-by`. The
+ * secret is not loaded by the pull_request workflow.
  *
  * The author, the committer, and the full message are all checked, including
  * merge commits (only the conventional-subject rule is skipped for those).
@@ -15,15 +16,17 @@
  * environment variable, one per line. Nothing in the repository stores the
  * patterns or their digests. A push, or a pull request whose head repository
  * is this repository (or is not identified), fails closed when the variable
- * is unset or blank. A pull request from a fork — `GITHUB_EVENT_NAME` is
- * `pull_request` and `PR_HEAD_REPO` differs from `GITHUB_REPOSITORY` — logs
- * a skip notice and does not fail, because Actions does not pass repository
- * secrets to that event. A run outside GitHub Actions still checks subjects
- * and the gitignored `.private-markers.local` file. A git-history run loads
- * that file from the repository root. The secret value is never printed.
+ * is unset or blank. A pull request from a fork — the event is
+ * `pull_request` or `pull_request_target`, and `PR_HEAD_REPO` differs from
+ * `GITHUB_REPOSITORY` — logs a skip notice and does not fail. A run outside
+ * GitHub Actions still checks subjects and the gitignored
+ * `.private-markers.local` file. A git-history run loads that file from the
+ * repository root. `--head` selects a fetched commit without checking it
+ * out. The secret value is never printed.
  *
  * Modes:
- *   (default)     check `git log <base>..HEAD`; base = --base, else origin/dev
+ *   (default)     check `git log <base>..<head>`; head = --head, else HEAD.
+ *                 base = --base, else origin/dev
  *                 when it exists, else HEAD (an empty range passes vacuously —
  *                 enforcement happens on PRs in CI).
  *   --file <path> check records from a file; records separated by a line
@@ -38,6 +41,7 @@ const { values } = parseArgs({
   options: {
     file: { type: "string" },
     base: { type: "string" },
+    head: { type: "string" },
     cwd: { type: "string" },
   },
 });
@@ -67,9 +71,10 @@ const secretMissing = typeof secret !== "string" || secret.trim() === "";
 const eventName = process.env.GITHUB_EVENT_NAME ?? "";
 const baseRepo = process.env.GITHUB_REPOSITORY ?? "";
 const headRepo = process.env.PR_HEAD_REPO ?? "";
+const pullRequestEvent = eventName === "pull_request" || eventName === "pull_request_target";
 const forkPullRequest =
-  eventName === "pull_request" && headRepo !== "" && baseRepo !== "" && headRepo !== baseRepo;
-const upstreamEvent = eventName === "push" || eventName === "pull_request";
+  pullRequestEvent && headRepo !== "" && baseRepo !== "" && headRepo !== baseRepo;
+const upstreamEvent = eventName === "push" || pullRequestEvent;
 
 if (!secretMissing) {
   addPatterns(secret, IDENTITY_SECRET);
@@ -139,15 +144,16 @@ if (values.file) {
       base = "HEAD";
     }
   }
+  const headRev = values.head || "HEAD";
   let out;
   try {
     out = execFileSync(
       "git",
-      ["log", "--format=%h%x1f%an%x1f%ae%x1f%cn%x1f%ce%x1f%B%x1e", `${base}..HEAD`],
+      ["log", "--format=%h%x1f%an%x1f%ae%x1f%cn%x1f%ce%x1f%B%x1e", `${base}..${headRev}`],
       { cwd: values.cwd, encoding: "utf8" },
     );
   } catch (err) {
-    console.error(`commit-policy: cannot read git history for ${base}..HEAD (${err.message}) — FAIL CLOSED`);
+    console.error(`commit-policy: cannot read git history for ${base}..${headRev} (${err.message}) — FAIL CLOSED`);
     process.exit(1);
   }
   for (const rec of out.split("\x1e")) {

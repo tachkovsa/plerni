@@ -1,0 +1,63 @@
+name: commit-policy
+
+# COMMIT_IDENTITY_PATTERNS is a repository secret. This is the only workflow
+# that loads it. pull_request_target uses the workflow file and the gate
+# script from the base revision. The job fetches the pull request's commits
+# and reads author, committer, and message with git log. It does not check
+# out the pull request and it does not run the pull request's code.
+# A fork pull request does not receive the secret. A push to dev, or a pull
+# request from this repository, fails closed when the secret is unset.
+
+on:
+  pull_request_target:
+  push:
+    branches: [dev]
+
+permissions:
+  contents: read
+
+jobs:
+  commit-policy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: check out the base revision
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.base.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: fetch pull request commits
+        if: github.event_name == 'pull_request_target'
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          case "$PR_NUMBER" in
+            ''|*[!0-9]*)
+              echo "commit-policy: pull request number is not numeric — FAIL CLOSED" >&2
+              exit 1
+              ;;
+          esac
+          git fetch --no-tags origin "pull/${PR_NUMBER}/head"
+
+      - name: commit policy
+        env:
+          COMMIT_IDENTITY_PATTERNS: ${{ (github.event_name != 'pull_request_target' || github.event.pull_request.head.repo.full_name == github.repository) && secrets.COMMIT_IDENTITY_PATTERNS || '' }}
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          POLICY_BASE: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.base.sha || github.event.before }}
+          POLICY_HEAD: ${{ github.event_name == 'pull_request_target' && 'FETCH_HEAD' || 'HEAD' }}
+        run: |
+          case "$POLICY_BASE" in
+            ''|*[!0-9a-fA-F]*)
+              echo "commit-policy: base revision is not a commit sha — FAIL CLOSED" >&2
+              exit 1
+              ;;
+          esac
+          case "$POLICY_HEAD" in
+            HEAD|FETCH_HEAD) ;;
+            *)
+              echo "commit-policy: head revision is not a fetched ref — FAIL CLOSED" >&2
+              exit 1
+              ;;
+          esac
+          node scripts/gates/commit-policy.mjs --base "$POLICY_BASE" --head "$POLICY_HEAD"

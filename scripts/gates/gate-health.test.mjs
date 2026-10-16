@@ -56,46 +56,49 @@ const cases = [
     cmd: gate("license-audit.mjs", "--root", join(fixtures, "isolated-transitive")),
     expectExit: 1,
     expectOutput:
-      /fake-lgpl-lib \(dependency of fake-mit-lib \(brand\)\): forbidden license "LGPL-3.0-or-later"(?![\s\S]*fake-other-platform)/,
+      /fake-lgpl-lib \(verified optional dependency of fake-mit-lib \(verified dependency of brand\)\): forbidden license "LGPL-3.0-or-later"(?![\s\S]*fake-other-platform)/,
   },
   {
     name: "license-audit blocks a forbidden license on an installed peer dependency",
     cmd: gate("license-audit.mjs", "--root", join(fixtures, "isolated-peer")),
     expectExit: 1,
-    expectOutput: /fake-gpl-peer \(dependency of fake-mit-lib \(brand\)\): forbidden license "GPL-3.0-only"/,
+    expectOutput:
+      /fake-gpl-peer \(verified peer of fake-mit-lib \(verified dependency of brand\)\): forbidden license "GPL-3.0-only"/,
   },
   {
     name: "license-audit blocks a required root peer when the package has no other dependencies",
     cmd: gate("license-audit.mjs", "--root", join(fixtures, "isolated-root-peer")),
     expectExit: 1,
     expectOutput:
-      /fake-gpl-peer \(brand\): forbidden license "GPL-3.0-only"(?![\s\S]*fake-optional-peer)/,
+      /fake-gpl-peer \(verified peer of brand\): forbidden license "GPL-3.0-only"(?![\s\S]*fake-optional-peer)/,
   },
   {
     name: "license-audit blocks a forbidden tarball license when the lockfile license field is allowlisted",
     cmd: gate("license-audit.mjs", "--root", join(fixtures, "isolated-foreign")),
     expectExit: 1,
-    expectOutput: /fake-darwin-gpl \(verified optional dependency of fake-mit-lib \(brand\)\): forbidden license "GPL-3.0-only"/,
+    expectOutput:
+      /fake-darwin-gpl \(verified optional dependency of fake-mit-lib \(verified dependency of brand\)\): forbidden license "GPL-3.0-only"/,
   },
   {
     name: "license-audit blocks a required peer of an absent optional package",
     cmd: gate("license-audit.mjs", "--root", join(fixtures, "isolated-absent-peer")),
     expectExit: 1,
     expectOutput:
-      /fake-gpl-peer \(verified peer of fake-darwin-mit \(verified optional dependency of fake-mit-lib \(brand\)\)\): forbidden license "GPL-3.0-only"(?![\s\S]*fake-optional-peer)/,
+      /fake-gpl-peer \(verified peer of fake-darwin-mit \(verified optional dependency of fake-mit-lib \(verified dependency of brand\)\)\): forbidden license "GPL-3.0-only"(?![\s\S]*fake-optional-peer)/,
   },
   {
     name: "license-audit blocks the locked child version when another version is installed",
     cmd: gate("license-audit.mjs", "--root", join(fixtures, "isolated-locked-child")),
     expectExit: 1,
     expectOutput:
-      /shared-child \(verified dependency of fake-darwin-app \(verified optional dependency of fake-mit-lib \(brand\)\)\): forbidden license "GPL-3.0-only"/,
+      /shared-child \(verified dependency of fake-darwin-app \(verified optional dependency of fake-mit-lib \(verified dependency of brand\)\)\): forbidden license "GPL-3.0-only"/,
   },
   {
     name: "license-audit fails closed when an absent optional dependency has no verifiable tarball",
     cmd: gate("license-audit.mjs", "--root", join(fixtures, "isolated-unverified")),
     expectExit: 1,
-    expectOutput: /fake-no-tarball \(verified optional dependency of fake-mit-lib \(brand\)\): lockfile entry has no integrity-checked tarball/,
+    expectOutput:
+      /fake-no-tarball \(verified optional dependency of fake-mit-lib \(verified dependency of brand\)\): lockfile entry has no integrity-checked tarball/,
   },
   {
     name: "license-audit blocks an isolated package with no lockfile",
@@ -190,6 +193,32 @@ const cases = [
       /COMMIT_IDENTITY_PATTERNS is not set on this repository \(pull_request\) — FAIL CLOSED(?![\s\S]*skipping forbidden-identity checks)/,
   },
   {
+    name: "commit-policy skips identity checks on a fork pull_request_target when the secret is unset",
+    cmd: gate("commit-policy.mjs", "--file", join(fixtures, "commit-policy", "merge-metadata.txt")),
+    env: {
+      COMMIT_IDENTITY_PATTERNS: "",
+      GITHUB_EVENT_NAME: "pull_request_target",
+      GITHUB_REPOSITORY: "example/plerni",
+      PR_HEAD_REPO: "other/plerni",
+    },
+    expectExit: 0,
+    expectOutput:
+      /COMMIT_IDENTITY_PATTERNS is not set — skipping forbidden-identity checks \(pull request from a fork; repository secrets are not available\)/,
+  },
+  {
+    name: "commit-policy fails closed on a same-repo pull_request_target when COMMIT_IDENTITY_PATTERNS is unset",
+    cmd: gate("commit-policy.mjs", "--file", join(fixtures, "commit-policy", "merge-metadata.txt")),
+    env: {
+      COMMIT_IDENTITY_PATTERNS: "",
+      GITHUB_EVENT_NAME: "pull_request_target",
+      GITHUB_REPOSITORY: "example/plerni",
+      PR_HEAD_REPO: "example/plerni",
+    },
+    expectExit: 1,
+    expectOutput:
+      /COMMIT_IDENTITY_PATTERNS is not set on this repository \(pull_request_target\) — FAIL CLOSED(?![\s\S]*skipping forbidden-identity checks)/,
+  },
+  {
     name: "commit-policy fails closed on a pull request when the head repository is not identified",
     cmd: gate("commit-policy.mjs", "--file", join(fixtures, "commit-policy", "merge-metadata.txt")),
     env: {
@@ -228,9 +257,11 @@ historyGit([
   "commit", "-q",
   "-m", "feat: record a run\n\nhttps://forbidden-provider.example/dashboard/1\n\nAI-assisted: yes\n",
 ]);
+const historyHead = historyGit(["rev-parse", "HEAD"]).trim();
+historyGit(["checkout", "-q", historyBase]);
 cases.push({
-  name: "commit-policy history mode applies patterns from the environment",
-  cmd: gate("commit-policy.mjs", "--cwd", historyDir, "--base", historyBase),
+  name: "commit-policy history mode reads a fetched commit without checking it out",
+  cmd: gate("commit-policy.mjs", "--cwd", historyDir, "--base", historyBase, "--head", historyHead),
   env: { COMMIT_IDENTITY_PATTERNS: "forbidden-provider\\.example" },
   expectExit: 1,
   expectOutput: /author matches a forbidden identity[\s\S]*message matches a forbidden identity/,

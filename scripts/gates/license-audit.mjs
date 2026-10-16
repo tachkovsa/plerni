@@ -7,13 +7,13 @@
  * Also audits npm packages that sit outside the workspace (assets/brand).
  * A manifest with external dependencies and no package-lock.json fails
  * closed. The locked version of each direct dependency must satisfy the
- * manifest range. Every license is read from the installed package manifest,
- * never from the lockfile's license field when the package is installed.
- * An optional dependency this platform did not install is still judged.
- * The lockfile supplies the tarball URL and integrity hash; the license is
- * read from that tarball's package.json after the hash matches. The lockfile
- * license field is ignored. A missing tarball, a bad hash, or a name or
- * version that does not match the lock entry fails closed.
+ * manifest range. Workspace packages are judged from the installed manifest
+ * after the package manager has installed them. An isolated package is
+ * judged from its integrity-checked lockfile tarball. A tracked
+ * node_modules manifest is not the license authority for an isolated
+ * package, even when the version matches. The lockfile license field is
+ * ignored. A missing tarball, a bad hash, or a name or version that does
+ * not match the lock entry fails closed.
  * A dependency of that tarball is resolved from the lock entry nested under
  * its parent, and the locked version must satisfy the parent's range. An
  * installed package of the same name at a different version does not stand
@@ -24,7 +24,9 @@
  * the package itself is audited even when it is the only external
  * declaration. An optional root peer is not seeded into that walk.
  * An optional peer (`peerDependenciesMeta.*.optional`) that is not installed
- * is skipped; an optional peer that is installed is judged.
+ * is skipped. An optional peer that is installed is judged from the same
+ * source as its parent: the verified tarball when the parent was verified
+ * that way.
  * Usage: node scripts/gates/license-audit.mjs [--root <dir>]
  */
 import { createHash } from "node:crypto";
@@ -307,7 +309,7 @@ const auditLockedOptional = async (startDir, name, label, relation = "verified o
     failures.push(`${name} (optional dependency of ${label}): not installed and no package-lock.json — fail closed`);
     return;
   }
-  if (!spec.parentKey || typeof spec.range !== "string" || spec.range.trim() === "") {
+  if (typeof spec.parentKey !== "string" || typeof spec.range !== "string" || spec.range.trim() === "") {
     failures.push(`${where}: parent lock entry or dependency range is missing — fail closed`);
     return;
   }
@@ -348,18 +350,23 @@ const auditLockedOptional = async (startDir, name, label, relation = "verified o
   checked++;
   const problem = judge(where, licenseOf(pkg));
   if (problem) failures.push(problem);
-  const nested = { ...pkg.dependencies, ...pkg.optionalDependencies };
-  for (const [child, childRange] of Object.entries(nested)) {
+  const optionalChildren = pkg.optionalDependencies ?? {};
+  for (const [child, childRange] of Object.entries(pkg.dependencies ?? {})) {
+    if (Object.prototype.hasOwnProperty.call(optionalChildren, child)) continue;
     await auditLockedOptional(startDir, child, where, "verified dependency", { parentKey: key, range: childRange });
+  }
+  for (const [child, childRange] of Object.entries(optionalChildren)) {
+    await auditLockedOptional(startDir, child, where, "verified optional dependency", {
+      parentKey: key,
+      range: childRange,
+    });
   }
   const peerMeta = pkg.peerDependenciesMeta ?? {};
   for (const [child, childRange] of Object.entries(pkg.peerDependencies ?? {})) {
     if (peerMeta[child]?.optional === true) {
       const childPath = resolveInstalled(startDir, child);
       if (!childPath) continue;
-      const installed = JSON.parse(readFileSync(childPath, "utf8"));
-      if (satisfies(installed.version, String(childRange)) !== true) continue;
-      await auditTree(childPath, `${child} (dependency of ${where})`);
+      await auditLockedOptional(startDir, child, where, "verified peer", { parentKey: key, range: String(childRange) });
       continue;
     }
     await auditLockedOptional(startDir, child, where, "verified peer", { parentKey: key, range: String(childRange) });
@@ -429,7 +436,10 @@ for (const dir of isolatedDirs) {
     failures.push(`${rel}: dependencies declared but package-lock.json is missing — fail closed`);
     continue;
   }
-  for (const [name, range] of externals) lockDeps.push({ name, range, dir });
+  const peers = new Set(requiredPeerEntries(pkg).map(([name]) => name));
+  for (const [name, range] of externals) {
+    lockDeps.push({ name, range, dir, relation: peers.has(name) ? "verified peer" : "verified dependency" });
+  }
 }
 
 if (deps.size === 0 && lockDeps.length === 0 && failures.length === 0) {
@@ -451,7 +461,7 @@ const main = async () => {
     await auditTree(pkgPath, name);
   }
 
-  for (const { name, range, dir } of lockDeps) {
+  for (const { name, range, dir, relation } of lockDeps) {
     const rel = relative(root, dir) || ".";
     const label = `${name} (${rel})`;
     const lock = JSON.parse(readFileSync(join(dir, "package-lock.json"), "utf8"));
@@ -472,18 +482,7 @@ const main = async () => {
     } else if (!sat) {
       failures.push(`${label}: lockfile version ${entry.version} does not satisfy manifest range ${range}`);
     }
-    const installedPath = join(dir, "node_modules", ...name.split("/"), "package.json");
-    if (!existsSync(installedPath)) {
-      failures.push(`${label}: not installed — run npm ci --ignore-scripts in ${rel}; gate is fail-closed`);
-      continue;
-    }
-    const installed = JSON.parse(readFileSync(installedPath, "utf8"));
-    if (installed.version && entry.version && installed.version !== entry.version) {
-      failures.push(
-        `${label}: installed version ${installed.version} does not match lockfile version ${entry.version}`,
-      );
-    }
-    await auditTree(installedPath, label);
+    await auditLockedOptional(dir, name, rel, relation, { parentKey: "", range });
   }
 
   if (failures.length) {

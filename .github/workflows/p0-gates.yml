@@ -71,9 +71,7 @@ jobs:
           fi
       - run: node scripts/gates/license-audit.mjs
       - run: node scripts/gates/kernel-purity.mjs
-      - name: commit policy
-        env:
-          COMMIT_IDENTITY_PATTERNS: ${{ secrets.COMMIT_IDENTITY_PATTERNS }}
-          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
-        run: node scripts/gates/commit-policy.mjs --base "${{ github.event_name == 'push' && github.event.before || format('origin/{0}', github.base_ref || 'dev') }}"
+      # Identity patterns stay in commit-policy.yml. This pull_request job
+      # must not receive that secret, because it checks out and runs the
+      # merge commit.
       - run: node scripts/gates/gate-health.test.mjs
