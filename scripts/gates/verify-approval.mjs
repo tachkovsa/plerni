@@ -9,10 +9,15 @@
  * head commit. Artifact json and sig files are outside the digest; maintainer.pub
  * stays inside it.
  *
- * Scope (plan T13): a plain `git diff base head --` of the workflow, gate,
- * harness, and sql trees, plus spike bench artifacts, excluding approval json
- * and sig files. maintainer.pub stays in the digest. No extra diff flags:
- * the digest is the byte stream of that command.
+ * Scope (plan T13): a plain `git diff base head --` of the workflow and gate
+ * trees, tools/harness/sql/, and spike bench artifacts, excluding approval
+ * json and sig files. The rest of tools/harness/ is outside that recipe.
+ * maintainer.pub stays in the digest. No extra diff flags: the digest is the
+ * byte stream of that command.
+ *
+ * A change to either half of an artifact pair (the json or the detached sig),
+ * including a deletion or a rename, is verified or rejected. A signature-only
+ * edit is not an empty scope.
  *
  * Push runs pass the pre-push commit (github.event.before) as --base. Pull
  * requests pass the merge-base of the base branch and the pull request head.
@@ -22,9 +27,11 @@
  * The signed artifact for gate-config changes is waived at the current stage
  * (docs/ai/model-routing.md, owner decision 2026-10-15). While that sentence
  * is committed at the base revision, a missing artifact does not fail the
- * job. A sentence added only on the head does not waive it. A present
- * artifact is still checked. Repositories without the sentence — including
- * the gate-health fixtures — enforce the missing-artifact rule.
+ * job. A sentence added only on the head does not waive it. The waiver does
+ * not cover a change to maintainer.pub: a rotation still needs an artifact
+ * signed by the key at the base. A present artifact is still checked.
+ * Repositories without the sentence — including the gate-health fixtures —
+ * enforce the missing-artifact rule.
  *
  * approval-artifact.yml runs this script from the base checkout
  * (pull_request_target). A pull_request job must not run it: that job checks
@@ -45,12 +52,13 @@ const KEY_PATH = "scripts/gates/approvals/maintainer.pub";
 const SCOPE_PATHS = [
   ".github/workflows/",
   "scripts/gates/",
-  "tools/harness/",
-  "sql/",
+  "tools/harness/sql/",
   "tools/spikes/*/bench/.artifacts/",
   ":(exclude)scripts/gates/approvals/*.json",
   ":(exclude)scripts/gates/approvals/*.json.sig",
 ];
+const JSON_NAME = /^scripts\/gates\/approvals\/[^/]+\.json$/;
+const SIG_NAME = /^scripts\/gates\/approvals\/[^/]+\.json\.sig$/;
 
 const { values } = parseArgs({
   options: {
@@ -98,22 +106,71 @@ const scopedDiff = (cwd, base, head) => {
   }
 };
 
+const jsonOf = (path) => {
+  if (typeof path !== "string") return null;
+  if (SIG_NAME.test(path)) return path.slice(0, -4);
+  if (JSON_NAME.test(path)) return path;
+  return null;
+};
+
 const artifactsInDiff = (cwd, base, head) => {
-  let out;
+  let raw;
   try {
-    out = git(cwd, [
+    raw = git(cwd, [
       "diff",
-      "--name-only",
-      "--diff-filter=AM",
+      "--name-status",
+      "-z",
+      "--find-renames",
       base,
       head,
       "--",
       "scripts/gates/approvals",
-    ]).toString("utf8");
+    ]);
   } catch (err) {
     fail(`cannot list approval artifacts (${err.message}) — FAIL CLOSED`);
   }
-  return out.split("\n").filter((path) => /^scripts\/gates\/approvals\/[^/]+\.json$/.test(path));
+  const parts = raw.toString("utf8").split("\0");
+  if (parts.length && parts[parts.length - 1] === "") parts.pop();
+  const verify = new Set();
+  const removed = new Set();
+  let index = 0;
+  while (index < parts.length) {
+    const status = parts[index++];
+    const renamed = status.startsWith("R") || status.startsWith("C");
+    const from = parts[index++];
+    const to = renamed ? parts[index++] : null;
+    if (!status || from === undefined || (renamed && to === undefined)) {
+      fail("cannot list approval artifacts — FAIL CLOSED");
+    }
+    if (renamed) {
+      const fromJson = jsonOf(from);
+      const toJson = jsonOf(to);
+      if (toJson) verify.add(toJson);
+      if (fromJson && fromJson !== toJson && gitShow(cwd, head, fromJson)) verify.add(fromJson);
+      if (fromJson && !toJson && !gitShow(cwd, head, fromJson)) removed.add(fromJson);
+      continue;
+    }
+    const pathJson = jsonOf(from);
+    if (!pathJson) continue;
+    if (status.startsWith("D")) {
+      if (gitShow(cwd, head, pathJson)) verify.add(pathJson);
+      else removed.add(pathJson);
+      continue;
+    }
+    verify.add(pathJson);
+  }
+  if (removed.size > 0) {
+    fail(`${[...removed].sort()[0]} was removed — FAIL CLOSED`);
+  }
+  return [...verify].sort();
+};
+
+const keyChanged = (cwd, base, head) => {
+  const before = gitShow(cwd, base, KEY_PATH);
+  const after = gitShow(cwd, head, KEY_PATH);
+  if (before === null && after === null) return false;
+  if (before === null || after === null) return true;
+  return !before.equals(after);
 };
 
 const canonicalOf = (value) => {
@@ -184,6 +241,9 @@ if (values["print-scope"]) {
 }
 
 const artifacts = artifactsInDiff(cwd, base, head);
+if (keyChanged(cwd, base, head) && artifacts.length === 0) {
+  fail("approval key changed; the waiver does not cover a key rotation — FAIL CLOSED");
+}
 if (artifacts.length === 0 && diff.length === 0) {
   console.log("verify-approval: OK (scoped diff empty)");
   process.exit(0);

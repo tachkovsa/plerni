@@ -1,9 +1,10 @@
 name: approval-artifact
 
 # pull_request_target uses this workflow file and verify-approval.mjs from the
-# base revision. The job fetches the pull request commits and diffs them. It
-# does not check out the pull request and it does not run the pull request's
-# copy of the verifier. A pull request cannot delete this step or replace the
+# base revision. The job fetches the event's pull request head sha and diffs
+# that object. It does not fetch the moving pull/<number>/head ref, it does
+# not check out the pull request, and it does not run the pull request's copy
+# of the verifier. A pull request cannot delete this step or replace the
 # script: the copy that runs is the one on the base branch.
 
 on:
@@ -25,10 +26,11 @@ jobs:
           fetch-depth: 0
           persist-credentials: true
 
-      - name: fetch pull request commits
+      - name: fetch the pull request head sha
         if: github.event_name == 'pull_request_target'
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           case "$PR_NUMBER" in
             ''|*[!0-9]*)
@@ -36,13 +38,30 @@ jobs:
               exit 1
               ;;
           esac
-          git fetch --no-tags origin "pull/${PR_NUMBER}/head"
+          case "$HEAD_SHA" in
+            *[!0-9a-fA-F]*)
+              echo "verify-approval: head revision is not a commit sha — FAIL CLOSED" >&2
+              exit 1
+              ;;
+          esac
+          if [ "${#HEAD_SHA}" -ne 40 ] || [ "$HEAD_SHA" = "0000000000000000000000000000000000000000" ]; then
+            echo "verify-approval: head revision is not a commit sha — FAIL CLOSED" >&2
+            exit 1
+          fi
+          git fetch --no-tags origin "$HEAD_SHA"
+          got=$(git rev-parse --verify "${HEAD_SHA}^{commit}")
+          got=$(printf '%s' "$got" | tr 'A-F' 'a-f')
+          want=$(printf '%s' "$HEAD_SHA" | tr 'A-F' 'a-f')
+          if [ "$got" != "$want" ]; then
+            echo "verify-approval: fetched head is not the event revision — FAIL CLOSED" >&2
+            exit 1
+          fi
 
       - name: verify gate-config approval artifacts
         env:
           APPROVAL_EVENT: ${{ github.event_name }}
           APPROVAL_BASE: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.base.sha || github.event.before }}
-          APPROVAL_HEAD: ${{ github.event_name == 'pull_request_target' && 'FETCH_HEAD' || 'HEAD' }}
+          APPROVAL_HEAD: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || 'HEAD' }}
         run: |
           set -eu
           case "$APPROVAL_EVENT" in
@@ -58,16 +77,26 @@ jobs:
               exit 1
               ;;
           esac
-          case "$APPROVAL_HEAD" in
-            HEAD|FETCH_HEAD) ;;
-            *)
-              echo "verify-approval: head revision is not a fetched ref — FAIL CLOSED" >&2
-              exit 1
-              ;;
-          esac
           if [ "$APPROVAL_EVENT" = "push" ]; then
+            case "$APPROVAL_HEAD" in
+              HEAD) ;;
+              *)
+                echo "verify-approval: head revision is not the push commit — FAIL CLOSED" >&2
+                exit 1
+                ;;
+            esac
             base="$APPROVAL_BASE"
           else
-            base=$(git merge-base "$APPROVAL_BASE" FETCH_HEAD)
+            case "$APPROVAL_HEAD" in
+              *[!0-9a-fA-F]*)
+                echo "verify-approval: head revision is not a commit sha — FAIL CLOSED" >&2
+                exit 1
+                ;;
+            esac
+            if [ "${#APPROVAL_HEAD}" -ne 40 ]; then
+              echo "verify-approval: head revision is not a commit sha — FAIL CLOSED" >&2
+              exit 1
+            fi
+            base=$(git merge-base "$APPROVAL_BASE" "$APPROVAL_HEAD")
           fi
           node scripts/gates/verify-approval.mjs --base "$base" --head "$APPROVAL_HEAD" --event "$APPROVAL_EVENT"

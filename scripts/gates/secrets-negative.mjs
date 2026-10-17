@@ -17,8 +17,10 @@
  * termination with no numeric exit code (a signal, or a spawn error such as
  * a full output buffer), or a completed scan that does not produce a JSON
  * finding list, is a scanner failure. A completed scan whose list lacks the
- * planted rule and file is an absent finding. A nonzero exit alone is not
- * proof. A thrown error is proof only when it carries exit 0 or 1.
+ * planted rule and file is an absent finding. The planted finding is proof
+ * only when the scanner exits 1. Exit 0 together with that finding is a
+ * broken scanner, not a pass. A nonzero exit alone is not proof. A thrown
+ * error is proof only when it carries exit 1 and the planted finding.
  */
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
@@ -77,6 +79,12 @@ const classify = (exitCode, reportText) => {
     return {
       ok: false,
       message: `expected finding rule ${EXPECT_RULE} file ${EXPECT_FILE} is absent — the scan completed without that finding`,
+    };
+  }
+  if (exitCode !== 1) {
+    return {
+      ok: false,
+      message: `scanner exit ${exitCode} contradicts a planted finding — a leak must exit 1`,
     };
   }
   return { ok: true };

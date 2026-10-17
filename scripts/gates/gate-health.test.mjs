@@ -436,8 +436,7 @@ const plainScope = (dir, base, head) => {
     "diff", base, head, "--",
     ".github/workflows/",
     "scripts/gates/",
-    "tools/harness/",
-    "sql/",
+    "tools/harness/sql/",
     "tools/spikes/*/bench/.artifacts/",
     ":(exclude)scripts/gates/approvals/*.json",
     ":(exclude)scripts/gates/approvals/*.json.sig",
@@ -590,6 +589,83 @@ cases.push({
   expectOutput: /signature verification failed(?![\s\S]*not a failure)/,
 });
 
+const harnessScope = repoWithBaseKey(approvalKeyA);
+mkdirSync(join(harnessScope.dir, "tools/harness/sql"), { recursive: true });
+writeFileSync(join(harnessScope.dir, "tools/harness/docker-compose.yml"), "services: {}\n");
+const harnessOutside = commitTree(harnessScope.dir, "ci: change a harness file outside tools/harness/sql");
+writeFileSync(join(harnessScope.dir, "tools/harness/sql/001_roles.sql"), "select 1;\n");
+const harnessInside = commitTree(harnessScope.dir, "ci: change tools/harness/sql");
+const harnessOutsideHash = scopeOf(harnessScope.dir, harnessScope.base, harnessOutside);
+const harnessInsideHash = scopeOf(harnessScope.dir, harnessScope.base, harnessInside);
+const harnessScopeMatches =
+  harnessOutsideHash === plainScope(harnessScope.dir, harnessScope.base, harnessOutside) &&
+  harnessOutsideHash === "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" &&
+  harnessInsideHash !== harnessOutsideHash;
+cases.push({
+  name: "verify-approval scope is tools/harness/sql and not the rest of the harness",
+  cmd: [
+    process.execPath,
+    ["-e", harnessScopeMatches ? "console.log('scope paths OK')" : "console.error('scope paths mismatch'); process.exit(1)"],
+  ],
+  expectExit: 0,
+  expectOutput: /scope paths OK/,
+});
+
+const sigOnly = repoWithBaseKey(approvalKeyA);
+writeFileSync(join(sigOnly.dir, ".github/workflows/p0-gates.yml"), "v2\n");
+const sigOnlyMid = commitTree(sigOnly.dir, "ci: change workflow");
+writeSignedArtifact(sigOnly.dir, approvalKeyA, scopeOf(sigOnly.dir, sigOnly.base, sigOnlyMid));
+const sigOnlyArtifact = commitTree(sigOnly.dir, "ci: add approval artifact");
+writeFileSync(join(sigOnly.dir, "scripts/gates/approvals/2026-10-17-secrets-gate-fix.json.sig"), "not-a-signature\n");
+const sigOnlyHead = commitTree(sigOnly.dir, "ci: replace only the detached signature");
+cases.push({
+  name: "verify-approval rejects a signature-only change",
+  cmd: approvalCmd(sigOnly.dir, sigOnly.base, sigOnlyHead),
+  expectExit: 1,
+  expectOutput: /signature verification failed(?![\s\S]*OK \(scoped diff empty\))/,
+});
+approvalGit(sigOnly.dir, ["checkout", "-q", sigOnlyArtifact]);
+execFileSync("git", ["rm", "-q", "scripts/gates/approvals/2026-10-17-secrets-gate-fix.json.sig"], { cwd: sigOnly.dir });
+const sigDeletedHead = commitTree(sigOnly.dir, "ci: delete only the detached signature");
+cases.push({
+  name: "verify-approval rejects deletion of a detached signature",
+  cmd: approvalCmd(sigOnly.dir, sigOnly.base, sigDeletedHead),
+  expectExit: 1,
+  expectOutput: /\.sig is absent(?![\s\S]*OK \(scoped diff empty\))/,
+});
+
+const waivedRotation = repoWithBaseKey(approvalKeyA);
+mkdirSync(join(waivedRotation.dir, "docs/ai"), { recursive: true });
+writeFileSync(join(waivedRotation.dir, "docs/ai/model-routing.md"), `${waiverSentence}\n`);
+const waivedRotationBase = commitTree(waivedRotation.dir, "docs: record the waiver on the base");
+writeFileSync(join(waivedRotation.dir, "scripts/gates/approvals/maintainer.pub"), readFileSync(`${approvalKeyB}.pub`));
+const waivedRotationHead = commitTree(waivedRotation.dir, "ci: replace the approval key under the waiver");
+cases.push({
+  name: "verify-approval does not waive an approval-key change",
+  cmd: approvalCmd(waivedRotation.dir, waivedRotationBase, waivedRotationHead),
+  expectExit: 1,
+  expectOutput: /approval key changed; the waiver does not cover a key rotation(?![\s\S]*not a failure)/,
+});
+
+const rotationSigned = repoWithBaseKey(approvalKeyA);
+mkdirSync(join(rotationSigned.dir, "docs/ai"), { recursive: true });
+writeFileSync(join(rotationSigned.dir, "docs/ai/model-routing.md"), `${waiverSentence}\n`);
+const rotationSignedBase = commitTree(rotationSigned.dir, "docs: record the waiver on the base");
+writeFileSync(join(rotationSigned.dir, "scripts/gates/approvals/maintainer.pub"), readFileSync(`${approvalKeyB}.pub`));
+const rotationSignedMid = commitTree(rotationSigned.dir, "ci: replace the approval key");
+writeSignedArtifact(
+  rotationSigned.dir,
+  approvalKeyA,
+  scopeOf(rotationSigned.dir, rotationSignedBase, rotationSignedMid),
+);
+const rotationSignedHead = commitTree(rotationSigned.dir, "ci: sign the key rotation with the incumbent key");
+cases.push({
+  name: "verify-approval accepts a key rotation signed by the incumbent key under the waiver",
+  cmd: approvalCmd(rotationSigned.dir, rotationSignedBase, rotationSignedHead),
+  expectExit: 0,
+  expectOutput: /OK \(1 artifact, scope [0-9a-f]{64}\)/,
+});
+
 cases.push({
   name: "verify-approval fails closed when the base sha is all zeros",
   cmd: approvalCmd(emptyScope.dir, "0000000000000000000000000000000000000000", emptyHead),
@@ -611,6 +687,12 @@ cases.push({
   cmd: gate("secrets-negative.mjs", "--report", plantedReport, "--scanner-exit", "1"),
   expectExit: 0,
   expectOutput: /secrets negative proof OK \(rule generic-api-key, file secret\.txt\)/,
+});
+cases.push({
+  name: "secrets negative proof rejects exit 0 when the planted finding is present",
+  cmd: gate("secrets-negative.mjs", "--report", plantedReport, "--scanner-exit", "0"),
+  expectExit: 1,
+  expectOutput: /scanner exit 0 contradicts a planted finding — a leak must exit 1(?![\s\S]*negative proof OK)/,
 });
 cases.push({
   name: "secrets negative proof rejects a completed scan that lacks the planted rule",
@@ -681,10 +763,13 @@ const workflowWired =
   approvalWorkflow.includes("github.event.pull_request.base.sha") &&
   approvalWorkflow.includes("github.event.before") &&
   approvalWorkflow.includes("git merge-base") &&
-  approvalWorkflow.includes("git fetch --no-tags origin \"pull/${PR_NUMBER}/head\"") &&
+  approvalWorkflow.includes("github.event.pull_request.head.sha") &&
+  approvalWorkflow.includes('git fetch --no-tags origin "$HEAD_SHA"') &&
   approvalWorkflow.includes("node scripts/gates/verify-approval.mjs") &&
   approvalWorkflow.includes("11d5960a326750d5838078e36cf38b85af677262") &&
-  !approvalWorkflow.includes("github.event.pull_request.head.sha") &&
+  approvalWorkflow.includes("github.event.pull_request.base.sha || github.sha") &&
+  !approvalWorkflow.includes("pull/${PR_NUMBER}/head") &&
+  !approvalWorkflow.includes("FETCH_HEAD") &&
   !approvalWorkflow.includes("git show HEAD:scripts/gates/approvals/maintainer.pub");
 cases.push({
   name: "approval verification runs from the base workflow, not the pull request checkout",
