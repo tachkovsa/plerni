@@ -16,17 +16,17 @@ jobs:
           fetch-depth: 0
       - name: gitleaks history scan (pinned v8.30.1)
         run: docker run --rm -v "$PWD:/repo" --entrypoint sh zricethezav/gitleaks:v8.30.1 -c "git config --global --add safe.directory /repo && gitleaks git --no-banner --redact /repo"
-      - name: negative proof — the synthetic fixture secret MUST be detected
-        run: |
-          set +e
-          docker run --rm -v "$PWD/scripts/gates/fixtures/gitleaks:/scan" zricethezav/gitleaks:v8.30.1 dir --no-banner /scan
-          code=$?
-          set -e
-          if [ "$code" -eq 0 ]; then
-            echo "gitleaks failed to detect the synthetic fixture secret — the secrets gate is NOT proven fail-closed"
-            exit 1
-          fi
-          echo "secrets negative proof OK (gitleaks exit $code)"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .nvmrc
+      # The negative proof requires the planted finding (rule generic-api-key
+      # on secret.txt). A scanner crash (bad flag, missing report, or any
+      # exit other than 0 or 1) is a scanner failure, not evidence. A
+      # completed scan whose report lacks that rule and file is an absent finding.
+      # Neither may pass. A nonzero exit alone is not proof. The repo
+      # allowlist is not loaded here; it applies only to the history scan.
+      - name: negative proof — the planted fixture finding must be present
+        run: node scripts/gates/secrets-negative.mjs
 
   private-markers:
     runs-on: ubuntu-latest
@@ -75,3 +75,32 @@ jobs:
       # must not receive that secret, because it checks out and runs the
       # merge commit.
       - run: node scripts/gates/gate-health.test.mjs
+      # Approval artifacts (plan §8 / T13). Required when the scoped diff is
+      # non-empty, signed by the key at the merge-base — on push, the
+      # pre-push commit github.event.before — never the head key. A missing
+      # key fails closed. While docs/ai/model-routing.md waives the signed
+      # artifact, a missing artifact does not fail this step; a present
+      # artifact is still verified.
+      - name: verify gate-config approval artifacts
+        env:
+          APPROVAL_EVENT: ${{ github.event_name }}
+          APPROVAL_BASE: ${{ github.event_name == 'push' && github.event.before || github.event.pull_request.base.sha }}
+        run: |
+          set -eu
+          case "$APPROVAL_EVENT" in
+            push|pull_request) ;;
+            *)
+              echo "verify-approval: event is not push or pull_request — FAIL CLOSED" >&2
+              exit 1
+              ;;
+          esac
+          if ! printf '%s\n' "$APPROVAL_BASE" | grep -Eq '^[0-9a-fA-F]{40}$'; then
+            echo "verify-approval: base revision is not a commit sha — FAIL CLOSED" >&2
+            exit 1
+          fi
+          if [ "$APPROVAL_EVENT" = "push" ]; then
+            base="$APPROVAL_BASE"
+          else
+            base=$(git merge-base "$APPROVAL_BASE" HEAD)
+          fi
+          node scripts/gates/verify-approval.mjs --base "$base" --head HEAD --event "$APPROVAL_EVENT"
