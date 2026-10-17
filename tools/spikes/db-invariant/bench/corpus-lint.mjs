@@ -3,7 +3,10 @@
 // A textual ban on "as" would reject Kysely's .as('alias') call. This walks
 // the TypeScript AST instead: type assertions, explicit any, explicit type
 // arguments on calls, $castTo / $narrowType / $assertType, and sql fragments.
-// The only allowed sql form is select set_config('plerni.<guc>', …, true).
+// A fragment is Kysely's sql export, including `sql as raw` and `kysely.sql`.
+// An unbound identifier named sql is still a fragment (ambient declare).
+// A different Kysely export renamed to sql is not. The only allowed form is
+// select set_config('plerni.<guc>', …, true).
 
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -23,11 +26,48 @@ function calleeName(expr) {
   return null;
 }
 
-function isSql(expr) {
-  if (ts.isIdentifier(expr) && expr.text === 'sql') return true;
-  return ts.isPropertyAccessExpression(expr)
-    && ts.isIdentifier(expr.expression)
-    && expr.expression.text === 'sql';
+function kyselySqlBindings(sf) {
+  const tags = new Set();
+  const namespaces = new Set();
+  const otherLocals = new Set();
+  for (const stmt of sf.statements) {
+    if (!ts.isImportDeclaration(stmt)) continue;
+    if (!ts.isStringLiteral(stmt.moduleSpecifier)) continue;
+    const fromKysely = stmt.moduleSpecifier.text === 'kysely';
+    const clause = stmt.importClause;
+    if (!clause || clause.isTypeOnly) continue;
+    if (clause.name) otherLocals.add(clause.name.text);
+    const named = clause.namedBindings;
+    if (!named) continue;
+    if (ts.isNamespaceImport(named)) {
+      if (fromKysely) namespaces.add(named.name.text);
+      else otherLocals.add(named.name.text);
+      continue;
+    }
+    for (const el of named.elements) {
+      if (el.isTypeOnly) continue;
+      const imported = el.propertyName ? el.propertyName.text : el.name.text;
+      if (fromKysely && imported === 'sql') tags.add(el.name.text);
+      else otherLocals.add(el.name.text);
+    }
+  }
+  return { tags, namespaces, otherLocals };
+}
+
+function isSqlIdentifier(expr, bindings) {
+  if (!ts.isIdentifier(expr)) return false;
+  if (bindings.tags.has(expr.text)) return true;
+  return expr.text === 'sql' && !bindings.otherLocals.has(expr.text);
+}
+
+function isSql(expr, bindings) {
+  if (ts.isIdentifier(expr)) return isSqlIdentifier(expr, bindings);
+  if (!ts.isPropertyAccessExpression(expr)) return false;
+  if (ts.isIdentifier(expr.expression)) {
+    if (bindings.namespaces.has(expr.expression.text) && expr.name.text === 'sql') return true;
+    return isSqlIdentifier(expr.expression, bindings);
+  }
+  return isSql(expr.expression, bindings);
 }
 
 function templateText(tpl) {
@@ -38,8 +78,8 @@ function templateText(tpl) {
   return raw;
 }
 
-function isAllowedSetConfig(node) {
-  if (!ts.isTaggedTemplateExpression(node) || !ts.isIdentifier(node.tag) || node.tag.text !== 'sql') {
+function isAllowedSetConfig(node, bindings) {
+  if (!ts.isTaggedTemplateExpression(node) || !isSqlIdentifier(node.tag, bindings)) {
     return false;
   }
   if (node.typeArguments && node.typeArguments.length > 0) return false;
@@ -51,6 +91,7 @@ function isAllowedSetConfig(node) {
 
 export function lintSource(fileName, sourceText) {
   const sf = ts.createSourceFile(fileName, sourceText, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const bindings = kyselySqlBindings(sf);
   const findings = [];
   const seen = new Set();
   const add = (node, rule, message) => {
@@ -73,10 +114,10 @@ export function lintSource(fileName, sourceText) {
     if (ts.isCallExpression(node) && HATCHES.has(calleeName(node.expression))) {
       add(node, 'escape-hatch', `${calleeName(node.expression)} is an escape hatch`);
     }
-    if (ts.isCallExpression(node) && isSql(node.expression)) {
+    if (ts.isCallExpression(node) && isSql(node.expression, bindings)) {
       add(node, 'sql-fragment', 'sql call is an escape hatch');
     }
-    if (ts.isTaggedTemplateExpression(node) && isSql(node.tag) && !isAllowedSetConfig(node)) {
+    if (ts.isTaggedTemplateExpression(node) && isSql(node.tag, bindings) && !isAllowedSetConfig(node, bindings)) {
       add(node, 'sql-fragment', 'sql fragment is an escape hatch (only set_config is allowed)');
     }
     ts.forEachChild(node, visit);

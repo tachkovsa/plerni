@@ -35,6 +35,30 @@ test('corpus and baseline follow the allocation at every band', () => {
       assert.ok(corpus.includes('// shape:L conditional statement=1'));
       assert.ok(corpus.includes('// shape:L helper statement=1'));
       assert.equal(baseline.split('sql<').length - 1, allocation.total);
+      const shapeBlock = (marker) => {
+        const start = baseline.indexOf(marker);
+        assert.notEqual(start, -1, marker);
+        return baseline.slice(start, baseline.indexOf('\n  }', start));
+      };
+      const mStatement = shapeBlock('// shape:M joins=2 statement=1');
+      assert.match(mStatement, /a\.status = \$\{status\}/);
+      assert.match(mStatement, /s\.seq > \$\{seq\}/);
+      assert.match(mStatement, /limit 50/);
+      const mEntity = shapeBlock('// shape:M joins=2 statement=0');
+      assert.match(mEntity, /a\.status = \$\{status\}/);
+      assert.match(mEntity, /a\.seq > \$\{seq\}/);
+      assert.match(mEntity, /order by a\.seq, a\.id limit 50/);
+      assert.match(shapeBlock('// shape:L cte-select statement=1'), /with picked as \(select id, tenant_id, payload/);
+      assert.match(shapeBlock('// shape:L cte-modify statement=1'), /with inserted as \(insert into plugin_lrs_statement/);
+      assert.match(shapeBlock('// shape:L cte-select statement=0'), /with picked as \(select id, tenant_id, label/);
+      assert.match(shapeBlock('// shape:L cte-modify statement=0'), /with inserted as \(insert into ent_/);
+      assert.match(shapeBlock('// shape:L conditional statement=1'), /or \(seq = \$\{seq\} and id > \$\{keyId\}\)/);
+      assert.equal(shapeBlock('// shape:L conditional statement=1').includes('limit 50'), false);
+      const conditionalEntity = shapeBlock('// shape:L conditional statement=0');
+      assert.match(conditionalEntity, /status = \$\{status\}/);
+      assert.match(conditionalEntity, /order by seq, id limit 50/);
+      assert.match(shapeBlock('// shape:L helper statement=1'), /or \(seq = \$\{seq\} and id > \$\{keyId\}\)\) limit 50/);
+      assert.match(shapeBlock('// shape:L helper statement=0'), /or \(seq = \$\{seq\} and id > \$\{keyId\}\)\) limit 50/);
       const findings = lintSource(`band-${n}/corpus.ts`, corpus);
       assert.deepEqual(findings, [], findings.map((finding) => finding.rule).join(','));
     } finally {

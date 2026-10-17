@@ -26,6 +26,13 @@ test('corpus-lint rejects escape hatches', () => {
   assert.ok(rules('explicit-result-generic.ts').has('explicit-type-argument'));
 });
 
+test('corpus-lint resolves the Kysely sql import, including an alias', () => {
+  assert.ok(rules('sql-alias.ts').has('sql-fragment'));
+  assert.ok(rules('sql-namespace.ts').has('sql-fragment'));
+  assert.deepEqual(lintFile(join(fixtureDir, 'sql-renamed-other.ts')), []);
+  assert.deepEqual(lintFile(join(fixtureDir, 'set-config-alias.ts')), []);
+});
+
 test('corpus-lint allows Kysely .as() and the set_config call', () => {
   assert.deepEqual(lintFile(join(fixtureDir, 'dot-as-allowed.ts')), []);
   assert.deepEqual(lintFile(join(fixtureDir, 'set-config-allowed.ts')), []);

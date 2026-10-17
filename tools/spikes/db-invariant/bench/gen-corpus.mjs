@@ -271,24 +271,53 @@ function emitQuery(desc) {
   return emitL(desc);
 }
 
+function statusPredicate(alias) {
+  const column = alias ? `${alias}.status` : 'status';
+  return `and (\${status}::text is null or ${column} = \${status})`;
+}
+
+function keysetPredicate(alias) {
+  const seq = alias ? `${alias}.seq` : 'seq';
+  const id = alias ? `${alias}.id` : 'id';
+  return `and (\${seq}::text is null or ${seq} > \${seq} or (${seq} = \${seq} and ${id} > \${keyId}))`;
+}
+
+function orderLimit(alias) {
+  const seq = alias ? `${alias}.seq` : 'seq';
+  const id = alias ? `${alias}.id` : 'id';
+  return `order by ${seq}, ${id} limit 50`;
+}
+
 function baselineSql(desc) {
   if (desc.kind === 'S' && desc.table.kind === 'entity' && desc.op === 'select') {
-    return [`select id, tenant_id, label from ${desc.table.name} where id = \${id}`, ENTITY_KEY];
+    return { sql: `select id, tenant_id, label from ${desc.table.name} where id = \${id}`, rowType: ENTITY_KEY };
   }
   if (desc.kind === 'S' && desc.table.kind === 'entity' && desc.op === 'insert') {
-    return [`insert into ${desc.table.name} (id, tenant_id, parent_id, label, status, seq, amount, note) values (\${id}, \${tenant}, null, 'bench', 'active', '1', '1.00', null) returning id, tenant_id, label`, ENTITY_KEY];
+    return {
+      sql: `insert into ${desc.table.name} (id, tenant_id, parent_id, label, status, seq, amount, note) values (\${id}, \${tenant}, null, 'bench', 'active', '1', '1.00', null) returning id, tenant_id, label`,
+      rowType: ENTITY_KEY,
+    };
   }
   if (desc.kind === 'S' && desc.table.kind === 'entity') {
-    return [`update ${desc.table.name} set label = 'next' where id = \${id} returning id, tenant_id, label`, ENTITY_KEY];
+    return {
+      sql: `update ${desc.table.name} set label = 'next' where id = \${id} returning id, tenant_id, label`,
+      rowType: ENTITY_KEY,
+    };
   }
   if (desc.kind === 'S' && desc.op === 'select') {
-    return [`select id, tenant_id, payload from ${desc.table.name} where id = \${id}`, STATEMENT_KEY];
+    return { sql: `select id, tenant_id, payload from ${desc.table.name} where id = \${id}`, rowType: STATEMENT_KEY };
   }
   if (desc.kind === 'S' && desc.op === 'insert') {
-    return [`insert into ${desc.table.name} (id, tenant_id, seq, payload) values (\${id}, \${tenant}, '1', '{}'::jsonb) returning id, tenant_id, payload`, STATEMENT_KEY];
+    return {
+      sql: `insert into ${desc.table.name} (id, tenant_id, seq, payload) values (\${id}, \${tenant}, '1', '{}'::jsonb) returning id, tenant_id, payload`,
+      rowType: STATEMENT_KEY,
+    };
   }
   if (desc.kind === 'S') {
-    return [`update ${desc.table.name} set seq = '2' where id = \${id} returning id, tenant_id, payload`, STATEMENT_KEY];
+    return {
+      sql: `update ${desc.table.name} set seq = '2' where id = \${id} returning id, tenant_id, payload`,
+      rowType: STATEMENT_KEY,
+    };
   }
   if (desc.kind === 'M' && desc.statement) {
     const [a, b, c] = desc.chain;
@@ -296,8 +325,8 @@ function baselineSql(desc) {
     const cols = desc.joins === 3
       ? 's.id as s_id, a.id as a_id, b.id as b_id, c.id as c_id, s.payload as payload'
       : 's.id as s_id, a.id as a_id, b.id as b_id, s.payload as payload';
-    const sql = `select ${cols} from plugin_lrs_statement s join ${a.name} a on a.tenant_id = s.tenant_id join ${b.name} b on b.parent_id = a.id${extra} where s.tenant_id = \${tenant}`;
-    return [sql, desc.joins === 3 ? ST_JOIN3 : ST_JOIN2];
+    const sql = `select ${cols} from plugin_lrs_statement s join ${a.name} a on a.tenant_id = s.tenant_id join ${b.name} b on b.parent_id = a.id${extra} where s.tenant_id = \${tenant} ${statusPredicate('a')} ${keysetPredicate('s')} ${orderLimit('s')}`;
+    return { sql, rowType: desc.joins === 3 ? ST_JOIN3 : ST_JOIN2 };
   }
   if (desc.kind === 'M') {
     const [a, b, c, d] = desc.chain;
@@ -305,24 +334,71 @@ function baselineSql(desc) {
     const cols = desc.joins === 3
       ? 'a.id as a_id, b.id as b_id, c.id as c_id, d.id as d_id'
       : 'a.id as a_id, b.id as b_id, c.id as c_id';
-    const sql = `select ${cols} from ${a.name} a join ${b.name} b on b.parent_id = a.id join ${c.name} c on c.parent_id = b.id${extra} where a.tenant_id = \${tenant}`;
-    return [sql, desc.joins === 3 ? JOIN3 : JOIN2];
+    const sql = `select ${cols} from ${a.name} a join ${b.name} b on b.parent_id = a.id join ${c.name} c on c.parent_id = b.id${extra} where a.tenant_id = \${tenant} ${statusPredicate('a')} ${keysetPredicate('a')} ${orderLimit('a')}`;
+    return { sql, rowType: desc.joins === 3 ? JOIN3 : JOIN2 };
   }
-  if (desc.statement) {
-    return ["select id, tenant_id, payload from plugin_lrs_statement where tenant_id = ${tenant}", STATEMENT_KEY];
+  if (desc.statement && desc.shape === 'cte-select') {
+    return {
+      sql: `with picked as (select id, tenant_id, payload from plugin_lrs_statement where tenant_id = \${tenant}) select id, tenant_id, payload from picked where (\${keyId}::text is null or id > \${keyId})`,
+      rowType: STATEMENT_KEY,
+    };
   }
-  return [`select id, tenant_id, label from ${desc.table.name} where tenant_id = \${tenant}`, ENTITY_KEY];
+  if (desc.statement && desc.shape === 'cte-modify') {
+    return {
+      sql: `with inserted as (insert into plugin_lrs_statement (id, tenant_id, seq, payload) values (\${id}, \${tenant}, '1', '{}'::jsonb) returning id, tenant_id, payload) select id, tenant_id, payload from inserted`,
+      rowType: STATEMENT_KEY,
+    };
+  }
+  if (desc.statement && desc.shape === 'conditional') {
+    return {
+      sql: `select id, tenant_id, payload from plugin_lrs_statement where tenant_id = \${tenant} ${keysetPredicate('')}`,
+      rowType: STATEMENT_KEY,
+    };
+  }
+  if (desc.statement && desc.shape === 'helper') {
+    return {
+      sql: `select id, tenant_id, payload from plugin_lrs_statement where tenant_id = \${tenant} ${keysetPredicate('')} limit 50`,
+      rowType: STATEMENT_KEY,
+    };
+  }
+  const name = desc.table.name;
+  if (desc.shape === 'cte-select') {
+    return {
+      sql: `with picked as (select id, tenant_id, label from ${name} where tenant_id = \${tenant}) select id, tenant_id, label from picked where (\${keyId}::text is null or id > \${keyId})`,
+      rowType: ENTITY_KEY,
+    };
+  }
+  if (desc.shape === 'cte-modify') {
+    return {
+      sql: `with inserted as (insert into ${name} (id, tenant_id, parent_id, label, status, seq, amount, note) values (\${id}, \${tenant}, null, 'bench', 'active', '1', '1.00', null) returning id, tenant_id, label) select id, tenant_id, label from inserted`,
+      rowType: ENTITY_KEY,
+    };
+  }
+  if (desc.shape === 'conditional') {
+    return {
+      sql: `select id, tenant_id, label from ${name} where tenant_id = \${tenant} ${statusPredicate('')} ${keysetPredicate('')} ${orderLimit('')}`,
+      rowType: ENTITY_KEY,
+    };
+  }
+  return {
+    sql: `select id, tenant_id, label from ${name} where tenant_id = \${tenant} ${keysetPredicate('')} limit 50`,
+    rowType: ENTITY_KEY,
+  };
 }
 
 function emitBaseline(desc) {
-  const [sql, rowType] = baselineSql(desc);
+  const { sql, rowType } = baselineSql(desc);
   const marker = desc.kind === 'S'
     ? `// shape:S ${desc.op} ${desc.table.name}`
     : desc.kind === 'M'
       ? `// shape:M joins=${desc.joins} statement=${desc.statement ? 1 : 0}`
       : `// shape:L ${desc.shape} statement=${desc.statement ? 1 : 0}`;
+  const prelude = [];
+  if (sql.includes('${seq}')) prelude.push('const seq = cursor === undefined ? null : cursor.seq;');
+  if (sql.includes('${keyId}')) prelude.push('const keyId = cursor === undefined ? null : cursor.id;');
   return [
     marker,
+    ...prelude,
     `void sql<${rowType}>\`${sql}\`.execute(db);`,
   ];
 }

@@ -24,6 +24,14 @@ import { renderCorpus } from './gen-corpus.mjs';
 const MIN_AVAILABLE_KIB = 6 * 1024 * 1024;
 const TIME_BIN = '/usr/bin/time';
 
+export function boundedCompilerDetail(exitCode, stdout, stderr) {
+  if (exitCode === 0 || exitCode === null) return null;
+  const out = String(stdout ?? '').slice(-2000);
+  const err = String(stderr ?? '').slice(-2000);
+  if (!out && !err) return null;
+  return [out, err].filter((part) => part.length > 0).join('\n');
+}
+
 export function parseTimeReport(stderr) {
   const wall = stderr.match(/Elapsed \(wall clock\) time \(h:mm:ss or m:ss\):\s*([0-9:.]+)/);
   const rss = stderr.match(/Maximum resident set size \(kbytes\):\s*(\d+)/);
@@ -120,7 +128,7 @@ function runTimed(tscBin, tsconfig) {
         rss_kib: parsed?.rss_kib ?? null,
         exit_code: code,
         signal: signal ?? null,
-        detail: parsed ? null : `${stdout}\n${stderr}`.slice(-2000),
+        detail: boundedCompilerDetail(code, stdout, stderr),
       });
     });
   });
@@ -178,13 +186,13 @@ async function timeTarget(band, target, tsconfig, environment) {
       rep,
       rerun,
       ...result,
-      detail: undefined,
     };
+    if (!result.detail) delete row.detail;
     if (!result.measured) row.outcome = 'invalid';
     writeEvidence(row);
     console.log(`[${result.measured ? 'measured' : 'invalid'}] band ${band} ${target} rep ${rep} wall_ms=${result.wall_ms} rss_kib=${result.rss_kib} exit=${result.exit_code}`);
     reps.push(result);
-    if (!result.measured && result.detail) console.error(result.detail);
+    if (result.detail) console.error(result.detail);
   }
   const summary = classifyTarget(band, reps);
   writeEvidence({ band, kind: 'target', target, ...summary, environment });

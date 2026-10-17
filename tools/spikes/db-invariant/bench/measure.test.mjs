@@ -2,11 +2,22 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { CEILING_RSS_KIB, CEILING_WALL_MS } from './band.mjs';
-import { classifyTarget, parseTimeReport } from './measure.mjs';
+import { boundedCompilerDetail, classifyTarget, parseTimeReport } from './measure.mjs';
 
 const report = `Elapsed (wall clock) time (h:mm:ss or m:ss): 1:02.25
 Maximum resident set size (kbytes): 123456
 `;
+
+test('boundedCompilerDetail keeps tsc output when the exit code is nonzero', () => {
+  const stdout = 'error TS2322: Type fail\n';
+  const stderr = 'Elapsed (wall clock) time (h:mm:ss or m:ss): 0:01.00\nMaximum resident set size (kbytes): 10\n';
+  assert.equal(boundedCompilerDetail(2, stdout, stderr), `${stdout}\n${stderr}`);
+  assert.equal(boundedCompilerDetail(137, stdout, stderr), `${stdout}\n${stderr}`);
+  assert.equal(boundedCompilerDetail(0, stdout, stderr), null);
+  assert.equal(boundedCompilerDetail(null, stdout, stderr), null);
+  const huge = 'x'.repeat(2500);
+  assert.equal(boundedCompilerDetail(1, huge, 'err'), `${huge.slice(-2000)}\nerr`);
+});
 
 test('parseTimeReport reads GNU time wall clock and peak RSS', () => {
   assert.deepEqual(parseTimeReport(report), { wall_ms: 62250, rss_kib: 123456 });

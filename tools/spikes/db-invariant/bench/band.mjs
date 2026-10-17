@@ -9,8 +9,9 @@ import { fileURLToPath } from 'node:url';
 export const BANDS = [50, 75, 200, 400];
 export const ACCEPTANCE_BAND = 75;
 export const CEILING_WALL_MS = 120_000;
-// 4 GB RSS, read as 4 GiB. /usr/bin/time reports kibibytes.
-export const CEILING_RSS_KIB = 4 * 1024 * 1024;
+// Plan §3.1 A5 says "4 GB" RSS. /usr/bin/time reports kibibytes, so the
+// ceiling is 4_000_000_000 bytes / 1024.
+export const CEILING_RSS_KIB = 3_906_250;
 export const REPETITIONS = 3;
 
 export const spikeRoot = join(dirname(fileURLToPath(import.meta.url)), '..');

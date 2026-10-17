@@ -21,7 +21,7 @@ test('allocation matches the integer rule at every band', () => {
   assert.deepEqual(allocation(400), { s: 1200, m: 600, l: 200, total: 2000 });
   assert.equal(ACCEPTANCE_BAND, 75);
   assert.equal(CEILING_WALL_MS, 120_000);
-  assert.equal(CEILING_RSS_KIB, 4 * 1024 * 1024);
+  assert.equal(CEILING_RSS_KIB, 4_000_000_000 / 1024);
 });
 
 test('shape floors reject a band that would dilute M or L', () => {

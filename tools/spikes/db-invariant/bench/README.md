@@ -1,13 +1,13 @@
 # Spike A typecheck benchmark
 
-Plan §3.1 A5. This directory generates a schema band, a Kysely query corpus, and a raw-`sql` baseline, then measures `tsc --noEmit` wall time and peak RSS. The acceptance point is band 75 (375 queries): at most 4 GiB RSS and 120 s on the CI runner class. Bands 50, 200, and 400 are the rest of the curve; an overrun there is recorded, and it is not an automatic ORM fallback.
+Plan §3.1 A5. This directory generates a schema band, a Kysely query corpus, and a raw-`sql` baseline, then measures `tsc --noEmit` wall time and peak RSS. The acceptance point is band 75 (375 queries): at most 4 GB RSS (3,906,250 KiB, the plan's decimal 4 GB) and 120 s on the CI runner class. Bands 50, 200, and 400 are the rest of the curve; an overrun there is recorded, and it is not an automatic ORM fallback.
 
 N counts **every** table in the band, including `plugin_lrs_statement`. The harness fixture tables `plerni_tenant` and `fencing_authority` live in the `plerni` database and are not part of N.
 
 | Band | S | M | L | Queries | Ceiling |
 |---|---:|---:|---:|---:|---|
 | 50 | 150 | 75 | 25 | 250 | stress |
-| 75 | 225 | 112 | 38 | 375 | 4 GiB RSS, 120 s |
+| 75 | 225 | 112 | 38 | 375 | 4 GB RSS (3,906,250 KiB), 120 s |
 | 200 | 600 | 300 | 100 | 1000 | stress |
 | 400 | 1200 | 600 | 200 | 2000 | stress |
 
@@ -15,7 +15,7 @@ N counts **every** table in the band, including `plugin_lrs_statement`. The harn
 
 `plugin_lrs_statement.payload` is JSONB. Annex L's class is 0.5–4 KiB typical, p99 ≤ 32 KiB; the check constraint is the p99 cap. A trigger rejects `UPDATE` and `DELETE`. The corpus still typechecks an update against that table so the S count stays 3N. Nothing in the corpus is executed.
 
-Queries are grouped 100 per function. A single function of the band-400 corpus exceeds the compiler's control-flow depth and the callbacks collapse to implicit `any`; the exported entry points only call the parts. Each Kysely query carries `Expect<Equal<Inferred, …>>` on `executeTakeFirstOrThrow`. `corpus-lint.mjs` walks the TypeScript AST and rejects `sql` fragments (except `select set_config('plerni.<guc>', …, true)`), `as` / angle type assertions, explicit `any`, explicit call type arguments, and `$castTo` / `$narrowType` / `$assertType`. A call `.as('alias')` is not a type assertion. The lint runs before any timing. The baseline is the same queries as `sql<Row>` templates and is not linted; that generic is the cost the corpus is compared with.
+Queries are grouped 100 per function. A single function of the band-400 corpus exceeds the compiler's control-flow depth and the callbacks collapse to implicit `any`; the exported entry points only call the parts. Each Kysely query carries `Expect<Equal<Inferred, …>>` on `executeTakeFirstOrThrow`. `corpus-lint.mjs` walks the TypeScript AST and rejects fragments of Kysely's `sql` export, including a renamed import such as `sql as raw` (except `select set_config('plerni.<guc>', …, true)`), `as` / angle type assertions, explicit `any`, explicit call type arguments, and `$castTo` / `$narrowType` / `$assertType`. A call `.as('alias')` is not a type assertion. The lint runs before any timing. The baseline is the same query shapes as one `sql<Row>` template each (the same joins, the M `status` predicate and `(seq, id)` keyset page, and the L CTE or conditional composition) and is not linted; that generic is the cost the corpus is compared with. A nonzero `tsc` exit keeps a bounded slice of stdout and stderr in the evidence row even when the timing line parsed.
 
 ## Regenerate committed artifacts
 
