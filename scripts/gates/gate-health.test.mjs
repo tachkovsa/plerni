@@ -39,6 +39,12 @@ const cases = [
     expectOutput: /forbidden license "GPL/,
   },
   {
+    name: "license-audit blocks a GPL devDependency",
+    cmd: gate("license-audit.mjs", "--root", join(fixtures, "dev-gpl")),
+    expectExit: 1,
+    expectOutput: /forbidden license "GPL/,
+  },
+  {
     name: "license-audit keeps a dependency install when a later peer reuses the name",
     cmd: gate("license-audit.mjs", "--root", join(fixtures, "peer-overwrites-dep")),
     expectExit: 1,

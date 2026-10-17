@@ -645,8 +645,7 @@ CREATE TABLE plugin_lrs_statement (
   tenant_id uuid NOT NULL,
   seq bigint NOT NULL,
   stored_at timestamptz NOT NULL DEFAULT clock_timestamp(),
-  payload jsonb NOT NULL,
-  CONSTRAINT plugin_lrs_statement_payload_p99 CHECK (octet_length(payload::text) <= 32768)
+  payload jsonb NOT NULL
 );
 COMMENT ON COLUMN plugin_lrs_statement.payload IS 'Annex L: JSON, 0.5-4 KiB typical, p99 <= 32 KiB';
 CREATE INDEX plugin_lrs_statement_keyset ON plugin_lrs_statement (tenant_id, stored_at, id);

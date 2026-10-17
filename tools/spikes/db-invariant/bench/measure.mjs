@@ -14,6 +14,7 @@ import {
   ACCEPTANCE_BAND,
   CEILING_RSS_KIB,
   CEILING_WALL_MS,
+  PAYLOAD_P99_BYTES,
   REPETITIONS,
   assertBand,
   spikeRoot,
@@ -211,7 +212,7 @@ export async function measureBand(n) {
     throw new Error(`corpus-lint failed for band ${n}`);
   }
   if (!environment.ok) {
-    const summary = { band: n, kind: 'summary', outcome: 'invalid', environment };
+    const summary = { band: n, kind: 'summary', outcome: 'invalid', environment, payload_p99_bytes: PAYLOAD_P99_BYTES };
     writeEvidence(summary);
     console.log(`[invalid] band ${n} preflight ${environment.reasons.join(',')}`);
     return summary;
@@ -225,9 +226,9 @@ export async function measureBand(n) {
   else if (n === ACCEPTANCE_BAND && outcomes.includes('over-ceiling')) outcome = 'over-ceiling';
   else if (n === ACCEPTANCE_BAND) outcome = 'within-ceiling';
   else outcome = 'stress';
-  const summary = { band: n, kind: 'summary', outcome, corpus, baseline };
+  const summary = { band: n, kind: 'summary', outcome, corpus, baseline, payload_p99_bytes: PAYLOAD_P99_BYTES };
   writeEvidence(summary);
-  console.log(`[${outcome}] band ${n} summary`);
+  console.log(`[${outcome}] band ${n} summary payload_p99_bytes=${PAYLOAD_P99_BYTES}`);
   return summary;
 }
 

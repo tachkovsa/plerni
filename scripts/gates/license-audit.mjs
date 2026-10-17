@@ -2,8 +2,9 @@
 /**
  * license-audit gate (spec §12): appliance dependencies must be OSI-approved.
  * Walks workspace package.json files and the installed dependency graph,
- * including transitive dependencies, peer dependencies, and platform-selected
- * optional packages, and fails on missing/unknown/copyleft licenses.
+ * including devDependencies, transitive dependencies, peer dependencies, and
+ * platform-selected optional packages, and fails on missing/unknown/copyleft
+ * licenses.
  * Also audits npm packages that sit outside the workspace (assets/brand).
  * A manifest with external dependencies and no package-lock.json fails
  * closed. The locked version of each direct dependency must satisfy the
@@ -82,7 +83,7 @@ const seenRoots = new Set();
 for (const dir of pkgDirs) {
   const pkg = JSON.parse(readFileSync(join(dir, "package.json"), "utf8"));
   for (const [name, range] of [
-    ...Object.entries({ ...pkg.dependencies, ...pkg.optionalDependencies }),
+    ...Object.entries({ ...pkg.dependencies, ...pkg.optionalDependencies, ...pkg.devDependencies }),
     ...requiredPeerEntries(pkg),
   ]) {
     if (String(range).startsWith("workspace:")) continue;
@@ -189,6 +190,67 @@ const resolveInstalled = (pkgDir, name) => {
 const lockCache = new Map();
 const seenLocked = new Set();
 
+const findPnpmLock = (startDir) => {
+  let dir = startDir;
+  for (;;) {
+    const candidate = join(dir, "pnpm-lock.yaml");
+    if (existsSync(candidate)) return candidate;
+    const parent = dirname(dir);
+    if (parent === dir || relative(root, parent).startsWith("..")) return null;
+    dir = parent;
+  }
+};
+
+const pnpmPackageCache = new Map();
+
+// pnpm-lock.yaml v9 has no npm `resolved` URL. Integrity is on the package
+// key; the registry tarball URL is the public npm form of that name and version.
+const readPnpmPackages = (lockPath) => {
+  if (pnpmPackageCache.has(lockPath)) return pnpmPackageCache.get(lockPath);
+  const packages = [];
+  let inPackages = false;
+  let current = null;
+  const flush = () => {
+    if (current) packages.push(current);
+    current = null;
+  };
+  for (const line of readFileSync(lockPath, "utf8").split("\n")) {
+    if (!inPackages) {
+      if (line === "packages:") inPackages = true;
+      continue;
+    }
+    if (line.length > 0 && !line.startsWith(" ")) {
+      flush();
+      break;
+    }
+    const keyMatch = /^  ['"]?(.+?)['"]?:$/.exec(line);
+    if (keyMatch) {
+      flush();
+      current = { key: keyMatch[1], integrity: null, directory: null };
+      continue;
+    }
+    if (!current) continue;
+    const integrity = /integrity: (sha\d+-[A-Za-z0-9+/=]+)/.exec(line);
+    if (integrity) current.integrity = integrity[1];
+    const directory = /directory: ([^,}]+)/.exec(line);
+    if (directory) current.directory = directory[1].trim();
+  }
+  flush();
+  pnpmPackageCache.set(lockPath, packages);
+  return packages;
+};
+
+const splitPnpmKey = (key) => {
+  const at = key.lastIndexOf("@");
+  if (at <= 0) return null;
+  return { name: key.slice(0, at), version: key.slice(at + 1) };
+};
+
+const registryTarball = (name, version) => {
+  const leaf = name.includes("/") ? name.slice(name.lastIndexOf("/") + 1) : name;
+  return `https://registry.npmjs.org/${name}/-/${leaf}-${version}.tgz`;
+};
+
 const findLock = (startDir) => {
   let dir = startDir;
   for (;;) {
@@ -273,7 +335,7 @@ const paxPath = (data) => {
 
 // npm keeps the last regular-file package/package.json when an archive repeats
 // that path. Exactly one such entry is accepted; zero or two is fail-closed.
-const packageJsonFromTarball = (bytes) => {
+const packageJsonFromTarball = (bytes, accept = (name) => name === "package/package.json") => {
   let tar;
   try {
     tar = gunzipSync(bytes);
@@ -306,7 +368,7 @@ const packageJsonFromTarball = (bytes) => {
     pendingName = null;
     const name = rawName.replace(/^\.\//, "");
     const regular = typeflag === 0 || typeflag === 48;
-    if (regular && name === "package/package.json") manifests.push(data);
+    if (regular && accept(name)) manifests.push(data);
   }
   if (manifests.length !== 1) {
     return {
@@ -431,6 +493,87 @@ const auditLockedOptional = async (startDir, name, label, relation = "verified o
   }
 };
 
+// Missing optional packages of a pnpm install have no package-lock.json entry.
+// Verify them from pnpm-lock.yaml and the integrity-checked registry tarball.
+const auditPnpmMissing = async (startDir, name, label, range) => {
+  const lockPath = findPnpmLock(startDir);
+  const where = `${name} (optional dependency of ${label})`;
+  if (!lockPath) return false;
+  if (typeof range !== "string" || range.trim() === "") {
+    failures.push(`${where}: dependency range is missing — fail closed`);
+    return true;
+  }
+  const matches = [];
+  for (const entry of readPnpmPackages(lockPath)) {
+    const parsed = splitPnpmKey(entry.key);
+    if (!parsed || parsed.name !== name) continue;
+    if (satisfies(parsed.version, range) === true) matches.push({ ...entry, ...parsed });
+  }
+  if (matches.length !== 1) {
+    failures.push(`${where}: pnpm-lock.yaml has ${matches.length} versions that satisfy ${range} — fail closed`);
+    return true;
+  }
+  const match = matches[0];
+  const id = `${lockPath}\0${match.key}\0${match.integrity ?? ""}\0${match.directory ?? ""}`;
+  if (seenLocked.has(id)) return true;
+  seenLocked.add(id);
+  let pkg;
+  if (match.directory) {
+    const abs = resolve(dirname(lockPath), match.directory);
+    const relToRoot = relative(root, abs);
+    if (relToRoot.startsWith("..") || relToRoot === "") {
+      failures.push(`${where}: pnpm directory is outside the audit root — fail closed`);
+      return true;
+    }
+    const manifest = join(abs, "package.json");
+    if (!existsSync(manifest)) {
+      failures.push(`${where}: pnpm directory has no package.json — fail closed`);
+      return true;
+    }
+    pkg = JSON.parse(readFileSync(manifest, "utf8"));
+  } else {
+    if (!match.integrity) {
+      failures.push(`${where}: pnpm-lock.yaml entry has no integrity — fail closed`);
+      return true;
+    }
+    const loaded = await readResolvedTarball(registryTarball(name, match.version), lockPath);
+    if (loaded.error || !loaded.bytes) {
+      failures.push(`${where}: tarball could not be verified (${loaded.error ?? "missing"}) — fail closed`);
+      return true;
+    }
+    if (!integrityMatches(loaded.bytes, match.integrity)) {
+      failures.push(`${where}: tarball integrity check failed — fail closed`);
+      return true;
+    }
+    const parsedTarball = packageJsonFromTarball(loaded.bytes, (name) => /^[^/]+\/package\.json$/.test(name));
+    if (!parsedTarball.pkg) {
+      failures.push(`${where}: ${parsedTarball.error ?? "tarball has no readable package manifest"} — fail closed`);
+      return true;
+    }
+    pkg = parsedTarball.pkg;
+    if (pkg.name !== name || pkg.version !== match.version) {
+      failures.push(`${where}: verified tarball does not match the locked name and version — fail closed`);
+      return true;
+    }
+  }
+  checked++;
+  const problem = judge(`${where}, verified from pnpm-lock.yaml`, licenseOf(pkg));
+  if (problem) failures.push(problem);
+  const optionalChildren = pkg.optionalDependencies ?? {};
+  for (const [child, childRange] of Object.entries(pkg.dependencies ?? {})) {
+    if (Object.prototype.hasOwnProperty.call(optionalChildren, child)) continue;
+    const childPath = resolveInstalled(startDir, child);
+    if (childPath) await auditTree(childPath, `${child} (dependency of ${where})`);
+    else await auditPnpmMissing(startDir, child, where, String(childRange));
+  }
+  for (const [child, childRange] of Object.entries(optionalChildren)) {
+    const childPath = resolveInstalled(startDir, child);
+    if (childPath) await auditTree(childPath, `${child} (dependency of ${where})`);
+    else await auditPnpmMissing(startDir, child, where, String(childRange));
+  }
+  return true;
+};
+
 const auditTree = async (pkgPath, label) => {
   // Follow the install layout (pnpm's virtual store is behind a symlink).
   const real = realpathSync(pkgPath);
@@ -460,7 +603,10 @@ const auditTree = async (pkgPath, label) => {
       continue;
     }
     if (!parentKey) {
-      failures.push(`${name} (optional dependency of ${label}): installed parent is not in package-lock.json — fail closed`);
+      const handled = await auditPnpmMissing(dir, name, label, pkg.optionalDependencies?.[name] ?? "");
+      if (!handled) {
+        failures.push(`${name} (optional dependency of ${label}): installed parent is not in package-lock.json — fail closed`);
+      }
       continue;
     }
     await auditLockedOptional(dir, name, label, "verified optional dependency", {
@@ -485,7 +631,7 @@ let failures = [];
 for (const dir of isolatedDirs) {
   const pkg = JSON.parse(readFileSync(join(dir, "package.json"), "utf8"));
   const externals = [
-    ...Object.entries({ ...pkg.dependencies, ...pkg.optionalDependencies }),
+    ...Object.entries({ ...pkg.dependencies, ...pkg.optionalDependencies, ...pkg.devDependencies }),
     ...requiredPeerEntries(pkg),
   ].filter(([, range]) => !String(range).startsWith("workspace:"));
   if (externals.length === 0) continue;
@@ -525,7 +671,7 @@ const main = async () => {
     const lock = JSON.parse(readFileSync(join(dir, "package-lock.json"), "utf8"));
     const rootPkg = lock.packages?.[""] ?? {};
     const rootSpec =
-      rootPkg.dependencies?.[name] ?? rootPkg.optionalDependencies?.[name] ?? rootPkg.peerDependencies?.[name];
+      rootPkg.dependencies?.[name] ?? rootPkg.devDependencies?.[name] ?? rootPkg.optionalDependencies?.[name] ?? rootPkg.peerDependencies?.[name];
     if (rootSpec !== range) {
       failures.push(`${label}: lockfile root specifier "${rootSpec ?? "MISSING"}" does not match manifest "${range}"`);
     }

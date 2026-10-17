@@ -12,6 +12,9 @@ export const CEILING_WALL_MS = 120_000;
 // Plan §3.1 A5 says "4 GB" RSS. /usr/bin/time reports kibibytes, so the
 // ceiling is 4_000_000_000 bytes / 1024.
 export const CEILING_RSS_KIB = 3_906_250;
+// Annex L freezes p99 ≤ 32 KiB. That is a reported workload percentile, not a
+// row-level gate: a tail of larger statements is allowed.
+export const PAYLOAD_P99_BYTES = 32 * 1024;
 export const REPETITIONS = 3;
 
 export const spikeRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -107,8 +110,7 @@ export function renderSchema(n) {
   lines.push('  tenant_id uuid NOT NULL,');
   lines.push('  seq bigint NOT NULL,');
   lines.push('  stored_at timestamptz NOT NULL DEFAULT clock_timestamp(),');
-  lines.push('  payload jsonb NOT NULL,');
-  lines.push(`  CONSTRAINT ${statement}_payload_p99 CHECK (octet_length(payload::text) <= 32768)`);
+  lines.push('  payload jsonb NOT NULL');
   lines.push(');');
   lines.push(`COMMENT ON COLUMN ${statement}.payload IS 'Annex L: JSON, 0.5-4 KiB typical, p99 <= 32 KiB';`);
   lines.push(`CREATE INDEX ${statement}_keyset ON ${statement} (tenant_id, stored_at, id);`);

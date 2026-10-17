@@ -13,7 +13,7 @@ N counts **every** table in the band, including `plugin_lrs_statement`. The harn
 
 `S = 3N`, `M = floor(1.5N)`, `L = 5N − S − M`. S is one select, one insert, and one update per table. M alternates two and three `JOIN` clauses (three and four tables), with a declared optional predicate and a `(seq, id)` keyset page. L is split round-robin across a select CTE, a data-modifying CTE, conditional composition, and a generic helper (`withKeyset` / `withOptionalLimit`). Every fifth M and L query reads or writes `plugin_lrs_statement`.
 
-`plugin_lrs_statement.payload` is JSONB. Annex L's class is 0.5–4 KiB typical, p99 ≤ 32 KiB; the check constraint is the p99 cap. A trigger rejects `UPDATE` and `DELETE`. The corpus still typechecks an update against that table so the S count stays 3N. Nothing in the corpus is executed.
+`plugin_lrs_statement.payload` is JSONB. Annex L's class is 0.5–4 KiB typical, p99 ≤ 32 KiB. That percentile is reported on each evidence summary as `payload_p99_bytes` (32,768). It is not a row-level `CHECK`: a tail of larger statements is part of the frozen class. A trigger rejects `UPDATE` and `DELETE`. The corpus still typechecks an update against that table so the S count stays 3N. Nothing in the corpus is executed.
 
 Queries are grouped 100 per function. A single function of the band-400 corpus exceeds the compiler's control-flow depth and the callbacks collapse to implicit `any`; the exported entry points only call the parts. Each Kysely query carries `Expect<Equal<Inferred, …>>` on `executeTakeFirstOrThrow`. `corpus-lint.mjs` walks the TypeScript AST and rejects fragments of Kysely's `sql` export, including a renamed import such as `sql as raw` (except `select set_config('plerni.<guc>', …, true)`), `as` / angle type assertions, explicit `any`, explicit call type arguments, and `$castTo` / `$narrowType` / `$assertType`. A call `.as('alias')` is not a type assertion. The lint runs before any timing. The baseline is the same query shapes as one `sql<Row>` template each (the same joins, the M `status` predicate and `(seq, id)` keyset page, and the L CTE or conditional composition) and is not linted; that generic is the cost the corpus is compared with. A nonzero `tsc` exit keeps a bounded slice of stdout and stderr in the evidence row even when the timing line parsed.
 
@@ -55,7 +55,7 @@ node bench/measure.mjs 75
 
 Band 75 is `within-ceiling` or `over-ceiling` from the **maximum** wall time and peak RSS of the three corpus reps, and the same for the baseline. Other bands are `stress`; `over_ceiling` is informational. Evidence is appended to `tools/spikes/db-invariant/evidence/bench.jsonl` (gitignored).
 
-The dispatch workflow `.github/workflows/bench-dispatch.yml` installs dependencies, starts the dev harness, runs `measure.mjs` for 50, 75, 200, and 400, and uploads that JSONL. It is `workflow_dispatch` only. Dispatch it against a ref whose workflow file contains these steps:
+The dispatch workflow `.github/workflows/bench-dispatch.yml` installs dependencies, starts the dev harness, runs `gen-schema.mjs` and then `measure.mjs` for 50, 75, 200, and 400, and uploads that JSONL. Each band is regenerated onto `spike_bench_<N>` before it is measured, so the compiled `database-types.ts` is the interface of that band's schema. It is `workflow_dispatch` only. Dispatch it against a ref whose workflow file contains these steps:
 
 ```bash
 gh workflow run bench-dispatch.yml --ref <branch>

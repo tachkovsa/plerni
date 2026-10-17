@@ -1,0 +1,7 @@
+{
+  "name": "fixture-dev-gpl",
+  "private": true,
+  "devDependencies": {
+    "fake-gpl-lib": "1.0.0"
+  }
+}

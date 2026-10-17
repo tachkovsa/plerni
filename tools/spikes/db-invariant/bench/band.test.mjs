@@ -8,6 +8,7 @@ import {
   BANDS,
   CEILING_RSS_KIB,
   CEILING_WALL_MS,
+  PAYLOAD_P99_BYTES,
   allocation,
   artifactDir,
   bandModel,
@@ -22,6 +23,7 @@ test('allocation matches the integer rule at every band', () => {
   assert.equal(ACCEPTANCE_BAND, 75);
   assert.equal(CEILING_WALL_MS, 120_000);
   assert.equal(CEILING_RSS_KIB, 4_000_000_000 / 1024);
+  assert.equal(PAYLOAD_P99_BYTES, 32 * 1024);
 });
 
 test('shape floors reject a band that would dilute M or L', () => {
@@ -39,7 +41,7 @@ test('schema N includes plugin_lrs_statement and excludes harness fixtures', () 
     assert.equal(sql.includes('CREATE TABLE fencing_authority'), false);
     assert.match(sql, /plugin_lrs_statement_append_only/);
     assert.match(sql, /REVOKE UPDATE, DELETE ON plugin_lrs_statement FROM PUBLIC/);
-    assert.match(sql, /octet_length\(payload::text\) <= 32768/);
+    assert.equal(sql.includes('CHECK (octet_length'), false);
     assert.match(sql, /Annex L: JSON, 0\.5-4 KiB typical, p99 <= 32 KiB/);
     const model = bandModel(n);
     assert.equal(model.tables.length, n);

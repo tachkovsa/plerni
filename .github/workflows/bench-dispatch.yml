@@ -48,7 +48,7 @@ jobs:
         working-directory: tools/harness
         run: ./reset.sh
 
-      - name: measure each band
+      - name: regenerate and measure each band
         working-directory: tools/spikes/db-invariant
         env:
           BENCH_REQUIRE_DB: "1"
@@ -60,6 +60,7 @@ jobs:
           rm -f evidence/bench.jsonl
           status=0
           for band in 50 75 200 400; do
+            node bench/gen-schema.mjs "$band"
             node bench/measure.mjs "$band" || status=$?
           done
           exit "$status"
