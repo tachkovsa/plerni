@@ -12,7 +12,7 @@ export POSTGRES_PASSWORD=… PLERNI_APP_PASSWORD=… PLERNI_MIGRATE_PASSWORD=…
 node seed.mjs     # 2 tenants, overlapping labels
 ```
 
-Any unset variable fails the script with a named message. Passwords are never committed: `render-secrets.mjs` generates `pgbouncer/userlist.txt` (gitignored, mode 600).
+Any unset variable fails the script with a named message. Passwords are never committed: `render-secrets.mjs` generates `pgbouncer/userlist.txt` (gitignored). It is mode 640, owned by the invoker and grouped to the image gid 70, so that user can read the read-only mount and other local accounts cannot. Setting that group is non-interactive (`sudo -n` only). If it cannot be set, the file is mode 600 inside `pgbouncer/private` (directory 700) and a gitignored compose override runs pgbouncer as the invoker.
 
 ## The three datasources
 

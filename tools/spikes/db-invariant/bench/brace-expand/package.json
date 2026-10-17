@@ -1,0 +1,8 @@
+{
+  "name": "@plerni-spike/brace-expand",
+  "private": true,
+  "version": "0.0.0",
+  "license": "Apache-2.0",
+  "main": "index.js",
+  "description": "Depth-capped stand-in for the braces package. kysely-codegen loads micromatch, which loads braces at import time. braces through 3.0.3 has no patched release (GHSA-vfj7-8cjw-p6xm)."
+}
