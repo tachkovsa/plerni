@@ -123,7 +123,6 @@ try {
         `${outDir}:/out`,
         IMAGE,
         "dir",
-        "--not-a-real-flag",
         "--no-banner",
         "--report-format",
         "json",
