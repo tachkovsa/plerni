@@ -9,19 +9,26 @@
  * head commit. Artifact json and sig files are outside the digest; maintainer.pub
  * stays inside it.
  *
- * Scope (plan T13): git diff base head -- the workflow, gate, harness, and
- * sql trees, plus spike bench artifacts, excluding approval json and sig files.
- * maintainer.pub stays in the digest.
+ * Scope (plan T13): a plain `git diff base head --` of the workflow, gate,
+ * harness, and sql trees, plus spike bench artifacts, excluding approval json
+ * and sig files. maintainer.pub stays in the digest. No extra diff flags:
+ * the digest is the byte stream of that command.
  *
  * Push runs pass the pre-push commit (github.event.before) as --base. Pull
- * requests pass the merge-base of the base branch and HEAD. A missing key, an
- * unreadable base, or a signature that does not verify fails closed.
+ * requests pass the merge-base of the base branch and the pull request head.
+ * A missing key, an unreadable base, or a signature that does not verify
+ * fails closed.
  *
  * The signed artifact for gate-config changes is waived at the current stage
  * (docs/ai/model-routing.md, owner decision 2026-10-15). While that sentence
- * is committed at head, a missing artifact does not fail the job. A present
+ * is committed at the base revision, a missing artifact does not fail the
+ * job. A sentence added only on the head does not waive it. A present
  * artifact is still checked. Repositories without the sentence — including
  * the gate-health fixtures — enforce the missing-artifact rule.
+ *
+ * approval-artifact.yml runs this script from the base checkout
+ * (pull_request_target). A pull_request job must not run it: that job checks
+ * out the pull request, so the pull request could replace this file.
  */
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
@@ -85,22 +92,7 @@ const gitShow = (cwd, rev, path) => {
 
 const scopedDiff = (cwd, base, head) => {
   try {
-    return git(cwd, [
-      "-c", "color.ui=false",
-      "-c", "core.quotePath=false",
-      "-c", "diff.mnemonicPrefix=false",
-      "diff",
-      "--no-color",
-      "--no-ext-diff",
-      "--no-textconv",
-      "--no-renames",
-      "--full-index",
-      "--unified=3",
-      base,
-      head,
-      "--",
-      ...SCOPE_PATHS,
-    ]);
+    return git(cwd, ["diff", base, head, "--", ...SCOPE_PATHS]);
   } catch (err) {
     fail(`cannot read the scoped diff (${err.message}) — FAIL CLOSED`);
   }
@@ -136,8 +128,8 @@ const canonicalOf = (value) => {
   return `{"approver":"maintainer","scope_sha256":${JSON.stringify(scope_sha256)},"timestamp":${JSON.stringify(timestamp)}}`;
 };
 
-const waiverActive = (cwd, head) => {
-  const body = gitShow(cwd, head, WAIVER_PATH);
+const waiverActive = (cwd, base) => {
+  const body = gitShow(cwd, base, WAIVER_PATH);
   if (!body) return false;
   return body.toString("utf8").includes(WAIVER_SENTENCE);
 };
@@ -197,7 +189,7 @@ if (artifacts.length === 0 && diff.length === 0) {
   process.exit(0);
 }
 if (artifacts.length === 0) {
-  if (waiverActive(cwd, head)) {
+  if (waiverActive(cwd, base)) {
     console.log(
       "verify-approval: WAIVER scoped diff is non-empty and no approval artifact is present; the signed artifact is waived at the current stage (docs/ai/model-routing.md) — not a failure",
     );

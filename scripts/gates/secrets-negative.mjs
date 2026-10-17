@@ -13,10 +13,12 @@
  * rules report is generic-api-key on secret.txt (observed with the official
  * v8.30.1 binary).
  *
- * A completed scan exits 0 (no leaks) or 1 (leaks found). Any other exit, or
- * a completed scan that does not produce a JSON finding list, is a scanner
- * failure. A completed scan whose list lacks the planted rule and file is an
- * absent finding. A nonzero exit alone is not proof.
+ * A completed scan exits 0 (no leaks) or 1 (leaks found). Any other exit, a
+ * termination with no numeric exit code (a signal, or a spawn error such as
+ * a full output buffer), or a completed scan that does not produce a JSON
+ * finding list, is a scanner failure. A completed scan whose list lacks the
+ * planted rule and file is an absent finding. A nonzero exit alone is not
+ * proof. A thrown error is proof only when it carries exit 0 or 1.
  */
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
@@ -135,8 +137,12 @@ try {
       console.error("secrets negative proof: scanner failed (docker is not available) — a crash is not a finding");
       process.exitCode = 1;
       aborted = true;
+    } else if (typeof err?.status !== "number") {
+      console.error("secrets negative proof: scanner failed (no exit code) — a crash is not a finding");
+      process.exitCode = 1;
+      aborted = true;
     } else {
-      code = typeof err.status === "number" ? err.status : 1;
+      code = err.status;
     }
   }
   if (!aborted) {

@@ -8,6 +8,7 @@
  * verifier's four fail-closed cases are artifact missing, digest mismatch,
  * bad signature, and head-key substitution.
  */
+import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -430,6 +431,19 @@ const scopeOf = (dir, base, head) => {
   if (!/^[0-9a-f]{64}$/.test(hash)) throw new Error("scope digest was not a sha256");
   return hash;
 };
+const plainScope = (dir, base, head) => {
+  const diff = execFileSync("git", [
+    "diff", base, head, "--",
+    ".github/workflows/",
+    "scripts/gates/",
+    "tools/harness/",
+    "sql/",
+    "tools/spikes/*/bench/.artifacts/",
+    ":(exclude)scripts/gates/approvals/*.json",
+    ":(exclude)scripts/gates/approvals/*.json.sig",
+  ], { cwd: dir });
+  return createHash("sha256").update(diff).digest("hex");
+};
 const writeSignedArtifact = (dir, keyFile, scope) => {
   const path = join(dir, "scripts/gates/approvals/2026-10-17-secrets-gate-fix.json");
   writeFileSync(path, `{"approver":"maintainer","scope_sha256":"${scope}","timestamp":"2026-10-17T00:00:00Z"}`);
@@ -458,6 +472,9 @@ const digested = repoWithBaseKey(approvalKeyA);
 writeFileSync(join(digested.dir, ".github/workflows/p0-gates.yml"), "v2\n");
 const digestedMid = commitTree(digested.dir, "ci: change workflow");
 const digestedScope = scopeOf(digested.dir, digested.base, digestedMid);
+if (digestedScope !== plainScope(digested.dir, digested.base, digestedMid)) {
+  throw new Error("scope digest does not match a plain git diff");
+}
 writeSignedArtifact(digested.dir, approvalKeyA, digestedScope);
 const digestedHead = commitTree(digested.dir, "ci: add approval artifact");
 if (scopeOf(digested.dir, digested.base, digestedHead) !== digestedScope) {
@@ -536,25 +553,39 @@ const waiverSentence = "The signed approval artifact for gate-config changes is 
 const waived = repoWithBaseKey(approvalKeyA);
 mkdirSync(join(waived.dir, "docs/ai"), { recursive: true });
 writeFileSync(join(waived.dir, "docs/ai/model-routing.md"), `${waiverSentence}\n`);
+const waivedBase = commitTree(waived.dir, "docs: record the waiver on the base");
 writeFileSync(join(waived.dir, ".github/workflows/p0-gates.yml"), "changed\n");
 const waivedHead = commitTree(waived.dir, "ci: change workflow under the waiver");
 cases.push({
-  name: "verify-approval does not require an artifact while the current-stage waiver is committed",
-  cmd: approvalCmd(waived.dir, waived.base, waivedHead),
+  name: "verify-approval does not require an artifact while the waiver sentence is on the base",
+  cmd: approvalCmd(waived.dir, waivedBase, waivedHead),
   expectExit: 0,
   expectOutput: /WAIVER scoped diff is non-empty and no approval artifact is present/,
+});
+
+const forgedWaiver = repoWithBaseKey(approvalKeyA);
+mkdirSync(join(forgedWaiver.dir, "docs/ai"), { recursive: true });
+writeFileSync(join(forgedWaiver.dir, "docs/ai/model-routing.md"), `${waiverSentence}\n`);
+writeFileSync(join(forgedWaiver.dir, ".github/workflows/p0-gates.yml"), "changed\n");
+const forgedWaiverHead = commitTree(forgedWaiver.dir, "ci: forge the waiver on the head");
+cases.push({
+  name: "verify-approval rejects a waiver sentence added only on the head",
+  cmd: approvalCmd(forgedWaiver.dir, forgedWaiver.base, forgedWaiverHead),
+  expectExit: 1,
+  expectOutput: /artifact is required for a non-empty scoped diff(?![\s\S]*not a failure)/,
 });
 
 const waivedBad = repoWithBaseKey(approvalKeyA);
 mkdirSync(join(waivedBad.dir, "docs/ai"), { recursive: true });
 writeFileSync(join(waivedBad.dir, "docs/ai/model-routing.md"), `${waiverSentence}\n`);
+const waivedBadBase = commitTree(waivedBad.dir, "docs: record the waiver on the base");
 writeFileSync(join(waivedBad.dir, ".github/workflows/p0-gates.yml"), "v2\n");
 const waivedBadMid = commitTree(waivedBad.dir, "ci: change workflow");
-writeSignedArtifact(waivedBad.dir, approvalKeyC, scopeOf(waivedBad.dir, waivedBad.base, waivedBadMid));
+writeSignedArtifact(waivedBad.dir, approvalKeyC, scopeOf(waivedBad.dir, waivedBadBase, waivedBadMid));
 const waivedBadHead = commitTree(waivedBad.dir, "ci: add a badly signed artifact under the waiver");
 cases.push({
-  name: "verify-approval still rejects a bad signature while the waiver is committed",
-  cmd: approvalCmd(waivedBad.dir, waivedBad.base, waivedBadHead),
+  name: "verify-approval still rejects a bad signature while the waiver is on the base",
+  cmd: approvalCmd(waivedBad.dir, waivedBadBase, waivedBadHead),
   expectExit: 1,
   expectOutput: /signature verification failed(?![\s\S]*not a failure)/,
 });
@@ -612,19 +643,51 @@ cases.push({
   expectOutput: /expected finding rule generic-api-key file secret\.txt is absent(?![\s\S]*negative proof OK)/,
 });
 
-const workflowText = readFileSync(join(here, "../../.github/workflows/p0-gates.yml"), "utf8");
-const workflowWired =
-  workflowText.includes("node scripts/gates/secrets-negative.mjs") &&
-  workflowText.includes("node scripts/gates/verify-approval.mjs") &&
-  workflowText.includes("git merge-base") &&
-  workflowText.includes("github.event.before") &&
-  workflowText.includes("scanner failure, not evidence") &&
-  workflowText.includes("absent finding") &&
-  workflowText.includes("nonzero exit alone is not proof") &&
-  !workflowText.includes("secrets negative proof OK (gitleaks exit") &&
-  !workflowText.includes("git show HEAD:scripts/gates/approvals/maintainer.pub");
+const fakeBin = join(secretsDir, "bin");
+mkdirSync(fakeBin);
+writeFileSync(join(fakeBin, "docker"), `#!/bin/sh
+prev=
+for arg in "$@"; do
+  if [ "$prev" = "-v" ]; then
+    case "$arg" in
+      *:/out)
+        printf '%s\\n' '[{"RuleID":"generic-api-key","File":"/scan/secret.txt"}]' > "\${arg%:*}/report.json"
+        ;;
+    esac
+  fi
+  prev=$arg
+done
+kill -KILL $$
+`, { mode: 0o755 });
 cases.push({
-  name: "p0-gates wires the finding assertion and the base-commit approval verifier",
+  name: "secrets negative proof rejects a scanner killed with no exit code",
+  cmd: gate("secrets-negative.mjs"),
+  env: { PATH: fakeBin },
+  expectExit: 1,
+  expectOutput: /scanner failed \(no exit code\) — a crash is not a finding(?![\s\S]*negative proof OK)/,
+});
+
+const gatesWorkflow = readFileSync(join(here, "../../.github/workflows/p0-gates.yml"), "utf8");
+const approvalWorkflow = readFileSync(join(here, "../../.github/workflows/approval-artifact.yml"), "utf8");
+const workflowWired =
+  gatesWorkflow.includes("node scripts/gates/secrets-negative.mjs") &&
+  !gatesWorkflow.includes("verify-approval.mjs") &&
+  gatesWorkflow.includes("scanner failure, not evidence") &&
+  gatesWorkflow.includes("absent finding") &&
+  gatesWorkflow.includes("nonzero exit alone is not proof") &&
+  gatesWorkflow.includes("no exit code") &&
+  !gatesWorkflow.includes("secrets negative proof OK (gitleaks exit") &&
+  approvalWorkflow.includes("pull_request_target:") &&
+  approvalWorkflow.includes("github.event.pull_request.base.sha") &&
+  approvalWorkflow.includes("github.event.before") &&
+  approvalWorkflow.includes("git merge-base") &&
+  approvalWorkflow.includes("git fetch --no-tags origin \"pull/${PR_NUMBER}/head\"") &&
+  approvalWorkflow.includes("node scripts/gates/verify-approval.mjs") &&
+  approvalWorkflow.includes("11d5960a326750d5838078e36cf38b85af677262") &&
+  !approvalWorkflow.includes("github.event.pull_request.head.sha") &&
+  !approvalWorkflow.includes("git show HEAD:scripts/gates/approvals/maintainer.pub");
+cases.push({
+  name: "approval verification runs from the base workflow, not the pull request checkout",
   cmd: [
     process.execPath,
     ["-e", workflowWired ? "console.log('workflow wiring OK')" : "console.error('workflow wiring missing'); process.exit(1)"],

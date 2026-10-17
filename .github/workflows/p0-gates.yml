@@ -20,11 +20,15 @@ jobs:
         with:
           node-version-file: .nvmrc
       # The negative proof requires the planted finding (rule generic-api-key
-      # on secret.txt). A scanner crash (bad flag, missing report, or any
-      # exit other than 0 or 1) is a scanner failure, not evidence. A
-      # completed scan whose report lacks that rule and file is an absent finding.
+      # on secret.txt). A scanner crash is a scanner failure, not evidence:
+      # a bad flag, a missing report, a signal or other termination with no exit code,
+      # or any exit other than 0 or 1. A completed scan whose
+      # report lacks that rule and file is an absent finding.
       # Neither may pass. A nonzero exit alone is not proof. The repo
       # allowlist is not loaded here; it applies only to the history scan.
+      # Gate-config approval verification is not this job. This job checks
+      # out the pull request, so the verifier lives in approval-artifact.yml,
+      # which runs the base revision's copy.
       - name: negative proof — the planted fixture finding must be present
         run: node scripts/gates/secrets-negative.mjs
 
@@ -75,32 +79,3 @@ jobs:
       # must not receive that secret, because it checks out and runs the
       # merge commit.
       - run: node scripts/gates/gate-health.test.mjs
-      # Approval artifacts (plan §8 / T13). Required when the scoped diff is
-      # non-empty, signed by the key at the merge-base — on push, the
-      # pre-push commit github.event.before — never the head key. A missing
-      # key fails closed. While docs/ai/model-routing.md waives the signed
-      # artifact, a missing artifact does not fail this step; a present
-      # artifact is still verified.
-      - name: verify gate-config approval artifacts
-        env:
-          APPROVAL_EVENT: ${{ github.event_name }}
-          APPROVAL_BASE: ${{ github.event_name == 'push' && github.event.before || github.event.pull_request.base.sha }}
-        run: |
-          set -eu
-          case "$APPROVAL_EVENT" in
-            push|pull_request) ;;
-            *)
-              echo "verify-approval: event is not push or pull_request — FAIL CLOSED" >&2
-              exit 1
-              ;;
-          esac
-          if ! printf '%s\n' "$APPROVAL_BASE" | grep -Eq '^[0-9a-fA-F]{40}$'; then
-            echo "verify-approval: base revision is not a commit sha — FAIL CLOSED" >&2
-            exit 1
-          fi
-          if [ "$APPROVAL_EVENT" = "push" ]; then
-            base="$APPROVAL_BASE"
-          else
-            base=$(git merge-base "$APPROVAL_BASE" HEAD)
-          fi
-          node scripts/gates/verify-approval.mjs --base "$base" --head HEAD --event "$APPROVAL_EVENT"
