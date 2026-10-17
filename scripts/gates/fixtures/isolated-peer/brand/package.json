@@ -1,0 +1,7 @@
+{
+  "name": "fixture-isolated-peer",
+  "private": true,
+  "dependencies": {
+    "fake-mit-lib": "1.0.0"
+  }
+}

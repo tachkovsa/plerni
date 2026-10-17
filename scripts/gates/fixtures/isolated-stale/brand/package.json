@@ -1,0 +1,7 @@
+{
+  "name": "fixture-isolated-stale",
+  "private": true,
+  "dependencies": {
+    "fake-mit-lib": "^2.0.0"
+  }
+}

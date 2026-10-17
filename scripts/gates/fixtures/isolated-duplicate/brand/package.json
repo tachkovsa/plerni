@@ -1,0 +1,7 @@
+{
+  "name": "fixture-isolated-duplicate",
+  "private": true,
+  "dependencies": {
+    "fake-decoy": "1.0.0"
+  }
+}

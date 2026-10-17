@@ -2,3 +2,10 @@ Plerni
 Copyright 2026 Sergei Tachkov
 
 Plerni was founded by Sergei Tachkov.
+
+Third-party font
+----------------
+Nunito SemiBold (assets/brand/source/Nunito-SemiBold.ttf)
+Copyright 2014 The Nunito Project Authors
+SIL Open Font License, Version 1.1. The licence text is assets/brand/source/OFL.txt.
+The font is used to outline the wordmark. The shipped marks are paths.

@@ -1,0 +1,29 @@
+author: Dev Example <https://forbidden-provider.example/author>
+committer: Dev Example <dev@example.com>
+
+feat(brand): add a mark
+
+AI-assisted: yes
+===
+author: Dev Example <dev@example.com>
+committer: Dev Example <https://forbidden-provider.example/committer>
+
+feat(brand): add a mark
+
+AI-assisted: yes
+===
+author: Dev Example <dev@example.com>
+committer: Dev Example <dev@example.com>
+
+feat(brand): add a mark
+
+See https://forbidden-provider.example/dashboard
+
+AI-assisted: yes
+===
+author: AI-assisted: some-model
+committer: Dev Example <dev@example.com>
+
+feat(brand): add a mark
+
+AI-assisted: yes

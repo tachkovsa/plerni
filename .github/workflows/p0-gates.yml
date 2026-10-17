@@ -57,7 +57,21 @@ jobs:
         with:
           node-version-file: .nvmrc
       - run: pnpm install --frozen-lockfile
+      - name: install brand exporter without lifecycle scripts
+        working-directory: assets/brand
+        run: npm ci --ignore-scripts
+      - name: brand export matches the committed svg, png, and ico files
+        working-directory: assets/brand
+        run: |
+          npm run export
+          status=$(git status --porcelain -- svg png social favicon.ico)
+          if [ -n "$status" ]; then
+            printf '%s\n' "$status"
+            exit 1
+          fi
       - run: node scripts/gates/license-audit.mjs
       - run: node scripts/gates/kernel-purity.mjs
-      - run: node scripts/gates/commit-policy.mjs --base "${{ github.event_name == 'push' && github.event.before || format('origin/{0}', github.base_ref || 'dev') }}"
+      # Identity patterns stay in commit-policy.yml. This pull_request job
+      # must not receive that secret, because it checks out and runs the
+      # merge commit.
       - run: node scripts/gates/gate-health.test.mjs
