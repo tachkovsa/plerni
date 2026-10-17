@@ -1,22 +1,74 @@
 name: bench-dispatch
 
-# Spike A typecheck-benchmark precursor (plan T4a step 0, δ-N3).
-# workflow_dispatch only: GitHub will not run a dispatch workflow from the
-# pull request that adds it, so this skeleton lands on dev before T4a.
-# T4a replaces the placeholder (install, harness compose, measure.mjs per
-# band, evidence upload) on this ubuntu-latest job. Keep the trigger list
-# to workflow_dispatch; measurement is not a pull-request check.
+# Spike A typecheck benchmark (plan T4a, §3.1 A5).
+# workflow_dispatch only. The skeleton of this file landed on dev first
+# (T4a step 0); this revision replaces the placeholder with install, harness
+# compose, per-band measurement, and evidence upload. Measurement is not a
+# pull-request check. The ceiling binds band 75 only; stress bands are recorded
+# either way. Commands are named in tools/spikes/db-invariant/bench/README.md.
 
 on:
   workflow_dispatch: {}
 
 permissions:
   contents: read
+  actions: write
 
 jobs:
   bench:
-    name: bench-dispatch skeleton
+    name: typecheck benchmark
     runs-on: ubuntu-latest
+    timeout-minutes: 180
     steps:
-      - name: placeholder
-        run: echo "bench-dispatch skeleton; the typecheck benchmark lands in T4a"
+      - name: check out the dispatched ref
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .nvmrc
+
+      - name: install
+        run: pnpm install --frozen-lockfile
+
+      - name: install GNU time and the psql client
+        run: sudo apt-get update && sudo apt-get install -y time postgresql-client
+
+      - name: generate ephemeral harness passwords
+        run: |
+          set -eu
+          gen() { openssl rand -hex 24; }
+          for name in POSTGRES_PASSWORD PLERNI_APP_PASSWORD PLERNI_MIGRATE_PASSWORD PLERNI_ADMIN_PASSWORD; do
+            value="$(gen)"
+            echo "::add-mask::${value}"
+            echo "${name}=${value}" >> "$GITHUB_ENV"
+          done
+
+      - name: harness compose up
+        working-directory: tools/harness
+        run: ./reset.sh
+
+      - name: measure each band
+        working-directory: tools/spikes/db-invariant
+        env:
+          BENCH_REQUIRE_DB: "1"
+          BENCH_PG_HOST: 127.0.0.1
+          BENCH_PG_PORT: "54320"
+          BENCH_PG_USER: postgres
+        run: |
+          set -eu
+          rm -f evidence/bench.jsonl
+          status=0
+          for band in 50 75 200 400; do
+            node bench/measure.mjs "$band" || status=$?
+          done
+          exit "$status"
+
+      - name: upload benchmark evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: typecheck-benchmark
+          path: tools/spikes/db-invariant/evidence/bench.jsonl
+          if-no-files-found: warn

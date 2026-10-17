@@ -4,15 +4,21 @@
   "type": "module",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "spike": "node src/run.ts"
+    "spike": "node src/run.ts",
+    "test": "node --test bench/band.test.mjs bench/corpus.test.mjs bench/corpus-lint.test.mjs bench/measure.test.mjs bench/typecheck-smoke.test.mjs",
+    "bench:schema": "node bench/gen-schema.mjs",
+    "bench:corpus": "node bench/gen-corpus.mjs",
+    "bench:lint": "node bench/corpus-lint.mjs",
+    "bench:measure": "node bench/measure.mjs"
   },
   "dependencies": {
     "kysely": "0.29.6",
     "pg": "8.23.1"
   },
   "devDependencies": {
-    "typescript": "5.9.3",
+    "@types/node": "26.6.5",
     "@types/pg": "8.23.1",
-    "@types/node": "26.6.5"
+    "kysely-codegen": "0.20.0",
+    "typescript": "5.9.3"
   }
 }
