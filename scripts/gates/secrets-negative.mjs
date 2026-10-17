@@ -122,6 +122,7 @@ try {
         "-v",
         `${outDir}:/out`,
         IMAGE,
+        "--not-a-real-flag",
         "dir",
         "--no-banner",
         "--report-format",
