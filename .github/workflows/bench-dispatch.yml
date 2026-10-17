@@ -1,0 +1,22 @@
+name: bench-dispatch
+
+# Spike A typecheck-benchmark precursor (plan T4a step 0, δ-N3).
+# workflow_dispatch only: GitHub will not run a dispatch workflow from the
+# pull request that adds it, so this skeleton lands on dev before T4a.
+# T4a replaces the placeholder (install, harness compose, measure.mjs per
+# band, evidence upload) on this ubuntu-latest job. Keep the trigger list
+# to workflow_dispatch; measurement is not a pull-request check.
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    name: bench-dispatch skeleton
+    runs-on: ubuntu-latest
+    steps:
+      - name: placeholder
+        run: echo "bench-dispatch skeleton; the typecheck benchmark lands in T4a"
