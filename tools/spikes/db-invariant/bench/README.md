@@ -30,7 +30,7 @@ pnpm --filter @plerni-spike/db-invariant bench:schema 200
 pnpm --filter @plerni-spike/db-invariant bench:schema 400
 ```
 
-Pinned codegen flags: `--dialect postgres --date-parser timestamp --numeric-parser string --default-schema public --type-only-imports`.
+Pinned codegen flags: `--dialect postgres --date-parser timestamp --numeric-parser string --default-schema public --type-only-imports`. `kysely-codegen` 0.20.0 depends on `micromatch`, which depends on `braces`. `braces` through 3.0.3 has no patched release (GHSA-vfj7-8cjw-p6xm), so the root manifest overrides `braces` with `bench/brace-expand`, a depth-capped stand-in. The benchmark does not pass brace patterns. `matcher()` uses `picomatch` and does not call the stand-in.
 
 ## Corpus, lint, compiler
 

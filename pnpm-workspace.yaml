@@ -4,3 +4,8 @@ packages:
   - "plugins/*"
   - "tools/*"
   - "tools/spikes/*"
+
+# braces through 3.0.3 has no patched release (GHSA-vfj7-8cjw-p6xm).
+# kysely-codegen 0.20.0 loads it via micromatch. The stand-in is depth-capped.
+overrides:
+  braces: file:tools/spikes/db-invariant/bench/brace-expand
