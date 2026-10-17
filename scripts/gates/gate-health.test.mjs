@@ -45,11 +45,18 @@ const cases = [
     expectOutput: /forbidden license "GPL/,
   },
   {
+    name: "license-audit blocks the locked child when an older copy is installed",
+    cmd: gate("license-audit.mjs", "--root", join(fixtures, "pnpm-locked-child")),
+    expectExit: 1,
+    expectOutput:
+      /shared-child@2\.0\.0 \(dependency of fake-absent \(optional dependency of fake-mit-lib\)\), verified from pnpm-lock.yaml: forbidden license "GPL-3.0-only"/,
+  },
+  {
     name: "license-audit blocks a required peer of a pnpm-locked absent optional package",
     cmd: gate("license-audit.mjs", "--root", join(fixtures, "pnpm-peer")),
     expectExit: 1,
     expectOutput:
-      /fake-gpl-peer \(peer of fake-absent \(optional dependency of fake-mit-lib\)\), verified from pnpm-lock.yaml: forbidden license "GPL-3.0-only"(?![\s\S]*fake-optional-peer)/,
+      /fake-gpl-peer@1\.0\.0 \(peer of fake-absent \(optional dependency of fake-mit-lib\)\), verified from pnpm-lock.yaml: forbidden license "GPL-3.0-only"(?![\s\S]*fake-optional-peer)/,
   },
   {
     name: "license-audit keeps a dependency install when a later peer reuses the name",

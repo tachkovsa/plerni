@@ -32,6 +32,8 @@ test('corpus-lint resolves the Kysely sql import, including an alias', () => {
   assert.ok(rules('sql-assign.ts').has('sql-fragment'));
   assert.ok(rules('sql-assign-chain.ts').has('sql-fragment'));
   assert.ok(rules('sql-reexport.ts').has('sql-fragment'));
+  assert.ok(rules('sql-destructure.ts').has('sql-fragment'));
+  assert.ok(rules('sql-namespace-member.ts').has('sql-fragment'));
   assert.deepEqual(lintFile(join(fixtureDir, 'sql-renamed-other.ts')), []);
   assert.deepEqual(lintFile(join(fixtureDir, 'set-config-alias.ts')), []);
   assert.deepEqual(lintFile(join(fixtureDir, 'set-config-assign.ts')), []);

@@ -29,10 +29,11 @@
  * Each (owning package directory, dependency name) is an independent root.
  * A required peer in one workspace package does not replace a dependency
  * of the same name installed for another package.
- * An optional peer (`peerDependenciesMeta.*.optional`) that is not installed
- * is skipped. An optional peer that is installed is judged from the same
- * source as its parent: the verified tarball when the parent was verified
- * that way, or the installed tree when the parent came from pnpm-lock.yaml.
+ * An optional peer (`peerDependenciesMeta.*.optional`) with no locked
+ * snapshot entry is skipped. An optional peer that is locked is judged from
+ * the same source as its parent. A child of a package verified from
+ * pnpm-lock.yaml is the version in that parent's snapshot, never a package
+ * Node resolves by name. A required child with no snapshot entry fails closed.
  * Usage: node scripts/gates/license-audit.mjs [--root <dir>]
  */
 import { createHash } from "node:crypto";
@@ -246,6 +247,108 @@ const splitPnpmKey = (key) => {
   if (at <= 0) return null;
   return { name: key.slice(0, at), version: key.slice(at + 1) };
 };
+
+const pnpmSnapshotCache = new Map();
+
+// pnpm-lock.yaml v9 records the resolved child version on the parent's
+// snapshot (dependencies / optionalDependencies / peerDependencies), including
+// the peer suffix. packages: holds the integrity or directory for that version.
+const readPnpmSnapshots = (lockPath) => {
+  if (pnpmSnapshotCache.has(lockPath)) return pnpmSnapshotCache.get(lockPath);
+  const snapshots = new Map();
+  let inSnapshots = false;
+  let current = null;
+  let inDeps = false;
+  const flush = () => {
+    if (current) snapshots.set(current.key, current.deps);
+    current = null;
+    inDeps = false;
+  };
+  for (const line of readFileSync(lockPath, "utf8").split("\n")) {
+    if (!inSnapshots) {
+      if (line === "snapshots:") inSnapshots = true;
+      continue;
+    }
+    if (line.length > 0 && !line.startsWith(" ")) {
+      flush();
+      break;
+    }
+    const keyMatch = /^  ([^ ].*):$/.exec(line);
+    if (keyMatch) {
+      flush();
+      const rawKey = keyMatch[1];
+      const key = rawKey.replace(/^['"]|['"]$/g, "");
+      current = { key, deps: new Map() };
+      inDeps = false;
+      continue;
+    }
+    if (!current) continue;
+    if (/^    (?:dependencies|optionalDependencies|peerDependencies):$/.test(line)) {
+      inDeps = true;
+      continue;
+    }
+    if (!inDeps || !line.startsWith("      ") || line.startsWith("       ")) {
+      inDeps = false;
+      continue;
+    }
+    const parsed = parseSnapshotChild(line.slice(6));
+    if (!parsed) continue;
+    const [name, version] = parsed;
+    if (!current.deps.has(name)) current.deps.set(name, new Set());
+    current.deps.get(name).add(version);
+  }
+  flush();
+  pnpmSnapshotCache.set(lockPath, snapshots);
+  return snapshots;
+};
+
+const parseSnapshotChild = (body) => {
+  let name;
+  let rest;
+  if (body.startsWith("'") || body.startsWith('"')) {
+    const quote = body[0];
+    const end = body.indexOf(quote, 1);
+    if (end < 0 || body[end + 1] !== ":") return null;
+    name = body.slice(1, end);
+    rest = body.slice(end + 2).trim();
+  } else {
+    const colon = body.indexOf(":");
+    if (colon < 0) return null;
+    name = body.slice(0, colon).trim();
+    rest = body.slice(colon + 1).trim();
+  }
+  if ((rest.startsWith("'") && rest.endsWith("'")) || (rest.startsWith('"') && rest.endsWith('"'))) {
+    rest = rest.slice(1, -1);
+  }
+  if (!name || !rest) return null;
+  return [name, rest];
+};
+
+// "1.2.3(peer@1.0.0)" is the snapshot dep path. The packages key is name@version
+// without that suffix; some keys keep it. Peel one balanced trailing group.
+const stripPeerSuffix = (depPath) => {
+  if (!depPath.endsWith(")")) return depPath;
+  let depth = 0;
+  for (let i = depPath.length - 1; i >= 0; i--) {
+    if (depPath[i] === ")") depth += 1;
+    else if (depPath[i] === "(") {
+      depth -= 1;
+      if (depth === 0) return depPath.slice(0, i);
+    }
+  }
+  return depPath;
+};
+
+const snapshotsForPackage = (lockPath, packageKey) => {
+  const found = [];
+  for (const [key, deps] of readPnpmSnapshots(lockPath)) {
+    if (key === packageKey || key.startsWith(`${packageKey}(`)) found.push(deps);
+  }
+  return found;
+};
+
+const packageEntryByKey = (lockPath, key) =>
+  readPnpmPackages(lockPath).find((entry) => entry.key === key) ?? null;
 
 const registryTarball = (name, version) => {
   const leaf = name.includes("/") ? name.slice(name.lastIndexOf("/") + 1) : name;
@@ -494,10 +597,130 @@ const auditLockedOptional = async (startDir, name, label, relation = "verified o
   }
 };
 
+// A child of a pnpm-verified package is the snapshot version for that parent.
+// An installed copy of another version is not that child. Optional peers with
+// no snapshot entry are skipped; every other missing entry fails closed.
+const auditPnpmChildren = async (lockPath, parentKey, pkg, parentWhere) => {
+  const optionalChildren = pkg.optionalDependencies ?? {};
+  const peerOptional = pkg.peerDependenciesMeta ?? {};
+  const declared = [];
+  for (const [child, childRange] of Object.entries(pkg.dependencies ?? {})) {
+    if (Object.prototype.hasOwnProperty.call(optionalChildren, child)) continue;
+    declared.push([child, String(childRange), "dependency", false]);
+  }
+  for (const [child, childRange] of Object.entries(optionalChildren)) {
+    declared.push([child, String(childRange), "optional dependency", false]);
+  }
+  for (const [child, childRange] of Object.entries(pkg.peerDependencies ?? {})) {
+    declared.push([child, String(childRange), "peer", peerOptional[child]?.optional === true]);
+  }
+  if (declared.length === 0) return;
+  const snaps = snapshotsForPackage(lockPath, parentKey);
+  if (snaps.length === 0) {
+    for (const [child, , relation, optionalPeer] of declared) {
+      if (optionalPeer) continue;
+      failures.push(
+        `${child} (${relation} of ${parentWhere}): pnpm snapshot for ${parentKey} is missing — fail closed`,
+      );
+    }
+    return;
+  }
+  for (const [child, childRange, relation, optionalPeer] of declared) {
+    const versions = new Set();
+    for (const deps of snaps) {
+      const specs = deps.get(child);
+      if (specs) for (const spec of specs) versions.add(spec);
+    }
+    if (versions.size === 0) {
+      if (optionalPeer) continue;
+      failures.push(
+        `${child} (${relation} of ${parentWhere}): locked version is missing from the pnpm snapshot — fail closed`,
+      );
+      continue;
+    }
+    if (versions.size !== 1) {
+      failures.push(
+        `${child} (${relation} of ${parentWhere}): pnpm snapshot has ${versions.size} locked versions — fail closed`,
+      );
+      continue;
+    }
+    const depPath = [...versions][0];
+    const bare = stripPeerSuffix(depPath);
+    const sat = satisfies(bare, childRange);
+    if (sat !== true) {
+      failures.push(
+        `${child} (${relation} of ${parentWhere}): lockfile version ${bare} does not satisfy range ${childRange} — fail closed`,
+      );
+      continue;
+    }
+    const entry =
+      packageEntryByKey(lockPath, `${child}@${depPath}`) ??
+      (bare === depPath ? null : packageEntryByKey(lockPath, `${child}@${bare}`));
+    if (!entry) {
+      failures.push(
+        `${child} (${relation} of ${parentWhere}): locked version ${bare} is missing from pnpm-lock.yaml packages — fail closed`,
+      );
+      continue;
+    }
+    await auditPnpmEntry(lockPath, entry, `${child}@${bare} (${relation} of ${parentWhere})`);
+  }
+};
+
+const auditPnpmEntry = async (lockPath, match, where) => {
+  const parsedKey = splitPnpmKey(match.key);
+  const name = parsedKey?.name ?? "";
+  const version = parsedKey?.version ?? "";
+  const id = `${lockPath}\0${match.key}\0${match.integrity ?? ""}\0${match.directory ?? ""}`;
+  if (seenLocked.has(id)) return;
+  seenLocked.add(id);
+  let pkg;
+  if (match.directory) {
+    const abs = resolve(dirname(lockPath), match.directory);
+    const relToRoot = relative(root, abs);
+    if (relToRoot.startsWith("..") || relToRoot === "") {
+      failures.push(`${where}: pnpm directory is outside the audit root — fail closed`);
+      return;
+    }
+    const manifest = join(abs, "package.json");
+    if (!existsSync(manifest)) {
+      failures.push(`${where}: pnpm directory has no package.json — fail closed`);
+      return;
+    }
+    pkg = JSON.parse(readFileSync(manifest, "utf8"));
+  } else {
+    if (!match.integrity) {
+      failures.push(`${where}: pnpm-lock.yaml entry has no integrity — fail closed`);
+      return;
+    }
+    const loaded = await readResolvedTarball(registryTarball(name, version), lockPath);
+    if (loaded.error || !loaded.bytes) {
+      failures.push(`${where}: tarball could not be verified (${loaded.error ?? "missing"}) — fail closed`);
+      return;
+    }
+    if (!integrityMatches(loaded.bytes, match.integrity)) {
+      failures.push(`${where}: tarball integrity check failed — fail closed`);
+      return;
+    }
+    const parsedTarball = packageJsonFromTarball(loaded.bytes, (fileName) => /^[^/]+\/package\.json$/.test(fileName));
+    if (!parsedTarball.pkg) {
+      failures.push(`${where}: ${parsedTarball.error ?? "tarball has no readable package manifest"} — fail closed`);
+      return;
+    }
+    pkg = parsedTarball.pkg;
+    if (pkg.name !== name || pkg.version !== version) {
+      failures.push(`${where}: verified tarball does not match the locked name and version — fail closed`);
+      return;
+    }
+  }
+  checked++;
+  const problem = judge(`${where}, verified from pnpm-lock.yaml`, licenseOf(pkg));
+  if (problem) failures.push(problem);
+  await auditPnpmChildren(lockPath, match.key, pkg, where);
+};
+
 // Missing optional packages of a pnpm install have no package-lock.json entry.
 // Verify them from pnpm-lock.yaml and the integrity-checked registry tarball
-// (or a lockfile directory). Required peers are walked the same way; peers
-// marked optional in peerDependenciesMeta are skipped unless installed.
+// (or a lockfile directory). Children come from that package's snapshot.
 const auditPnpmMissing = async (startDir, name, label, range, relation = "optional dependency") => {
   const lockPath = findPnpmLock(startDir);
   const where = `${name} (${relation} of ${label})`;
@@ -516,76 +739,7 @@ const auditPnpmMissing = async (startDir, name, label, range, relation = "option
     failures.push(`${where}: pnpm-lock.yaml has ${matches.length} versions that satisfy ${range} — fail closed`);
     return true;
   }
-  const match = matches[0];
-  const id = `${lockPath}\0${match.key}\0${match.integrity ?? ""}\0${match.directory ?? ""}`;
-  if (seenLocked.has(id)) return true;
-  seenLocked.add(id);
-  let pkg;
-  if (match.directory) {
-    const abs = resolve(dirname(lockPath), match.directory);
-    const relToRoot = relative(root, abs);
-    if (relToRoot.startsWith("..") || relToRoot === "") {
-      failures.push(`${where}: pnpm directory is outside the audit root — fail closed`);
-      return true;
-    }
-    const manifest = join(abs, "package.json");
-    if (!existsSync(manifest)) {
-      failures.push(`${where}: pnpm directory has no package.json — fail closed`);
-      return true;
-    }
-    pkg = JSON.parse(readFileSync(manifest, "utf8"));
-  } else {
-    if (!match.integrity) {
-      failures.push(`${where}: pnpm-lock.yaml entry has no integrity — fail closed`);
-      return true;
-    }
-    const loaded = await readResolvedTarball(registryTarball(name, match.version), lockPath);
-    if (loaded.error || !loaded.bytes) {
-      failures.push(`${where}: tarball could not be verified (${loaded.error ?? "missing"}) — fail closed`);
-      return true;
-    }
-    if (!integrityMatches(loaded.bytes, match.integrity)) {
-      failures.push(`${where}: tarball integrity check failed — fail closed`);
-      return true;
-    }
-    const parsedTarball = packageJsonFromTarball(loaded.bytes, (name) => /^[^/]+\/package\.json$/.test(name));
-    if (!parsedTarball.pkg) {
-      failures.push(`${where}: ${parsedTarball.error ?? "tarball has no readable package manifest"} — fail closed`);
-      return true;
-    }
-    pkg = parsedTarball.pkg;
-    if (pkg.name !== name || pkg.version !== match.version) {
-      failures.push(`${where}: verified tarball does not match the locked name and version — fail closed`);
-      return true;
-    }
-  }
-  checked++;
-  const problem = judge(`${where}, verified from pnpm-lock.yaml`, licenseOf(pkg));
-  if (problem) failures.push(problem);
-  const optionalChildren = pkg.optionalDependencies ?? {};
-  for (const [child, childRange] of Object.entries(pkg.dependencies ?? {})) {
-    if (Object.prototype.hasOwnProperty.call(optionalChildren, child)) continue;
-    const childPath = resolveInstalled(startDir, child);
-    if (childPath) await auditTree(childPath, `${child} (dependency of ${where})`);
-    else await auditPnpmMissing(startDir, child, where, String(childRange));
-  }
-  for (const [child, childRange] of Object.entries(optionalChildren)) {
-    const childPath = resolveInstalled(startDir, child);
-    if (childPath) await auditTree(childPath, `${child} (dependency of ${where})`);
-    else await auditPnpmMissing(startDir, child, where, String(childRange));
-  }
-  const peers = pkg.peerDependencies ?? {};
-  const peerOptional = pkg.peerDependenciesMeta ?? {};
-  for (const [child, childRange] of Object.entries(peers)) {
-    const childPath = resolveInstalled(startDir, child);
-    if (peerOptional[child]?.optional === true) {
-      if (!childPath) continue;
-      await auditTree(childPath, `${child} (peer of ${where})`);
-      continue;
-    }
-    if (childPath) await auditTree(childPath, `${child} (peer of ${where})`);
-    else await auditPnpmMissing(startDir, child, where, String(childRange), "peer");
-  }
+  await auditPnpmEntry(lockPath, matches[0], where);
   return true;
 };
 

@@ -1,0 +1,15 @@
+lockfileVersion: '9.0'
+
+packages:
+
+  fake-absent@1.0.0:
+    resolution: {directory: node_modules/fixture-tarballs/fake-absent, type: directory}
+
+  shared-child@2.0.0:
+    resolution: {directory: node_modules/fixture-tarballs/shared-child, type: directory}
+
+snapshots:
+
+  fake-absent@1.0.0:
+    dependencies:
+      shared-child: 2.0.0

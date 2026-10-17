@@ -13,6 +13,8 @@ temp/
 *.local.md
 # generated at reset time from env — never committed (credentials)
 tools/harness/pgbouncer/userlist.txt
+tools/harness/pgbouncer/private/
+tools/harness/docker-compose.override.yml
 # spike run artifacts — regenerated per run; reports cite selected evidence
 tools/spikes/*/evidence/
 # typecheck-benchmark corpus is generated per run; committed artifacts are bench/.artifacts/
