@@ -16,17 +16,22 @@ jobs:
           fetch-depth: 0
       - name: gitleaks history scan (pinned v8.30.1)
         run: docker run --rm -v "$PWD:/repo" --entrypoint sh zricethezav/gitleaks:v8.30.1 -c "git config --global --add safe.directory /repo && gitleaks git --no-banner --redact /repo"
-      - name: negative proof — the synthetic fixture secret MUST be detected
-        run: |
-          set +e
-          docker run --rm -v "$PWD/scripts/gates/fixtures/gitleaks:/scan" zricethezav/gitleaks:v8.30.1 dir --no-banner /scan
-          code=$?
-          set -e
-          if [ "$code" -eq 0 ]; then
-            echo "gitleaks failed to detect the synthetic fixture secret — the secrets gate is NOT proven fail-closed"
-            exit 1
-          fi
-          echo "secrets negative proof OK (gitleaks exit $code)"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .nvmrc
+      # The negative proof requires the planted finding (rule generic-api-key
+      # on secret.txt). A scanner crash is a scanner failure, not evidence:
+      # a bad flag, a missing report, a signal or other termination with no exit code,
+      # or any exit other than 0 or 1. A completed scan whose
+      # report lacks that rule and file is an absent finding.
+      # Exit 0 together with that finding is not proof: a leak must exit 1.
+      # Neither may pass. A nonzero exit alone is not proof. The repo
+      # allowlist is not loaded here; it applies only to the history scan.
+      # Gate-config approval verification is not this job. This job checks
+      # out the pull request, so the verifier lives in approval-artifact.yml,
+      # which runs the base revision's copy.
+      - name: negative proof — the planted fixture finding must be present
+        run: node scripts/gates/secrets-negative.mjs
 
   private-markers:
     runs-on: ubuntu-latest
