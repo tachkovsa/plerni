@@ -1,0 +1,12 @@
+lockfileVersion: '9.0'
+
+packages:
+
+  fake-absent@1.0.0:
+    resolution: {directory: node_modules/fixture-tarballs/fake-absent, type: directory}
+
+  fake-gpl-peer@1.0.0:
+    resolution: {directory: node_modules/fixture-tarballs/fake-gpl-peer, type: directory}
+
+  fake-optional-peer@1.0.0:
+    resolution: {directory: node_modules/fixture-tarballs/fake-optional-peer, type: directory}

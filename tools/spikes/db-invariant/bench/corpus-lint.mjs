@@ -3,9 +3,11 @@
 // A textual ban on "as" would reject Kysely's .as('alias') call. This walks
 // the TypeScript AST instead: type assertions, explicit any, explicit type
 // arguments on calls, $castTo / $narrowType / $assertType, and sql fragments.
-// A fragment is Kysely's sql export, including `sql as raw` and `kysely.sql`.
-// An unbound identifier named sql is still a fragment (ambient declare).
-// A different Kysely export renamed to sql is not. The only allowed form is
+// A fragment is Kysely's sql export, including `sql as raw`, `kysely.sql`,
+// `export { sql as raw } from 'kysely'`, and a local assigned from that
+// binding (`const raw = sql`, including a chain and a later `=`). An unbound
+// identifier named sql is still a fragment (ambient declare). A different
+// Kysely export renamed to sql is not. The only allowed form is
 // select set_config('plerni.<guc>', …, true).
 
 import { readFileSync } from 'node:fs';
@@ -51,7 +53,74 @@ function kyselySqlBindings(sf) {
       else otherLocals.add(el.name.text);
     }
   }
+  for (const stmt of sf.statements) {
+    if (!ts.isExportDeclaration(stmt) || stmt.isTypeOnly) continue;
+    if (!stmt.moduleSpecifier || !ts.isStringLiteral(stmt.moduleSpecifier)) continue;
+    const fromKysely = stmt.moduleSpecifier.text === 'kysely';
+    const clause = stmt.exportClause;
+    if (!clause) continue;
+    if (ts.isNamespaceExport(clause)) {
+      if (fromKysely) namespaces.add(clause.name.text);
+      else otherLocals.add(clause.name.text);
+      continue;
+    }
+    for (const el of clause.elements) {
+      if (el.isTypeOnly) continue;
+      const imported = el.propertyName ? el.propertyName.text : el.name.text;
+      if (fromKysely && imported === 'sql') tags.add(el.name.text);
+      else otherLocals.add(el.name.text);
+    }
+  }
   return { tags, namespaces, otherLocals };
+}
+
+function unwrapValue(expr) {
+  let node = expr;
+  while (
+    ts.isParenthesizedExpression(node) ||
+    ts.isAsExpression(node) ||
+    ts.isTypeAssertionExpression(node) ||
+    ts.isSatisfiesExpression(node) ||
+    ts.isNonNullExpression(node)
+  ) {
+    node = node.expression;
+  }
+  return node;
+}
+
+function aliasInitializers(sf) {
+  const inits = [];
+  const visit = (node) => {
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) {
+      inits.push([node.name.text, unwrapValue(node.initializer)]);
+    } else if (
+      ts.isBinaryExpression(node) &&
+      node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+      ts.isIdentifier(node.left)
+    ) {
+      inits.push([node.left.text, unwrapValue(node.right)]);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sf);
+  return inits;
+}
+
+// Import aliases are not the only way a local names Kysely's sql. A const
+// copy, a later assignment, and a chain of those copies all keep the binding.
+function followSqlAliases(sf, bindings) {
+  const inits = aliasInitializers(sf);
+  let grew = true;
+  while (grew) {
+    grew = false;
+    for (const [name, expr] of inits) {
+      if (bindings.tags.has(name)) continue;
+      if (!isSql(expr, bindings)) continue;
+      bindings.tags.add(name);
+      bindings.otherLocals.delete(name);
+      grew = true;
+    }
+  }
 }
 
 function isSqlIdentifier(expr, bindings) {
@@ -92,6 +161,7 @@ function isAllowedSetConfig(node, bindings) {
 export function lintSource(fileName, sourceText) {
   const sf = ts.createSourceFile(fileName, sourceText, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
   const bindings = kyselySqlBindings(sf);
+  followSqlAliases(sf, bindings);
   const findings = [];
   const seen = new Set();
   const add = (node, rule, message) => {

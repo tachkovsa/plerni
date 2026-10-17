@@ -22,16 +22,17 @@
  * in for that child.
  * A required dependency that is not installed fails closed. A required peer
  * that is not installed fails closed, including a required peer declared by
- * an absent optional package's verified tarball. A required peer declared on
- * the package itself is audited even when it is the only external
- * declaration. An optional root peer is not seeded into that walk.
+ * an absent optional package verified from its tarball or from pnpm-lock.yaml.
+ * A required peer declared on the package itself is audited even when it is
+ * the only external declaration. An optional root peer is not seeded into
+ * that walk.
  * Each (owning package directory, dependency name) is an independent root.
  * A required peer in one workspace package does not replace a dependency
  * of the same name installed for another package.
  * An optional peer (`peerDependenciesMeta.*.optional`) that is not installed
  * is skipped. An optional peer that is installed is judged from the same
  * source as its parent: the verified tarball when the parent was verified
- * that way.
+ * that way, or the installed tree when the parent came from pnpm-lock.yaml.
  * Usage: node scripts/gates/license-audit.mjs [--root <dir>]
  */
 import { createHash } from "node:crypto";
@@ -494,10 +495,12 @@ const auditLockedOptional = async (startDir, name, label, relation = "verified o
 };
 
 // Missing optional packages of a pnpm install have no package-lock.json entry.
-// Verify them from pnpm-lock.yaml and the integrity-checked registry tarball.
-const auditPnpmMissing = async (startDir, name, label, range) => {
+// Verify them from pnpm-lock.yaml and the integrity-checked registry tarball
+// (or a lockfile directory). Required peers are walked the same way; peers
+// marked optional in peerDependenciesMeta are skipped unless installed.
+const auditPnpmMissing = async (startDir, name, label, range, relation = "optional dependency") => {
   const lockPath = findPnpmLock(startDir);
-  const where = `${name} (optional dependency of ${label})`;
+  const where = `${name} (${relation} of ${label})`;
   if (!lockPath) return false;
   if (typeof range !== "string" || range.trim() === "") {
     failures.push(`${where}: dependency range is missing — fail closed`);
@@ -570,6 +573,18 @@ const auditPnpmMissing = async (startDir, name, label, range) => {
     const childPath = resolveInstalled(startDir, child);
     if (childPath) await auditTree(childPath, `${child} (dependency of ${where})`);
     else await auditPnpmMissing(startDir, child, where, String(childRange));
+  }
+  const peers = pkg.peerDependencies ?? {};
+  const peerOptional = pkg.peerDependenciesMeta ?? {};
+  for (const [child, childRange] of Object.entries(peers)) {
+    const childPath = resolveInstalled(startDir, child);
+    if (peerOptional[child]?.optional === true) {
+      if (!childPath) continue;
+      await auditTree(childPath, `${child} (peer of ${where})`);
+      continue;
+    }
+    if (childPath) await auditTree(childPath, `${child} (peer of ${where})`);
+    else await auditPnpmMissing(startDir, child, where, String(childRange), "peer");
   }
   return true;
 };
