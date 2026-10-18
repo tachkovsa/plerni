@@ -7,12 +7,11 @@
 // https://www.pgbouncer.org/config.html (pool_mode=transaction)
 // https://www.pgbouncer.org/usage.html (SHOW POOLS cl_waiting)
 
-import pg from 'pg';
 import { randomUUID } from 'node:crypto';
 import { commitExecution, createExecution, dispatch, getStatus, sweepAbandoned } from '../authority.mjs';
 import { assertBounds, deferred, steps } from './clock.mjs';
 import { LEASE_MS, isAborted, openAppClient } from './control.mjs';
-import { countEffects, ensureEffects, insertEffect } from './support.mjs';
+import { countEffects, ensureEffects, insertEffect, openAdminClient } from './support.mjs';
 
 const POOL_PIN = 10;
 const HOLD_BOUND_MS = 50_000;
@@ -20,20 +19,6 @@ const SAMPLE_MS = 400;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function adminClient() {
-  if (process.env.HARNESS_ADMIN_DSN) {
-    return new pg.Client({ connectionString: process.env.HARNESS_ADMIN_DSN });
-  }
-  if (!process.env.PLERNI_ADMIN_PASSWORD) return null;
-  return new pg.Client({
-    host: 'localhost',
-    port: 54321,
-    database: 'pgbouncer',
-    user: 'plerni_admin_ro',
-    password: process.env.PLERNI_ADMIN_PASSWORD,
-  });
 }
 
 async function poolSize(admin) {
@@ -99,7 +84,7 @@ function holdServer(release) {
 export async function saturatedPool() {
   const timing = steps();
   await timing.run(() => ensureEffects(), 'effects fixture');
-  const admin = adminClient();
+  const admin = openAdminClient();
   if (!admin) return { pass: false, detail: { error: 'no pgbouncer admin datasource', bounds: [] } };
   await timing.run(() => admin.connect(), 'admin connect');
   const release = deferred();

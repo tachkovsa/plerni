@@ -9,15 +9,6 @@ import { b3 } from './cases/b3-backpressure.mjs';
 import { b4 } from './cases/b4-bounds.mjs';
 import { b5 } from './cases/b5-crash.mjs';
 import { b6 } from './cases/b6-mux-identity.mjs';
-import { deathBeforeCommit } from './races/death-before-commit.mjs';
-import { lostReply } from './races/lost-reply.mjs';
-import { recoveryVsLiveCommit } from './races/recovery-vs-live-commit.mjs';
-import { healthyLong } from './races/healthy-long.mjs';
-import { heartbeatBehindCommit } from './races/heartbeat-behind-commit.mjs';
-import { saturatedPool } from './races/saturated-pool.mjs';
-import { queuedPastLease } from './races/queued-past-lease.mjs';
-import { secondExecutorTakeover } from './races/second-executor-takeover.mjs';
-import { vacuityAuthority } from './races/vacuity-authority.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const evidenceDir = join(__dirname, '..', 'evidence');
@@ -40,15 +31,6 @@ async function main() {
     ['b2-fencing', b2],
     ['b6-mux-identity', () => b6()],
     ['b6-vacuity', () => b6({ stampIdentity: false, flood: false })],
-    ['death-before-commit', deathBeforeCommit],
-    ['lost-reply', lostReply],
-    ['recovery-vs-live-commit', recoveryVsLiveCommit],
-    ['healthy-long', healthyLong],
-    ['heartbeat-behind-commit', heartbeatBehindCommit],
-    ['saturated-pool', saturatedPool],
-    ['queued-past-lease', queuedPastLease],
-    ['second-executor-takeover', secondExecutorTakeover],
-    ['vacuity-authority', vacuityAuthority],
     ['b1-throughput', b1],
     ['b3-backpressure', b3],
     ['smoke', smoke],
@@ -60,9 +42,7 @@ async function main() {
     const pass = name === 'b6-vacuity'
       ? result.pass === false && result.exploit === true && result.checks?.routing === true
         && result.checks?.mismatch === true && result.checks?.stale === true
-      : name === 'vacuity-authority'
-        ? result.pass === false && result.exploit === true && result.realHeld === true
-        : result.pass;
+      : result.pass;
     if (pass === false) failed = true;
     else if (pass !== true) unscored = true;
     record({

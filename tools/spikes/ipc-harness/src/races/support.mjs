@@ -8,9 +8,10 @@ import { LEASE_MS, isAborted, openAppClient } from './control.mjs';
 
 let effectsReady;
 
-function rootClient() {
+function rootClient(connectionTimeoutMillis = 0) {
+  const timeout = connectionTimeoutMillis > 0 ? { connectionTimeoutMillis } : {};
   if (process.env.HARNESS_ROOT_DSN) {
-    const c = new pg.Client({ connectionString: process.env.HARNESS_ROOT_DSN });
+    const c = new pg.Client({ connectionString: process.env.HARNESS_ROOT_DSN, ...timeout });
     c.on('error', () => {});
     return c;
   }
@@ -23,9 +24,74 @@ function rootClient() {
     database: 'plerni',
     user: 'postgres',
     password: process.env.POSTGRES_PASSWORD,
+    ...timeout,
   });
   c.on('error', () => {});
   return c;
+}
+
+export function openAdminClient(connectionTimeoutMillis = 0) {
+  const timeout = connectionTimeoutMillis > 0 ? { connectionTimeoutMillis } : {};
+  if (process.env.HARNESS_ADMIN_DSN) {
+    const client = new pg.Client({ connectionString: process.env.HARNESS_ADMIN_DSN, ...timeout });
+    client.on('error', () => {});
+    return client;
+  }
+  if (!process.env.PLERNI_ADMIN_PASSWORD) return null;
+  const client = new pg.Client({
+    host: 'localhost',
+    port: 54321,
+    database: 'pgbouncer',
+    user: 'plerni_admin_ro',
+    password: process.env.PLERNI_ADMIN_PASSWORD,
+    ...timeout,
+  });
+  client.on('error', () => {});
+  return client;
+}
+
+const PROBE_MS = 2000;
+
+async function probe(open, query) {
+  const client = open();
+  if (!client) return 'not configured';
+  try {
+    await client.connect();
+    await client.query(query);
+    return null;
+  } catch {
+    return 'connection failed';
+  } finally {
+    await client.end().catch(() => {});
+  }
+}
+
+export function rootConfigured() {
+  return Boolean(process.env.HARNESS_ROOT_DSN || process.env.POSTGRES_PASSWORD);
+}
+
+export async function rootProbeReason() {
+  if (!rootConfigured()) return 'no root connection configured';
+  const failed = await probe(() => rootClient(PROBE_MS), 'SELECT 1');
+  return failed ? `root ${failed}` : null;
+}
+
+export function adminConfigured() {
+  return Boolean(process.env.HARNESS_ADMIN_DSN || process.env.PLERNI_ADMIN_PASSWORD);
+}
+
+export async function adminProbeReason() {
+  if (!adminConfigured()) return 'no PgBouncer admin connection configured';
+  const failed = await probe(() => openAdminClient(PROBE_MS), 'SHOW VERSION');
+  return failed ? `PgBouncer admin ${failed}` : null;
+}
+
+// Local runs skip a case whose service is missing. CI is expected to have
+// the harness, so a missing service stays runnable and the test fails.
+export function raceSkip(missing, ci) {
+  const reasons = missing.filter(Boolean);
+  if (reasons.length === 0 || ci) return false;
+  return reasons.join('; ');
 }
 
 export async function ensureEffects() {

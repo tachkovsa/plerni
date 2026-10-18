@@ -1,9 +1,9 @@
 // healthy-long (plan B2 / T5c): the positive control keeps one production
 // commitExecution open for 25–30s of wall time. Production renewals (cadence
 // 5s, lease 20s) and the production sweeper run while it is open. The row
-// stays ACTIVE, then commits with its effect. The negative control is the
-// only fake-time path here: the heartbeat is backdated and the production
-// sweeper abandons the row before the same commit can land.
+// stays ACTIVE, then commits with its effect. The renewal-suppressed control
+// uses quietRenew and the same production sweeper, stays open past the real
+// lease, and the conditional commit is fenced.
 
 import { randomUUID } from 'node:crypto';
 import {
@@ -13,15 +13,16 @@ import {
   dispatch,
   getStatus,
   startSweeper,
-  sweepAbandoned,
 } from '../authority.mjs';
 import { assertBounds, steps } from './clock.mjs';
 import { CADENCE_MS, LEASE_MS, isAborted } from './control.mjs';
-import { countEffects, ensureEffects, expireHeartbeat, insertEffect, quietRenew } from './support.mjs';
+import { countEffects, ensureEffects, insertEffect, quietRenew } from './support.mjs';
 
 const OPEN_MIN_MS = 25_000;
 const OPEN_MAX_MS = 30_000;
 const POSITIVE_BOUND_MS = 40_000;
+const SUPPRESSED_BOUND_MS = 50_000;
+const SUPPRESSED_LIMIT_MS = 40_000;
 const SAMPLE_MS = 400;
 
 function sleep(ms) {
@@ -88,26 +89,42 @@ async function suppressed(timing) {
   const token = `suppressed-${randomUUID()}`;
   const id = await timing.run(() => createExecution('t5c-healthy', token, true), 'suppressed create');
   await timing.run(() => dispatch(id, true), 'suppressed dispatch');
-  let sweptDuring = false;
+  const stop = startSweeper(true);
+  let wallMs = 0;
   let committed = false;
   let fenced = false;
+  let abandoned = false;
   try {
     const result = await timing.run(() => commitExecution(id, token, async (client) => {
       await insertEffect(client, id, 'long');
-      await expireHeartbeat(id);
-      const swept = await sweepAbandoned(true);
-      sweptDuring = swept.includes(id);
-      if (!sweptDuring) throw new Error('suppressed sweep missed the row');
-    }, true, quietRenew()), 'suppressed commit');
+      const opened = Date.now();
+      for (;;) {
+        if (isAborted()) throw new Error('aborted');
+        const row = await getStatus(id, true);
+        if (row?.status === 'ABANDONED') abandoned = true;
+        if (row?.status === 'COMMITTED') throw new Error('suppressed execution committed');
+        const visible = await countEffects(id, 'long');
+        if (visible !== 0) throw new Error('uncommitted effect was visible');
+        wallMs = Date.now() - opened;
+        if (abandoned && wallMs > LEASE_MS) return;
+        if (wallMs > SUPPRESSED_LIMIT_MS) {
+          throw new Error(`suppressed sweeper left the row ${row?.status} at ${wallMs}ms`);
+        }
+        await sleep(SAMPLE_MS);
+      }
+    }, true, quietRenew()), 'suppressed commit', SUPPRESSED_BOUND_MS);
     committed = result.committed === true;
   } catch (err) {
     fenced = err instanceof FencedError;
     if (!fenced) throw err;
+  } finally {
+    stop();
   }
   return {
     committed,
     fenced,
-    sweptDuring,
+    abandoned,
+    wallMs,
     status: (await timing.run(() => getStatus(id, true), 'suppressed status'))?.status ?? null,
     effects: await timing.run(() => countEffects(id, 'long'), 'suppressed effects'),
   };
@@ -139,7 +156,8 @@ export async function healthyLong() {
     && held.effectsDuring === 0
     && dropped.committed === false
     && dropped.fenced === true
-    && dropped.sweptDuring === true
+    && dropped.abandoned === true
+    && dropped.wallMs > LEASE_MS
     && dropped.status === 'ABANDONED'
     && dropped.effects === 0;
   return { pass, detail };

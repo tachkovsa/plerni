@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { VACUOUS_COMMIT_SQL, VACUOUS_SWEEP_SQL } from './control.mjs';
+import { raceSkip } from './support.mjs';
 
 const PRODUCTION_COMMIT = "UPDATE fencing_authority SET status = 'COMMITTED' WHERE id = $1 AND token = $2 AND status = 'ACTIVE' RETURNING clock_timestamp() AS locked_at";
 const PRODUCTION_SWEEP = "UPDATE fencing_authority SET status = 'ABANDONED' WHERE status = 'ACTIVE' AND heartbeat_at < now() - make_interval(secs => $1) RETURNING id";
@@ -21,4 +22,14 @@ test('vacuity statements drop the ACTIVE predicate and the harness sets no sessi
   for (const word of ['requireActive', 'renewBehindLock', 'afterLock', 'afterCommit', 'openHarnessClient', 'committedUpdateSql']) {
     assert.equal(authority.includes(word), false, word);
   }
+});
+
+test('a missing race service skips locally and fails closed in CI', () => {
+  assert.equal(raceSkip([null], false), false);
+  assert.equal(raceSkip(['no root connection configured'], false), 'no root connection configured');
+  assert.equal(
+    raceSkip(['no root connection configured', 'no PgBouncer admin connection configured'], false),
+    'no root connection configured; no PgBouncer admin connection configured',
+  );
+  assert.equal(raceSkip(['no root connection configured'], true), false);
 });

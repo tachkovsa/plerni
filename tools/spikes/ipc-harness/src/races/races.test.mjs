@@ -1,10 +1,13 @@
-// T5c race battery. Skips without a harness database so a checkout stays green.
-// Cases share the fencing table, so they run one at a time.
+// T5c race battery. A case skips when its database, root, or PgBouncer admin
+// connection is missing, so a direct-only checkout stays green. In CI the
+// same gap fails the case. Cases share the fencing table, so they run one
+// at a time.
 
 import { describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { dbConfigured } from '../supervisor.mjs';
 import { assertBounds } from './clock.mjs';
+import { adminProbeReason, raceSkip, rootProbeReason } from './support.mjs';
 import { deathBeforeCommit } from './death-before-commit.mjs';
 import { lostReply } from './lost-reply.mjs';
 import { recoveryVsLiveCommit } from './recovery-vs-live-commit.mjs';
@@ -15,42 +18,61 @@ import { queuedPastLease } from './queued-past-lease.mjs';
 import { secondExecutorTakeover } from './second-executor-takeover.mjs';
 import { vacuityAuthority } from './vacuity-authority.mjs';
 
-const skip = dbConfigured() ? false : 'no harness database in the environment';
+const ci = process.env.CI === 'true' || process.env.GITHUB_ACTIONS === 'true';
+const databaseReason = dbConfigured() ? null : 'no harness database in the environment';
+const rootReason = await rootProbeReason();
+const adminReason = await adminProbeReason();
 
 function check(result) {
   assert.equal(result.pass, true, JSON.stringify(result.detail));
   assertBounds(result.detail.bounds);
 }
 
-describe('T5c race battery', { concurrency: 1, skip, timeout: 180_000 }, () => {
-  test('death-before-commit', async () => {
+function ready(reasons) {
+  const missing = reasons.filter(Boolean);
+  if (missing.length && ci) assert.fail(`CI harness incomplete: ${missing.join('; ')}`);
+}
+
+describe('T5c race battery', { concurrency: 1, timeout: 180_000 }, () => {
+  test('death-before-commit', { skip: raceSkip([databaseReason, rootReason], ci) }, async () => {
+    ready([databaseReason, rootReason]);
     check(await deathBeforeCommit());
   });
-  test('lost-reply', async () => {
+  test('lost-reply', { skip: raceSkip([databaseReason, rootReason], ci) }, async () => {
+    ready([databaseReason, rootReason]);
     check(await lostReply());
   });
-  test('recovery-vs-live-commit', async () => {
+  test('recovery-vs-live-commit', { skip: raceSkip([databaseReason, rootReason], ci) }, async () => {
+    ready([databaseReason, rootReason]);
     check(await recoveryVsLiveCommit());
   });
-  test('healthy-long', async () => {
+  test('healthy-long', { skip: raceSkip([databaseReason, rootReason], ci) }, async () => {
+    ready([databaseReason, rootReason]);
     check(await healthyLong());
   });
-  test('heartbeat-behind-commit', async () => {
+  test('heartbeat-behind-commit', { skip: raceSkip([databaseReason, rootReason], ci) }, async () => {
+    ready([databaseReason, rootReason]);
     const result = await heartbeatBehindCommit();
     check(result);
     assert.equal(result.detail.boundMs, HEARTBEAT_BOUND_MS);
     assert.ok(result.detail.elapsedMs <= result.detail.boundMs);
   });
-  test('saturated-pool', async () => {
+  test('saturated-pool', { skip: raceSkip([databaseReason, rootReason, adminReason], ci) }, async () => {
+    ready([databaseReason, rootReason, adminReason]);
     check(await saturatedPool());
   });
-  test('queued-past-lease', async () => {
+  test('queued-past-lease', { skip: raceSkip([databaseReason], ci) }, async () => {
+    ready([databaseReason]);
     check(await queuedPastLease());
   });
-  test('second-executor-takeover', async () => {
+  test('second-executor-takeover', { skip: raceSkip([databaseReason, rootReason], ci) }, async () => {
+    ready([databaseReason, rootReason]);
     check(await secondExecutorTakeover());
   });
-  test('vacuity-authority fails when the ACTIVE predicate is removed', async () => {
+  test('vacuity-authority fails when the ACTIVE predicate is removed', {
+    skip: raceSkip([databaseReason, rootReason], ci),
+  }, async () => {
+    ready([databaseReason, rootReason]);
     const result = await vacuityAuthority();
     assert.equal(result.pass, false);
     assert.equal(result.exploit, true, JSON.stringify(result.detail));
