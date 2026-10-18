@@ -48,13 +48,27 @@ export function resetAbort() {
   aborted = false;
 }
 
+function directClient(extra = {}) {
+  const dsn = process.env.HARNESS_DIRECT_DSN;
+  if (dsn) return new pg.Client({ connectionString: dsn, ...extra });
+  return new pg.Client({
+    host: 'localhost',
+    port: 54320,
+    database: 'plerni',
+    user: 'plerni_app',
+    password: process.env.PLERNI_APP_PASSWORD,
+    ...extra,
+  });
+}
+
 function appClient(pooled, connectionTimeoutMillis = 0) {
   const timeout = connectionTimeoutMillis > 0 ? { connectionTimeoutMillis } : {};
-  const dsn = pooled ? process.env.HARNESS_POOLED_DSN : process.env.HARNESS_DIRECT_DSN;
+  if (!pooled) return directClient(timeout);
+  const dsn = process.env.HARNESS_POOLED_DSN;
   if (dsn) return new pg.Client({ connectionString: dsn, ...timeout });
   return new pg.Client({
     host: 'localhost',
-    port: pooled ? 54321 : 54320,
+    port: 54321,
     database: 'plerni',
     user: 'plerni_app',
     password: process.env.PLERNI_APP_PASSWORD,
@@ -70,34 +84,157 @@ export function openAppClient(kind = 'direct', connectionTimeoutMillis = 0) {
 }
 
 function destroy(client) {
-  client?.connection?.stream?.destroy();
+  try {
+    client?.connection?.stream?.destroy();
+  } catch {
+    // The socket is already gone.
+  }
 }
 
-// Cancel active work, drop idle transactions so their locks release, and close
-// every client this process opened. Callers await their own work promise after
-// this so renewal intervals cleared in finally have actually stopped.
-export async function abortInFlight() {
-  aborted = true;
-  const victims = [...live];
-  const killer = appClient(false);
-  try {
+// Direct connection only. statement_timeout is a startup parameter, not a
+// session SET, so a pooled server cannot reuse it. The outer cap destroys
+// the socket if connect or a statement ignores its own timeout.
+const KILL_MS = 2000;
+const KILL_CAP_MS = 3000;
+export const CLEANUP_MS = 3000;
+
+const CANCEL_SQL = `SELECT pg_cancel_backend(pid) FROM pg_stat_activity
+ WHERE pid <> pg_backend_pid() AND usename = current_user AND state = 'active'`;
+const TERMINATE_SQL = `SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+ WHERE pid <> pg_backend_pid() AND usename = current_user
+   AND state LIKE 'idle in transaction%'`;
+
+function defaultKiller() {
+  return directClient({
+    connectionTimeoutMillis: KILL_MS,
+    statement_timeout: KILL_MS,
+    query_timeout: KILL_MS,
+  });
+}
+
+let openKiller = defaultKiller;
+
+export function setKillerOpener(fn) {
+  openKiller = fn ?? defaultKiller;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export async function queryWithin(client, text, values, ms = KILL_MS) {
+  const query = client.query(text, values);
+  query.catch(() => {});
+  let timer;
+  const outcome = await Promise.race([
+    query.then((value) => ({ kind: 'value', value }), (error) => ({ kind: 'error', error })),
+    new Promise((resolve) => {
+      timer = setTimeout(() => {
+        destroy(client);
+        resolve({ kind: 'timeout' });
+      }, ms);
+    }),
+  ]);
+  clearTimeout(timer);
+  if (outcome.kind === 'value') return outcome.value;
+  if (outcome.kind === 'error') throw outcome.error;
+  await Promise.race([query.then(() => {}, () => {}), sleep(500)]);
+  throw new Error('deadline exceeded');
+}
+
+export async function endClient(client, ms = KILL_MS) {
+  if (!client) return;
+  let timer;
+  const ended = Promise.resolve().then(() => client.end()).catch(() => {});
+  await Promise.race([
+    ended,
+    new Promise((resolve) => {
+      timer = setTimeout(() => {
+        destroy(client);
+        resolve();
+      }, ms);
+    }),
+  ]);
+  clearTimeout(timer);
+  await Promise.race([ended, sleep(ms)]);
+}
+
+async function cancelBackends() {
+  const killer = openKiller();
+  const work = (async () => {
     await killer.connect();
-    await killer.query(
-      `SELECT pg_cancel_backend(pid) FROM pg_stat_activity
-       WHERE pid <> pg_backend_pid() AND usename = current_user AND state = 'active'`,
-    );
-    await killer.query(
-      `SELECT pg_terminate_backend(pid) FROM pg_stat_activity
-       WHERE pid <> pg_backend_pid() AND usename = current_user
-         AND state LIKE 'idle in transaction%'`,
-    );
-  } catch {
-    // The socket destroy below still unblocks a client the signal missed.
-  } finally {
-    await killer.end().catch(() => {});
-  }
-  for (const client of victims) destroy(client);
-  await Promise.all(victims.map((client) => client.end().catch(() => {})));
+    await killer.query(CANCEL_SQL);
+    await killer.query(TERMINATE_SQL);
+  })();
+  work.catch(() => {});
+  let timer;
+  await Promise.race([
+    work.then(() => 'done', () => 'done'),
+    new Promise((resolve) => {
+      timer = setTimeout(() => {
+        destroy(killer);
+        resolve('timeout');
+      }, KILL_CAP_MS);
+    }),
+  ]);
+  clearTimeout(timer);
+  await Promise.race([work.then(() => {}, () => {}), sleep(500)]);
+  await endClient(killer);
+}
+
+let aborting = null;
+
+// Destroy tracked sockets first so local waits unblock, then best-effort
+// cancel of backends the destroy did not reach. Callers await this before
+// the next race step. A second call waits for the one already running.
+export async function abortInFlight() {
+  if (aborting) return aborting;
+  aborting = (async () => {
+    aborted = true;
+    const victims = [...live];
+    for (const client of victims) destroy(client);
+    await cancelBackends();
+    await Promise.all(victims.map((client) => endClient(client)));
+  })().finally(() => {
+    aborting = null;
+  });
+  return aborting;
+}
+
+// Wait until `promise` settles. On the cap, cancel in-flight clients and
+// wait once more. A promise that is still pending after that is a leftover
+// handle, and the caller must not start the next race.
+export async function settleWithin(promise, ms, label) {
+  const tracked = Promise.resolve(promise);
+  tracked.catch(() => {});
+  const finished = tracked.then(() => 'done', () => 'done');
+  let timer;
+  const outcome = await Promise.race([
+    finished,
+    new Promise((resolve) => {
+      timer = setTimeout(() => resolve('timeout'), ms);
+    }),
+  ]);
+  clearTimeout(timer);
+  if (outcome === 'done') return;
+  await abortInFlight();
+  let again;
+  const retry = await Promise.race([
+    finished,
+    new Promise((resolve) => {
+      again = setTimeout(() => resolve('timeout'), ms);
+    }),
+  ]);
+  clearTimeout(again);
+  if (retry !== 'done') throw new Error(`cleanup leftover: ${label}`);
+}
+
+export async function settleAll(tasks) {
+  const settled = await Promise.allSettled(
+    tasks.map(([label, promise]) => settleWithin(promise, CLEANUP_MS, label)),
+  );
+  const missed = settled.find((item) => item.status === 'rejected');
+  if (missed) throw missed.reason;
 }
 
 // Holds the fencing row so production updates queue behind it. Release commits
@@ -112,12 +249,22 @@ export async function holdRow(id) {
     async release() {
       if (released) return;
       released = true;
+      let timer;
+      const committed = client.query('COMMIT');
+      committed.catch(() => {});
       try {
-        await client.query('COMMIT');
-      } catch {
-        destroy(client);
+        await Promise.race([
+          committed,
+          new Promise((resolve) => {
+            timer = setTimeout(() => {
+              destroy(client);
+              resolve();
+            }, KILL_MS);
+          }),
+        ]);
       } finally {
-        await client.end().catch(() => {});
+        clearTimeout(timer);
+        await endClient(client);
       }
     },
   };
@@ -142,7 +289,7 @@ export async function vacuousCommit(id, token, effectsFn) {
     if (!(err instanceof FencedError)) await client.query('ROLLBACK').catch(() => {});
     throw err;
   } finally {
-    await client.end().catch(() => {});
+    await endClient(client);
   }
 }
 
@@ -153,6 +300,6 @@ export async function vacuousSweep(id) {
     const updated = await client.query(VACUOUS_SWEEP_SQL, [LEASE_MS / 1000, id]);
     return updated.rows.map((row) => row.id);
   } finally {
-    await client.end().catch(() => {});
+    await endClient(client);
   }
 }

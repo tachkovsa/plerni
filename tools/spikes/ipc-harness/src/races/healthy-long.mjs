@@ -15,7 +15,7 @@ import {
   startSweeper,
 } from '../authority.mjs';
 import { assertBounds, steps } from './clock.mjs';
-import { CADENCE_MS, LEASE_MS, isAborted } from './control.mjs';
+import { CADENCE_MS, LEASE_MS, abortInFlight, isAborted } from './control.mjs';
 import { commitMetrics, commitReportHeld, countEffects, ensureEffects, insertEffect, quietRenew } from './support.mjs';
 
 const OPEN_MIN_MS = 25_000;
@@ -70,6 +70,7 @@ async function positive(timing) {
     if (!fenced) throw err;
   } finally {
     stop();
+    await abortInFlight();
   }
   const increasing = beats.every((beat, index) => index === 0 || beat > beats[index - 1]);
   return {
@@ -94,6 +95,7 @@ async function suppressed(timing) {
   let committed = false;
   let fenced = false;
   let abandoned = false;
+  let abandonedAtMs = null;
   try {
     const result = await timing.run(() => commitExecution(id, token, async (client) => {
       await insertEffect(client, id, 'long');
@@ -101,7 +103,13 @@ async function suppressed(timing) {
       for (;;) {
         if (isAborted()) throw new Error('aborted');
         const row = await getStatus(id, true);
-        if (row?.status === 'ABANDONED') abandoned = true;
+        if (row?.status === 'ABANDONED' && abandonedAtMs === null) {
+          abandonedAtMs = Date.now() - opened;
+          abandoned = true;
+          if (abandonedAtMs < LEASE_MS) {
+            throw new Error(`suppressed row abandoned at ${abandonedAtMs}ms, before the ${LEASE_MS}ms lease`);
+          }
+        }
         if (row?.status === 'COMMITTED') throw new Error('suppressed execution committed');
         const visible = await countEffects(id, 'long');
         if (visible !== 0) throw new Error('uncommitted effect was visible');
@@ -119,11 +127,13 @@ async function suppressed(timing) {
     if (!fenced) throw err;
   } finally {
     stop();
+    await abortInFlight();
   }
   return {
     committed,
     fenced,
     abandoned,
+    abandonedAtMs,
     wallMs,
     status: (await timing.run(() => getStatus(id, true), 'suppressed status'))?.status ?? null,
     effects: await timing.run(() => countEffects(id, 'long'), 'suppressed effects'),
@@ -162,6 +172,7 @@ export async function healthyLong() {
     && dropped.committed === false
     && dropped.fenced === true
     && dropped.abandoned === true
+    && dropped.abandonedAtMs >= LEASE_MS
     && dropped.wallMs > LEASE_MS
     && dropped.status === 'ABANDONED'
     && dropped.effects === 0;

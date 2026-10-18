@@ -5,7 +5,7 @@
 
 import { createExecution, dispatch, getStatus, sweepAbandoned } from '../authority.mjs';
 import { assertBounds, steps } from './clock.mjs';
-import { openAppClient } from './control.mjs';
+import { endClient, openAppClient } from './control.mjs';
 import { countEffects, ensureEffects, expireHeartbeat, insertEffect, killClient } from './support.mjs';
 
 export async function deathBeforeCommit() {
@@ -28,7 +28,7 @@ export async function deathBeforeCommit() {
     await timing.run(() => killClient(client), 'kill executor', 8000);
   } finally {
     client.connection?.stream?.destroy();
-    await client.end().catch(() => {});
+    await endClient(client);
   }
 
   const afterDeath = await timing.run(() => getStatus(id, true), 'status after death');

@@ -4,7 +4,7 @@
 // migration and it is not part of the fencing authority schema.
 
 import pg from 'pg';
-import { CADENCE_MS, LEASE_MS, isAborted, openAppClient } from './control.mjs';
+import { CADENCE_MS, LEASE_MS, endClient, isAborted, openAppClient, queryWithin } from './control.mjs';
 
 let effectsReady;
 
@@ -80,7 +80,7 @@ export async function probeConnection(open, query, boundMs = PROBE_MS) {
     return 'connection failed';
   } finally {
     clearTimeout(timer);
-    await client.end().catch(() => {});
+    await endClient(client);
   }
 }
 
@@ -159,7 +159,7 @@ export async function ensureEffects() {
       )`);
       await c.query('GRANT SELECT, INSERT ON spike_ipc_effect TO plerni_app');
     } finally {
-      await c.end();
+      await endClient(c);
     }
   })();
   return effectsReady;
@@ -171,7 +171,7 @@ export async function withDirect(fn) {
   try {
     return await fn(c);
   } finally {
-    await c.end();
+    await endClient(c);
   }
 }
 
@@ -264,7 +264,8 @@ export async function waitForQueryLock(fragment, deadlineMs = 5000) {
   try {
     while (Date.now() - started < deadlineMs) {
       if (isAborted()) throw new Error('aborted');
-      const r = await c.query(
+      const r = await queryWithin(
+        c,
         `SELECT pid FROM pg_stat_activity
          WHERE pid <> pg_backend_pid()
            AND wait_event_type = 'Lock'
@@ -276,6 +277,6 @@ export async function waitForQueryLock(fragment, deadlineMs = 5000) {
     }
     throw new Error(`deadline: no lock wait matching ${fragment}`);
   } finally {
-    await c.end();
+    await endClient(c);
   }
 }

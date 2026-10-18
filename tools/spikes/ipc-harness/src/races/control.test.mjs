@@ -1,7 +1,8 @@
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { CADENCE_MS, VACUOUS_COMMIT_SQL, VACUOUS_SWEEP_SQL } from './control.mjs';
+import pg from 'pg';
+import { CADENCE_MS, VACUOUS_COMMIT_SQL, VACUOUS_SWEEP_SQL, abortInFlight, setKillerOpener } from './control.mjs';
 import { recoveryRaceHeld } from './recovery-vs-live-commit.mjs';
 import { commitReportHeld, directProbeReason, probeConnection, raceSkip, runningInCi } from './support.mjs';
 
@@ -23,6 +24,64 @@ test('vacuity statements drop the ACTIVE predicate and the harness sets no sessi
   for (const word of ['requireActive', 'renewBehindLock', 'afterLock', 'afterCommit', 'openHarnessClient', 'committedUpdateSql']) {
     assert.equal(authority.includes(word), false, word);
   }
+});
+
+test('abort destroys tracked sockets before a stalled killer and still returns', async () => {
+  const order = [];
+  const victim = new pg.Client({
+    host: 'localhost',
+    port: 1,
+    database: 'plerni',
+    user: 'x',
+    password: 'x',
+    connectionTimeoutMillis: 200,
+  });
+  victim.connection = {
+    stream: { destroy() { order.push('victim'); } },
+  };
+  let releaseConnect;
+  const killer = {
+    connection: {
+      stream: {
+        destroy() {
+          order.push('killer');
+          releaseConnect?.();
+        },
+      },
+    },
+    connect() {
+      order.push('connect');
+      return new Promise((resolve) => {
+        releaseConnect = resolve;
+      });
+    },
+    async query() {
+      throw new Error('killer query is not required');
+    },
+    async end() {
+      order.push('end');
+    },
+  };
+  setKillerOpener(() => killer);
+  const started = Date.now();
+  try {
+    await abortInFlight();
+  } finally {
+    setKillerOpener(null);
+    await victim.end().catch(() => {});
+  }
+  assert.ok(order.indexOf('victim') >= 0);
+  assert.ok(order.indexOf('victim') < order.indexOf('connect'));
+  assert.ok(order.includes('killer'));
+  assert.ok(Date.now() - started < 5000);
+  const source = readFileSync(new URL('./control.mjs', import.meta.url), 'utf8');
+  const body = source.slice(
+    source.indexOf('export async function abortInFlight'),
+    source.indexOf('export async function settleWithin'),
+  );
+  assert.ok(body.indexOf('destroy(client)') < body.indexOf('await cancelBackends()'));
+  assert.match(source, /connectionTimeoutMillis: KILL_MS/);
+  assert.match(source, /statement_timeout: KILL_MS/);
 });
 
 test('the recovery oracle accepts one winner and rejects a rewritten terminal row', () => {

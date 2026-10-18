@@ -10,7 +10,7 @@
 import { randomUUID } from 'node:crypto';
 import { commitExecution, createExecution, dispatch, getStatus, sweepAbandoned } from '../authority.mjs';
 import { assertBounds, deferred, steps, withDeadline } from './clock.mjs';
-import { CADENCE_MS, LEASE_MS, abortInFlight, isAborted, openAppClient } from './control.mjs';
+import { CADENCE_MS, LEASE_MS, abortInFlight, endClient, isAborted, openAppClient, settleAll } from './control.mjs';
 import { commitMetrics, commitReportHeld, countEffects, ensureEffects, insertEffect, openAdminClient } from './support.mjs';
 
 const POOL_PIN = 10;
@@ -149,12 +149,13 @@ export async function saturatedPool() {
     watcher = (async () => {
       while (watch) {
         if (isAborted()) return;
-        const swept = await withDeadline(
-          sweepAbandoned(true),
-          5_000,
-          'saturation sweep',
-          () => { abortInFlight().catch(() => {}); },
-        );
+        let swept;
+        try {
+          swept = await withDeadline(sweepAbandoned(true), 5_000, 'saturation sweep');
+        } catch (err) {
+          await abortInFlight();
+          throw err;
+        }
         for (const item of executors) {
           if (item.id && swept.includes(item.id)) sweptDuring += 1;
         }
@@ -251,16 +252,17 @@ export async function saturatedPool() {
     watch = false;
     saturated.resolve();
     release.resolve();
+    const tasks = [
+      ['saturation watcher', watcher],
+      ['saturation probe', probeDone],
+      ...executors.map((item) => [`saturation executor ${item.index}`, item.done]),
+    ];
     try {
-      await withDeadline(
-        Promise.allSettled([watcher, probeDone, ...executors.map((item) => item.done)]),
-        8_000,
-        'saturation cleanup',
-        () => { abortInFlight().catch(() => {}); },
-      );
+      await abortInFlight();
+      await settleAll(tasks);
     } finally {
-      if (probe) await probe.end().catch(() => {});
-      await admin.end().catch(() => {});
+      if (probe) await endClient(probe);
+      await endClient(admin);
     }
   }
 }

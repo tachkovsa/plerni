@@ -71,7 +71,7 @@ test('steps.run awaits the default canceller before rejecting', () => {
   const cancel = source.slice(source.indexOf('async function cancelStep'), source.indexOf('export const COMPLETION_BOUND_MS'));
   assert.match(cancel, /await abortInFlight\(\)/);
   const run = source.slice(source.indexOf('async run('), source.indexOf('export function assertBounds'));
-  assert.match(run, /await cancelStep\(\);\s*await task;/);
+  assert.match(run, /await cancelStep\(\);\s*await settleWithin\(task,/);
   assert.equal(run.includes('onTimeout'), false);
 });
 

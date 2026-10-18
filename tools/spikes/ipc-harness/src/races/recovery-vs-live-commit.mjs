@@ -17,7 +17,7 @@ import {
   sweepAbandoned,
 } from '../authority.mjs';
 import { assertBounds, steps } from './clock.mjs';
-import { holdRow } from './control.mjs';
+import { holdRow, settleAll } from './control.mjs';
 import { commitMetrics, commitReportHeld, countEffects, ensureEffects, expireHeartbeat, insertEffect, quietRenew, waitForQueryLock } from './support.mjs';
 
 const RACE_BOUND_MS = 15_000;
@@ -87,7 +87,10 @@ async function executorWins(timing, authority) {
     };
   } finally {
     await barrier.release().catch(() => {});
-    await Promise.allSettled([commitP, sweepP]);
+    await settleAll([
+      ['recovery commit', commitP],
+      ['recovery sweep', sweepP],
+    ]);
   }
 }
 
@@ -127,7 +130,10 @@ async function sweeperWins(timing, authority) {
     };
   } finally {
     await barrier.release().catch(() => {});
-    await Promise.allSettled([commitP, sweepP]);
+    await settleAll([
+      ['recovery commit', commitP],
+      ['recovery sweep', sweepP],
+    ]);
   }
 }
 

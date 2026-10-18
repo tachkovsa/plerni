@@ -3,7 +3,7 @@
 // production executor. Advancing the clock fires due timers and waits for
 // their async work.
 
-import { abortInFlight, resetAbort } from './control.mjs';
+import { abortInFlight, resetAbort, settleWithin, CLEANUP_MS } from './control.mjs';
 
 export const RACE_EPOCH_MS = Date.UTC(2026, 0, 1);
 
@@ -156,7 +156,7 @@ export function steps(ms = COMPLETION_BOUND_MS) {
       const elapsedMs = Date.now() - started;
       if (outcome.kind === 'timeout') {
         await cancelStep();
-        await task;
+        await settleWithin(task, CLEANUP_MS, label);
         throw new Error(`deadline exceeded: ${label} (bound ${boundMs}ms)`);
       }
       if (outcome.kind === 'value') {

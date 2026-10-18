@@ -5,7 +5,7 @@
 import { describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { assertBounds } from './clock.mjs';
-import { CADENCE_MS } from './control.mjs';
+import { CADENCE_MS, LEASE_MS, abortInFlight } from './control.mjs';
 import { adminProbeReason, commitReportHeld, directProbeReason, pooledProbeReason, raceSkip, rootProbeReason, runningInCi } from './support.mjs';
 import { deathBeforeCommit } from './death-before-commit.mjs';
 import { lostReply } from './lost-reply.mjs';
@@ -34,26 +34,39 @@ function ready(reasons) {
   if (missing.length && ci) assert.fail(`CI harness incomplete: ${missing.join('; ')}`);
 }
 
+async function runRace(work) {
+  try {
+    return await work();
+  } finally {
+    await abortInFlight();
+  }
+}
+
 describe('T5c race battery', { concurrency: 1, timeout: 180_000 }, () => {
   test('death-before-commit', { skip: raceSkip([directReason, rootReason], ci) }, async () => {
     ready([directReason, rootReason]);
-    check(await deathBeforeCommit());
+    check(await runRace(() => deathBeforeCommit()));
   });
   test('lost-reply', { skip: raceSkip([directReason, rootReason], ci) }, async () => {
     ready([directReason, rootReason]);
-    check(await lostReply());
+    check(await runRace(() => lostReply()));
   });
   test('recovery-vs-live-commit', { skip: raceSkip([directReason, rootReason], ci) }, async () => {
     ready([directReason, rootReason]);
-    check(await recoveryVsLiveCommit());
+    check(await runRace(() => recoveryVsLiveCommit()));
   });
   test('healthy-long', { skip: raceSkip([directReason, rootReason], ci) }, async () => {
     ready([directReason, rootReason]);
-    check(await healthyLong());
+    const result = await runRace(() => healthyLong());
+    check(result);
+    assert.ok(result.detail.positive.wallMs >= 25_000);
+    assert.ok(result.detail.positive.wallMs <= 30_000);
+    assert.ok(result.detail.positive.wallMs > LEASE_MS);
+    assert.ok(result.detail.suppressed.abandonedAtMs >= LEASE_MS);
   });
   test('stalled shutdown fails the renewal-to-lock oracle', { skip: raceSkip([directReason], ci) }, async () => {
     ready([directReason]);
-    const result = await stalledShutdown();
+    const result = await runRace(() => stalledShutdown());
     assert.equal(result.pass, false, JSON.stringify(result.detail));
     assert.equal(result.detail.committed, true);
     assert.equal(result.detail.boundViolation, true);
@@ -66,28 +79,35 @@ describe('T5c race battery', { concurrency: 1, timeout: 180_000 }, () => {
   });
   test('heartbeat-behind-commit', { skip: raceSkip([directReason, rootReason], ci) }, async () => {
     ready([directReason, rootReason]);
-    const result = await heartbeatBehindCommit();
+    const result = await runRace(() => heartbeatBehindCommit());
     check(result);
     assert.equal(result.detail.boundMs, HEARTBEAT_BOUND_MS);
     assert.ok(result.detail.elapsedMs <= result.detail.boundMs);
   });
   test('saturated-pool', { skip: raceSkip([directReason, pooledReason, rootReason, adminReason], ci) }, async () => {
     ready([directReason, pooledReason, rootReason, adminReason]);
-    check(await saturatedPool());
+    const result = await runRace(() => saturatedPool());
+    check(result);
+    assert.equal(result.detail.executors, 10);
+    for (const report of result.detail.reports) {
+      assert.ok(report.holdMs > LEASE_MS);
+      assert.equal(report.boundViolation, false);
+      assert.ok(report.lastRenewalToLockMs <= CADENCE_MS);
+    }
   });
   test('queued-past-lease', { skip: raceSkip([directReason], ci) }, async () => {
     ready([directReason]);
-    check(await queuedPastLease());
+    check(await runRace(() => queuedPastLease()));
   });
   test('second-executor-takeover', { skip: raceSkip([directReason, rootReason], ci) }, async () => {
     ready([directReason, rootReason]);
-    check(await secondExecutorTakeover());
+    check(await runRace(() => secondExecutorTakeover()));
   });
   test('vacuity-authority fails when the ACTIVE predicate is removed', {
     skip: raceSkip([directReason, rootReason], ci),
   }, async () => {
     ready([directReason, rootReason]);
-    const result = await vacuityAuthority();
+    const result = await runRace(() => vacuityAuthority());
     assert.equal(result.real.pass, true, JSON.stringify(result.real.detail));
     assert.equal(commitReportHeld(result.real.detail.executor), true, JSON.stringify(result.real.detail.executor));
     assert.equal(result.open.pass, false, JSON.stringify(result.open.detail));
