@@ -4,12 +4,37 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  committedUpdateSql,
+  renewUpdateSql,
+  sweepUpdateSql,
   createExecution,
   dispatch,
   commitExecution,
   getStatus,
   renewExecution,
 } from './authority.mjs';
+
+test('production authority SQL keeps the ACTIVE predicate', () => {
+  assert.equal(
+    committedUpdateSql(),
+    "UPDATE fencing_authority SET status = 'COMMITTED' WHERE id = $1 AND token = $2 AND status = 'ACTIVE' RETURNING clock_timestamp() AS locked_at",
+  );
+  assert.equal(
+    renewUpdateSql(),
+    "UPDATE fencing_authority SET heartbeat_at = clock_timestamp() WHERE id = $1 AND token = $2 AND status = 'ACTIVE' RETURNING clock_timestamp() AS renewed_at",
+  );
+  assert.equal(
+    sweepUpdateSql(),
+    "UPDATE fencing_authority SET status = 'ABANDONED' WHERE status = 'ACTIVE' AND heartbeat_at < now() - make_interval(secs => $1) RETURNING id",
+  );
+  assert.equal(
+    sweepUpdateSql({ clocked: true, scoped: true }),
+    "UPDATE fencing_authority SET status = 'ABANDONED' WHERE status = 'ACTIVE' AND heartbeat_at < $2::timestamptz - make_interval(secs => $1) AND id = $3 RETURNING id",
+  );
+  assert.equal(committedUpdateSql({ requireActive: false }).includes("status = 'ACTIVE'"), false);
+  assert.equal(sweepUpdateSql({ requireActive: false }).includes("status = 'ACTIVE'"), false);
+  assert.throws(() => committedUpdateSql({ tag: '1; drop' }), /sql tag/);
+});
 
 const hasDb = Boolean(process.env.HARNESS_DIRECT_DSN || process.env.PLERNI_APP_PASSWORD);
 const db = { skip: hasDb ? false : 'no harness database in the environment' };
