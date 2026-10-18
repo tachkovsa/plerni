@@ -86,6 +86,17 @@ export async function adminProbeReason() {
   return failed ? `PgBouncer admin ${failed}` : null;
 }
 
+// Fail closed on any CI marker except an absent, empty, '0', or 'false' CI
+// value. A non-empty GITHUB_ACTIONS is itself a marker. There is no shared
+// detector in the repo; the benchmark records GITHUB_ACTIONS === 'true' only
+// as a measurement label.
+export function runningInCi(env = process.env) {
+  const marker = env.CI;
+  if (marker != null && marker !== '' && marker !== '0' && marker !== 'false') return true;
+  const actions = env.GITHUB_ACTIONS;
+  return actions != null && actions !== '';
+}
+
 // Local runs skip a case whose service is missing. CI is expected to have
 // the harness, so a missing service stays runnable and the test fails.
 export function raceSkip(missing, ci) {

@@ -7,7 +7,7 @@ import { describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { dbConfigured } from '../supervisor.mjs';
 import { assertBounds } from './clock.mjs';
-import { adminProbeReason, raceSkip, rootProbeReason } from './support.mjs';
+import { adminProbeReason, raceSkip, rootProbeReason, runningInCi } from './support.mjs';
 import { deathBeforeCommit } from './death-before-commit.mjs';
 import { lostReply } from './lost-reply.mjs';
 import { recoveryVsLiveCommit } from './recovery-vs-live-commit.mjs';
@@ -18,7 +18,7 @@ import { queuedPastLease } from './queued-past-lease.mjs';
 import { secondExecutorTakeover } from './second-executor-takeover.mjs';
 import { vacuityAuthority } from './vacuity-authority.mjs';
 
-const ci = process.env.CI === 'true' || process.env.GITHUB_ACTIONS === 'true';
+const ci = runningInCi();
 const databaseReason = dbConfigured() ? null : 'no harness database in the environment';
 const rootReason = await rootProbeReason();
 const adminReason = await adminProbeReason();

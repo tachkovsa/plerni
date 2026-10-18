@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { VACUOUS_COMMIT_SQL, VACUOUS_SWEEP_SQL } from './control.mjs';
-import { raceSkip } from './support.mjs';
+import { raceSkip, runningInCi } from './support.mjs';
 
 const PRODUCTION_COMMIT = "UPDATE fencing_authority SET status = 'COMMITTED' WHERE id = $1 AND token = $2 AND status = 'ACTIVE' RETURNING clock_timestamp() AS locked_at";
 const PRODUCTION_SWEEP = "UPDATE fencing_authority SET status = 'ABANDONED' WHERE status = 'ACTIVE' AND heartbeat_at < now() - make_interval(secs => $1) RETURNING id";
@@ -32,4 +32,17 @@ test('a missing race service skips locally and fails closed in CI', () => {
     'no root connection configured; no PgBouncer admin connection configured',
   );
   assert.equal(raceSkip(['no root connection configured'], true), false);
+});
+
+test('any CI marker except empty, 0, or false fails closed', () => {
+  assert.equal(runningInCi({ CI: '1' }), true);
+  assert.equal(runningInCi({ CI: 'true' }), true);
+  assert.equal(runningInCi({ CI: '' }), false);
+  assert.equal(runningInCi({}), false);
+  assert.equal(runningInCi({ CI: '0' }), false);
+  assert.equal(runningInCi({ CI: 'false' }), false);
+  assert.equal(runningInCi({ GITHUB_ACTIONS: 'true' }), true);
+  assert.equal(runningInCi({ GITHUB_ACTIONS: '1' }), true);
+  assert.equal(runningInCi({ GITHUB_ACTIONS: '' }), false);
+  assert.equal(runningInCi({ CI: 'false', GITHUB_ACTIONS: 'true' }), true);
 });
