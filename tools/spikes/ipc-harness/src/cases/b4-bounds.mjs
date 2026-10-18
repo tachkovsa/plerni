@@ -29,12 +29,14 @@ async function roundTrip(stub, credential) {
 
 export async function b4() {
   const detail = {};
-  // The partial cap sits on the framer ceiling. This case proves the framer's
-  // typed NdjsonOversizeError. A lower cap faults earlier as partial-cap.
+  // The framer throws only once the residual is greater than HARD_FRAME + 1.
+  // The partial cap is that same threshold, so feed() throws NdjsonOversizeError
+  // before the supervisor can fault partial-cap, for any stdout chunk size.
   // Total is above 1 MiB so the per-plugin byte pause is not what rejects it.
+  const partialCap = HARD_FRAME + 1;
   const pair = await connectPair({
     sweeper: false,
-    caps: { partial: HARD_FRAME, total: 8 * 1024 * 1024, totalGlobal: 8 * 1024 * 1024 },
+    caps: { partial: partialCap, total: 8 * 1024 * 1024, totalGlobal: 8 * 1024 * 1024 },
   });
   try {
     const good = pair.sup.spawn({ pluginId: 'good', script: echoPath });
@@ -59,6 +61,7 @@ export async function b4() {
     detail.neverTerminated = {
       code: ntFault?.code ?? null,
       pendingBytes: ntFault?.pendingBytes ?? null,
+      pastFramer: Boolean(ntFault) && ntFault.pendingBytes > HARD_FRAME + 1,
       bounded: Boolean(ntFault) && ntFault.pendingBytes < HARD_FRAME * 2,
       siblingRoundTrip: await roundTrip(pair.stub, good.credential),
     };
@@ -85,6 +88,7 @@ export async function b4() {
       && detail.malformed.processAlive
       && detail.malformed.siblingRoundTrip
       && detail.neverTerminated.code === 'NdjsonOversizeError'
+      && detail.neverTerminated.pastFramer
       && detail.neverTerminated.bounded
       && detail.neverTerminated.siblingRoundTrip
       && detail.oversize.code === 'MuxOversizeError'

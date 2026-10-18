@@ -110,7 +110,11 @@ describe('T5c race battery', { concurrency: 1, timeout: 180_000 }, () => {
     check(result);
     assert.equal(result.detail.revokerWaitedOnLock, true);
     assert.equal(result.detail.waitEvent, 'transactionid');
-    assert.equal(result.detail.winners, 1);
+    assert.equal(result.detail.commit, true);
+    assert.equal(result.detail.cancelWon, false);
+    assert.equal(result.detail.fenced, false);
+    assert.equal(result.detail.status, 'COMMITTED');
+    assert.ok(result.detail.bounds.some((item) => item.label === 'revoker settled'));
   });
   test('commit-vs-revoke overlap oracle fails when the revoker does not wait', {
     skip: raceSkip([directReason, pooledReason], ci),

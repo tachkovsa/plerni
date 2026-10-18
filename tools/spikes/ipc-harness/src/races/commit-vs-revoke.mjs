@@ -1,7 +1,7 @@
 // commit-vs-revoke: the executor holds the fencing row with SELECT FOR UPDATE
 // inside the effects transaction, and the revoker issues CANCELLED on a second
-// pooled connection. The revoker waits on Lock / transactionid. Releasing the
-// transaction lets exactly one status transition win. No deadlock.
+// pooled connection. The revoker waits on Lock / transactionid. The executor
+// already holds the lock, so the commit wins and the cancel loses. No deadlock.
 
 import { randomUUID } from 'node:crypto';
 import {
@@ -16,6 +16,7 @@ import { assertBounds, steps } from './clock.mjs';
 import { endClient, isAborted, openAppClient, queryWithin } from './control.mjs';
 
 const USE_DIRECT = false;
+const RACE_BOUND_MS = 15_000;
 
 async function waitForCancelLock(deadlineMs = 8_000) {
   const client = openAppClient('direct');
@@ -41,13 +42,16 @@ async function waitForCancelLock(deadlineMs = 8_000) {
   }
 }
 
+// The executor acquired the row lock before the revoker started, so the
+// commit is the only accepted winner. A cancel that wins means the effects
+// transaction did not keep the lock it had already shown as held.
 export function overlapHeld(row) {
-  const commitWon = row.commit === true && row.cancelWon === false && row.status === 'COMMITTED';
-  const cancelWon = row.commit === false && row.cancelWon === true && row.fenced === true && row.status === 'CANCELLED';
   return row.revokerWaitedOnLock === true
     && row.waitEvent === 'transactionid'
-    && row.winners === 1
-    && (commitWon || cancelWon);
+    && row.commit === true
+    && row.fenced === false
+    && row.cancelWon === false
+    && row.status === 'COMMITTED';
 }
 
 export async function commitVsRevoke() {
@@ -60,22 +64,22 @@ export async function commitVsRevoke() {
   let cancelP = null;
   let commit = false;
   let fenced = false;
+  let commitError = null;
   try {
     await timing.run(() => commitExecution(id, token, async (client) => {
       await client.query('SELECT id FROM fencing_authority WHERE id = $1 FOR UPDATE', [id]);
-      cancelP = cancelExecution(id, USE_DIRECT).then((won) => {
-        cancelWon = won;
-        return won;
-      });
+      cancelP = cancelExecution(id, USE_DIRECT);
       cancelP.catch(() => {});
       waitEvent = await waitForCancelLock();
-    }, USE_DIRECT), 'overlap commit', 15_000);
+    }, USE_DIRECT), 'overlap commit', RACE_BOUND_MS);
     commit = true;
   } catch (err) {
     fenced = err instanceof FencedError;
-    if (!fenced) throw err;
+    if (!fenced) commitError = err;
+  } finally {
+    if (cancelP) cancelWon = await timing.run(() => cancelP, 'revoker settled', RACE_BOUND_MS);
   }
-  if (cancelP) await cancelP;
+  if (commitError) throw commitError;
   const status = await timing.run(() => getStatus(id, USE_DIRECT), 'status');
   const detail = {
     commit,
@@ -84,15 +88,15 @@ export async function commitVsRevoke() {
     status: status?.status ?? null,
     revokerWaitedOnLock: waitEvent != null,
     waitEvent,
-    winners: Number(commit) + Number(cancelWon === true),
     bounds: timing.bounds,
   };
   assertBounds(detail.bounds);
   return { pass: overlapHeld(detail), detail };
 }
 
-// The same oracle, with the cancel finished before the executor starts.
-// Nothing waits on the row lock, so a passing overlap result cannot be this run.
+// Cancel finishes before the executor starts. The overlap oracle requires the
+// commit to win after a lock wait, so this run fails it. The cancel is the
+// outcome of this run.
 export async function commitVsRevokeVacuity() {
   const timing = steps();
   const token = `overlap-open-${randomUUID()}`;
@@ -119,7 +123,6 @@ export async function commitVsRevokeVacuity() {
     status: status?.status ?? null,
     revokerWaitedOnLock: false,
     waitEvent: null,
-    winners: Number(commit) + Number(cancelWon === true),
     bounds: timing.bounds,
   };
   assertBounds(detail.bounds);

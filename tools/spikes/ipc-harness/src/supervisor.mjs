@@ -699,8 +699,9 @@ export class Supervisor {
     }
     // An unfinished frame cannot shrink. Pausing would wait for bytes that
     // only make it larger. The slice already fed is the only overshoot past
-    // the configured cap. The framer still throws NdjsonOversizeError at its
-    // own ceiling when this cap sits at or above that ceiling.
+    // the configured cap. The framer throws NdjsonOversizeError only once the
+    // residual is greater than HARD_FRAME + 1, so a cap of at least that
+    // value makes feed() throw before this fault, for any chunk size.
     if (rec.framer.pendingBytes() > this.partialHighWater) {
       this.caps.partial = true;
       if (this.enforcePartial) {
