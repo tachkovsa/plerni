@@ -1,8 +1,8 @@
 # Spike rerun evidence (2026-10-18)
 
-Backing lines for `2026-10-18-spike-a-report.md` and `2026-10-18-spike-b-report.md`. Dev SHA `1b1f536c6fa874369ce1d30e9337f4224961be93`. Node v24.22.0. PostgreSQL 18.6, PgBouncer 1.26.0, `pool_mode=transaction`, `max_prepared_statements=0`. JSONL stays gitignored. Passwords are not recorded.
+Backing lines for `2026-10-18-spike-a-report.md` and `2026-10-18-spike-b-report.md`. The A1–A4 suite and the B3 rerun are `0ed56fad9a7bfae4ed054c71f23a08484ecccb77`. B1, B2, B4, B5, B6, and the race battery stay dev `1b1f536c6fa874369ce1d30e9337f4224961be93`. Node v24.22.0. PostgreSQL 18.6, PgBouncer 1.26.0, `pool_mode=transaction`, `max_prepared_statements=0`. JSONL stays gitignored. Passwords are not recorded.
 
-Review receipt: pending (δ, cross-family).
+Review receipt: REV-T6-2026-10-19-9cf9740 covers the `1b1f536` lines and the A5 citation. The `0ed56fa` lines are pending (δ).
 
 ## Suite commands
 
@@ -12,7 +12,7 @@ From a clean worktree of that SHA, after the four harness passwords are exported
 cd tools/harness && ./reset.sh && cd ../.. && node tools/harness/seed.mjs && pnpm --filter @plerni-spike/db-invariant spike
 ```
 
-Scored result: exit 0, 9249 ms, 0 failing cases, 38 JSONL rows. An earlier invocation on dev `3de0b5b28130960eb8a3df5bc7ea28c4164b9766` exited 1 with `client_login_timeout (server down)` before any pooled case. That run is the invalid-run record in the A report. It is not a verdict.
+Scored result on `0ed56fad9a7bfae4ed054c71f23a08484ecccb77`: exit 0, 7973 ms, 0 failing cases, 39 JSONL rows. An earlier invocation on dev `3de0b5b28130960eb8a3df5bc7ea28c4164b9766` exited 1 with `client_login_timeout (server down)` before any pooled case. That run is the invalid-run record in the A report. It is not a verdict.
 
 ```bash
 cd tools/harness && ./reset.sh && cd ../.. && node tools/harness/seed.mjs && pnpm --filter @plerni-spike/ipc-harness spike && pnpm --filter @plerni-spike/ipc-harness test && pnpm --filter @plerni-spike/ipc-harness test:races
@@ -23,23 +23,28 @@ cd tools/harness && ./reset.sh && cd ../.. && node tools/harness/seed.mjs && pnp
 ## A1–A4 and the battery
 
 ```text
-[PASS] A1 @ direct — {"via":"kysely","runs":[[28102,28102,28102],[28103,28103,28103],[28107,28107,28107],[28104,28104,28104],[28105,28105,28105],[28106,28106,28106],[28109,28109,28109],[28108,28108,28108]]}
-[PASS] A1 @ pooled — {"via":"kysely","runs":[[28115,28115,28115],[28111,28111,28111],[28113,28113,28113],[28114,28114,28114],[28110,28110,28110],[28110,28110,28110],[28111,28111,28111],[28112,28112,28112]]}
-[PASS] A1 @ direct (raw-pg control) — {"via":"raw-pg","runs":[[28121,28121,28121],[28116,28116,28116],[28119,28119,28119],[28117,28117,28117],[28118,28118,28118],[28120,28120,28120],[28122,28122,28122],[28123,28123,28123]]}
-[PASS] A3 A1 pinning @ pooled — {"statementsPerTransaction":3,"concurrent":8,"runs":[[28110,28110,28110],[28111,28111,28111],[28112,28112,28112],[28111,28111,28111],[28112,28112,28112],[28113,28113,28113],[28113,28113,28113],[28110,28110,28110]]}
-[PASS] A3 mid-transaction error rollback @ pooled — {"code":"22012","installedPid":28140,"after":{"pid":28140,"absent":true,"rows":0,"guard":true}}
-[PASS] A3 contamination lifecycle @ pooled — {"detectedOnExecutingBackend":true,"terminatedAndGone":true,"absenceOnReplacement":true,"positiveControl":true,"retries":1,"boundedRetry":true,"cleanupMs":26,"deadPid":28142,"backendGoneMs":6,"replacementPid":28144}
+[PASS] A1 @ direct — {"via":"kysely","runs":[[43865,43865,43865],[43867,43867,43867],[43866,43866,43866],[43869,43869,43869],[43870,43870,43870],[43868,43868,43868],[43871,43871,43871],[43872,43872,43872]]}
+[PASS] A1 @ pooled — {"via":"kysely","runs":[[43874,43874,43874],[43874,43874,43874],[43878,43878,43878],[43873,43873,43873],[43876,43876,43876],[43875,43875,43875],[43877,43877,43877],[43873,43873,43873]]}
+[PASS] A1 @ direct (raw-pg control) — {"via":"raw-pg","runs":[[43880,43880,43880],[43881,43881,43881],[43883,43883,43883],[43879,43879,43879],[43885,43885,43885],[43882,43882,43882],[43886,43886,43886],[43884,43884,43884]]}
+[PASS] A1 @ pooled (raw-pg control) — {"via":"raw-pg","runs":[[43876,43876,43876],[43874,43874,43874],[43877,43877,43877],[43887,43887,43887],[43888,43888,43888],[43873,43873,43873],[43875,43875,43875],[43878,43878,43878]]}
+[PASS] A3 A1 pinning @ pooled — {"statementsPerTransaction":3,"concurrent":8,"runs":[[43875,43875,43875],[43877,43877,43877],[43878,43878,43878],[43875,43875,43875],[43874,43874,43874],[43873,43873,43873],[43877,43877,43877],[43876,43876,43876]]}
+[PASS] A3 mid-transaction error rollback @ pooled — {"code":"22012","installedPid":43905,"after":{"pid":43905,"absent":true,"rows":0,"guard":true}}
+[PASS] A3 contamination lifecycle @ pooled — {"detectedOnExecutingBackend":true,"terminatedAndGone":true,"absenceOnReplacement":true,"positiveControl":true,"retries":1,"boundedRetry":true,"cleanupMs":27,"deadPid":43907,"backendGoneMs":6,"replacementPid":43909}
 [PASS] A4 unnamed statement names @ direct+pooled — {"observed":75,"extended":34,"simple":41,"nonempty":[],"loadError":null}
-[PASS] A4 unnamed-vs-named overhead @ direct — {"overheadPct":[23.9,27.5,32.5,11.9,44.4,19.8,21.7,34.3,24.9,42.9],"spread":{"min":11.9,"median":26.2,"p95":44.4,"mean":28.4,"meanUnrounded":28.378052826668274,"ci95Low":21,"ci95High":35.7},"decision":"mean-exceeds-20","a4bRequired":true}
+[PASS] A4 unnamed-vs-named overhead @ direct — {"overheadPct":[19.9,24.3,21.3,75.7,34.1,40.5,23.9,27,34.8,28.8],"spread":{"min":19.9,"median":27.9,"p95":75.7,"mean":33,"meanUnrounded":33.03735652482319,"ci95Low":21.4,"ci95High":44.7},"decision":"mean-exceeds-20","a4bRequired":true}
 [PASS] battery terminations == injected @ pooled(1) — {"injected":8,"terminated":8,"warmTailTerminations":0}
-evidence: tools/spikes/db-invariant/evidence/run-2026-10-18T20-39-16-541Z.jsonl (9249ms) — 0 failing case(s)
+evidence: tools/spikes/db-invariant/evidence/run-2026-10-18T21-47-41-864Z.jsonl (7973ms) — 0 failing case(s)
 ```
 
-The pooled A1 row is Kysely. There is no `A1 @ pooled (raw-pg control)` line. That is why the pooled raw-pg claim is NOT DEMONSTRATED. The A3 lines above are the runner's Kysely passes. A3's criterion requires A1 green via PgBouncer, and A1 includes that raw control, so the A report withholds the A3 verdict. The runner did not print a pooled raw-pg row for A3 either.
+The pooled raw-pg row is a `pg.Client` on the pooled DSN. Each of its eight transactions keeps one backend pid. That is the A1 pooled PASS, and it is why A3 is PASS.
 
-## B1–B6 scored spike
+## B3 on 0ed56fa
 
-Fields below are taken from the scored lines. They are this run, not a second one. The runner printed PASS for `b3-backpressure`. The partial object is demonstrated: 36864 bytes, `partial-cap`, cap 32768, one 4096-byte read chunk. The total object is `buffered` 0 and `bound` true. That count is `bufferedBytes()` after `#fault` marks the child dead and replaces the framer, so the B report withholds the B3 verdict.
+`b3()` from `tools/spikes/ipc-harness`, same SHA as the A suite. Pass true. Partial `pendingBytes` 36864, `partial-cap`, `bound` true. Total cap 49152: `buffered` 53248, `afterCleanup` 0, `bound` true, `vacuity` true. 53248 = 49152 + 4096. RSS growth 995328, 10956800, 356352, each ≤ 67108864.
+
+## B1–B6 scored spike at dev 1b1f536
+
+These lines are the earlier full suite. REV-T6-2026-10-19-9cf9740 covers them. They are not the B3 verdict. The total object here is the post-cleanup 0 that the section above replaces.
 
 ```text
 [PASS] b2-fencing — {"lost":"lost","lostStatus":"COMMITTED","ack":"cancelled","ackStatus":"CANCELLED","fenceAck":"cancelled","fenced":true,"fenceStatus":"CANCELLED","ignoreResult":"ignore","ignoreCancelCode":"timeout"}
