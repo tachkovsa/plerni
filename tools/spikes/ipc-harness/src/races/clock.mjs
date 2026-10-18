@@ -1,8 +1,13 @@
-// Manual clock for the race battery. Advancing it fires due timers and waits
-// for their async work, so a lease crossing is a sequence of barriers rather
-// than a wall-clock sleep.
+// Manual clock for the clock unit test. The race battery does not use it for
+// the positive lease crossing; that case runs on wall time through the
+// production executor. Advancing the clock fires due timers and waits for
+// their async work.
+
+import { abortInFlight, resetAbort } from './control.mjs';
 
 export const RACE_EPOCH_MS = Date.UTC(2026, 0, 1);
+
+const gates = new Set();
 
 export function manualClock(startMs = RACE_EPOCH_MS) {
   let now = startMs;
@@ -45,13 +50,42 @@ export function manualClock(startMs = RACE_EPOCH_MS) {
 }
 
 export function deferred() {
-  let resolve;
-  let reject;
-  const promise = new Promise((res, rej) => {
-    resolve = res;
-    reject = rej;
+  const gate = { done: false, promise: null, resolve() {}, reject() {} };
+  gate.promise = new Promise((resolve, reject) => {
+    const settle = (fn, value) => {
+      if (gate.done) return;
+      gate.done = true;
+      gates.delete(gate);
+      fn(value);
+    };
+    gate.resolve = (value) => settle(resolve, value);
+    gate.reject = (error) => settle(reject, error);
   });
-  return { promise, resolve, reject };
+  gates.add(gate);
+  return gate;
+}
+
+function rejectGates() {
+  for (const gate of [...gates]) {
+    gate.reject(new Error('aborted'));
+  }
+}
+
+// Unit tests replace the default canceller so they can prove the await order
+// without a database. Production steps use abortInFlight.
+let stepCanceller = null;
+
+export function setStepCanceller(fn) {
+  stepCanceller = fn;
+}
+
+async function cancelStep() {
+  if (stepCanceller) {
+    await stepCanceller();
+    return;
+  }
+  rejectGates();
+  await abortInFlight();
 }
 
 // Every race wait uses this ceiling unless a case names a tighter one.
@@ -105,21 +139,33 @@ export function steps(ms = COMPLETION_BOUND_MS) {
     ok() {
       return bounds.length > 0 && bounds.every((item) => item.elapsedMs <= item.boundMs);
     },
-    async run(work, label, overrideMs, onTimeout) {
+    async run(work, label, overrideMs) {
+      resetAbort();
       const boundMs = overrideMs ?? ms;
       const started = Date.now();
-      try {
-        const result = await bounded(() => work(), boundMs, label, onTimeout);
-        bounds.push({ label, elapsedMs: result.elapsedMs, boundMs: result.boundMs });
-        return result.value;
-      } catch (err) {
-        const elapsedMs = Date.now() - started;
-        const deadline = typeof err?.message === 'string' && err.message.startsWith('deadline exceeded');
-        if (!deadline && elapsedMs <= boundMs) {
-          bounds.push({ label, elapsedMs, boundMs });
-        }
-        throw err;
+      const task = Promise.resolve().then(() => work()).then(
+        (value) => ({ kind: 'value', value }),
+        (error) => ({ kind: 'error', error }),
+      );
+      let timer;
+      const timeout = new Promise((resolve) => {
+        timer = setTimeout(() => resolve({ kind: 'timeout' }), boundMs);
+      });
+      const outcome = await Promise.race([task, timeout]);
+      clearTimeout(timer);
+      const elapsedMs = Date.now() - started;
+      if (outcome.kind === 'timeout') {
+        await cancelStep();
+        await task;
+        throw new Error(`deadline exceeded: ${label} (bound ${boundMs}ms)`);
       }
+      if (outcome.kind === 'value') {
+        if (elapsedMs > boundMs) throw new Error(`bound exceeded: ${label} (${elapsedMs}ms)`);
+        bounds.push({ label, elapsedMs, boundMs });
+        return outcome.value;
+      }
+      if (elapsedMs <= boundMs) bounds.push({ label, elapsedMs, boundMs });
+      throw outcome.error;
     },
   };
 }

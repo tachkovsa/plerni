@@ -1,65 +1,67 @@
-// recovery-vs-live-commit (plan B2 / T5c): the sweeper and the executor race
-// on one ACTIVE row whose lease is already expired. PostgreSQL READ COMMITTED
-// waits on the row lock and rechecks the status predicate, so exactly one
-// transition wins. Both orderings are forced with barriers.
-// The executor update and the sweeper update are the production statements
-// (the harness adds only a comment tag and, for the sweep, the row id).
+// recovery-vs-live-commit (plan B2 / T5c): the production sweeper and the
+// production executor race on one ACTIVE row whose lease is already expired.
+// A third session holds the row with SELECT FOR UPDATE. Each production
+// statement queues on that lock. PostgreSQL grants the same lock mode to the
+// waiter that has waited longest, then READ COMMITTED rechecks the status
+// predicate, so exactly one transition wins.
+// https://www.postgresql.org/docs/18/explicit-locking.html
 // https://www.postgresql.org/docs/18/transaction-iso.html
 
 import { randomUUID } from 'node:crypto';
-import { FencedError, createExecution, dispatch, getStatus } from '../authority.mjs';
+import {
+  FencedError,
+  commitExecution,
+  createExecution,
+  dispatch,
+  getStatus,
+  sweepAbandoned,
+} from '../authority.mjs';
 import { assertBounds, steps } from './clock.mjs';
-import { raceCommit, raceSweep } from './control.mjs';
-import { countEffects, ensureEffects, expireHeartbeat, heldClock, insertEffect, waitForQueryLock } from './support.mjs';
+import { holdRow } from './control.mjs';
+import { countEffects, ensureEffects, expireHeartbeat, insertEffect, quietRenew, waitForQueryLock } from './support.mjs';
 
-const RACE_BOUND_MS = 15000;
-const BARRIER_MS = 4000;
+const RACE_BOUND_MS = 15_000;
 
 async function executorWins(timing) {
   const token = `exec-${randomUUID()}`;
   const id = await timing.run(() => createExecution('t5c-recovery', token, true), 'executor create');
   await timing.run(() => dispatch(id, true), 'executor dispatch');
   await timing.run(() => expireHeartbeat(id), 'executor expire');
-  let sweepP = Promise.resolve({ ids: [] });
-  let committed = false;
-  let fenced = false;
+  const barrier = await timing.run(() => holdRow(id), 'executor barrier');
+  let commitP = Promise.resolve(null);
+  let sweepP = Promise.resolve([]);
   try {
-    const result = await raceCommit(id, token, async (client) => {
+    commitP = commitExecution(id, token, async (client) => {
       await insertEffect(client, id, 'exec-wins');
-    }, true, {
-      ...heldClock(),
-      tag: 'race-exec-live',
-      label: 'executor-first commit',
-      bounds: timing.bounds,
-      boundMs: RACE_BOUND_MS,
-      afterLock: async () => {
-        sweepP = raceSweep(true, {
-          id,
-          tag: 'race-sweep-live',
-          label: 'executor-first sweep',
-          bounds: timing.bounds,
-          boundMs: RACE_BOUND_MS,
-        });
-        await waitForQueryLock('race-sweep-live', BARRIER_MS);
-      },
-    });
-    committed = result.committed === true;
-  } catch (err) {
-    fenced = err instanceof FencedError;
-    if (!fenced) {
-      await sweepP.catch(() => {});
-      throw err;
+    }, true, quietRenew());
+    commitP.catch(() => {});
+    await timing.run(() => waitForQueryLock('COMMITTED', 8_000), 'executor update queued', 10_000);
+    sweepP = sweepAbandoned(true);
+    sweepP.catch(() => {});
+    await timing.run(() => waitForQueryLock('ABANDONED', 8_000), 'executor-first sweeper queued', 10_000);
+    await timing.run(() => barrier.release(), 'executor release');
+    let committed = false;
+    let fenced = false;
+    try {
+      const result = await timing.run(() => commitP, 'executor-first commit', RACE_BOUND_MS);
+      committed = result?.committed === true;
+    } catch (err) {
+      fenced = err instanceof FencedError;
+      if (!fenced) throw err;
     }
+    const swept = await timing.run(() => sweepP, 'executor-first sweep', RACE_BOUND_MS);
+    return {
+      ordering: 'executor-first',
+      committed,
+      fenced,
+      swept: swept.includes(id),
+      status: (await timing.run(() => getStatus(id, true), 'executor status'))?.status ?? null,
+      effects: await timing.run(() => countEffects(id, 'exec-wins'), 'executor effects'),
+    };
+  } finally {
+    await barrier.release().catch(() => {});
+    await Promise.allSettled([commitP, sweepP]);
   }
-  const swept = await sweepP;
-  return {
-    ordering: 'executor-first',
-    committed,
-    fenced,
-    swept: swept.ids.includes(id),
-    status: (await timing.run(() => getStatus(id, true), 'executor status'))?.status ?? null,
-    effects: await timing.run(() => countEffects(id, 'exec-wins'), 'executor effects'),
-  };
 }
 
 async function sweeperWins(timing) {
@@ -67,57 +69,41 @@ async function sweeperWins(timing) {
   const id = await timing.run(() => createExecution('t5c-recovery', token, true), 'sweeper create');
   await timing.run(() => dispatch(id, true), 'sweeper dispatch');
   await timing.run(() => expireHeartbeat(id), 'sweeper expire');
-  let sweepP = Promise.resolve({ ids: [] });
-  let committed = false;
-  let fenced = false;
-  let releaseLock;
-  const locked = new Promise((resolve, reject) => {
-    releaseLock = { resolve, reject };
-  });
+  const barrier = await timing.run(() => holdRow(id), 'sweeper barrier');
+  let commitP = Promise.resolve(null);
+  let sweepP = Promise.resolve([]);
   try {
-    const result = await raceCommit(id, token, async (client) => {
+    sweepP = sweepAbandoned(true);
+    sweepP.catch(() => {});
+    await timing.run(() => waitForQueryLock('ABANDONED', 8_000), 'sweeper update queued', 10_000);
+    commitP = commitExecution(id, token, async (client) => {
       await insertEffect(client, id, 'sweep-wins');
-    }, true, {
-      ...heldClock(),
-      tag: 'race-exec-sweep',
-      label: 'sweeper-first commit',
-      bounds: timing.bounds,
-      boundMs: RACE_BOUND_MS,
-      beforeCommit: async () => {
-        sweepP = raceSweep(true, {
-          id,
-          tag: 'race-sweep-hold',
-          label: 'sweeper-first sweep',
-          bounds: timing.bounds,
-          boundMs: RACE_BOUND_MS,
-          afterLock: async () => {
-            releaseLock.resolve();
-            await waitForQueryLock('race-exec-sweep', BARRIER_MS);
-          },
-        }).catch((err) => {
-          releaseLock.reject(err);
-          throw err;
-        });
-        await timing.run(() => locked, 'sweeper locked the row', BARRIER_MS);
-      },
-    });
-    committed = result.committed === true;
-  } catch (err) {
-    fenced = err instanceof FencedError;
-    if (!fenced) {
-      await sweepP.catch(() => {});
-      throw err;
+    }, true, quietRenew());
+    commitP.catch(() => {});
+    await timing.run(() => waitForQueryLock('COMMITTED', 8_000), 'sweeper-first executor queued', 10_000);
+    await timing.run(() => barrier.release(), 'sweeper release');
+    const swept = await timing.run(() => sweepP, 'sweeper-first sweep', RACE_BOUND_MS);
+    let committed = false;
+    let fenced = false;
+    try {
+      const result = await timing.run(() => commitP, 'sweeper-first commit', RACE_BOUND_MS);
+      committed = result?.committed === true;
+    } catch (err) {
+      fenced = err instanceof FencedError;
+      if (!fenced) throw err;
     }
+    return {
+      ordering: 'sweeper-first',
+      committed,
+      fenced,
+      swept: swept.includes(id),
+      status: (await timing.run(() => getStatus(id, true), 'sweeper status'))?.status ?? null,
+      effects: await timing.run(() => countEffects(id, 'sweep-wins'), 'sweeper effects'),
+    };
+  } finally {
+    await barrier.release().catch(() => {});
+    await Promise.allSettled([commitP, sweepP]);
   }
-  const swept = await sweepP;
-  return {
-    ordering: 'sweeper-first',
-    committed,
-    fenced,
-    swept: swept.ids.includes(id),
-    status: (await timing.run(() => getStatus(id, true), 'sweeper status'))?.status ?? null,
-    effects: await timing.run(() => countEffects(id, 'sweep-wins'), 'sweeper effects'),
-  };
 }
 
 export async function recoveryVsLiveCommit() {

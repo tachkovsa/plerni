@@ -4,12 +4,12 @@
 import { describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { dbConfigured } from '../supervisor.mjs';
-import { assertBounds, COMPLETION_BOUND_MS } from './clock.mjs';
+import { assertBounds } from './clock.mjs';
 import { deathBeforeCommit } from './death-before-commit.mjs';
 import { lostReply } from './lost-reply.mjs';
 import { recoveryVsLiveCommit } from './recovery-vs-live-commit.mjs';
 import { healthyLong } from './healthy-long.mjs';
-import { heartbeatBehindCommit } from './heartbeat-behind-commit.mjs';
+import { HEARTBEAT_BOUND_MS, heartbeatBehindCommit } from './heartbeat-behind-commit.mjs';
 import { saturatedPool } from './saturated-pool.mjs';
 import { queuedPastLease } from './queued-past-lease.mjs';
 import { secondExecutorTakeover } from './second-executor-takeover.mjs';
@@ -22,7 +22,7 @@ function check(result) {
   assertBounds(result.detail.bounds);
 }
 
-describe('T5c race battery', { concurrency: 1, skip }, () => {
+describe('T5c race battery', { concurrency: 1, skip, timeout: 180_000 }, () => {
   test('death-before-commit', async () => {
     check(await deathBeforeCommit());
   });
@@ -38,7 +38,7 @@ describe('T5c race battery', { concurrency: 1, skip }, () => {
   test('heartbeat-behind-commit', async () => {
     const result = await heartbeatBehindCommit();
     check(result);
-    assert.equal(result.detail.boundMs, COMPLETION_BOUND_MS);
+    assert.equal(result.detail.boundMs, HEARTBEAT_BOUND_MS);
     assert.ok(result.detail.elapsedMs <= result.detail.boundMs);
   });
   test('saturated-pool', async () => {

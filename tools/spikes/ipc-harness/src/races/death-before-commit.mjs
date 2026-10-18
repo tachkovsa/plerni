@@ -24,7 +24,7 @@ export async function deathBeforeCommit() {
       await client.connect();
       await client.query('BEGIN');
       await insertEffect(client, id, 'died');
-    }, 'begin effects', undefined, () => client.connection?.stream?.destroy());
+    }, 'begin effects');
     await timing.run(() => killClient(client), 'kill executor', 8000);
   } finally {
     client.connection?.stream?.destroy();

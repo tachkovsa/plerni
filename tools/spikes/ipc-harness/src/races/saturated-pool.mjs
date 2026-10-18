@@ -1,39 +1,39 @@
-// saturated-pool (plan B2 / T5c): concurrency equals the pinned default_pool_size
-// (10). Effects transactions hold every server connection. Renewals still land
-// because they use the reserved direct connection, the sweeper on that same
-// direct path does not abandon them, and each execution commits.
-// A pooled probe stays in cl_waiting for the whole lease crossing
-// (PgBouncer transaction mode: the server connection is held until COMMIT).
-// The lease crossing is the manual clock. Each wait has a deadline.
+// saturated-pool (plan B2 / T5c): one production commitExecution holds a
+// pooled server connection past a real lease. The other server connections
+// are held by explicit transactions, and a pooled probe stays in cl_waiting.
+// Renewals still land because commitExecution uses the reserved direct
+// connection. The production sweeper, on that same direct path, does not
+// abandon the row.
 // https://www.pgbouncer.org/config.html (pool_mode=transaction)
 // https://www.pgbouncer.org/usage.html (SHOW POOLS cl_waiting)
 
 import pg from 'pg';
-import { createExecution, dispatch, getStatus } from '../authority.mjs';
-import { assertBounds, bounded, deferred, manualClock, RACE_EPOCH_MS, steps } from './clock.mjs';
-import { CADENCE_MS, LEASE_MS, openAppClient, raceCommit, raceSweep, stampHeartbeat } from './control.mjs';
+import { randomUUID } from 'node:crypto';
+import { commitExecution, createExecution, dispatch, getStatus, sweepAbandoned } from '../authority.mjs';
+import { assertBounds, deferred, steps } from './clock.mjs';
+import { LEASE_MS, isAborted, openAppClient } from './control.mjs';
 import { countEffects, ensureEffects, insertEffect } from './support.mjs';
 
 const POOL_PIN = 10;
-const TICKS = 5;
-const HOLD_BOUND_MS = 45000;
+const HOLD_BOUND_MS = 50_000;
+const SAMPLE_MS = 400;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function adminClient() {
   if (process.env.HARNESS_ADMIN_DSN) {
-    const client = new pg.Client({ connectionString: process.env.HARNESS_ADMIN_DSN });
-    client.on('error', () => {});
-    return client;
+    return new pg.Client({ connectionString: process.env.HARNESS_ADMIN_DSN });
   }
   if (!process.env.PLERNI_ADMIN_PASSWORD) return null;
-  const client = new pg.Client({
+  return new pg.Client({
     host: 'localhost',
     port: 54321,
     database: 'pgbouncer',
     user: 'plerni_admin_ro',
     password: process.env.PLERNI_ADMIN_PASSWORD,
   });
-  client.on('error', () => {});
-  return client;
 }
 
 async function poolSize(admin) {
@@ -57,6 +57,7 @@ async function poolRow(admin) {
 async function pollPool(admin, ready, label, deadlineMs, bounds) {
   const started = Date.now();
   for (;;) {
+    if (isAborted()) throw new Error('aborted');
     const row = await poolRow(admin);
     if (ready(row)) {
       bounds.push({ label, elapsedMs: Date.now() - started, boundMs: deadlineMs });
@@ -65,8 +66,34 @@ async function pollPool(admin, ready, label, deadlineMs, bounds) {
     if (Date.now() - started >= deadlineMs) {
       throw new Error(`deadline exceeded: ${label} (cl_waiting=${row.clWaiting}, sv_active=${row.svActive})`);
     }
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    await sleep(20);
   }
+}
+
+function holdServer(release) {
+  const client = openAppClient('pooled');
+  let markReady;
+  let failReady;
+  const ready = new Promise((resolve, reject) => {
+    markReady = resolve;
+    failReady = reject;
+  });
+  const done = (async () => {
+    try {
+      await client.connect();
+      await client.query('BEGIN');
+      markReady();
+      await release.promise;
+      await client.query('COMMIT');
+    } catch (err) {
+      failReady(err);
+      throw err;
+    } finally {
+      await client.end().catch(() => {});
+    }
+  })();
+  done.catch(() => {});
+  return { ready, done };
 }
 
 export async function saturatedPool() {
@@ -76,13 +103,20 @@ export async function saturatedPool() {
   if (!admin) return { pass: false, detail: { error: 'no pgbouncer admin datasource', bounds: [] } };
   await timing.run(() => admin.connect(), 'admin connect');
   const release = deferred();
-  const execs = [];
-  const cancels = [];
+  const entered = deferred();
+  const saturated = deferred();
+  const fillers = [];
   let probe;
+  let probeDone = Promise.resolve();
+  let probeSettled = false;
+  let commitP = Promise.resolve(null);
   try {
     const configured = await timing.run(() => poolSize(admin), 'read pool size');
     if (configured !== POOL_PIN) {
-      return { pass: false, detail: { error: 'default_pool_size is not the pinned 10', configured, bounds: timing.bounds } };
+      return {
+        pass: false,
+        detail: { error: 'default_pool_size is not the pinned 10', configured, bounds: timing.bounds },
+      };
     }
     await pollPool(
       admin,
@@ -92,37 +126,48 @@ export async function saturatedPool() {
       timing.bounds,
     );
 
-    const clock = manualClock(RACE_EPOCH_MS);
-    const rows = [];
-    for (let i = 0; i < configured; i += 1) {
-      const token = `sat-${i}-${clock.millis()}`;
-      const id = await timing.run(() => createExecution('t5c-saturated', token, true), `create ${i}`);
-      await timing.run(() => dispatch(id, true), `dispatch ${i}`);
-      await stampHeartbeat(id, await clock.now(), timing.bounds);
-      rows.push({ id, token });
-    }
-    let entered = 0;
-    const allEntered = deferred();
-    for (const [index, row] of rows.entries()) {
-      execs.push(raceCommit(row.id, row.token, async (client) => {
-        await insertEffect(client, row.id, 'sat');
-        entered += 1;
-        if (entered === rows.length) allEntered.resolve();
-        await release.promise;
-      }, false, {
-        clock,
-        label: `saturated commit ${index}`,
-        bounds: timing.bounds,
-        boundMs: HOLD_BOUND_MS,
-        register: (cancel) => cancels.push(cancel),
-      }));
-    }
-    await timing.run(() => allEntered.promise, 'executions filled the pool', 5000);
+    const token = `sat-${randomUUID()}`;
+    const id = await timing.run(() => createExecution('t5c-saturated', token, true), 'create');
+    await timing.run(() => dispatch(id, true), 'dispatch');
+    const beats = [];
+    let sweptDuring = 0;
+    let holdMs = 0;
+    let waitingAtEnd = 0;
+    commitP = commitExecution(id, token, async (client) => {
+      await insertEffect(client, id, 'sat');
+      entered.resolve();
+      await saturated.promise;
+      const opened = Date.now();
+      for (;;) {
+        if (isAborted()) throw new Error('aborted');
+        const row = await getStatus(id, true);
+        if (row?.status !== 'ACTIVE') throw new Error(`abandoned during saturation: ${row?.status}`);
+        const beat = new Date(row.heartbeat_at).getTime();
+        if (beats.at(-1) !== beat) beats.push(beat);
+        const swept = await sweepAbandoned(true);
+        if (swept.includes(id)) sweptDuring += 1;
+        holdMs = Date.now() - opened;
+        if (holdMs > LEASE_MS && beats.length >= 5) break;
+        if (holdMs > 35_000) {
+          throw new Error(`lease crossing missed (${holdMs}ms, beats ${beats.length})`);
+        }
+        await sleep(SAMPLE_MS);
+      }
+      const still = await poolRow(admin);
+      waitingAtEnd = still.clWaiting;
+      if (waitingAtEnd < 1 || probeSettled) {
+        throw new Error(`saturation dropped (cl_waiting=${waitingAtEnd}, probeSettled=${probeSettled})`);
+      }
+    }, false);
+    commitP.catch(() => {});
+
+    await timing.run(() => entered.promise, 'execution entered', 10_000);
+    for (let i = 0; i < configured - 1; i += 1) fillers.push(holdServer(release));
+    await timing.run(() => Promise.all(fillers.map((item) => item.ready)), 'fillers began', 10_000);
 
     probe = openAppClient('pooled');
     await timing.run(() => probe.connect(), 'probe connect');
-    let probeSettled = false;
-    const probeDone = probe.query('SELECT 1').then(() => {
+    probeDone = probe.query('SELECT 1').then(() => {
       probeSettled = true;
     }, () => {
       probeSettled = true;
@@ -131,61 +176,30 @@ export async function saturatedPool() {
       admin,
       (row) => row.clWaiting >= 1,
       'pooled probe entered cl_waiting',
-      5000,
+      5_000,
       timing.bounds,
     );
+    saturated.resolve();
 
-    const samples = [];
-    let sweptDuring = 0;
-    const renewal = await bounded(async () => {
-      for (let tick = 0; tick < TICKS; tick += 1) {
-        await clock.advance(CADENCE_MS);
-        const row = await getStatus(rows[0].id, true);
-        samples.push(new Date(row.heartbeat_at).getTime() - RACE_EPOCH_MS);
-        const swept = await raceSweep(true, {
-          id: rows[0].id,
-          now: await clock.now(),
-          label: `saturated sweep ${tick}`,
-          bounds: timing.bounds,
-        });
-        if (swept.ids.includes(rows[0].id)) sweptDuring += 1;
-      }
-    }, 10_000, 'reserved renewals while the pool is saturated', () => {
-      for (const cancel of cancels) cancel();
-    });
-    timing.bounds.push({
-      label: renewal.label,
-      elapsedMs: renewal.elapsedMs,
-      boundMs: renewal.boundMs,
-    });
-    const blockedDuringRenewal = probeSettled === false;
-    const waitingDuringRenewal = await timing.run(() => poolRow(admin), 'pool during renewal');
-    const offsets = [];
-    for (const row of rows) {
-      const status = await timing.run(() => getStatus(row.id, true), 'heartbeat before release');
-      offsets.push(new Date(status.heartbeat_at).getTime() - RACE_EPOCH_MS);
-    }
-
+    const result = await timing.run(() => commitP, 'saturated commit', HOLD_BOUND_MS);
     release.resolve();
-    const committed = await timing.run(() => Promise.all(execs), 'commits drained', 10_000);
-    await timing.run(() => probeDone, 'probe drained', 5000);
+    await timing.run(() => Promise.all(fillers.map((item) => item.done)), 'fillers drained', 10_000);
+    await timing.run(() => probeDone, 'probe drained', 5_000);
 
-    const statuses = [];
-    let effects = 0;
-    for (const row of rows) {
-      statuses.push((await timing.run(() => getStatus(row.id, true), 'status after commit'))?.status ?? null);
-      effects += await timing.run(() => countEffects(row.id, 'sat'), 'effects after commit');
-    }
+    const status = (await timing.run(() => getStatus(id, true), 'status'))?.status ?? null;
+    const effects = await timing.run(() => countEffects(id, 'sat'), 'effects');
+    const increasing = beats.every((beat, index) => index === 0 || beat > beats[index - 1]);
     const detail = {
       configured,
       waiting: waiting.clWaiting,
-      blockedDuringRenewal,
-      waitingDuringRenewal: waitingDuringRenewal.clWaiting,
-      samples,
-      offsets,
+      waitingAtEnd,
+      holdMs,
+      beats: beats.length,
+      increasing,
+      renewals: result.renewals,
       sweptDuring,
-      commits: committed.filter((item) => item.committed).length,
-      statuses,
+      committed: result.committed === true,
+      status,
       effects,
       leaseMs: LEASE_MS,
       bounds: timing.bounds,
@@ -193,25 +207,22 @@ export async function saturatedPool() {
     assertBounds(detail.bounds);
     const pass = configured === POOL_PIN
       && waiting.clWaiting >= 1
-      && blockedDuringRenewal
-      && waitingDuringRenewal.clWaiting >= 1
-      && samples.length === TICKS
-      && new Set(samples).size === TICKS
-      && samples.at(-1) === CADENCE_MS * TICKS
-      && samples.at(-1) > LEASE_MS
-      && offsets.every((offset) => offset > LEASE_MS)
+      && waitingAtEnd >= 1
+      && holdMs > LEASE_MS
+      && beats.length >= 5
+      && increasing
+      && result.renewals >= 4
       && sweptDuring === 0
-      && detail.commits === configured
-      && statuses.every((status) => status === 'COMMITTED')
-      && effects === configured;
+      && result.committed === true
+      && status === 'COMMITTED'
+      && effects === 1;
     return { pass, detail };
   } finally {
+    entered.resolve();
+    saturated.resolve();
     release.resolve();
-    await Promise.allSettled(execs);
-    if (probe) {
-      probe.connection?.stream?.destroy();
-      await probe.end().catch(() => {});
-    }
+    await Promise.allSettled([commitP, probeDone, ...fillers.map((item) => item.done)]);
+    if (probe) await probe.end().catch(() => {});
     await admin.end().catch(() => {});
   }
 }

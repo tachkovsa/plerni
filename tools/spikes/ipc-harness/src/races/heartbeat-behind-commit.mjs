@@ -1,16 +1,17 @@
-// heartbeat-behind-commit (plan B2 / T5c): a renewal is placed behind the
-// uncommitted COMMITTED update and blocks on that row lock. COMMIT is
-// observed before the renewal returns. The whole commit is inside a deadline;
-// a shutdown-order regression that waits on the parked renewal never reaches
-// the boolean checks, and the observed elapsed time is asserted against the bound.
+// heartbeat-behind-commit (plan B2 / T5c): the production renewal runs on its
+// own interval. The effects transaction locks the fencing row, so that
+// renewal's UPDATE waits. commitExecution then stops scheduling, issues the
+// conditional COMMITTED update, commits, and only then drains the renewal.
+// A shutdown order that awaited the renewal first would deadlock, and the
+// deadline on this step would fire.
 
 import { randomUUID } from 'node:crypto';
-import { createExecution, dispatch, getStatus } from '../authority.mjs';
-import { assertBounds, COMPLETION_BOUND_MS, deferred, steps } from './clock.mjs';
-import { raceCommit } from './control.mjs';
-import { countEffects, ensureEffects, heldClock, insertEffect, waitForQueryLock } from './support.mjs';
+import { commitExecution, createExecution, dispatch, getStatus } from '../authority.mjs';
+import { assertBounds, steps } from './clock.mjs';
+import { countEffects, ensureEffects, insertEffect, waitForQueryLock } from './support.mjs';
 
-const BARRIER_MS = 2000;
+export const HEARTBEAT_BOUND_MS = 20_000;
+const LOCK_WAIT_MS = 12_000;
 
 export async function heartbeatBehindCommit() {
   const timing = steps();
@@ -18,48 +19,20 @@ export async function heartbeatBehindCommit() {
   const token = `behind-${randomUUID()}`;
   const id = await timing.run(() => createExecution('t5c-heartbeat', token, true), 'create');
   await timing.run(() => dispatch(id, true), 'dispatch');
-  const release = deferred();
-  let renewalReturned = false;
-  let sawCommitFirst = false;
+  let sawBlocked = false;
 
-  const renew = async (rowId, rowToken, reserved, ctl) => {
-    const updated = await reserved.query(
-      `UPDATE fencing_authority SET heartbeat_at = clock_timestamp()
-       WHERE id = $1 AND token = $2 AND status = 'ACTIVE'
-       RETURNING heartbeat_at /* hb-behind */`,
-      [rowId, rowToken],
-    );
-    if (ctl?.stop) return null;
-    await release.promise;
-    renewalReturned = true;
-    return updated.rowCount === 1 ? updated.rows[0].heartbeat_at : null;
-  };
-
-  const result = await raceCommit(id, token, async (client) => {
+  const result = await timing.run(() => commitExecution(id, token, async (client) => {
+    await client.query('SELECT id FROM fencing_authority WHERE id = $1 FOR UPDATE', [id]);
     await insertEffect(client, id, 'behind');
-  }, true, {
-    ...heldClock(),
-    renew,
-    renewBehindLock: true,
-    label: 'heartbeat-behind-commit',
-    bounds: timing.bounds,
-    boundMs: COMPLETION_BOUND_MS,
-    afterLock: async () => {
-      await waitForQueryLock('hb-behind', BARRIER_MS);
-    },
-    afterCommit: async () => {
-      const status = (await getStatus(id, true))?.status ?? null;
-      sawCommitFirst = status === 'COMMITTED' && renewalReturned === false;
-      release.resolve();
-    },
-  });
+    await waitForQueryLock('heartbeat_at', LOCK_WAIT_MS);
+    sawBlocked = true;
+  }, true), 'heartbeat-behind-commit', HEARTBEAT_BOUND_MS);
 
   const commitBound = timing.bounds.find((item) => item.label === 'heartbeat-behind-commit');
   const detail = {
     id,
     committed: result.committed === true,
-    sawCommitFirst,
-    renewalReturned,
+    sawBlocked,
     status: (await timing.run(() => getStatus(id, true), 'status'))?.status ?? null,
     effects: await timing.run(() => countEffects(id, 'behind'), 'effects'),
     elapsedMs: commitBound?.elapsedMs ?? null,
@@ -67,8 +40,10 @@ export async function heartbeatBehindCommit() {
     bounds: timing.bounds,
   };
   assertBounds(detail.bounds);
-  const pass = detail.committed && detail.sawCommitFirst && detail.renewalReturned
-    && detail.status === 'COMMITTED' && detail.effects === 1
+  const pass = detail.committed
+    && detail.sawBlocked
+    && detail.status === 'COMMITTED'
+    && detail.effects === 1
     && detail.elapsedMs != null
     && detail.elapsedMs <= detail.boundMs;
   return { pass, detail };

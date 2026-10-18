@@ -13,7 +13,7 @@ import {
   sweepAbandoned,
 } from '../authority.mjs';
 import { assertBounds, steps } from './clock.mjs';
-import { raceCommit, raceSweep } from './control.mjs';
+import { vacuousCommit, vacuousSweep } from './control.mjs';
 import { countEffects, ensureEffects, expireHeartbeat, insertEffect, quietRenew } from './support.mjs';
 
 async function abandon(token, timing) {
@@ -55,14 +55,9 @@ export async function vacuityAuthority() {
   const openId = await abandon(openToken, timing);
   let openCommitted = false;
   try {
-    const result = await raceCommit(openId, openToken, async (client) => {
+    const result = await timing.run(() => vacuousCommit(openId, openToken, async (client) => {
       await insertEffect(client, openId, 'rewritten');
-    }, true, {
-      ...quietRenew(),
-      requireActive: false,
-      label: 'vacuous commit',
-      bounds: timing.bounds,
-    });
+    }), 'vacuous commit');
     openCommitted = result.committed === true;
   } catch (err) {
     if (!(err instanceof FencedError)) throw err;
@@ -74,12 +69,7 @@ export async function vacuityAuthority() {
   const safeStatus = (await timing.run(() => getStatus(safeId, true), 'safe status'))?.status ?? null;
 
   const openSweepId = await commitSettled(`sweep-${randomUUID()}`, timing);
-  const openSwept = await raceSweep(true, {
-    id: openSweepId,
-    requireActive: false,
-    label: 'vacuous sweep',
-    bounds: timing.bounds,
-  });
+  const openSwept = await timing.run(() => vacuousSweep(openSweepId), 'vacuous sweep');
   const openSweepStatus = (await timing.run(() => getStatus(openSweepId, true), 'open sweep status'))?.status ?? null;
 
   const heldEffects = await timing.run(() => countEffects(heldId, 'held'), 'held effects');
@@ -92,7 +82,7 @@ export async function vacuityAuthority() {
   const exploit = openCommitted
     && openStatus === 'COMMITTED'
     && rewrittenEffects === 1
-    && openSwept.ids.includes(openSweepId)
+    && openSwept.includes(openSweepId)
     && openSweepStatus === 'ABANDONED';
   const detail = {
     heldStatus,

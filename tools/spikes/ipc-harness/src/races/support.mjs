@@ -4,8 +4,7 @@
 // migration and it is not part of the fencing authority schema.
 
 import pg from 'pg';
-import { LEASE_MS, openAppClient } from './control.mjs';
-import { manualClock } from './clock.mjs';
+import { LEASE_MS, isAborted, openAppClient } from './control.mjs';
 
 let effectsReady;
 
@@ -89,12 +88,6 @@ export async function expireHeartbeat(id) {
   });
 }
 
-// Wall-clock renewals would heal a backdated lease if a case ran long.
-// A manual clock that the case does not advance cannot.
-export function heldClock(extra = {}) {
-  return { clock: manualClock(), renew: async () => null, ...extra };
-}
-
 // Production commitExecution honors `renew` (T5a). A null renewal does not
 // extend the lease when the wall-clock cadence fires during a slow run.
 export function quietRenew() {
@@ -117,21 +110,23 @@ export async function killClient(client) {
 // Poll until some other backend is blocked on a lock and its query carries
 // `fragment`. The deadline fails a missed barrier; it is not the synchronization.
 export async function waitForQueryLock(fragment, deadlineMs = 5000) {
-  if (!/^[a-z0-9-]{1,40}$/.test(fragment)) throw new Error('bad lock fragment');
+  if (!/^[A-Za-z0-9_-]{1,40}$/.test(fragment)) throw new Error('bad lock fragment');
+  const pattern = `%${fragment.replaceAll('_', '\\_')}%`;
   const c = openAppClient('direct');
   await c.connect();
   const started = Date.now();
   try {
     while (Date.now() - started < deadlineMs) {
+      if (isAborted()) throw new Error('aborted');
       const r = await c.query(
         `SELECT pid FROM pg_stat_activity
          WHERE pid <> pg_backend_pid()
            AND wait_event_type = 'Lock'
-           AND query LIKE $1`,
-        [`%${fragment}%`],
+           AND query LIKE $1 ESCAPE '\\'`,
+        [pattern],
       );
       if (r.rowCount > 0) return Number(r.rows[0].pid);
-      await new Promise((resolve) => setImmediate(resolve));
+      await new Promise((resolve) => setTimeout(resolve, 20));
     }
     throw new Error(`deadline: no lock wait matching ${fragment}`);
   } finally {
