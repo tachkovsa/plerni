@@ -38,8 +38,13 @@ if grep -q 'created_at' "$corpus"; then
   echo "rename-unused-column: created_at is referenced by the corpus generator" >&2
   exit 1
 fi
-if ! git -C "$root" --no-pager diff --exit-code --color=never -- "$schema_rel" "$types_rel" >/dev/null; then
-  echo "rename-unused-column: band-50 schema or interface is already dirty" >&2
+# Worktree vs index, and index vs HEAD. A staged-only edit is invisible to plain git diff.
+artifacts_match_head() {
+  git -C "$root" --no-pager diff --exit-code --color=never -- "$schema_rel" "$types_rel" >/dev/null \
+    && git -C "$root" --no-pager diff --cached --exit-code --color=never -- "$schema_rel" "$types_rel" >/dev/null
+}
+if ! artifacts_match_head; then
+  echo "rename-unused-column: band-50 schema or interface differs from HEAD" >&2
   exit 1
 fi
 
@@ -91,7 +96,7 @@ if ! printf '%s\n' "$output" | grep -E -q '^\+[[:space:]]*opened_at:'; then
 fi
 
 git -C "$root" restore --worktree --source=HEAD -- "$schema_rel" "$types_rel"
-if ! git -C "$root" --no-pager diff --exit-code --color=never -- "$schema_rel" "$types_rel" >/dev/null; then
+if ! artifacts_match_head; then
   echo "rename-unused-column: restore left the band-50 files dirty" >&2
   exit 1
 fi

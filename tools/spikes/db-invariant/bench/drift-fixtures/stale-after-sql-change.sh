@@ -36,8 +36,13 @@ if grep -q 'drift_marker' "$schema" || grep -q 'drift_marker' "$types"; then
   echo "stale-after-sql-change: drift_marker is already present" >&2
   exit 1
 fi
-if ! git -C "$root" --no-pager diff --exit-code --color=never -- "$schema_rel" "$types_rel" >/dev/null; then
-  echo "stale-after-sql-change: band-50 schema or interface is already dirty" >&2
+# Worktree vs index, and index vs HEAD. A staged-only edit is invisible to plain git diff.
+artifacts_match_head() {
+  git -C "$root" --no-pager diff --exit-code --color=never -- "$schema_rel" "$types_rel" >/dev/null \
+    && git -C "$root" --no-pager diff --cached --exit-code --color=never -- "$schema_rel" "$types_rel" >/dev/null
+}
+if ! artifacts_match_head; then
+  echo "stale-after-sql-change: band-50 schema or interface differs from HEAD" >&2
   exit 1
 fi
 
@@ -90,7 +95,7 @@ if ! printf '%s\n' "$output" | grep -E -q '^\+[[:space:]]*drift_marker:'; then
 fi
 
 git -C "$root" restore --worktree --source=HEAD -- "$schema_rel" "$types_rel"
-if ! git -C "$root" --no-pager diff --exit-code --color=never -- "$schema_rel" "$types_rel" >/dev/null; then
+if ! artifacts_match_head; then
   echo "stale-after-sql-change: restore left the band-50 files dirty" >&2
   exit 1
 fi
