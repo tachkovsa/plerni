@@ -56,7 +56,7 @@ A3's pooled pinning rows are that case's own Kysely run. They do not fill in the
 
 ## A1 pooled raw control
 
-Plan §8 opens the replacement-validation track when a verdict replaces the shipped substrate, and that track carries a revised capacity estimate. A1 pooled is NOT DEMONSTRATED because the raw control never traversed PgBouncer. That is a missing control, and the direct raw-`pg` result stays PASS. The consequence is a follow-up: add a raw `pg.Client` on the pooled DSN inside the A1 case, then rerun A1. The replacement track is not opened. No revised capacity estimate is attached here.
+A1 pooled is NOT DEMONSTRATED because the raw control never traversed PgBouncer. The direct raw-`pg` result stays PASS. The consequence is a follow-up: add a raw `pg.Client` on the pooled DSN inside the A1 case, then rerun A1. A missing control does not replace the shipped substrate, so this clause does not open the replacement-validation track and does not revise the capacity note. The B3 FAIL opens that track in the Spike B report.
 
 ## A3 contamination lifecycle
 
@@ -116,4 +116,4 @@ The clean tree passed the gate on bands 50, 75, 200, and 400 in the T4b run (exi
 
 ## Replacement-validation track
 
-Plan §8 opens that track when a verdict replaces the shipped substrate, and the track carries a revised capacity estimate. A2, A3, A4's unnamed discipline, and A5 stay on the results the suite demonstrated. A4b stays issue #34. A1 pooled is the follow-up in the section above, not a driver-level failure and not this track. No revised capacity estimate is attached here. The capacity annex remains T7.
+Plan §8 opens the replacement-validation track when a verdict replaces the shipped substrate, and the track carries a revised capacity estimate. A2, A3, A4's unnamed discipline, and A5 stay on the results the suite demonstrated. A4b stays issue #34. A1 pooled is the follow-up in the section above. The track this pair of reports opens is the B3 FAIL, recorded in the Spike B report, with the revised capacity note attached there. The capacity annex remains T7. That annex takes no partial-buffer cost from the failed B3 run.

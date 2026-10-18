@@ -6,7 +6,7 @@ Evidence label, verbatim: "transport + minimal-real-authority; full broker proof
 
 ## Rerun
 
-One command, from a clean worktree of that SHA. Export the four harness passwords first. Node is the major in `.nvmrc` (this run: v24.22.0). `reset.sh` needs Docker Compose v2 and `psql`.
+The scored suites are one command, from a clean worktree of that SHA. Export the four harness passwords first. Node is the major in `.nvmrc` (this run: v24.22.0). `reset.sh` needs Docker Compose v2 and `psql`.
 
 ```bash
 cd tools/harness && ./reset.sh && cd ../.. && node tools/harness/seed.mjs && pnpm --filter @plerni-spike/ipc-harness spike && pnpm --filter @plerni-spike/ipc-harness test && pnpm --filter @plerni-spike/ipc-harness test:races
@@ -14,7 +14,9 @@ cd tools/harness && ./reset.sh && cd ../.. && node tools/harness/seed.mjs && pnp
 
 `spike` is in that command because the performance windows live there. `test` scores the deterministic B2–B6 checks and does not apply the 60 s contract. `test:races` is the race battery plus the B6 identity-stamping vacuity control.
 
-This run: `spike` exit 0; `test` 107 pass, 0 fail, 0 skipped, 23004 ms; `test:races` 24 pass then the vacuity test 1 pass, 0 fail, 0 skipped, race file 92139 ms. JSONL stays gitignored. The lines that back these verdicts, including the later partial-cap and commit/revoke overlap runs, are in `docs/plans/2026-10-18-spike-rerun-evidence.md`.
+This run: `spike` exit 0; `test` 107 pass, 0 fail, 0 skipped, 23004 ms; `test:races` 24 pass then the vacuity test 1 pass, 0 fail, 0 skipped, race file 92139 ms. JSONL stays gitignored. The lines that back these verdicts are in `docs/plans/2026-10-18-spike-rerun-evidence.md`.
+
+That suite command does not start the commit-versus-revoke overlap. The overlap has a second command in the evidence file, under "Partial cap and commit-versus-revoke overlap". Run it from `tools/spikes/ipc-harness` after `reset.sh` and `seed.mjs`, with the same passwords exported, on this dev SHA. It calls the existing exports only. The three overlap lines in the evidence file are that command's stdout.
 
 Review receipt: pending (δ, cross-family).
 
@@ -43,7 +45,7 @@ Frozen shape: 2 children, in-flight 128, offered rate 8000/s, 1024-byte payload,
 
 The four suite outcomes run one after another. Commit finishes before the lost revocation. Revocation finishes before the fenced commit. The ignore-cancel child times out. The race battery's recovery-vs-live-commit case is the sweeper's `ABANDONED` update against commit.
 
-The concurrent clause is a later run of the existing exports, not a new harness file. `commitExecution` holds `SELECT id FROM fencing_authority WHERE id = $1 FOR UPDATE` inside the effects transaction, and `cancelExecution` issues the `CANCELLED` update on a second pooled connection. `pg_stat_activity` showed that update waiting on `Lock` / `transactionid` before the executor committed. Three runs: commit won, `cancelWon` false, status `COMMITTED`, 41 ms, 39 ms, 36 ms. The suite command does not invoke this overlap. Follow-up: register it in the race battery so that command reruns it.
+The concurrent clause is a later run of the existing exports, not a new harness file. `commitExecution` holds `SELECT id FROM fencing_authority WHERE id = $1 FOR UPDATE` inside the effects transaction, and `cancelExecution` issues the `CANCELLED` update on a second pooled connection. `pg_stat_activity` showed that update waiting on `Lock` / `transactionid` before the executor committed. Three runs: commit won, `cancelWon` false, status `COMMITTED`, 41 ms, 39 ms, 36 ms. The command that produced those three lines is in the evidence file. Follow-up: register that overlap in the race battery so `test:races` reruns it.
 
 ## B3
 
@@ -56,7 +58,7 @@ The concurrent clause is a later run of the existing exports, not a new harness 
 
 The other measurements in the same case stay as recorded: pending admitted 4 and rejected 4; total cap tripped with buffered 0; the kernel socket pause admitted one call (270 buffered bytes) and rejected a frame above the kernel byte cap before a waiter was installed. RSS growth was 778240, 290816, and 10981376 bytes, each at or under 67108864, on holds of about 5 s inside the 60 s window. Those bounds do not make the partial-frame clause pass.
 
-Plan §8 opens the replacement-validation track when a verdict replaces the shipped substrate, and that track carries a revised capacity estimate. This FAIL is an unenforced harness cap. The consequence is the follow-up above, then a B3 rerun. The replacement track is not opened. No revised capacity estimate is attached here. The flow-control hypothesis is not accepted.
+This FAIL opens the replacement-validation track in the section below. The flow-control hypothesis is not accepted. P0 does not close on this run.
 
 Each hold warmed 5002 ms, 5004 ms, and 5003 ms, then offered 300 slots (issued 300, skipped 0). Pending, partial, total, lo, and hi flags tripped on every hold, and the near-cap checks stayed true. The partial flag on those holds is the same high-water mark as the FAIL above. The sibling answered. Growth for the three holds is in the B3 row. The third hold is larger than the first two and remains under 64 MiB. The environment stayed valid (loads 1.02, 1.18, 1.14).
 
@@ -93,4 +95,20 @@ A direct call of `queuedPastLease` and `secondExecutorTakeover` immediately afte
 
 ## Replacement-validation track
 
-Plan §8 opens that track when a verdict replaces the shipped substrate, and that track carries a revised capacity estimate. B1, B2's demonstrated clauses, B4, B5, B6, and the race battery stay on framed NDJSON, the supervisor-stamped credential, and the conditional authority row. B3 is the follow-up in the B3 section: a harness fix and a rerun, not this track. No revised capacity estimate is attached here.
+Plan §8 opens this track on a flipped verdict, and P0 closes only on green on the shipped substrate. B3's fail column is a redesign of flow control, then a re-spike. This FAIL opens that track.
+
+The redesign is the partial-frame rule these runs did not enforce. Fault or stop when an unfinished frame passes the configured partial cap, allow only a defined read-chunk overshoot, and assert `pendingBytes` against that cap. The re-spike is a B3 rerun after that change. The harness change lands in a separate pull request. This document records the track and does not edit the harness.
+
+B1, B2's demonstrated clauses, B4, B5, B6, and the race battery stay on framed NDJSON, the supervisor-stamped credential, and the conditional authority row. A1's missing pooled raw control stays the follow-up in the Spike A report. It does not open a second track.
+
+### Revised capacity note
+
+T7 still writes the annex. This note is the revision the flip attaches now.
+
+| Input | This run | What the annex may use |
+|---|---|---|
+| Renewal traffic | Unchanged. The recovery section still supports the formula. | `active executions / cadence` UPDATE transactions per second. |
+| RSS on the three B3 holds | 778240, 290816, and 10981376 bytes, each ≤ 67108864. | These samples were taken while `pendingBytes` was 1052672. They do not certify the 32768-byte partial cap. The annex takes no RSS allowance for that cap from this run. |
+| Partial-buffer cost | 1052672 bytes buffered. The configured cap is 32768. The runner's bound is under 2 MiB. | No partial-buffer cost from this run. The figure comes from the B3 rerun after the cap is enforced. |
+
+This note does not compute the T7 annex.

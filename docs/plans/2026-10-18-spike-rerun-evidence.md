@@ -58,9 +58,112 @@ SPIKE_EXIT 0
 
 The partial object is taken from the scored b3 line. It is the B3 FAIL: 1052672 bytes against a 32768-byte cap, with `bound` true only because the predicate is `< 2 MiB`.
 
-## Partial cap, three more runs
+## Partial cap and commit-versus-revoke overlap
 
-Same dev SHA, existing `tripCaps()` export, no harness edit. Each call:
+One Node process on the same dev SHA, after `reset.sh` and `seed.mjs`, with the four harness passwords already exported. Working directory `tools/spikes/ipc-harness`, so the relative imports and the `pg` dependency resolve. No harness file was added. The stdout is the two blocks below.
+
+```bash
+cd tools/spikes/ipc-harness
+node --input-type=module <<'EOF'
+import pg from 'pg';
+import { tripCaps } from './src/cases/b3-backpressure.mjs';
+import {
+  FencedError,
+  cancelExecution,
+  commitExecution,
+  createExecution,
+  dispatch,
+  getStatus,
+} from './src/authority.mjs';
+
+const partials = [];
+for (let i = 0; i < 3; i++) {
+  const row = await tripCaps();
+  partials.push({
+    pass: row.pass,
+    pendingBytes: row.detail.partial.pendingBytes,
+    code: row.detail.partial.code,
+    tripped: row.detail.partial.tripped,
+    bound: row.detail.partial.bound,
+    cap: 32 * 1024,
+  });
+}
+
+function root() {
+  return new pg.Client({
+    host: 'localhost',
+    port: 54320,
+    database: 'plerni',
+    user: 'postgres',
+    password: process.env.POSTGRES_PASSWORD,
+  });
+}
+
+async function raceOnce() {
+  const useDirect = false;
+  const id = await createExecution('b2-overlap', 'tok-overlap', useDirect);
+  await dispatch(id, useDirect);
+  const watcher = root();
+  await watcher.connect();
+  let cancelWon = null;
+  let waitSample = null;
+  const started = Date.now();
+  let commitOutcome = null;
+  try {
+    const commitP = commitExecution(id, 'tok-overlap', async (c) => {
+      await c.query('SELECT id FROM fencing_authority WHERE id = $1 FOR UPDATE', [id]);
+      const cancelP = cancelExecution(id, useDirect).then((won) => {
+        cancelWon = won;
+        return won;
+      });
+      const deadline = Date.now() + 2000;
+      while (Date.now() < deadline) {
+        const q = await watcher.query(
+          `SELECT wait_event_type, wait_event, state
+             FROM pg_stat_activity
+            WHERE datname = 'plerni'
+              AND query LIKE '%status = ''CANCELLED''%'
+              AND pid <> pg_backend_pid()`,
+        );
+        const hit = q.rows.find((row) => row.wait_event_type === 'Lock');
+        if (hit) {
+          waitSample = hit;
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      globalThis.__cancelP = cancelP;
+    }, useDirect);
+    try {
+      commitOutcome = await commitP;
+    } catch (err) {
+      commitOutcome = {
+        error: err instanceof FencedError ? 'FencedError' : err.constructor?.name,
+      };
+    }
+    await globalThis.__cancelP;
+  } finally {
+    await watcher.end();
+  }
+  const status = await getStatus(id, useDirect);
+  return {
+    ms: Date.now() - started,
+    commit: commitOutcome && commitOutcome.committed === true,
+    fenced: commitOutcome?.error === 'FencedError',
+    cancelWon,
+    status: status?.status ?? null,
+    revokerWaitedOnLock: waitSample !== null,
+    waitEvent: waitSample?.wait_event ?? null,
+  };
+}
+
+const races = [];
+for (let i = 0; i < 3; i++) races.push(await raceOnce());
+console.log(JSON.stringify({ partials, races }, null, 2));
+EOF
+```
+
+`tripCaps()` rows from that process:
 
 ```text
 {"pass":true,"pendingBytes":1052672,"code":"NdjsonOversizeError","tripped":true,"bound":true,"cap":32768}
@@ -68,17 +171,13 @@ Same dev SHA, existing `tripCaps()` export, no harness edit. Each call:
 {"pass":true,"pendingBytes":1052672,"code":"NdjsonOversizeError","tripped":true,"bound":true,"cap":32768}
 ```
 
-## Commit versus revoke overlap, three runs
-
-Same dev SHA. Existing `createExecution`, `dispatch`, `commitExecution`, and `cancelExecution` on the pooled datasource. The effects callback takes `SELECT id FROM fencing_authority WHERE id = $1 FOR UPDATE`, starts `cancelExecution` on a second connection, and waits until `pg_stat_activity` shows that `CANCELLED` update in `Lock` / `transactionid`. The executor then commits. No harness file was added.
+Overlap rows from the same process. `useDirect` is false, so commit and cancel use the pooled datasource. The effects callback takes `SELECT id FROM fencing_authority WHERE id = $1 FOR UPDATE`, starts `cancelExecution` on a second connection, and waits until `pg_stat_activity` shows that `CANCELLED` update in `Lock` / `transactionid`. The executor then commits.
 
 ```text
 {"ms":41,"commit":true,"fenced":false,"cancelWon":false,"status":"COMMITTED","revokerWaitedOnLock":true,"waitEvent":"transactionid"}
 {"ms":39,"commit":true,"fenced":false,"cancelWon":false,"status":"COMMITTED","revokerWaitedOnLock":true,"waitEvent":"transactionid"}
 {"ms":36,"commit":true,"fenced":false,"cancelWon":false,"status":"COMMITTED","revokerWaitedOnLock":true,"waitEvent":"transactionid"}
 ```
-
-The suite command does not run this overlap.
 
 ## Race battery
 
