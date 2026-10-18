@@ -31,7 +31,7 @@ Same pinned harness as the Spike A report: PostgreSQL 18.6, PgBouncer 1.26.0, `p
 | B1 | PASS | Per-rep rate 7999.52, 8000, 8000 /s. Per-rep p99 0.718, 0.371, 0.358 ms. Corrupt 0, errors 0. Target ≥5000 /s and p99 ≤10 ms. |
 | B2 sequential | PASS | Lost cancel stays `COMMITTED` and is reported `lost`. Live cancel is `cancelled` / `CANCELLED`. Commit after cancel is fenced. Ignore-cancel returns `ignore` and the cancel times out. |
 | B2 concurrent | PASS | `test:races` case `commit-vs-revoke`, 35.05 ms. The case requires the executor to hold the row first, the revoker to wait on `Lock` / `transactionid`, the commit to win, the cancel to lose, and the row to stay `COMMITTED`. |
-| B3 | PASS | The partial cap is 32768 bytes. The scored fault is `partial-cap` at 36864 bytes, and `bound` is true because that count is the cap plus one 4096-byte read chunk. Pending, total, kernel, and RSS checks in the same case stayed inside their own bounds. |
+| B3 | NOT DEMONSTRATED | The partial cap is demonstrated: `partial-cap` at 36864 bytes, the 32768-byte cap plus one 4096-byte read chunk. The total-buffer field is `buffered` 0 and `bound` true. That count is taken after `#fault` clears the child, so it is not the high-water. |
 | B4 | PASS | Oversize and never-terminated frames are typed errors. A malformed child does not kill its sibling. |
 | B5 | PASS | Mid-call exit is `child-exited` (code 1). The retired token is refused. The respawn token is distinct and fenced. Status stays `ACTIVE`. |
 | B6 | PASS | Hostile checks all true. Flood cancel p99 87.58, 66.59, 73.85 ms, each ≤ 500 ms. |
@@ -57,9 +57,11 @@ The concurrent clause is `commit-vs-revoke` in `test:races`. The executor holds 
 4. **Fix.** Pull request #47, now dev `1b1f536c6fa874369ce1d30e9337f4224961be93`, faults when an unfinished frame passes the configured partial cap. The only overshoot is one read chunk, 4096 bytes. The B3 bound is `pendingBytes` against that cap plus the chunk, and the fault code is `partial-cap`. The framer still throws `NdjsonOversizeError` once the residual is greater than 1 MiB + 1 byte.
 5. **This rerun.** The scored partial object is `pendingBytes` 36864, `partial-cap`, `bound` true. 36864 = 32768 + 4096. That is the cap plus one read chunk.
 
-The other measurements in this same case: pending admitted 4 and rejected 4; total cap tripped with buffered 0; the kernel socket pause admitted one call (270 buffered bytes) and rejected a frame above the kernel byte cap before a waiter was installed. RSS growth was 507904, 466944, and 1605632 bytes, each at or under 67108864.
+The other measurements in this same case: pending admitted 4 and rejected 4; the kernel socket pause admitted one call (270 buffered bytes) and rejected a frame above the kernel byte cap before a waiter was installed. RSS growth was 507904, 466944, and 1605632 bytes, each at or under 67108864.
 
-This PASS closes the replacement-validation track in the section below. The plan §8 re-spike track was opened by the original FAIL and closed by this rerun.
+The total-buffer object in that same line is `tripped` true, `buffered` 0, `bound` true. `tripCaps` sets `total: 48 * 1024` and waits until `caps.total`, then reads `bufferedBytes()`. An unfinished frame past the per-child room calls `#fault('total-cap')`. `#fault` records `pendingBytes`, marks the child dead, and replaces the framer. `bufferedBytes()` skips dead children, so the scored count is the post-cleanup value. `bound` is `buffered <= 48 * 1024 + 192 * 1024`, which is true of 0. `tripCaps` does not read the fault's `pendingBytes`. The high-water is not in the scored line. This is an oracle defect. Plan §3.0 routes it to fix and rerun, not to a substrate redesign.
+
+The partial-cap clause of this rerun stands. The overall B3 verdict does not. The plan §8 re-spike for the partial cap was opened by the original FAIL and closed by the 36864-byte fault. It is not reopened by this gap. Issue #14 also owns the measurement fix and the B3 rerun.
 
 Each hold warmed 5005 ms, 5005 ms, and 5004 ms, then offered 300 slots (issued 300, skipped 0). Pending, partial, total, lo, and hi flags tripped on every hold, and the near-cap checks stayed true. The sibling answered. Growth for the three holds is in the B3 row. Each hold remains under 64 MiB. The environment stayed valid (loads 0.98, 1.17, 1.07).
 
@@ -96,13 +98,13 @@ Cadence is 5 s and the lease is 20 s. Renewal traffic for the capacity annex is 
 
 ## Replacement-validation track
 
-The original B3 FAIL opened the plan §8 re-spike track: enforce the partial cap, then rerun B3. Pull request #47 is that enforcement. This rerun is the re-spike, and B3 passes, so the track is closed. The flow-control hypothesis is accepted on this run. A substrate redesign is not required by this result.
+The original B3 FAIL opened the plan §8 re-spike track for the partial cap. Pull request #47 is that enforcement. The rerun faulted at 36864 bytes with code `partial-cap`, so that track is closed. A substrate redesign is not required by that result. The overall B3 verdict is NOT DEMONSTRATED because the total-buffer count is post-cleanup. That oracle defect stays on the §3.0 fix-and-rerun path. It does not open a second track.
 
-B1, B2, B4, B5, B6, and the race battery stay on framed NDJSON, the supervisor-stamped credential, and the conditional authority row. A1 pooled and A3 stay NOT DEMONSTRATED for the same missing pooled raw-`pg` control. Issue #14 owns that control and the A1 and A3 rerun, and this pull request does not close #14. ADR-0002 does not treat those two clauses as complete. That gap does not open a second track. A4b stays issue #34.
+B1, B2, B4, B5, B6, and the race battery stay on framed NDJSON, the supervisor-stamped credential, and the conditional authority row. A1 pooled and A3 stay NOT DEMONSTRATED for the missing pooled raw-`pg` control. Issue #14 owns that control, the A1 and A3 rerun, and the total-buffer measurement fix with its B3 rerun. This pull request does not close #14. ADR-0002 does not treat A1 pooled, A3, or B3 as complete. A4b stays issue #34.
 
 ### Revised capacity note
 
-T7 still writes the annex. This note is what the closed re-spike attaches.
+T7 still writes the annex. This note is what the closed partial-cap re-spike attaches. It is not an overall B3 PASS. The total-buffer high-water was not scored.
 
 The enforced partial cap in the passing B3 case is 32768 bytes per child. This run faulted at 36864 bytes, the cap plus one 4096-byte read chunk. The per-host partial-buffer bound is `32768 × children` bytes, plus at most `4096 × children` for that read chunk. The scored `tripCaps` partial child is one child, so the bound for that child is 32768 bytes and the fault landed at 36864.
 

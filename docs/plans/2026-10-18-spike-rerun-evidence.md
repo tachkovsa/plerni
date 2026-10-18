@@ -39,7 +39,7 @@ The pooled A1 row is Kysely. There is no `A1 @ pooled (raw-pg control)` line. Th
 
 ## B1–B6 scored spike
 
-Fields below are taken from the scored lines. They are this run, not a second one. The partial object is the B3 PASS: 36864 bytes, `partial-cap`, cap 32768, one 4096-byte read chunk.
+Fields below are taken from the scored lines. They are this run, not a second one. The runner printed PASS for `b3-backpressure`. The partial object is demonstrated: 36864 bytes, `partial-cap`, cap 32768, one 4096-byte read chunk. The total object is `buffered` 0 and `bound` true. That count is `bufferedBytes()` after `#fault` marks the child dead and replaces the framer, so the B report withholds the B3 verdict.
 
 ```text
 [PASS] b2-fencing — {"lost":"lost","lostStatus":"COMMITTED","ack":"cancelled","ackStatus":"CANCELLED","fenceAck":"cancelled","fenced":true,"fenceStatus":"CANCELLED","ignoreResult":"ignore","ignoreCancelCode":"timeout"}
