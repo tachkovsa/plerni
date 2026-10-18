@@ -4,7 +4,7 @@
 // migration and it is not part of the fencing authority schema.
 
 import pg from 'pg';
-import { LEASE_MS, isAborted, openAppClient } from './control.mjs';
+import { CADENCE_MS, LEASE_MS, isAborted, openAppClient } from './control.mjs';
 
 let effectsReady;
 
@@ -169,6 +169,33 @@ export async function expireHeartbeat(id) {
 // extend the lease when the wall-clock cadence fires during a slow run.
 export function quietRenew() {
   return { renew: async () => null };
+}
+
+// commitExecution reports the shutdown interval. Production sets the bound
+// to the cadence (plan B2 / F8: last durable renewal → COMMITTED row lock).
+// A count of renewals does not check that interval: null <= 5000 is true,
+// and boundViolation stays false when no renewal timestamp was recorded.
+export function commitMetrics(result) {
+  return {
+    committed: result?.committed === true,
+    renewals: result?.renewals ?? null,
+    lastRenewalToLockMs: result?.lastRenewalToLockMs ?? null,
+    boundViolation: result?.boundViolation ?? null,
+    bound: result?.bound ?? null,
+    lockWaitMs: result?.lockWaitMs ?? null,
+  };
+}
+
+export function commitReportHeld(result) {
+  if (result?.committed !== true) return false;
+  if (result.boundViolation !== false) return false;
+  if (result.bound !== CADENCE_MS) return false;
+  if (!Number.isInteger(result.renewals) || result.renewals < 0) return false;
+  if (!Number.isFinite(result.lockWaitMs) || result.lockWaitMs < 0) return false;
+  if (result.renewals === 0) return result.lastRenewalToLockMs === null;
+  return Number.isFinite(result.lastRenewalToLockMs)
+    && result.lastRenewalToLockMs >= 0
+    && result.lastRenewalToLockMs <= CADENCE_MS;
 }
 
 export async function killClient(client) {

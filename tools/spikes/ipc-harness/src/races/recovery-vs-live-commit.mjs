@@ -18,7 +18,7 @@ import {
 } from '../authority.mjs';
 import { assertBounds, steps } from './clock.mjs';
 import { holdRow } from './control.mjs';
-import { countEffects, ensureEffects, expireHeartbeat, insertEffect, quietRenew, waitForQueryLock } from './support.mjs';
+import { commitMetrics, commitReportHeld, countEffects, ensureEffects, expireHeartbeat, insertEffect, quietRenew, waitForQueryLock } from './support.mjs';
 
 const RACE_BOUND_MS = 15_000;
 
@@ -40,11 +40,10 @@ async function executorWins(timing) {
     sweepP.catch(() => {});
     await timing.run(() => waitForQueryLock('ABANDONED', 8_000), 'executor-first sweeper queued', 10_000);
     await timing.run(() => barrier.release(), 'executor release');
-    let committed = false;
+    let report = commitMetrics(null);
     let fenced = false;
     try {
-      const result = await timing.run(() => commitP, 'executor-first commit', RACE_BOUND_MS);
-      committed = result?.committed === true;
+      report = commitMetrics(await timing.run(() => commitP, 'executor-first commit', RACE_BOUND_MS));
     } catch (err) {
       fenced = err instanceof FencedError;
       if (!fenced) throw err;
@@ -52,7 +51,7 @@ async function executorWins(timing) {
     const swept = await timing.run(() => sweepP, 'executor-first sweep', RACE_BOUND_MS);
     return {
       ordering: 'executor-first',
-      committed,
+      ...report,
       fenced,
       swept: swept.includes(id),
       status: (await timing.run(() => getStatus(id, true), 'executor status'))?.status ?? null,
@@ -113,7 +112,7 @@ export async function recoveryVsLiveCommit() {
   const sweeper = await sweeperWins(timing);
   const detail = { executor, sweeper, bounds: timing.bounds };
   assertBounds(detail.bounds);
-  const pass = executor.committed === true
+  const pass = commitReportHeld(executor)
     && executor.fenced === false
     && executor.swept === false
     && executor.status === 'COMMITTED'

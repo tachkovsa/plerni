@@ -16,7 +16,7 @@ import {
 } from '../authority.mjs';
 import { assertBounds, steps } from './clock.mjs';
 import { CADENCE_MS, LEASE_MS, isAborted } from './control.mjs';
-import { countEffects, ensureEffects, insertEffect, quietRenew } from './support.mjs';
+import { commitMetrics, commitReportHeld, countEffects, ensureEffects, insertEffect, quietRenew } from './support.mjs';
 
 const OPEN_MIN_MS = 25_000;
 const OPEN_MAX_MS = 30_000;
@@ -39,7 +39,7 @@ async function positive(timing) {
   let wallMs = 0;
   let committed = false;
   let fenced = false;
-  let renewals = 0;
+  let report = commitMetrics(null);
   try {
     const result = await timing.run(() => commitExecution(id, token, async (client) => {
       await insertEffect(client, id, 'long');
@@ -63,8 +63,8 @@ async function positive(timing) {
         await sleep(SAMPLE_MS);
       }
     }, true), 'healthy commit', POSITIVE_BOUND_MS);
-    committed = result.committed === true;
-    renewals = result.renewals;
+    report = commitMetrics(result);
+    committed = report.committed;
   } catch (err) {
     fenced = err instanceof FencedError;
     if (!fenced) throw err;
@@ -75,7 +75,7 @@ async function positive(timing) {
   return {
     committed,
     fenced,
-    renewals,
+    ...report,
     wallMs,
     advances: beats.length,
     increasing,
@@ -149,6 +149,11 @@ export async function healthyLong() {
     && held.committed === true
     && held.fenced === false
     && held.renewals >= 4
+    && held.boundViolation === false
+    && Number.isFinite(held.lastRenewalToLockMs)
+    && held.lastRenewalToLockMs >= 0
+    && held.lastRenewalToLockMs <= CADENCE_MS
+    && commitReportHeld(held)
     && held.advances >= 5
     && held.increasing === true
     && held.status === 'COMMITTED'

@@ -7,7 +7,7 @@
 import { randomUUID } from 'node:crypto';
 import { FencedError, commitExecution, createExecution, dispatch, getStatus } from '../authority.mjs';
 import { assertBounds, steps } from './clock.mjs';
-import { countEffects, ensureEffects, insertEffect, quietRenew } from './support.mjs';
+import { commitMetrics, commitReportHeld, countEffects, ensureEffects, insertEffect, quietRenew } from './support.mjs';
 
 function reportDurable(status) {
   if (status === 'COMMITTED') return 'committed';
@@ -22,9 +22,9 @@ export async function lostReply() {
   const id = await timing.run(() => createExecution('t5c-lost-reply', token, true), 'create');
   await timing.run(() => dispatch(id, true), 'dispatch');
 
-  await timing.run(() => commitExecution(id, token, async (client) => {
+  const durable = commitMetrics(await timing.run(() => commitExecution(id, token, async (client) => {
     await insertEffect(client, id, 'durable');
-  }, true, quietRenew()), 'durable commit');
+  }, true, quietRenew()), 'durable commit'));
 
   let fenced = false;
   try {
@@ -40,6 +40,7 @@ export async function lostReply() {
   const reported = reportDurable(status);
   const detail = {
     id,
+    durable,
     fenced,
     status,
     reported,
@@ -48,7 +49,8 @@ export async function lostReply() {
     bounds: timing.bounds,
   };
   assertBounds(detail.bounds);
-  const pass = fenced
+  const pass = commitReportHeld(durable)
+    && fenced
     && reported === 'committed'
     && reported !== 'cancelled'
     && detail.durableEffects === 1

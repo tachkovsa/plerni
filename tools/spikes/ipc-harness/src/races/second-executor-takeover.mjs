@@ -14,30 +14,30 @@ import {
   sweepAbandoned,
 } from '../authority.mjs';
 import { assertBounds, steps } from './clock.mjs';
-import { countEffects, ensureEffects, expireHeartbeat, insertEffect, quietRenew } from './support.mjs';
+import { commitMetrics, commitReportHeld, countEffects, ensureEffects, expireHeartbeat, insertEffect, quietRenew } from './support.mjs';
 
 async function settle(kind, id, token, timing) {
   if (kind === 'COMMITTED') {
-    await timing.run(() => commitExecution(id, token, async (client) => {
+    return commitMetrics(await timing.run(() => commitExecution(id, token, async (client) => {
       await insertEffect(client, id, 'settled');
-    }, true, quietRenew()), `${kind} settle`);
-    return;
+    }, true, quietRenew()), `${kind} settle`));
   }
   if (kind === 'CANCELLED') {
     const won = await timing.run(() => cancelExecution(id, true), `${kind} cancel`);
     if (!won) throw new Error('cancel did not win');
-    return;
+    return null;
   }
   await timing.run(() => expireHeartbeat(id), `${kind} expire`);
   const swept = await timing.run(() => sweepAbandoned(true), `${kind} sweep`);
   if (!swept.includes(id)) throw new Error('sweeper did not abandon the settled row');
+  return null;
 }
 
 async function one(kind, timing) {
   const token = `stale-${kind}-${randomUUID()}`;
   const id = await timing.run(() => createExecution('t5c-takeover', token, true), `${kind} create`);
   await timing.run(() => dispatch(id, true), `${kind} dispatch`);
-  await settle(kind, id, token, timing);
+  const settled = await settle(kind, id, token, timing);
   let fenced = false;
   try {
     await timing.run(() => commitExecution(id, token, async (client) => {
@@ -52,6 +52,7 @@ async function one(kind, timing) {
     fenced,
     status: (await timing.run(() => getStatus(id, true), `${kind} status`))?.status ?? null,
     takeoverEffects: await timing.run(() => countEffects(id, 'takeover'), `${kind} takeover effects`),
+    settled,
     settledEffects: kind === 'COMMITTED'
       ? await timing.run(() => countEffects(id, 'settled'), `${kind} settled effects`)
       : null,
@@ -70,6 +71,6 @@ export async function secondExecutorTakeover() {
   const pass = rows.every((row) => row.fenced
     && row.status === row.kind
     && row.takeoverEffects === 0
-    && (row.kind !== 'COMMITTED' || row.settledEffects === 1));
+    && (row.kind !== 'COMMITTED' || (commitReportHeld(row.settled) && row.settledEffects === 1)));
   return { pass, detail };
 }

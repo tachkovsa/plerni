@@ -8,7 +8,7 @@
 import { randomUUID } from 'node:crypto';
 import { commitExecution, createExecution, dispatch, getStatus } from '../authority.mjs';
 import { assertBounds, steps } from './clock.mjs';
-import { countEffects, ensureEffects, insertEffect, waitForQueryLock } from './support.mjs';
+import { commitMetrics, commitReportHeld, countEffects, ensureEffects, insertEffect, waitForQueryLock } from './support.mjs';
 
 export const HEARTBEAT_BOUND_MS = 20_000;
 const LOCK_WAIT_MS = 12_000;
@@ -29,9 +29,10 @@ export async function heartbeatBehindCommit() {
   }, true), 'heartbeat-behind-commit', HEARTBEAT_BOUND_MS);
 
   const commitBound = timing.bounds.find((item) => item.label === 'heartbeat-behind-commit');
+  const report = commitMetrics(result);
   const detail = {
     id,
-    committed: result.committed === true,
+    ...report,
     sawBlocked,
     status: (await timing.run(() => getStatus(id, true), 'status'))?.status ?? null,
     effects: await timing.run(() => countEffects(id, 'behind'), 'effects'),
@@ -40,7 +41,7 @@ export async function heartbeatBehindCommit() {
     bounds: timing.bounds,
   };
   assertBounds(detail.bounds);
-  const pass = detail.committed
+  const pass = commitReportHeld(report)
     && detail.sawBlocked
     && detail.status === 'COMMITTED'
     && detail.effects === 1

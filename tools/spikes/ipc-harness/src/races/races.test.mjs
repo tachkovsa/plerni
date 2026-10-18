@@ -7,11 +7,13 @@ import { describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { dbConfigured } from '../supervisor.mjs';
 import { assertBounds } from './clock.mjs';
+import { CADENCE_MS } from './control.mjs';
 import { adminProbeReason, raceSkip, rootProbeReason, runningInCi } from './support.mjs';
 import { deathBeforeCommit } from './death-before-commit.mjs';
 import { lostReply } from './lost-reply.mjs';
 import { recoveryVsLiveCommit } from './recovery-vs-live-commit.mjs';
 import { healthyLong } from './healthy-long.mjs';
+import { stalledShutdown } from './stalled-shutdown.mjs';
 import { HEARTBEAT_BOUND_MS, heartbeatBehindCommit } from './heartbeat-behind-commit.mjs';
 import { saturatedPool } from './saturated-pool.mjs';
 import { queuedPastLease } from './queued-past-lease.mjs';
@@ -49,6 +51,15 @@ describe('T5c race battery', { concurrency: 1, timeout: 180_000 }, () => {
   test('healthy-long', { skip: raceSkip([databaseReason, rootReason], ci) }, async () => {
     ready([databaseReason, rootReason]);
     check(await healthyLong());
+  });
+  test('stalled shutdown fails the renewal-to-lock oracle', { skip: raceSkip([databaseReason], ci) }, async () => {
+    ready([databaseReason]);
+    const result = await stalledShutdown();
+    assert.equal(result.pass, false, JSON.stringify(result.detail));
+    assert.equal(result.detail.boundViolation, true);
+    assert.ok(result.detail.renewals >= 1);
+    assert.equal(result.detail.bound, CADENCE_MS);
+    assert.ok(result.detail.lastRenewalToLockMs > CADENCE_MS);
   });
   test('heartbeat-behind-commit', { skip: raceSkip([databaseReason, rootReason], ci) }, async () => {
     ready([databaseReason, rootReason]);

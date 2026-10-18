@@ -1,8 +1,8 @@
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { VACUOUS_COMMIT_SQL, VACUOUS_SWEEP_SQL } from './control.mjs';
-import { raceSkip, runningInCi } from './support.mjs';
+import { CADENCE_MS, VACUOUS_COMMIT_SQL, VACUOUS_SWEEP_SQL } from './control.mjs';
+import { commitReportHeld, raceSkip, runningInCi } from './support.mjs';
 
 const PRODUCTION_COMMIT = "UPDATE fencing_authority SET status = 'COMMITTED' WHERE id = $1 AND token = $2 AND status = 'ACTIVE' RETURNING clock_timestamp() AS locked_at";
 const PRODUCTION_SWEEP = "UPDATE fencing_authority SET status = 'ABANDONED' WHERE status = 'ACTIVE' AND heartbeat_at < now() - make_interval(secs => $1) RETURNING id";
@@ -32,6 +32,21 @@ test('a missing race service skips locally and fails closed in CI', () => {
     'no root connection configured; no PgBouncer admin connection configured',
   );
   assert.equal(raceSkip(['no root connection configured'], true), false);
+});
+
+test('the renewal-to-lock oracle rejects an interval past the cadence', () => {
+  const held = {
+    committed: true,
+    renewals: 4,
+    lastRenewalToLockMs: 1000,
+    boundViolation: false,
+    bound: CADENCE_MS,
+    lockWaitMs: 1,
+  };
+  assert.equal(commitReportHeld(held), true);
+  assert.equal(commitReportHeld({ ...held, lastRenewalToLockMs: CADENCE_MS + 1, boundViolation: true }), false);
+  assert.equal(commitReportHeld({ ...held, renewals: 1, lastRenewalToLockMs: null }), false);
+  assert.equal(commitReportHeld({ ...held, renewals: 0, lastRenewalToLockMs: null }), true);
 });
 
 test('any CI marker except empty, 0, or false fails closed', () => {

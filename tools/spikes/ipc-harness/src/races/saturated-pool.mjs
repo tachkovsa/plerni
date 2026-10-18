@@ -11,7 +11,7 @@ import { randomUUID } from 'node:crypto';
 import { commitExecution, createExecution, dispatch, getStatus, sweepAbandoned } from '../authority.mjs';
 import { assertBounds, deferred, steps } from './clock.mjs';
 import { LEASE_MS, isAborted, openAppClient } from './control.mjs';
-import { countEffects, ensureEffects, insertEffect, openAdminClient } from './support.mjs';
+import { commitMetrics, commitReportHeld, countEffects, ensureEffects, insertEffect, openAdminClient } from './support.mjs';
 
 const POOL_PIN = 10;
 const HOLD_BOUND_MS = 50_000;
@@ -181,9 +181,8 @@ export async function saturatedPool() {
       holdMs,
       beats: beats.length,
       increasing,
-      renewals: result.renewals,
+      ...commitMetrics(result),
       sweptDuring,
-      committed: result.committed === true,
       status,
       effects,
       leaseMs: LEASE_MS,
@@ -197,6 +196,11 @@ export async function saturatedPool() {
       && beats.length >= 5
       && increasing
       && result.renewals >= 4
+      && result.boundViolation === false
+      && Number.isFinite(result.lastRenewalToLockMs)
+      && result.lastRenewalToLockMs >= 0
+      && result.lastRenewalToLockMs <= result.bound
+      && commitReportHeld(result)
       && sweptDuring === 0
       && result.committed === true
       && status === 'COMMITTED'
