@@ -17,6 +17,7 @@ import { saturatedPool } from './saturated-pool.mjs';
 import { queuedPastLease } from './queued-past-lease.mjs';
 import { secondExecutorTakeover } from './second-executor-takeover.mjs';
 import { vacuityAuthority } from './vacuity-authority.mjs';
+import { commitVsRevoke, commitVsRevokeVacuity } from './commit-vs-revoke.mjs';
 
 const ci = runningInCi();
 const directReason = await directProbeReason();
@@ -102,6 +103,30 @@ describe('T5c race battery', { concurrency: 1, timeout: 180_000 }, () => {
   test('second-executor-takeover', { skip: raceSkip([directReason, rootReason], ci) }, async () => {
     ready([directReason, rootReason]);
     check(await runRace(() => secondExecutorTakeover()));
+  });
+  test('commit-vs-revoke', { skip: raceSkip([directReason, pooledReason], ci) }, async () => {
+    ready([directReason, pooledReason]);
+    const result = await runRace(() => commitVsRevoke());
+    check(result);
+    assert.equal(result.detail.revokerWaitedOnLock, true);
+    assert.equal(result.detail.waitEvent, 'transactionid');
+    assert.equal(result.detail.commit, true);
+    assert.equal(result.detail.cancelWon, false);
+    assert.equal(result.detail.fenced, false);
+    assert.equal(result.detail.status, 'COMMITTED');
+    assert.ok(result.detail.bounds.some((item) => item.label === 'revoker settled'));
+  });
+  test('commit-vs-revoke overlap oracle fails when the revoker does not wait', {
+    skip: raceSkip([directReason, pooledReason], ci),
+  }, async () => {
+    ready([directReason, pooledReason]);
+    const result = await runRace(() => commitVsRevokeVacuity());
+    assert.equal(result.pass, false, JSON.stringify(result.detail));
+    assert.equal(result.detail.cancelWon, true);
+    assert.equal(result.detail.fenced, true);
+    assert.equal(result.detail.status, 'CANCELLED');
+    assert.equal(result.detail.revokerWaitedOnLock, false);
+    assertBounds(result.detail.bounds);
   });
   test('vacuity-authority fails when the ACTIVE predicate is removed', {
     skip: raceSkip([directReason, rootReason], ci),
