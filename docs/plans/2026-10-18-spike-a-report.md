@@ -1,6 +1,6 @@
 # Spike A report
 
-Verdicts for plan §3.1 A1–A5 and the §3.2 battery. The scored A1–A4 run is 2026-10-18 on dev `3de0b5b28130960eb8a3df5bc7ea28c4164b9766`. The A5 curve and drift gate stay the 2026-10-17 measurement cited below. This file is the T4b skeleton with the T6 verdicts added.
+Verdicts for plan §3.1 A1–A5 and the §3.2 battery. The scored A1–A4 run is 2026-10-18 on dev `1b1f536c6fa874369ce1d30e9337f4224961be93`. The A5 curve and drift gate stay the 2026-10-17 measurement cited below. This file is the T4b skeleton with the T6 verdicts added.
 
 ## Rerun
 
@@ -10,7 +10,7 @@ One command, from a clean worktree of that SHA. Export `POSTGRES_PASSWORD`, `PLE
 cd tools/harness && ./reset.sh && cd ../.. && node tools/harness/seed.mjs && pnpm --filter @plerni-spike/db-invariant spike
 ```
 
-The scored run exited 0 in 6766 ms with `0 failing case(s)` and 38 JSONL rows. JSONL stays gitignored (`tools/spikes/*/evidence/`). The lines that back these verdicts are in `docs/plans/2026-10-18-spike-rerun-evidence.md`.
+The scored run exited 0 in 9249 ms with `0 failing case(s)` and 38 JSONL rows. JSONL stays gitignored (`tools/spikes/*/evidence/`). The lines that back these verdicts are in `docs/plans/2026-10-18-spike-rerun-evidence.md`.
 
 Review receipt: pending (δ, cross-family).
 
@@ -18,12 +18,12 @@ Review receipt: pending (δ, cross-family).
 
 | Item | Value |
 |---|---|
-| dev SHA | `3de0b5b28130960eb8a3df5bc7ea28c4164b9766` |
+| dev SHA | `1b1f536c6fa874369ce1d30e9337f4224961be93` |
 | Node | v24.22.0 |
 | PostgreSQL | 18.6 (Debian 18.6-1.pgdg13+2), image `postgres:18` digest `sha256:74935e72…fc4336` |
 | PgBouncer | 1.26.0, image `edoburu/pgbouncer:v1.26.0-p0` digest `sha256:b17551c7…95b711` |
 | Admin `SHOW` | `pool_mode=transaction`, `max_prepared_statements=0`, `default_pool_size=10`, `server_reset_query=DISCARD ALL`, `server_reset_query_always=0` |
-| Host | 4 CPUs, quota unlimited. Preflight load 0.12, not throttled, not overloaded. Memory 16387280 kB total, 4872436 kB available |
+| Host | 4 CPUs, quota unlimited. Memory 16387280 kB total, 4932784 kB available at this rerun |
 
 ## Invalid run
 
@@ -36,7 +36,7 @@ The first `spike` after `reset.sh` is not a verdict. A1 on the direct datasource
 3. **Runs.** The original spike and one pooled `psql` in that window failed `client_login_timeout (server down)`. After the scored suites, the dropping filter was restored. Three probes against the pooler that still held the scored run's server state failed `query_wait_timeout`. A pooler restart, then three more pooled raw-`pg` probes, each exited 2 with `client_login_timeout (server down)`. The direct control beside that trio succeeded. The login timeout and the queue timeout are both environmental, and they are different errors.
 4. **Oracle.** The pooled oracle did not run. Destination: invalid run. No A1–A5 label is taken from it.
 
-The filter was then set to accept compose-bridge forwarding. Three pooled probes succeeded. `reset.sh` and `seed.mjs` ran again. The verdicts below are that second `spike`.
+The filter was then set to accept compose-bridge forwarding. Three pooled probes succeeded. That episode is on dev `3de0b5b28130960eb8a3df5bc7ea28c4164b9766`. The verdicts below are the later `spike` on dev `1b1f536c6fa874369ce1d30e9337f4224961be93`.
 
 ## Verdicts
 
@@ -46,7 +46,7 @@ The filter was then set to accept compose-bridge forwarding. Three pooled probes
 | A1 pooled | NOT DEMONSTRATED | The Kysely pooled run printed constant pids. The identical raw-`pg` control did not. `rawApp()` always opens the direct DSN, and `pidsViaRawPg()` only calls `rawApp()`. `HARNESS_DIRECT_DSN` moves the direct path and the raw control together. No run-configuration switch adds a pooled raw client. |
 | A2 | PASS | Clean-deny reads 0 rows and the app guard raises. Tenant B's positive control returns B's three labels. After commit, context is absent and the context-less follow-up reads 0 rows. Both datasources. |
 | A3 | PASS | A1+A2 through PgBouncer, including division-by-zero rollback (`22012`) and the contamination lifecycle. |
-| A4 | PASS on unnamed discipline. A4b stays open. | Every observed statement name was empty (75 statements, 0 non-empty). Unnamed-vs-named mean overhead 31.5% (unrounded 31.518, 95% interval 28.7–34.3), so the mean is above 20%. Issue #34 stays the named-statement experiment. `max_prepared_statements` stayed 0. |
+| A4 | PASS on unnamed discipline. A4b stays open. | Every observed statement name was empty (75 statements, 0 non-empty). Unnamed-vs-named mean overhead 28.4% (unrounded 28.378, 95% interval 21.0–35.7), so the mean is above 20%. Issue #34 stays the named-statement experiment. `max_prepared_statements` stayed 0. |
 | A5 | PASS at the acceptance point | Band 75 is within the ceiling on the 2026-10-17 CI run. Stress bands did not overrun. No ergonomics fallback. |
 | Battery | PASS | Terminations equal injected contaminations (8 and 8). Warm-tail terminations 0. |
 
@@ -56,15 +56,15 @@ A3's pooled pinning rows are that case's own Kysely run. They do not fill in the
 
 ## A1 pooled raw control
 
-A1 pooled is NOT DEMONSTRATED because the raw control never traversed PgBouncer. The direct raw-`pg` result stays PASS. The consequence is a follow-up: add a raw `pg.Client` on the pooled DSN inside the A1 case, then rerun A1. A missing control does not replace the shipped substrate, so this clause does not open the replacement-validation track and does not revise the capacity note. The B3 FAIL opens that track in the Spike B report.
+A1 pooled is NOT DEMONSTRATED because the raw control never traversed PgBouncer. The direct raw-`pg` result stays PASS. The consequence is a follow-up: add a raw `pg.Client` on the pooled DSN inside the A1 case, then rerun A1. No run-configuration switch adds that client. A missing control does not replace the shipped substrate, so this clause does not open the replacement-validation track. The B3 re-spike in the Spike B report is closed.
 
 ## A3 contamination lifecycle
 
-On the pooled datasource the executing backend was detected before tenant access, `pg_terminate_backend` removed it (`backendGoneMs` 5), and the absence check ran on the replacement session. The positive control passed. Retries were 1. Cleanup was 24 ms. The rival checkout was held off and did not time out.
+On the pooled datasource the executing backend was detected before tenant access, `pg_terminate_backend` removed it (`backendGoneMs` 6), and the absence check ran on the replacement session. The positive control passed. Retries were 1. Cleanup was 26 ms. The rival checkout was held off and did not time out.
 
 ## A4 overhead
 
-Ten reps, ABBA then BAAB, 2500 iterations per block, 4 blocks per rep, direct connection, Node v24.22.0. Overhead percent: 31.2, 30.9, 29.3, 29.7, 37.1, 30.2, 34.2, 37.9, 24.6, 30.1. Median 30.5, minimum 24.6, p95 37.9. The runner's decision is `mean-exceeds-20` and `a4bRequired` is true. Issue #34 already tracks `test(spike): A4b named-statement branch` (`max_prepared_statements > 0`, then A1–A3 again on the pool). This report does not run that experiment.
+Ten reps, ABBA then BAAB, 2500 iterations per block, 4 blocks per rep, direct connection, Node v24.22.0. Overhead percent: 23.9, 27.5, 32.5, 11.9, 44.4, 19.8, 21.7, 34.3, 24.9, 42.9. Median 26.2, minimum 11.9, p95 44.4. The runner's decision is `mean-exceeds-20` and `a4bRequired` is true. Issue #34 already tracks `test(spike): A4b named-statement branch` (`max_prepared_statements > 0`, then A1–A3 again on the pool). This report does not run that experiment.
 
 ## Battery
 
@@ -116,4 +116,4 @@ The clean tree passed the gate on bands 50, 75, 200, and 400 in the T4b run (exi
 
 ## Replacement-validation track
 
-Plan §8 opens the replacement-validation track when a verdict replaces the shipped substrate, and the track carries a revised capacity estimate. A2, A3, A4's unnamed discipline, and A5 stay on the results the suite demonstrated. A4b stays issue #34. A1 pooled is the follow-up in the section above. The track this pair of reports opens is the B3 FAIL, recorded in the Spike B report, with the revised capacity note attached there. The capacity annex remains T7. That annex takes no partial-buffer cost from the failed B3 run.
+Plan §8 opens the replacement-validation track when a verdict replaces the shipped substrate, and the track carries a revised capacity estimate. A2, A3, A4's unnamed discipline, and A5 stay on the results the suite demonstrated. A4b stays issue #34. A1 pooled is the follow-up in the section above. The B3 re-spike in the Spike B report was opened by the original FAIL and closed by the rerun at this dev SHA. The capacity annex remains T7. The partial-buffer bound that rerun attaches is `32768 × children` bytes, plus at most one 4096-byte read chunk per child.
