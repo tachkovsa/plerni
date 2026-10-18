@@ -76,6 +76,16 @@ export async function rootProbeReason() {
   return failed ? `root ${failed}` : null;
 }
 
+export function appConfigured() {
+  return Boolean(process.env.HARNESS_DIRECT_DSN || process.env.PLERNI_APP_PASSWORD);
+}
+
+export async function appProbeReason() {
+  if (!appConfigured()) return 'no harness database in the environment';
+  const failed = await probe(() => openAppClient('direct', PROBE_MS), 'SELECT 1');
+  return failed ? `harness database ${failed}` : null;
+}
+
 export function adminConfigured() {
   return Boolean(process.env.HARNESS_ADMIN_DSN || process.env.PLERNI_ADMIN_PASSWORD);
 }

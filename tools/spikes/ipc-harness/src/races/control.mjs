@@ -48,23 +48,25 @@ export function resetAbort() {
   aborted = false;
 }
 
-function appClient(pooled) {
+function appClient(pooled, connectionTimeoutMillis = 0) {
+  const timeout = connectionTimeoutMillis > 0 ? { connectionTimeoutMillis } : {};
   const dsn = pooled ? process.env.HARNESS_POOLED_DSN : process.env.HARNESS_DIRECT_DSN;
-  if (dsn) return new pg.Client({ connectionString: dsn });
+  if (dsn) return new pg.Client({ connectionString: dsn, ...timeout });
   return new pg.Client({
     host: 'localhost',
     port: pooled ? 54321 : 54320,
     database: 'plerni',
     user: 'plerni_app',
     password: process.env.PLERNI_APP_PASSWORD,
+    ...timeout,
   });
 }
 
-export function openAppClient(kind = 'direct') {
+export function openAppClient(kind = 'direct', connectionTimeoutMillis = 0) {
   if (kind !== 'direct' && kind !== 'reserved' && kind !== 'pooled') {
     throw new Error('unknown harness client kind');
   }
-  return appClient(kind === 'pooled');
+  return appClient(kind === 'pooled', connectionTimeoutMillis);
 }
 
 function destroy(client) {

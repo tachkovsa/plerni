@@ -5,10 +5,9 @@
 
 import { describe, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { dbConfigured } from '../supervisor.mjs';
 import { assertBounds } from './clock.mjs';
 import { CADENCE_MS } from './control.mjs';
-import { adminProbeReason, raceSkip, rootProbeReason, runningInCi } from './support.mjs';
+import { adminProbeReason, appProbeReason, raceSkip, rootProbeReason, runningInCi } from './support.mjs';
 import { deathBeforeCommit } from './death-before-commit.mjs';
 import { lostReply } from './lost-reply.mjs';
 import { recoveryVsLiveCommit } from './recovery-vs-live-commit.mjs';
@@ -21,7 +20,7 @@ import { secondExecutorTakeover } from './second-executor-takeover.mjs';
 import { vacuityAuthority } from './vacuity-authority.mjs';
 
 const ci = runningInCi();
-const databaseReason = dbConfigured() ? null : 'no harness database in the environment';
+const databaseReason = await appProbeReason();
 const rootReason = await rootProbeReason();
 const adminReason = await adminProbeReason();
 
@@ -85,9 +84,13 @@ describe('T5c race battery', { concurrency: 1, timeout: 180_000 }, () => {
   }, async () => {
     ready([databaseReason, rootReason]);
     const result = await vacuityAuthority();
-    assert.equal(result.pass, false);
-    assert.equal(result.exploit, true, JSON.stringify(result.detail));
-    assert.equal(result.realHeld, true, JSON.stringify(result.detail));
-    assertBounds(result.detail.bounds);
+    assert.equal(result.real.pass, true, JSON.stringify(result.real.detail));
+    assert.equal(result.open.pass, false, JSON.stringify(result.open.detail));
+    assert.equal(result.open.detail.executor.status, 'ABANDONED');
+    assert.equal(result.open.detail.executor.effects, 1);
+    assert.equal(result.open.detail.sweeper.status, 'COMMITTED');
+    assert.equal(result.open.detail.sweeper.effects, 1);
+    assertBounds(result.real.detail.bounds);
+    assertBounds(result.open.detail.bounds);
   });
 });
