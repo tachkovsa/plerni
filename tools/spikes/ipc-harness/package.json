@@ -4,7 +4,8 @@
   "type": "module",
   "scripts": {
     "spike": "node src/run.mjs",
-    "test": "node --test src/framing.test.mjs src/authority.test.mjs src/supervisor.test.mjs"
+    "test": "node --test src/framing.test.mjs src/authority.test.mjs src/supervisor.test.mjs",
+    "test:races": "node --test --test-concurrency=1 src/races/clock.test.mjs src/races/control.test.mjs src/races/races.test.mjs && node --test --test-concurrency=1 --test-name-pattern \"B6 vacuity without identity stamping\" src/supervisor.test.mjs"
   },
   "dependencies": {
     "pg": "8.23.1"
