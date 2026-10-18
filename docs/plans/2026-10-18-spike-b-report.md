@@ -1,38 +1,38 @@
 # Spike B report
 
-Verdicts for plan §4 B1–B6 and the T5c race battery. B3 was rerun on 2026-10-18 as three `spike:b3` invocations on the tree of this commit (parent `60a233ac31ddd812a13e7d4f6d08fa54677f3877`). B1, B4, B5, and B6 stay the 2026-10-18 run at dev `1b1f536c6fa874369ce1d30e9337f4224961be93` (pull request #47). `test` and `test:races` were rerun on this commit. The invalid pooled login from earlier that day is recorded in the Spike A report and is not a B verdict.
+Verdicts for plan §4 B1–B6 and the T5c race battery. The partial high-water was rerun on 2026-10-18 as three `spike:b3` invocations on the tree of this commit (parent `281f9d3a6e29fd57f6ece14fd255abd4667b41be`). The total-buffer figures stay the three accounted totals measured on that parent. B1, B4, B5, and B6 stay the 2026-10-18 run at dev `1b1f536c6fa874369ce1d30e9337f4224961be93` (pull request #47). `test` and `test:races` were rerun on this commit. The invalid pooled login from earlier that day is recorded in the Spike A report and is not a B verdict.
 
 Evidence label, verbatim: "transport + minimal-real-authority; full broker proof remains P2 acceptance".
 
 ## Rerun
 
-The scored suites are one command, from a clean worktree of that SHA. Export the four harness passwords first. Node is the major in `.nvmrc` (this run: v24.22.0). `reset.sh` needs Docker Compose v2 and `psql`.
-
-```bash
-cd tools/harness && ./reset.sh && cd ../.. && node tools/harness/seed.mjs && pnpm --filter @plerni-spike/ipc-harness spike && pnpm --filter @plerni-spike/ipc-harness test && pnpm --filter @plerni-spike/ipc-harness test:races
-```
-
-`spike` is in that command because the performance windows live there. `test` scores the deterministic B2–B6 checks and does not apply the 60 s contract. `test:races` is the race battery plus the B6 identity-stamping vacuity control.
-
-The dev `1b1f536` suite, covered by the receipt below, was `spike` exit 0; `test` 108 pass, 0 fail, 0 skipped, 23311 ms; `test:races` 26 pass, 0 fail, 0 skipped, 92167 ms, then the B6 vacuity control 1 pass, 1663 ms. That 108-test figure is not this commit.
-
-On this commit, `pnpm --filter @plerni-spike/ipc-harness test` is 110 pass, 0 fail, 0 skipped, duration_ms 23409.979972. `pnpm --filter @plerni-spike/ipc-harness test:races` is 26 pass, 0 fail, 0 skipped, duration_ms 92300.065604, then the B6 vacuity control 1 pass, duration_ms 1655.777184.
-
-B3's scored command is not a direct `b3()` call:
+The scored commands are separate. Export the four harness passwords first. Node is the major in `.nvmrc` (this run: v24.22.0). `reset.sh` needs Docker Compose v2 and `psql`. `spike:b3` exits 1, so joining it to the other two with `&&` would not run them.
 
 ```bash
 pnpm --filter @plerni-spike/ipc-harness spike:b3
 ```
 
-That script calls `b3()` with no window, repetition, or preflight override. The frozen contract is warmup 5000 ms, window 60000 ms, 3 reps. Three invocations each exited 1. JSONL stays gitignored. The lines that back these verdicts are in `docs/plans/2026-10-18-spike-rerun-evidence.md`.
+Exit 1 on each of three invocations. That script calls `b3()` with no window, repetition, or preflight override. The frozen contract is warmup 5000 ms, window 60000 ms, 3 reps. JSONL stays gitignored. The lines that back these verdicts are in `docs/plans/2026-10-18-spike-rerun-evidence.md`.
 
-`test:races` includes `commit-vs-revoke`. That case is the concurrent clause.
+```bash
+pnpm --filter @plerni-spike/ipc-harness test
+```
 
-Review receipt: REV-T6-2026-10-19-9cf9740 covers B1, B2, B4, B5, B6, the race battery, and the partial-cap history. The B3 total-buffer measurement on this commit is pending (δ).
+Exit 0. 114 pass, 0 fail, 0 skipped, duration_ms 23631.451671. `test` scores the deterministic B2–B6 checks and does not apply the 60 s contract.
+
+```bash
+pnpm --filter @plerni-spike/ipc-harness test:races
+```
+
+Exit 0. 26 pass, 0 fail, 0 skipped, duration_ms 92184.704125, then the B6 vacuity control 1 pass, duration_ms 1662.383168. `test:races` includes `commit-vs-revoke`. That case is the concurrent clause.
+
+The dev `1b1f536` suite, covered by the receipt below, was a different tree: `spike` exit 0, then `test` 108 pass, 0 fail, 0 skipped, 23311 ms, then `test:races` 26 pass, 0 fail, 0 skipped, 92167 ms, then the B6 vacuity control 1 pass, 1663 ms. That 108-test figure is not this commit.
+
+Review receipt: REV-T6-2026-10-19-9cf9740 covers B1, B2, B4, B5, B6, the race battery, and the partial-cap history through the framer-residual rerun. The B3 total-buffer measurement and this commit's partial high-water are pending (δ).
 
 ## Environment
 
-Same pinned harness as the Spike A report: PostgreSQL 18.6, PgBouncer 1.26.0, `pool_mode=transaction`, `max_prepared_statements=0`, `default_pool_size=10`. The first preflight printed by the `1b1f536` spike is the B6 flood environment: 4 CPUs, quota unlimited, load 0.14, not throttled, not overloaded, `valid: true`. Smoke recorded `mainPath: pooled`. Renewals use the reserved direct connection. Each scored performance repetition from that suite has `envAfter.valid: true`. The three B3 invocations on this commit also had preflight `valid: true`, with starting loads 0.30, 0.95, and 1.01. No performance case returned `invalid`.
+Same pinned harness as the Spike A report: PostgreSQL 18.6, PgBouncer 1.26.0, `pool_mode=transaction`, `max_prepared_statements=0`, `default_pool_size=10`. The first preflight printed by the `1b1f536` spike is the B6 flood environment: 4 CPUs, quota unlimited, load 0.14, not throttled, not overloaded, `valid: true`. Smoke recorded `mainPath: pooled`. Renewals use the reserved direct connection. Each scored performance repetition from that suite has `envAfter.valid: true`. The parent's three total-buffer invocations had preflight `valid: true`, with starting loads 0.30, 0.95, and 1.01. This commit's three partial invocations also had preflight `valid: true`, with starting loads 0.05, 0.87, and 1. No performance case returned `invalid`.
 
 ## Verdicts
 
@@ -40,8 +40,8 @@ Same pinned harness as the Spike A report: PostgreSQL 18.6, PgBouncer 1.26.0, `p
 |---|---|---|
 | B1 | PASS | Per-rep rate 7999.52, 8000, 8000 /s. Per-rep p99 0.718, 0.371, 0.358 ms. Corrupt 0, errors 0. Target ≥5000 /s and p99 ≤10 ms. |
 | B2 sequential | PASS | Lost cancel stays `COMMITTED` and is reported `lost`. Live cancel is `cancelled` / `CANCELLED`. Commit after cancel is fenced. Ignore-cancel returns `ignore` and the cancel times out. |
-| B2 concurrent | PASS | This commit's `test:races` case `commit-vs-revoke`, 29.29 ms. The case requires the executor to hold the row first, the revoker to wait on `Lock` / `transactionid`, the commit to win, the cancel to lose, and the row to stay `COMMITTED`. |
-| B3 | FAIL | Partial cap still holds: `partial-cap` at 36864 bytes, the 32768-byte cap plus one 4096-byte read chunk, in all three invocations. Total cap 49152 bytes does not. Accounted bytes (high-water, including the chunk tail, plus FIONREAD) were 106496, 57344, and 155648. The allowed overshoot is one 4096-byte read chunk (53248). All three are above it. |
+| B2 concurrent | PASS | This commit's `test:races` case `commit-vs-revoke`, 28.79 ms. The case requires the executor to hold the row first, the revoker to wait on `Lock` / `transactionid`, the commit to win, the cancel to lose, and the row to stay `COMMITTED`. |
+| B3 | FAIL | Partial cap does not hold. Code `partial-cap`. Framer residual `pendingBytes` 36864, in-flight tail 32768, high-water 69632 in all three invocations, above the 32768-byte cap plus one 4096-byte read chunk (36864). Total cap 49152 bytes does not. Accounted bytes (high-water, including the chunk tail, plus FIONREAD) were 106496, 57344, and 155648. The allowed overshoot is one 4096-byte read chunk (53248). All three are above it. |
 | B4 | PASS | Oversize and never-terminated frames are typed errors. A malformed child does not kill its sibling. |
 | B5 | PASS | Mid-call exit is `child-exited` (code 1). The retired token is refused. The respawn token is distinct and fenced. Status stays `ACTIVE`. |
 | B6 | PASS | Hostile checks all true. Flood cancel p99 87.58, 66.59, 73.85 ms, each ≤ 500 ms. |
@@ -55,7 +55,7 @@ Frozen shape: 2 children, in-flight 128, offered rate 8000/s, 1024-byte payload,
 
 The four suite outcomes run one after another. Commit finishes before the lost revocation. Revocation finishes before the fenced commit. The ignore-cancel child times out. The race battery's recovery-vs-live-commit case is the sweeper's `ABANDONED` update against commit.
 
-The concurrent clause is `commit-vs-revoke` in `test:races`. The executor holds `SELECT id FROM fencing_authority WHERE id = $1 FOR UPDATE` inside the effects transaction, and `cancelExecution` issues the `CANCELLED` update on a second pooled connection. The case waits until that update is on `Lock` / `transactionid`, then requires the commit to win and the cancel to lose. This commit's rerun passed in 29.29 ms. The following case finishes the cancel first: the overlap oracle fails, the row is `CANCELLED`, and the executor is fenced. That case passed in 23.69 ms.
+The concurrent clause is `commit-vs-revoke` in `test:races`. The executor holds `SELECT id FROM fencing_authority WHERE id = $1 FOR UPDATE` inside the effects transaction, and `cancelExecution` issues the `CANCELLED` update on a second pooled connection. The case waits until that update is on `Lock` / `transactionid`, then requires the commit to win and the cancel to lose. This commit's rerun passed in 28.79 ms. The following case finishes the cancel first: the overlap oracle fails, the row is `CANCELLED`, and the executor is fenced. That case passed in 22.73 ms.
 
 ## B3
 
@@ -74,9 +74,14 @@ The concurrent clause is `commit-vs-revoke` in `test:races`. The executor holds 
 10. **Not noise.** All three preflights were valid (4 CPUs, quota unlimited, not throttled, not overloaded). The three accounted totals agree on the direction. No database setting is on this path.
 11. **Oracle.** The hypothesis that the configured cap plus one read chunk covers the buffered bytes is false. Destination: plan §4 B3's fail column is redesign of flow control. Plan §8 opens a replacement-validation track for that flip. This round does not start the redesign.
 
-The partial-cap clause stands. The total-buffer clause is FAIL. The plan §8 re-spike for the partial cap was opened by the original FAIL and closed by the 36864-byte fault. The total-buffer FAIL opens a separate replacement-validation track.
+12. **Partial high-water.** Items 5 and 9 scored `pendingBytes` only. The fault already stored `inFlightTailBytes`, the unprocessed rest of the current stdout chunk. On this commit the scored high-water is the sum. `partialCapHolds` requires that sum to be above the 32768-byte cap and at most that cap plus one 4096-byte read chunk (36864).
+13. **Three runs.** Command `pnpm --filter @plerni-spike/ipc-harness spike:b3`, recorded separately from `test` and `test:races`. Frozen warmup 5000 ms, window 60000 ms, 3 reps. Each exited 1. Each partial object was `pendingBytes` 36864, `inFlightTailBytes` 32768, `highWater` 69632, code `partial-cap`, `bound` false. 69632 = 36864 + 32768. The framer residual is the cap plus one read chunk. The tail is another 32768 bytes of the same unterminated frame. 69632 is above 36864.
+14. **Not noise.** All three preflights were valid (4 CPUs, quota unlimited, not throttled, not overloaded; starting loads 0.05, 0.87, and 1). The three high-waters agree. No database setting is on this path.
+15. **Oracle.** The hypothesis that the partial cap plus one read chunk covers the buffered partial frame is false once the tail is counted. Destination: plan §4 B3's fail column is redesign of flow control. This round does not start the redesign.
 
-Each invocation's three holds warmed about 5003–5006 ms, then offered 300 slots (issued 300, skipped 0). Pending, partial, total, lo, and hi flags tripped on every hold, and the near-cap checks stayed true. The sibling answered. RSS growth stayed at or under 67108864 (largest sample 17641472). The environment stayed valid. Those holds do not repair the total-cap bound.
+The partial-cap clause is FAIL. The high-water, `pendingBytes` plus `inFlightTailBytes`, is 69632 in all three runs, above 36864. The total-buffer clause is FAIL. The plan §8 re-spike for the partial cap was opened by the original FAIL. The 36864-byte framer fault closed the earlier oversize defect and does not cover the tail. The total-buffer FAIL opens a separate replacement-validation track.
+
+On the parent measurement, each invocation's three holds warmed about 5003–5006 ms, then offered 300 slots (issued 300, skipped 0). Pending, partial, total, lo, and hi flags tripped on every hold, and the near-cap checks stayed true. The sibling answered. RSS growth stayed at or under 67108864 (largest sample 17641472). The environment stayed valid. Those holds do not repair the total-cap bound.
 
 ## B4, B5, B6
 
@@ -96,22 +101,22 @@ Cadence is 5 s and the lease is 20 s. Renewal traffic for the capacity annex is 
 
 | Case | Suite result | What the passing oracle required |
 |---|---|---|
-| death-before-commit | PASS (85 ms) | Expired `ACTIVE` becomes `ABANDONED` with zero effects. |
-| lost-reply | PASS (54 ms) | A retry reads `COMMITTED`. |
-| recovery-vs-live-commit | PASS (149 ms) | Sweeper and executor: exactly one transition wins. |
-| healthy-long | PASS (46680 ms) | Effects wall is between 25 s and 30 s, above the 20 s lease, with the sweeper active. The renewal-suppressed variant is abandoned at or after the lease. |
-| stalled shutdown | Designed failure of the renewal-to-lock oracle (11051 ms) | The case's pass bit is false, the row still commits, and last renewal-to-lock exceeds the 5 s cadence. |
-| heartbeat-behind-commit | PASS (5048 ms) | Completion stays inside the bound. |
-| saturated-pool | PASS (21383 ms) | 10 executors, each held past the lease, no bound violation, renewal-to-lock at or under the cadence. This is the reserved-path proof at concurrency equal to `default_pool_size`. |
-| queued-past-lease | PASS (62 ms) | A `QUEUED` row older than the lease stays `QUEUED` and is not swept. An `ACTIVE` row expired the same way is swept to `ABANDONED`. |
-| second-executor-takeover | PASS (135 ms) | After `COMMITTED`, `CANCELLED`, and `ABANDONED`, a second executor with the stale token loses the conditional update: fenced, status unchanged, takeover effects 0. The `COMMITTED` row keeps its one settled effect. |
+| death-before-commit | PASS (89 ms) | Expired `ACTIVE` becomes `ABANDONED` with zero effects. |
+| lost-reply | PASS (64 ms) | A retry reads `COMMITTED`. |
+| recovery-vs-live-commit | PASS (159 ms) | Sweeper and executor: exactly one transition wins. |
+| healthy-long | PASS (46377 ms) | Effects wall is between 25 s and 30 s, above the 20 s lease, with the sweeper active. The renewal-suppressed variant is abandoned at or after the lease. |
+| stalled shutdown | Designed failure of the renewal-to-lock oracle (11072 ms) | The case's pass bit is false, the row still commits, and last renewal-to-lock exceeds the 5 s cadence. |
+| heartbeat-behind-commit | PASS (5068 ms) | Completion stays inside the bound. |
+| saturated-pool | PASS (21451 ms) | 10 executors, each held past the lease, no bound violation, renewal-to-lock at or under the cadence. This is the reserved-path proof at concurrency equal to `default_pool_size`. |
+| queued-past-lease | PASS (57 ms) | A `QUEUED` row older than the lease stays `QUEUED` and is not swept. An `ACTIVE` row expired the same way is swept to `ABANDONED`. |
+| second-executor-takeover | PASS (145 ms) | After `COMMITTED`, `CANCELLED`, and `ABANDONED`, a second executor with the stale token loses the conditional update: fenced, status unchanged, takeover effects 0. The `COMMITTED` row keeps its one settled effect. |
 | commit-vs-revoke | PASS (29 ms) | The executor holds the row first. The revoker waits on `Lock` / `transactionid`. The commit wins, the cancel loses, and the row stays `COMMITTED`. |
-| commit-vs-revoke vacuity | Designed failure of the overlap oracle (24 ms) | The cancel finishes before the executor starts. The overlap oracle fails. The row is `CANCELLED` and the executor is fenced. |
-| vacuity-authority | Designed failure (231 ms) | With the `status='ACTIVE'` predicate removed, the open variant loses the race (`ABANDONED` on the executor, `COMMITTED` on the sweeper, effects present). The real predicate still commits. |
+| commit-vs-revoke vacuity | Designed failure of the overlap oracle (23 ms) | The cancel finishes before the executor starts. The overlap oracle fails. The row is `CANCELLED` and the executor is fenced. |
+| vacuity-authority | Designed failure (285 ms) | With the `status='ACTIVE'` predicate removed, the open variant loses the race (`ABANDONED` on the executor, `COMMITTED` on the sweeper, effects present). The real predicate still commits. |
 
 ## Replacement-validation track
 
-The original B3 FAIL opened the plan §8 re-spike track for the partial cap. Pull request #47 is that enforcement. The rerun faulted at 36864 bytes with code `partial-cap`, so that track is closed. The total-buffer clause is now FAIL. Plan §4 sends that fail to a flow-control redesign, and plan §8 opens a replacement-validation track for the flip. This round records the FAIL. It does not start the redesign.
+The original B3 FAIL opened the plan §8 re-spike track for the partial cap. Pull request #47 is that enforcement. The framer residual on that rerun was 36864 bytes with code `partial-cap`. That closed the defect of reading until `NdjsonOversizeError`. This commit's partial high-water is 69632 bytes, so the partial clause is FAIL and that track is not closed. The total-buffer clause is now FAIL. Plan §4 sends that fail to a flow-control redesign, and plan §8 opens a replacement-validation track for the flip. This round records the FAIL. It does not start the redesign.
 
 B1, B2, B4, B5, B6, and the race battery stay on framed NDJSON, the supervisor-stamped credential, and the conditional authority row. A1 pooled and A3 pass on this commit. A4b stays issue #34.
 
@@ -119,6 +124,6 @@ B1, B2, B4, B5, B6, and the race battery stay on framed NDJSON, the supervisor-s
 
 T7 still writes the annex. This note is what the closed partial-cap re-spike and the failed total-buffer rerun attach.
 
-The enforced partial cap is 32768 bytes per child. This run faulted at 36864 bytes, the cap plus one 4096-byte read chunk. The per-host partial-buffer bound is `32768 × children` bytes, plus at most `4096 × children` for that read chunk. The scored total cap is 49152 bytes for that one child, plus one 4096-byte read chunk. The three accounted totals were 106496, 57344, and 155648. The stdout socket's measured receive buffer was 131072 bytes. The cap does not cover the chunk tail plus the unread socket bytes.
+The enforced partial cap is 32768 bytes per child. The framer residual is 36864 bytes. The scored high-water, including the in-flight tail, is 69632 bytes in all three runs, above the cap plus one 4096-byte read chunk. The scored total cap is 49152 bytes for that one child, plus one 4096-byte read chunk. The three accounted totals were 106496, 57344, and 155648. The stdout socket's measured receive buffer was 131072 bytes. The cap does not cover the chunk tail plus the unread socket bytes.
 
 Renewal traffic stays `active executions / cadence` UPDATE transactions per second. RSS growth on the holds stayed at or under 67108864. The largest sample was 17641472. This note does not compute the rest of the T7 annex.

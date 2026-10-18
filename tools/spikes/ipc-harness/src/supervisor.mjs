@@ -154,6 +154,7 @@ export class Supervisor {
     this.socket = socket;
     this.stampIdentity = opts.stampIdentity !== false;
     this.enforcePartial = opts.enforcePartial !== false;
+    this.pipeProbe = typeof opts.pipeProbe === 'function' ? opts.pipeProbe : pipePending;
     this.useDirect = opts.useDirect ?? useDirectFromEnv();
     this.capsConfig = { ...DEFAULT_CAPS, ...opts.caps };
     if (opts.caps?.pending != null && opts.caps.pendingGlobal == null) {
@@ -977,7 +978,11 @@ export class Supervisor {
   #pipePending(rec) {
     const fd = rec.child?.stdout?._handle?.fd;
     if (!Number.isInteger(fd)) return null;
-    return pipePending(fd);
+    try {
+      return this.pipeProbe(fd);
+    } catch {
+      return null;
+    }
   }
 
   #fault(rec, code) {

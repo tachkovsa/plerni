@@ -1,6 +1,6 @@
 # Spike A report
 
-Verdicts for plan §3.1 A1–A5 and the §3.2 battery. The scored A1–A4 evidence is three separate suite invocations on 2026-10-18, on the tree of this commit (parent `60a233ac31ddd812a13e7d4f6d08fa54677f3877`). The A5 curve and drift gate stay the 2026-10-17 measurement cited below. This file is the T4b skeleton with the T6 verdicts added.
+Verdicts for plan §3.1 A1–A5 and the §3.2 battery. The scored A1–A4 evidence is three separate suite invocations on 2026-10-18, on parent `281f9d3a6e29fd57f6ece14fd255abd4667b41be` (that tree's parent `60a233ac31ddd812a13e7d4f6d08fa54677f3877`). This commit does not repeat them. The A5 curve and drift gate stay the 2026-10-17 measurement cited below. This file is the T4b skeleton with the T6 verdicts added.
 
 ## Rerun
 
@@ -56,7 +56,7 @@ A3's pooled pinning rows are that case's own Kysely run. The pooled raw-`pg` con
 
 ## A1 pooled raw control
 
-A1 pooled is PASS. Three separate suite invocations each opened `rawAppPooled()`, a `pg.Client` on the pooled DSN, began a transaction, and read `pg_backend_pid()` three times. In every invocation, each of the 8 concurrent transactions kept one pid. The direct raw-`pg` result stays PASS on the same three invocations. A3 is PASS because that control is green in all three and the A3 probes passed in all three. These two clauses do not open the replacement-validation track. The partial-cap re-spike in the Spike B report is closed. The B3 total-buffer clause on this commit is FAIL.
+A1 pooled is PASS. Three separate suite invocations each opened `rawAppPooled()`, a `pg.Client` on the pooled DSN, began a transaction, and read `pg_backend_pid()` three times. In every invocation, each of the 8 concurrent transactions kept one pid. The direct raw-`pg` result stays PASS on the same three invocations. A3 is PASS because that control is green in all three and the A3 probes passed in all three. These two clauses do not open the replacement-validation track. The partial-cap clause in the Spike B report is FAIL on this commit. The B3 total-buffer clause is FAIL.
 
 ## A3 contamination lifecycle
 
@@ -116,4 +116,4 @@ The clean tree passed the gate on bands 50, 75, 200, and 400 in the T4b run (exi
 
 ## Replacement-validation track
 
-Plan §8 opens the replacement-validation track when a verdict replaces the shipped substrate, and the track carries a revised capacity estimate. A1, A2, A3, A4's unnamed discipline, and A5 stay on the results the suite demonstrated. A4b stays issue #34. The partial-cap re-spike in the Spike B report was opened by the original FAIL and closed by the rerun at dev `1b1f536c6fa874369ce1d30e9337f4224961be93`. The B3 total-buffer clause on this commit is FAIL, and that FAIL opens a replacement-validation track for flow control. The capacity annex remains T7. The partial-buffer bound is `32768 × children` bytes, plus at most one 4096-byte read chunk per child.
+Plan §8 opens the replacement-validation track when a verdict replaces the shipped substrate, and the track carries a revised capacity estimate. A1, A2, A3, A4's unnamed discipline, and A5 stay on the results the suite demonstrated. A4b stays issue #34. The partial-cap re-spike in the Spike B report was opened by the original FAIL. The framer residual at dev `1b1f536c6fa874369ce1d30e9337f4224961be93` closed the oversize defect. This commit's partial high-water is 69632 bytes, so that clause is FAIL. The B3 total-buffer clause is FAIL, and that FAIL opens a replacement-validation track for flow control. The capacity annex remains T7.

@@ -1,12 +1,12 @@
 # Spike rerun evidence (2026-10-18)
 
-Backing lines for `2026-10-18-spike-a-report.md` and `2026-10-18-spike-b-report.md`. The A1–A4 suite and the B3 rerun are the tree of this commit (parent `60a233ac31ddd812a13e7d4f6d08fa54677f3877`). B1, B4, B5, and B6 stay dev `1b1f536c6fa874369ce1d30e9337f4224961be93`. Node v24.22.0. PostgreSQL 18.6, PgBouncer 1.26.0, `pool_mode=transaction`, `max_prepared_statements=0`. JSONL stays gitignored. Passwords are not recorded.
+Backing lines for `2026-10-18-spike-a-report.md` and `2026-10-18-spike-b-report.md`. The A1–A4 suite and the B3 total-buffer figures are parent `281f9d3a6e29fd57f6ece14fd255abd4667b41be` (that tree's parent `60a233ac31ddd812a13e7d4f6d08fa54677f3877`). The partial high-water is this commit. B1, B4, B5, and B6 stay dev `1b1f536c6fa874369ce1d30e9337f4224961be93`. Node v24.22.0. PostgreSQL 18.6, PgBouncer 1.26.0, `pool_mode=transaction`, `max_prepared_statements=0`. JSONL stays gitignored. Passwords are not recorded.
 
-Review receipt: REV-T6-2026-10-19-9cf9740 covers the `1b1f536` lines and the A5 citation. The lines from this commit are pending (δ).
+Review receipt: REV-T6-2026-10-19-9cf9740 covers the `1b1f536` lines and the A5 citation. The lines from the parent and from this commit are pending (δ).
 
 ## Suite commands
 
-From a clean worktree of this commit, after the four harness passwords are exported. The A command was run three times. Each invocation followed `reset.sh` and `seed.mjs`, exited 0, and wrote 39 JSONL rows with 0 failing cases.
+From a clean worktree of the parent commit named above, after the four harness passwords are exported. The A command was run three times. Each invocation followed `reset.sh` and `seed.mjs`, exited 0, and wrote 39 JSONL rows with 0 failing cases.
 
 ```bash
 cd tools/harness && ./reset.sh && cd ../.. && node tools/harness/seed.mjs && pnpm --filter @plerni-spike/db-invariant spike
@@ -22,7 +22,19 @@ pnpm --filter @plerni-spike/ipc-harness spike:b3
 
 Three invocations. Each printed `frozen warmupMs=5000 windowMs=60000 reps=3` and exited 1.
 
-On this commit, `pnpm --filter @plerni-spike/ipc-harness test` is 110 pass, 0 fail, 0 skipped, duration_ms 23409.979972. `pnpm --filter @plerni-spike/ipc-harness test:races` is 26 pass, 0 fail, duration_ms 92300.065604, then the B6 vacuity control 1 pass, duration_ms 1655.777184.
+On this commit the two commands are separate, because `spike:b3` exits 1:
+
+```bash
+pnpm --filter @plerni-spike/ipc-harness test
+```
+
+Exit 0. 114 pass, 0 fail, 0 skipped, duration_ms 23631.451671.
+
+```bash
+pnpm --filter @plerni-spike/ipc-harness test:races
+```
+
+Exit 0. 26 pass, 0 fail, duration_ms 92184.704125, then the B6 vacuity control 1 pass, duration_ms 1662.383168.
 
 The dev `1b1f536` full suite, which the receipt covers, was a different command and a different `test` count (108 pass, duration_ms 23310.678471). That count is not this commit.
 
@@ -59,13 +71,13 @@ Run 3, `tools/spikes/db-invariant/evidence/run-2026-10-18T22-37-01-938Z.jsonl`:
 
 A3's rollback was `22012` with context absent afterward in all three. A4 observed 75 statements and 0 non-empty names in all three.
 
-## B3 on this commit
+## B3 total-buffer measurement on the parent
 
 ```bash
 pnpm --filter @plerni-spike/ipc-harness spike:b3
 ```
 
-Each invocation: `[run-b3] frozen warmupMs=5000 windowMs=60000 reps=3`, then exit 1. The allowed total is 49152 + 4096 = 53248. `pipeCapacity` is the measured `SO_RCVBUF` of the child stdout socket.
+Each invocation: `[run-b3] frozen warmupMs=5000 windowMs=60000 reps=3`, then exit 1. The allowed total is 49152 + 4096 = 53248. `pipeCapacity` is the measured `SO_RCVBUF` of the child stdout socket. These three accounted totals are the total-buffer verdict. This commit does not replace them.
 
 ```text
 [FAIL] b3-backpressure total — {"buffered":98304,"inFlightTailBytes":45056,"pipeUnread":8192,"pipeCapacity":131072,"accounted":106496,"afterCleanup":0,"bound":false,"vacuity":true}
@@ -73,7 +85,17 @@ Each invocation: `[run-b3] frozen warmupMs=5000 windowMs=60000 reps=3`, then exi
 [FAIL] b3-backpressure total — {"buffered":110592,"inFlightTailBytes":57344,"pipeUnread":45056,"pipeCapacity":131072,"accounted":155648,"afterCleanup":0,"bound":false,"vacuity":true}
 ```
 
-Partial, on all three: `pendingBytes` 36864, `partial-cap`, `bound` true. RSS growth stayed ≤ 67108864. Largest sample 17641472. Preflight `valid` true on all three. The holds do not make the total bound true.
+Partial, under the oracle that scored `pendingBytes` only: 36864, `partial-cap`, `bound` true. RSS growth stayed ≤ 67108864. Largest sample 17641472. Preflight `valid` true on all three. The holds do not make the total bound true.
+
+## Partial high-water on this commit
+
+The same command, three more invocations, each exit 1. The scored high-water is `pendingBytes + inFlightTailBytes`. The allowed partial sum is 32768 + 4096 = 36864. Each preflight was `valid` true (loads 0.05, 0.87, and 1).
+
+```text
+[FAIL] b3-backpressure partial — {"pendingBytes":36864,"inFlightTailBytes":32768,"highWater":69632,"code":"partial-cap","bound":false}
+[FAIL] b3-backpressure partial — {"pendingBytes":36864,"inFlightTailBytes":32768,"highWater":69632,"code":"partial-cap","bound":false}
+[FAIL] b3-backpressure partial — {"pendingBytes":36864,"inFlightTailBytes":32768,"highWater":69632,"code":"partial-cap","bound":false}
+```
 
 ## B1–B6 scored spike at dev 1b1f536
 
@@ -93,27 +115,27 @@ Evidence path: `tools/spikes/ipc-harness/evidence/run-2026-10-18T20-39-40-686Z.j
 
 ## Race battery
 
-`pnpm --filter @plerni-spike/ipc-harness test:races` on this commit. `commit-vs-revoke` is the concurrent B2 clause. The case asserts the commit wins and the cancel loses after a `Lock` / `transactionid` wait. The next case is the overlap vacuity: the oracle fails because the cancel finishes first. REV-T6-2026-10-19-9cf9740 covers the earlier battery at `1b1f536`. This block is the rerun.
+`pnpm --filter @plerni-spike/ipc-harness test:races` on this commit, exit 0. `commit-vs-revoke` is the concurrent B2 clause. The case asserts the commit wins and the cancel loses after a `Lock` / `transactionid` wait. The next case is the overlap vacuity: the oracle fails because the cancel finishes first. REV-T6-2026-10-19-9cf9740 covers the earlier battery at `1b1f536`. This block is the rerun.
 
 ```text
-✔ death-before-commit (84.86226ms)
-✔ lost-reply (54.209647ms)
-✔ recovery-vs-live-commit (148.640696ms)
-✔ healthy-long (46680.355577ms)
-✔ stalled shutdown fails the renewal-to-lock oracle (11051.154525ms)
-✔ heartbeat-behind-commit (5047.589537ms)
-✔ saturated-pool (21383.417249ms)
-✔ queued-past-lease (61.919949ms)
-✔ second-executor-takeover (134.556968ms)
-✔ commit-vs-revoke (29.291196ms)
-✔ commit-vs-revoke overlap oracle fails when the revoker does not wait (23.687386ms)
-✔ vacuity-authority fails when the ACTIVE predicate is removed (231.493926ms)
+✔ death-before-commit (88.654006ms)
+✔ lost-reply (63.682985ms)
+✔ recovery-vs-live-commit (158.97433ms)
+✔ healthy-long (46377.124466ms)
+✔ stalled shutdown fails the renewal-to-lock oracle (11071.902349ms)
+✔ heartbeat-behind-commit (5067.53743ms)
+✔ saturated-pool (21450.786093ms)
+✔ queued-past-lease (57.403808ms)
+✔ second-executor-takeover (145.370408ms)
+✔ commit-vs-revoke (28.792679ms)
+✔ commit-vs-revoke overlap oracle fails when the revoker does not wait (22.726356ms)
+✔ vacuity-authority fails when the ACTIVE predicate is removed (285.250509ms)
 ℹ pass 26
 ℹ fail 0
-ℹ duration_ms 92300.065604
+ℹ duration_ms 92184.704125
 ```
 
-The B6 vacuity control that follows the battery: 1 pass, duration_ms 1655.777184.
+The B6 vacuity control that follows the battery: 1 pass, duration_ms 1662.383168.
 
 ## Original B3 FAIL, dev 3de0b5b
 

@@ -13,9 +13,35 @@ function until(fn, ms) {
   return waitUntil(fn, ms);
 }
 
-export async function tripCaps() {
+// Framer residual plus the unprocessed rest of the stdout chunk. Both are
+// already buffered when the partial cap faults. A missing tail is not zero.
+export function partialFrameHighWater(pendingBytes, inFlightTailBytes) {
+  if (!Number.isFinite(pendingBytes) || !Number.isFinite(inFlightTailBytes)) return null;
+  if (inFlightTailBytes < 0) return null;
+  return pendingBytes + inFlightTailBytes;
+}
+
+// A null or unavailable pipe probe is an invalid run. A measured count is scored,
+// including a count that misses the cap.
+export function scoreTotalProbe({ pipeUnread, pipeCapacity, accounted, cap, afterCleanup }) {
+  const measured = Number.isInteger(pipeUnread)
+    && pipeUnread >= 0
+    && Number.isInteger(pipeCapacity)
+    && pipeCapacity > 0;
+  const vacuity = totalCapHolds(afterCleanup, cap) === false;
+  if (!measured) return { outcome: 'invalid', bound: null, vacuity };
+  const pipeCounted = pipeUnread <= pipeCapacity;
+  return {
+    outcome: 'scored',
+    bound: pipeCounted && totalCapHolds(accounted, cap),
+    vacuity,
+  };
+}
+
+export async function tripCaps(opts = {}) {
   const detail = {};
-  const pendingPair = await connectPair({ sweeper: false, caps: { pending: 4, partial: 1024 * 1024, total: 8 * 1024 * 1024 } });
+  const probe = typeof opts.pipeProbe === 'function' ? { pipeProbe: opts.pipeProbe } : {};
+  const pendingPair = await connectPair({ ...probe, sweeper: false, caps: { pending: 4, partial: 1024 * 1024, total: 8 * 1024 * 1024 } });
   try {
     const silent = pendingPair.sup.spawn({
       pluginId: 'silent',
@@ -43,6 +69,7 @@ export async function tripCaps() {
 
   const partialCap = 32 * 1024;
   const partialPair = await connectPair({
+    ...probe,
     sweeper: false,
     caps: { pending: 32, partial: partialCap, total: 8 * 1024 * 1024 },
   });
@@ -53,11 +80,16 @@ export async function tripCaps() {
       5_000,
     );
     const fault = partialPair.sup.faults.find((row) => row.pluginId === 'partial');
+    const pendingBytes = fault?.pendingBytes ?? null;
+    const inFlightTailBytes = fault?.inFlightTailBytes ?? null;
+    const highWater = partialFrameHighWater(pendingBytes, inFlightTailBytes);
     detail.partial = {
       tripped: tripped && partialPair.sup.caps.partial === true,
-      pendingBytes: fault?.pendingBytes ?? null,
+      pendingBytes,
+      inFlightTailBytes,
+      highWater,
       code: fault?.code ?? null,
-      bound: Boolean(fault) && fault.code === 'partial-cap' && partialCapHolds(fault.pendingBytes, partialCap),
+      bound: Boolean(fault) && fault.code === 'partial-cap' && partialCapHolds(highWater, partialCap),
     };
   } finally {
     await partialPair.close();
@@ -65,6 +97,7 @@ export async function tripCaps() {
 
   const totalCap = 48 * 1024;
   const totalPair = await connectPair({
+    ...probe,
     sweeper: false,
     caps: { pending: 64, partial: 1024 * 1024, total: totalCap },
     partialHighWater: 1024 * 1024,
@@ -82,10 +115,13 @@ export async function tripCaps() {
     const pipeCapacity = fault?.pipeCapacity ?? null;
     const accounted = fault?.accountedBytes ?? null;
     const afterCleanup = totalPair.sup.bufferedBytes();
-    const pipeCounted = Number.isInteger(pipeUnread)
-      && Number.isInteger(pipeCapacity)
-      && pipeCapacity > 0
-      && pipeUnread <= pipeCapacity;
+    const scored = scoreTotalProbe({
+      pipeUnread,
+      pipeCapacity,
+      accounted,
+      cap: totalCap,
+      afterCleanup,
+    });
     detail.total = {
       tripped: tripped && totalPair.sup.caps.total === true,
       buffered,
@@ -94,16 +130,21 @@ export async function tripCaps() {
       pipeCapacity,
       accounted,
       afterCleanup,
-      // High-water, including the chunk tail, plus the measured unread pipe.
-      bound: pipeCounted && totalCapHolds(accounted, totalCap),
+      // High-water, including the chunk tail, plus the measured unread socket.
+      // An unavailable probe leaves bound null; it is not a scored miss.
+      bound: scored.bound,
       // The post-cleanup count is the old oracle. It must not satisfy the bound.
-      vacuity: totalCapHolds(afterCleanup, totalCap) === false,
+      vacuity: scored.vacuity,
     };
+    if (scored.outcome === 'invalid') {
+      return { pass: null, outcome: 'invalid', detail };
+    }
   } finally {
     await totalPair.close();
   }
 
   const kernelPair = await connectPair({
+    ...probe,
     sweeper: false,
     kernel: { pendingCap: 4, byteCap: 64 * 1024 },
   });
@@ -137,6 +178,7 @@ export async function tripCaps() {
   }
 
   const bytePair = await connectPair({
+    ...probe,
     sweeper: false,
     kernel: { pendingCap: 32, byteCap: 32 },
   });
@@ -166,7 +208,7 @@ export async function tripCaps() {
     && detail.total.tripped && detail.total.bound && detail.total.vacuity
     && detail.kernel.tripped && detail.kernel.bound
     && detail.kernelBytes.tripped && detail.kernelBytes.bound;
-  return { pass, detail };
+  return { pass, outcome: 'scored', detail };
 }
 
 const PARTIAL_MARK = 32 * 1024;
@@ -379,7 +421,10 @@ export async function b3(opts = {}) {
   if (readRss([process.pid]) == null) {
     return { pass: null, outcome: 'invalid', detail: { reason: 'rss-unreadable', limit: RSS_GROWTH_LIMIT } };
   }
-  const tripped = await tripCaps();
+  const tripped = await tripCaps({ pipeProbe: opts.pipeProbe });
+  if (tripped.outcome === 'invalid') {
+    return { pass: null, outcome: 'invalid', detail: { reason: 'pipe-probe-unavailable', caps: tripped.detail } };
+  }
   if (opts.hold === false) return tripped;
   const warmupMs = opts.warmupMs ?? CONTRACT.warmupMs;
   const windowMs = opts.windowMs ?? CONTRACT.windowMs;
