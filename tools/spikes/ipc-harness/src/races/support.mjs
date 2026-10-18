@@ -4,7 +4,7 @@
 // migration and it is not part of the fencing authority schema.
 
 import pg from 'pg';
-import { LEASE_MS, openHarnessClient } from '../authority.mjs';
+import { LEASE_MS, openAppClient } from './control.mjs';
 import { manualClock } from './clock.mjs';
 
 let effectsReady;
@@ -48,7 +48,7 @@ export async function ensureEffects() {
 }
 
 export async function withDirect(fn) {
-  const c = openHarnessClient('direct');
+  const c = openAppClient('direct');
   await c.connect();
   try {
     return await fn(c);
@@ -95,6 +95,12 @@ export function heldClock(extra = {}) {
   return { clock: manualClock(), renew: async () => null, ...extra };
 }
 
+// Production commitExecution honors `renew` (T5a). A null renewal does not
+// extend the lease when the wall-clock cadence fires during a slow run.
+export function quietRenew() {
+  return { renew: async () => null };
+}
+
 export async function killClient(client) {
   const stream = client.connection?.stream;
   if (!stream) throw new Error('client has no socket to kill');
@@ -112,7 +118,7 @@ export async function killClient(client) {
 // `fragment`. The deadline fails a missed barrier; it is not the synchronization.
 export async function waitForQueryLock(fragment, deadlineMs = 5000) {
   if (!/^[a-z0-9-]{1,40}$/.test(fragment)) throw new Error('bad lock fragment');
-  const c = openHarnessClient('direct');
+  const c = openAppClient('direct');
   await c.connect();
   const started = Date.now();
   try {

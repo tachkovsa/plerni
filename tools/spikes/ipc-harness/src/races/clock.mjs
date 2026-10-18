@@ -54,14 +54,81 @@ export function deferred() {
   return { promise, resolve, reject };
 }
 
-// Failure bound only. The pass path settles when `promise` does.
-export function withDeadline(promise, ms, label) {
+// Every race wait uses this ceiling unless a case names a tighter one.
+// The pass path records the observed elapsed time and asserts it is inside.
+export const COMPLETION_BOUND_MS = 5000;
+
+// Failure bound. The pass path settles when `promise` does.
+// `onTimeout` runs as the deadline fires so a blocked client can be destroyed.
+export function withDeadline(promise, ms, label, onTimeout) {
   let timer;
+  let settled = false;
+  const task = Promise.resolve(promise).then(
+    (value) => {
+      settled = true;
+      return value;
+    },
+    (error) => {
+      settled = true;
+      throw error;
+    },
+  );
+  // A late rejection after the deadline must not surface as an unhandled rejection.
+  task.catch(() => {});
   const timeout = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`deadline exceeded: ${label}`)), ms);
+    timer = setTimeout(() => {
+      if (settled) return;
+      try { onTimeout?.(); } catch { /* the deadline is the failure */ }
+      reject(new Error(`deadline exceeded: ${label}`));
+    }, ms);
   });
   return Promise.race([
-    promise.finally(() => clearTimeout(timer)),
+    task.finally(() => clearTimeout(timer)),
     timeout,
   ]);
+}
+
+// Resolves with the value and the observed elapsed time, or rejects at `ms`.
+export async function bounded(work, ms, label, onTimeout) {
+  const started = Date.now();
+  const value = await withDeadline(Promise.resolve().then(work), ms, label, onTimeout);
+  const elapsedMs = Date.now() - started;
+  if (elapsedMs > ms) throw new Error(`bound exceeded: ${label} (${elapsedMs}ms)`);
+  return { value, elapsedMs, boundMs: ms, label };
+}
+
+// Collects a bound for every wait a scenario starts outside the harness commit.
+export function steps(ms = COMPLETION_BOUND_MS) {
+  const bounds = [];
+  return {
+    bounds,
+    ok() {
+      return bounds.length > 0 && bounds.every((item) => item.elapsedMs <= item.boundMs);
+    },
+    async run(work, label, overrideMs, onTimeout) {
+      const boundMs = overrideMs ?? ms;
+      const started = Date.now();
+      try {
+        const result = await bounded(() => work(), boundMs, label, onTimeout);
+        bounds.push({ label, elapsedMs: result.elapsedMs, boundMs: result.boundMs });
+        return result.value;
+      } catch (err) {
+        const elapsedMs = Date.now() - started;
+        const deadline = typeof err?.message === 'string' && err.message.startsWith('deadline exceeded');
+        if (!deadline && elapsedMs <= boundMs) {
+          bounds.push({ label, elapsedMs, boundMs });
+        }
+        throw err;
+      }
+    },
+  };
+}
+
+export function assertBounds(bounds) {
+  if (!bounds?.length) throw new Error('missing completion bounds');
+  for (const item of bounds) {
+    if (!(item.elapsedMs <= item.boundMs)) {
+      throw new Error(`completion bound missed: ${item.label} ${item.elapsedMs}ms > ${item.boundMs}ms`);
+    }
+  }
 }

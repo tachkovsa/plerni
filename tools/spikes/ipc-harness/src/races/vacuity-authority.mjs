@@ -1,6 +1,7 @@
 // vacuity-authority (plan T5c): the same race without status='ACTIVE' rewrites
-// a terminal row. The production predicate does not. The case returns pass
-// false when that exploit lands; the runner scores the demonstration.
+// a terminal row. The production predicate does not. The open predicate lives
+// in the race harness. The case returns pass false when that exploit lands;
+// the runner scores the demonstration.
 
 import { randomUUID } from 'node:crypto';
 import {
@@ -11,77 +12,97 @@ import {
   getStatus,
   sweepAbandoned,
 } from '../authority.mjs';
-import { countEffects, ensureEffects, expireHeartbeat, heldClock, insertEffect } from './support.mjs';
+import { assertBounds, steps } from './clock.mjs';
+import { raceCommit, raceSweep } from './control.mjs';
+import { countEffects, ensureEffects, expireHeartbeat, insertEffect, quietRenew } from './support.mjs';
 
-async function abandon(token) {
-  const id = await createExecution('t5c-vacuity', token, true);
-  await dispatch(id, true);
-  await expireHeartbeat(id);
-  const swept = await sweepAbandoned(true, { id });
+async function abandon(token, timing) {
+  const id = await timing.run(() => createExecution('t5c-vacuity', token, true), `abandon ${token} create`);
+  await timing.run(() => dispatch(id, true), `abandon ${token} dispatch`);
+  await timing.run(() => expireHeartbeat(id), `abandon ${token} expire`);
+  const swept = await timing.run(() => sweepAbandoned(true), `abandon ${token} sweep`);
   if (!swept.includes(id)) throw new Error('setup sweep missed the row');
   return id;
 }
 
-async function commitSettled(token) {
-  const id = await createExecution('t5c-vacuity', token, true);
-  await dispatch(id, true);
-  await commitExecution(id, token, async (client) => {
+async function commitSettled(token, timing) {
+  const id = await timing.run(() => createExecution('t5c-vacuity', token, true), `settle ${token} create`);
+  await timing.run(() => dispatch(id, true), `settle ${token} dispatch`);
+  await timing.run(() => commitExecution(id, token, async (client) => {
     await insertEffect(client, id, 'kept');
-  }, true, heldClock());
-  await expireHeartbeat(id);
+  }, true, quietRenew()), `settle ${token} commit`);
+  await timing.run(() => expireHeartbeat(id), `settle ${token} expire`);
   return id;
 }
 
 export async function vacuityAuthority() {
-  await ensureEffects();
+  const timing = steps();
+  await timing.run(() => ensureEffects(), 'effects fixture');
   const heldToken = `held-${randomUUID()}`;
-  const heldId = await abandon(heldToken);
+  const heldId = await abandon(heldToken, timing);
   let heldFenced = false;
   try {
-    await commitExecution(heldId, heldToken, async (client) => {
+    await timing.run(() => commitExecution(heldId, heldToken, async (client) => {
       await insertEffect(client, heldId, 'held');
-    }, true, heldClock());
+    }, true, quietRenew()), 'production commit on abandoned');
   } catch (err) {
     heldFenced = err instanceof FencedError;
     if (!heldFenced) throw err;
   }
-  const heldStatus = (await getStatus(heldId, true))?.status ?? null;
+  const heldStatus = (await timing.run(() => getStatus(heldId, true), 'held status'))?.status ?? null;
 
   const openToken = `open-${randomUUID()}`;
-  const openId = await abandon(openToken);
+  const openId = await abandon(openToken, timing);
   let openCommitted = false;
   try {
-    const result = await commitExecution(openId, openToken, async (client) => {
+    const result = await raceCommit(openId, openToken, async (client) => {
       await insertEffect(client, openId, 'rewritten');
-    }, true, heldClock({ requireActive: false }));
+    }, true, {
+      ...quietRenew(),
+      requireActive: false,
+      label: 'vacuous commit',
+      bounds: timing.bounds,
+    });
     openCommitted = result.committed === true;
   } catch (err) {
     if (!(err instanceof FencedError)) throw err;
   }
-  const openStatus = (await getStatus(openId, true))?.status ?? null;
+  const openStatus = (await timing.run(() => getStatus(openId, true), 'open status'))?.status ?? null;
 
-  const safeId = await commitSettled(`safe-${randomUUID()}`);
-  const safeSwept = await sweepAbandoned(true, { id: safeId });
-  const safeStatus = (await getStatus(safeId, true))?.status ?? null;
+  const safeId = await commitSettled(`safe-${randomUUID()}`, timing);
+  const safeSwept = await timing.run(() => sweepAbandoned(true), 'production sweep of committed');
+  const safeStatus = (await timing.run(() => getStatus(safeId, true), 'safe status'))?.status ?? null;
 
-  const openSweepId = await commitSettled(`sweep-${randomUUID()}`);
-  const openSwept = await sweepAbandoned(true, { id: openSweepId, requireActive: false });
-  const openSweepStatus = (await getStatus(openSweepId, true))?.status ?? null;
+  const openSweepId = await commitSettled(`sweep-${randomUUID()}`, timing);
+  const openSwept = await raceSweep(true, {
+    id: openSweepId,
+    requireActive: false,
+    label: 'vacuous sweep',
+    bounds: timing.bounds,
+  });
+  const openSweepStatus = (await timing.run(() => getStatus(openSweepId, true), 'open sweep status'))?.status ?? null;
 
+  const heldEffects = await timing.run(() => countEffects(heldId, 'held'), 'held effects');
+  const rewrittenEffects = await timing.run(() => countEffects(openId, 'rewritten'), 'rewritten effects');
   const realHeld = heldFenced
     && heldStatus === 'ABANDONED'
-    && await countEffects(heldId, 'held') === 0
+    && heldEffects === 0
     && safeSwept.includes(safeId) === false
     && safeStatus === 'COMMITTED';
   const exploit = openCommitted
     && openStatus === 'COMMITTED'
-    && await countEffects(openId, 'rewritten') === 1
-    && openSwept.includes(openSweepId)
+    && rewrittenEffects === 1
+    && openSwept.ids.includes(openSweepId)
     && openSweepStatus === 'ABANDONED';
-  return {
-    pass: false,
-    exploit,
+  const detail = {
+    heldStatus,
+    openStatus,
+    safeStatus,
+    openSweepStatus,
     realHeld,
-    detail: { heldStatus, openStatus, safeStatus, openSweepStatus, realHeld, exploit },
+    exploit,
+    bounds: timing.bounds,
   };
+  assertBounds(detail.bounds);
+  return { pass: false, exploit, realHeld, detail };
 }

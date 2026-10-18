@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "spike": "node src/run.mjs",
-    "test": "node --test src/framing.test.mjs src/authority.test.mjs src/supervisor.test.mjs src/races/clock.test.mjs src/races/races.test.mjs"
+    "test": "node --test src/framing.test.mjs src/authority.test.mjs src/supervisor.test.mjs src/races/clock.test.mjs src/races/control.test.mjs src/races/races.test.mjs"
   },
   "dependencies": {
     "pg": "8.23.1"

@@ -4,42 +4,36 @@
 // direct path does not abandon them, and each execution commits.
 // A pooled probe stays in cl_waiting for the whole lease crossing
 // (PgBouncer transaction mode: the server connection is held until COMMIT).
+// The lease crossing is the manual clock. Each wait has a deadline.
 // https://www.pgbouncer.org/config.html (pool_mode=transaction)
 // https://www.pgbouncer.org/usage.html (SHOW POOLS cl_waiting)
 
 import pg from 'pg';
-import {
-  CADENCE_MS,
-  LEASE_MS,
-  commitExecution,
-  createExecution,
-  dispatch,
-  getStatus,
-  openHarnessClient,
-  sweepAbandoned,
-} from '../authority.mjs';
-import { deferred, manualClock, RACE_EPOCH_MS, withDeadline } from './clock.mjs';
+import { createExecution, dispatch, getStatus } from '../authority.mjs';
+import { assertBounds, bounded, deferred, manualClock, RACE_EPOCH_MS, steps } from './clock.mjs';
+import { CADENCE_MS, LEASE_MS, openAppClient, raceCommit, raceSweep, stampHeartbeat } from './control.mjs';
 import { countEffects, ensureEffects, insertEffect } from './support.mjs';
 
 const POOL_PIN = 10;
 const TICKS = 5;
+const HOLD_BOUND_MS = 45000;
 
 function adminClient() {
   if (process.env.HARNESS_ADMIN_DSN) {
-    const c = new pg.Client({ connectionString: process.env.HARNESS_ADMIN_DSN });
-    c.on('error', () => {});
-    return c;
+    const client = new pg.Client({ connectionString: process.env.HARNESS_ADMIN_DSN });
+    client.on('error', () => {});
+    return client;
   }
   if (!process.env.PLERNI_ADMIN_PASSWORD) return null;
-  const c = new pg.Client({
+  const client = new pg.Client({
     host: 'localhost',
     port: 54321,
     database: 'pgbouncer',
     user: 'plerni_admin_ro',
     password: process.env.PLERNI_ADMIN_PASSWORD,
   });
-  c.on('error', () => {});
-  return c;
+  client.on('error', () => {});
+  return client;
 }
 
 async function poolSize(admin) {
@@ -60,62 +54,73 @@ async function poolRow(admin) {
   };
 }
 
-async function pollPool(admin, ready, label, deadlineMs) {
+async function pollPool(admin, ready, label, deadlineMs, bounds) {
   const started = Date.now();
   for (;;) {
     const row = await poolRow(admin);
-    if (ready(row)) return row;
+    if (ready(row)) {
+      bounds.push({ label, elapsedMs: Date.now() - started, boundMs: deadlineMs });
+      return row;
+    }
     if (Date.now() - started >= deadlineMs) {
-      throw new Error(`${label} (cl_waiting=${row.clWaiting}, sv_active=${row.svActive})`);
+      throw new Error(`deadline exceeded: ${label} (cl_waiting=${row.clWaiting}, sv_active=${row.svActive})`);
     }
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
 }
 
 export async function saturatedPool() {
-  await ensureEffects();
+  const timing = steps();
+  await timing.run(() => ensureEffects(), 'effects fixture');
   const admin = adminClient();
-  if (!admin) return { pass: false, detail: { error: 'no pgbouncer admin datasource' } };
-  await admin.connect();
+  if (!admin) return { pass: false, detail: { error: 'no pgbouncer admin datasource', bounds: [] } };
+  await timing.run(() => admin.connect(), 'admin connect');
   const release = deferred();
   const execs = [];
+  const cancels = [];
   let probe;
   try {
-    const configured = await poolSize(admin);
+    const configured = await timing.run(() => poolSize(admin), 'read pool size');
     if (configured !== POOL_PIN) {
-      return { pass: false, detail: { error: 'default_pool_size is not the pinned 10', configured } };
+      return { pass: false, detail: { error: 'default_pool_size is not the pinned 10', configured, bounds: timing.bounds } };
     }
-    // Other harness cases release the pool as they finish. Proceed on the
-    // observation, not after a fixed pause.
     await pollPool(
       admin,
       (row) => row.clWaiting === 0 && row.svActive === 0,
-      'deadline: pool not idle',
+      'pool idle',
       20_000,
+      timing.bounds,
     );
 
     const clock = manualClock(RACE_EPOCH_MS);
     const rows = [];
     for (let i = 0; i < configured; i += 1) {
       const token = `sat-${i}-${clock.millis()}`;
-      const id = await createExecution('t5c-saturated', token, true);
-      await dispatch(id, true, { now: await clock.now() });
+      const id = await timing.run(() => createExecution('t5c-saturated', token, true), `create ${i}`);
+      await timing.run(() => dispatch(id, true), `dispatch ${i}`);
+      await stampHeartbeat(id, await clock.now(), timing.bounds);
       rows.push({ id, token });
     }
     let entered = 0;
     const allEntered = deferred();
-    for (const row of rows) {
-      execs.push(commitExecution(row.id, row.token, async (client) => {
+    for (const [index, row] of rows.entries()) {
+      execs.push(raceCommit(row.id, row.token, async (client) => {
         await insertEffect(client, row.id, 'sat');
         entered += 1;
         if (entered === rows.length) allEntered.resolve();
         await release.promise;
-      }, false, { clock }));
+      }, false, {
+        clock,
+        label: `saturated commit ${index}`,
+        bounds: timing.bounds,
+        boundMs: HOLD_BOUND_MS,
+        register: (cancel) => cancels.push(cancel),
+      }));
     }
-    await withDeadline(allEntered.promise, 5000, 'executions did not fill the pool');
+    await timing.run(() => allEntered.promise, 'executions filled the pool', 5000);
 
-    probe = openHarnessClient('pooled');
-    await probe.connect();
+    probe = openAppClient('pooled');
+    await timing.run(() => probe.connect(), 'probe connect');
     let probeSettled = false;
     const probeDone = probe.query('SELECT 1').then(() => {
       probeSettled = true;
@@ -125,38 +130,51 @@ export async function saturatedPool() {
     const waiting = await pollPool(
       admin,
       (row) => row.clWaiting >= 1,
-      'deadline: pooled probe never entered cl_waiting',
+      'pooled probe entered cl_waiting',
       5000,
+      timing.bounds,
     );
 
     const samples = [];
     let sweptDuring = 0;
-    await withDeadline((async () => {
+    const renewal = await bounded(async () => {
       for (let tick = 0; tick < TICKS; tick += 1) {
         await clock.advance(CADENCE_MS);
         const row = await getStatus(rows[0].id, true);
         samples.push(new Date(row.heartbeat_at).getTime() - RACE_EPOCH_MS);
-        const swept = await sweepAbandoned(true, { id: rows[0].id, now: await clock.now() });
-        if (swept.includes(rows[0].id)) sweptDuring += 1;
+        const swept = await raceSweep(true, {
+          id: rows[0].id,
+          now: await clock.now(),
+          label: `saturated sweep ${tick}`,
+          bounds: timing.bounds,
+        });
+        if (swept.ids.includes(rows[0].id)) sweptDuring += 1;
       }
-    })(), 10_000, 'reserved renewals did not finish while the pool was saturated');
+    }, 10_000, 'reserved renewals while the pool is saturated', () => {
+      for (const cancel of cancels) cancel();
+    });
+    timing.bounds.push({
+      label: renewal.label,
+      elapsedMs: renewal.elapsedMs,
+      boundMs: renewal.boundMs,
+    });
     const blockedDuringRenewal = probeSettled === false;
-    const waitingDuringRenewal = await poolRow(admin);
+    const waitingDuringRenewal = await timing.run(() => poolRow(admin), 'pool during renewal');
     const offsets = [];
     for (const row of rows) {
-      const status = await getStatus(row.id, true);
+      const status = await timing.run(() => getStatus(row.id, true), 'heartbeat before release');
       offsets.push(new Date(status.heartbeat_at).getTime() - RACE_EPOCH_MS);
     }
 
     release.resolve();
-    const committed = await Promise.all(execs);
-    await withDeadline(probeDone, 5000, 'pooled probe did not drain after commit');
+    const committed = await timing.run(() => Promise.all(execs), 'commits drained', 10_000);
+    await timing.run(() => probeDone, 'probe drained', 5000);
 
     const statuses = [];
     let effects = 0;
     for (const row of rows) {
-      statuses.push((await getStatus(row.id, true))?.status ?? null);
-      effects += await countEffects(row.id, 'sat');
+      statuses.push((await timing.run(() => getStatus(row.id, true), 'status after commit'))?.status ?? null);
+      effects += await timing.run(() => countEffects(row.id, 'sat'), 'effects after commit');
     }
     const detail = {
       configured,
@@ -170,7 +188,9 @@ export async function saturatedPool() {
       statuses,
       effects,
       leaseMs: LEASE_MS,
+      bounds: timing.bounds,
     };
+    assertBounds(detail.bounds);
     const pass = configured === POOL_PIN
       && waiting.clWaiting >= 1
       && blockedDuringRenewal
