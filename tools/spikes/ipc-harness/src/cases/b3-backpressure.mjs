@@ -77,12 +77,25 @@ export async function tripCaps() {
     );
     const fault = totalPair.sup.faults.find((row) => row.pluginId === 'total' && row.code === 'total-cap');
     const buffered = fault?.bufferedBytes ?? null;
+    const inFlightTailBytes = fault?.inFlightTailBytes ?? null;
+    const pipeUnread = fault?.pipeUnread ?? null;
+    const pipeCapacity = fault?.pipeCapacity ?? null;
+    const accounted = fault?.accountedBytes ?? null;
     const afterCleanup = totalPair.sup.bufferedBytes();
+    const pipeCounted = Number.isInteger(pipeUnread)
+      && Number.isInteger(pipeCapacity)
+      && pipeCapacity > 0
+      && pipeUnread <= pipeCapacity;
     detail.total = {
       tripped: tripped && totalPair.sup.caps.total === true,
       buffered,
+      inFlightTailBytes,
+      pipeUnread,
+      pipeCapacity,
+      accounted,
       afterCleanup,
-      bound: totalCapHolds(buffered, totalCap),
+      // High-water, including the chunk tail, plus the measured unread pipe.
+      bound: pipeCounted && totalCapHolds(accounted, totalCap),
       // The post-cleanup count is the old oracle. It must not satisfy the bound.
       vacuity: totalCapHolds(afterCleanup, totalCap) === false,
     };

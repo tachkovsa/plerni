@@ -58,7 +58,25 @@ test('B5 crash typed error', { timeout: 20_000, skip: dbConfigured() ? false : '
 
 test('B3 caps trip', { timeout: 20_000 }, async () => {
   const result = await tripCaps();
-  assert.equal(result.pass, true, JSON.stringify(result.detail));
+  const total = result.detail.total;
+  const cap = 48 * 1024;
+  assert.equal(result.detail.pending.admitted, 4);
+  assert.ok(result.detail.pending.rejected > 0);
+  assert.equal(result.detail.partial.bound, true, JSON.stringify(result.detail.partial));
+  assert.equal(total.tripped, true);
+  assert.equal(total.vacuity, true);
+  assert.equal(total.accounted, total.buffered + total.pipeUnread);
+  assert.ok(total.pipeCapacity > 0, String(total.pipeCapacity));
+  assert.ok(total.pipeUnread <= total.pipeCapacity, String(total.pipeUnread));
+  assert.equal(total.bound, totalCapHolds(total.accounted, cap));
+  assert.equal(result.detail.kernel.bound, true);
+  assert.equal(result.detail.kernelBytes.tripped, true);
+  assert.equal(
+    result.pass,
+    Boolean(result.detail.pending.tripped && result.detail.partial.tripped && total.bound && total.vacuity
+      && result.detail.kernel.tripped && result.detail.kernel.bound
+      && result.detail.kernelBytes.tripped && result.detail.kernelBytes.bound),
+  );
 });
 
 test('B6 hostile battery rejects forged identity', { timeout: 20_000 }, async () => {
@@ -336,10 +354,45 @@ test('total-buffer bound fails when read after fault cleanup', { timeout: 15_000
     );
     assert.equal(faulted, true);
     const fault = pair.sup.faults.find((row) => row.pluginId === 'total');
-    assert.equal(totalCapHolds(fault.bufferedBytes, cap), true, String(fault.bufferedBytes));
-    assert.ok(fault.bufferedBytes > cap, String(fault.bufferedBytes));
+    assert.equal(fault.accountedBytes, fault.bufferedBytes + fault.pipeUnread);
+    assert.ok(fault.pipeCapacity > 0, String(fault.pipeCapacity));
+    assert.ok(fault.pipeUnread <= fault.pipeCapacity, String(fault.pipeUnread));
+    assert.ok(fault.bufferedBytes >= fault.pendingBytes + fault.inFlightTailBytes, String(fault.bufferedBytes));
     assert.equal(pair.sup.children.get('total').dead, true);
+    assert.equal(totalCapHolds(cap + PARTIAL_READ_CHUNK, cap), true);
+    assert.equal(totalCapHolds(cap + PARTIAL_READ_CHUNK + 1, cap), false);
     assert.equal(totalCapHolds(pair.sup.bufferedBytes(), cap), false, String(pair.sup.bufferedBytes()));
+  } finally {
+    await pair.close();
+  }
+});
+
+test('total-cap snapshot keeps the unread chunk tail', { timeout: 15_000 }, async () => {
+  const cap = 1024;
+  const pair = await connectPair({
+    sweeper: false,
+    caps: { pending: 64, partial: 1024 * 1024, total: cap, totalGlobal: 8 * 1024 * 1024 },
+    partialHighWater: 1024 * 1024,
+  });
+  try {
+    pair.sup.spawn({
+      pluginId: 'total',
+      script: floodPath,
+      env: { FLOOD_MODE: 'partial', FLOOD_CHUNK: '32768' },
+    });
+    const faulted = await waitUntil(
+      () => pair.sup.faults.some((fault) => fault.pluginId === 'total' && fault.code === 'total-cap'),
+      10_000,
+    );
+    assert.equal(faulted, true);
+    const fault = pair.sup.faults.find((row) => row.pluginId === 'total');
+    assert.ok(fault.inFlightTailBytes > 0, String(fault.inFlightTailBytes));
+    assert.ok(
+      fault.bufferedBytes >= fault.pendingBytes + fault.inFlightTailBytes,
+      `${fault.bufferedBytes} vs ${fault.pendingBytes}+${fault.inFlightTailBytes}`,
+    );
+    assert.equal(fault.accountedBytes, fault.bufferedBytes + fault.pipeUnread);
+    assert.equal(totalCapHolds(pair.sup.bufferedBytes(), cap), false);
   } finally {
     await pair.close();
   }

@@ -15,7 +15,11 @@ process.stdout.on('error', () => {});
 if (mode === 'silent') {
   setInterval(() => {}, 60_000);
 } else if (mode === 'partial') {
-  const chunk = Buffer.alloc(4096, 0x61);
+  const requested = Number(process.env.FLOOD_CHUNK);
+  const chunkSize = Number.isInteger(requested) && requested >= 1 && requested <= 1024 * 1024
+    ? requested
+    : 4096;
+  const chunk = Buffer.alloc(chunkSize, 0x61);
   const pump = () => {
     if (process.stdout.write(chunk)) setImmediate(pump);
     else process.stdout.once('drain', pump);
