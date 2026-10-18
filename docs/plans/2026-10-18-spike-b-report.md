@@ -98,7 +98,7 @@ Cadence is 5 s and the lease is 20 s. Renewal traffic for the capacity annex is 
 
 The original B3 FAIL opened the plan §8 re-spike track: enforce the partial cap, then rerun B3. Pull request #47 is that enforcement. This rerun is the re-spike, and B3 passes, so the track is closed. The flow-control hypothesis is accepted on this run. A substrate redesign is not required by this result.
 
-B1, B2, B4, B5, B6, and the race battery stay on framed NDJSON, the supervisor-stamped credential, and the conditional authority row. A1 pooled and A3 stay NOT DEMONSTRATED for the same missing pooled raw-`pg` control, the follow-up in the Spike A report. That gap does not open a second track. A4b stays issue #34.
+B1, B2, B4, B5, B6, and the race battery stay on framed NDJSON, the supervisor-stamped credential, and the conditional authority row. A1 pooled and A3 stay NOT DEMONSTRATED for the same missing pooled raw-`pg` control. Issue #14 owns that control and the A1 and A3 rerun, and this pull request does not close #14. ADR-0002 does not treat those two clauses as complete. That gap does not open a second track. A4b stays issue #34.
 
 ### Revised capacity note
 
