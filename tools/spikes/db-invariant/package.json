@@ -9,7 +9,8 @@
     "bench:schema": "node bench/gen-schema.mjs",
     "bench:corpus": "node bench/gen-corpus.mjs",
     "bench:lint": "node bench/corpus-lint.mjs",
-    "bench:measure": "node bench/measure.mjs"
+    "bench:measure": "node bench/measure.mjs",
+    "bench:drift-gate": "bash bench/drift-gate.sh"
   },
   "dependencies": {
     "kysely": "0.29.6",
