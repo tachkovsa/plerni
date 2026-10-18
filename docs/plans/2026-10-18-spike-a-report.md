@@ -45,22 +45,22 @@ The filter was then set to accept compose-bridge forwarding. Three pooled probes
 | A1 direct | PASS | Kysely and the raw-`pg` control, both on the direct app DSN: `pg_backend_pid()` constant across 3 statements in each of 8 concurrent transactions. The two result sets match. |
 | A1 pooled | NOT DEMONSTRATED | The Kysely pooled run printed constant pids. The identical raw-`pg` control did not. `rawApp()` always opens the direct DSN, and `pidsViaRawPg()` only calls `rawApp()`. `HARNESS_DIRECT_DSN` moves the direct path and the raw control together. No run-configuration switch adds a pooled raw client. |
 | A2 | PASS | Clean-deny reads 0 rows and the app guard raises. Tenant B's positive control returns B's three labels. After commit, context is absent and the context-less follow-up reads 0 rows. Both datasources. |
-| A3 | PASS | A1+A2 through PgBouncer, including division-by-zero rollback (`22012`) and the contamination lifecycle. |
+| A3 | NOT DEMONSTRATED | The Kysely probes passed on the pooled datasource: pinning, A2(a–c), division-by-zero rollback (`22012`), and the contamination lifecycle. Plan §3.1 A3 requires A1+A2 green via PgBouncer, and A1's pass criterion includes an identical raw-`pg` control. That control never opened the pooled DSN. |
 | A4 | PASS on unnamed discipline. A4b stays open. | Every observed statement name was empty (75 statements, 0 non-empty). Unnamed-vs-named mean overhead 28.4% (unrounded 28.378, 95% interval 21.0–35.7), so the mean is above 20%. Issue #34 stays the named-statement experiment. `max_prepared_statements` stayed 0. |
 | A5 | PASS at the acceptance point | Band 75 is within the ceiling on the 2026-10-17 CI run. Stress bands did not overrun. No ergonomics fallback. |
 | Battery | PASS | Terminations equal injected contaminations (8 and 8). Warm-tail terminations 0. |
 
 The vacuity control passed: skipping the context install reads 0 rows and raises `MissingTenantContextError`. The `ALTER ROLE` default injection ends in the designed loud failure after 2 retries (3 terminations, 3 injected logins) and is recorded as a pass.
 
-A3's pooled pinning rows are that case's own Kysely run. They do not fill in the missing A1 raw pooled control.
+A3's pooled pinning rows are that case's own Kysely run. They do not fill in the missing A1 raw pooled control. `recordProbe` attaches its raw-`pg` script only after a Kysely failure, and that script calls `rawApp()`, which opens the direct DSN. The passing A3 lines therefore do not carry a pooled raw control.
 
 ## A1 pooled raw control
 
-A1 pooled is NOT DEMONSTRATED because the raw control never traversed PgBouncer. The direct raw-`pg` result stays PASS. The consequence is a follow-up: add a raw `pg.Client` on the pooled DSN inside the A1 case, then rerun A1. No run-configuration switch adds that client. A missing control does not replace the shipped substrate, so this clause does not open the replacement-validation track. The B3 re-spike in the Spike B report is closed.
+A1 pooled is NOT DEMONSTRATED because the raw control never traversed PgBouncer. A3 is NOT DEMONSTRATED for the same gap: its criterion starts from A1 green via PgBouncer, and the raw control is part of A1. The direct raw-`pg` result stays PASS. The Kysely A3 probes stay as recorded measurements. The consequence is one follow-up: add a raw `pg.Client` on the pooled DSN inside the A1 case, then rerun A1 and A3. No run-configuration switch adds that client. A missing control does not replace the shipped substrate, so this clause does not open the replacement-validation track. The B3 re-spike in the Spike B report is closed.
 
 ## A3 contamination lifecycle
 
-On the pooled datasource the executing backend was detected before tenant access, `pg_terminate_backend` removed it (`backendGoneMs` 6), and the absence check ran on the replacement session. The positive control passed. Retries were 1. Cleanup was 26 ms. The rival checkout was held off and did not time out.
+These are the Kysely measurements. They are not an A3 PASS. On the pooled datasource the executing backend was detected before tenant access, `pg_terminate_backend` removed it (`backendGoneMs` 6), and the absence check ran on the replacement session. The positive control passed. Retries were 1. Cleanup was 26 ms. The rival checkout was held off and did not time out.
 
 ## A4 overhead
 
@@ -116,4 +116,4 @@ The clean tree passed the gate on bands 50, 75, 200, and 400 in the T4b run (exi
 
 ## Replacement-validation track
 
-Plan §8 opens the replacement-validation track when a verdict replaces the shipped substrate, and the track carries a revised capacity estimate. A2, A3, A4's unnamed discipline, and A5 stay on the results the suite demonstrated. A4b stays issue #34. A1 pooled is the follow-up in the section above. The B3 re-spike in the Spike B report was opened by the original FAIL and closed by the rerun at this dev SHA. The capacity annex remains T7. The partial-buffer bound that rerun attaches is `32768 × children` bytes, plus at most one 4096-byte read chunk per child.
+Plan §8 opens the replacement-validation track when a verdict replaces the shipped substrate, and the track carries a revised capacity estimate. A2, A4's unnamed discipline, and A5 stay on the results the suite demonstrated. A3 is withheld with A1 pooled: the Kysely probes passed, and the raw-`pg` control required for A1 green via PgBouncer did not run on that datasource. A4b stays issue #34. The follow-up is the pooled raw client in the section above, then an A1 and A3 rerun. The B3 re-spike in the Spike B report was opened by the original FAIL and closed by the rerun at this dev SHA. The capacity annex remains T7. The partial-buffer bound that rerun attaches is `32768 × children` bytes, plus at most one 4096-byte read chunk per child.

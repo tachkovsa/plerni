@@ -35,7 +35,7 @@ cd tools/harness && ./reset.sh && cd ../.. && node tools/harness/seed.mjs && pnp
 evidence: tools/spikes/db-invariant/evidence/run-2026-10-18T20-39-16-541Z.jsonl (9249ms) — 0 failing case(s)
 ```
 
-The pooled A1 row is Kysely. There is no `A1 @ pooled (raw-pg control)` line. That is why the pooled raw-pg claim is NOT DEMONSTRATED.
+The pooled A1 row is Kysely. There is no `A1 @ pooled (raw-pg control)` line. That is why the pooled raw-pg claim is NOT DEMONSTRATED. The A3 lines above are the runner's Kysely passes. A3's criterion requires A1 green via PgBouncer, and A1 includes that raw control, so the A report withholds the A3 verdict. The runner did not print a pooled raw-pg row for A3 either.
 
 ## B1–B6 scored spike
 
