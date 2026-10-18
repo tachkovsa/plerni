@@ -1,21 +1,21 @@
-// saturated-pool (plan B2 / T5c): one production commitExecution holds a
-// pooled server connection past a real lease. The other server connections
-// are held by explicit transactions, and a pooled probe stays in cl_waiting.
-// Renewals still land because commitExecution uses the reserved direct
-// connection. The production sweeper, on that same direct path, does not
-// abandon the row.
+// saturated-pool (plan B2 / T5c): default_pool_size healthy executors (10,
+// pinned by T2) each run production commitExecution on the pooled datasource
+// and keep it past a real lease. Renewals use that execution's reserved
+// direct connection. One more pooled client waits in cl_waiting, which is
+// the saturation witness, not an executor. The production sweeper on the
+// direct path does not abandon any of them.
 // https://www.pgbouncer.org/config.html (pool_mode=transaction)
 // https://www.pgbouncer.org/usage.html (SHOW POOLS cl_waiting)
 
 import { randomUUID } from 'node:crypto';
 import { commitExecution, createExecution, dispatch, getStatus, sweepAbandoned } from '../authority.mjs';
-import { assertBounds, deferred, steps } from './clock.mjs';
-import { LEASE_MS, isAborted, openAppClient } from './control.mjs';
+import { assertBounds, deferred, steps, withDeadline } from './clock.mjs';
+import { CADENCE_MS, LEASE_MS, abortInFlight, isAborted, openAppClient } from './control.mjs';
 import { commitMetrics, commitReportHeld, countEffects, ensureEffects, insertEffect, openAdminClient } from './support.mjs';
 
 const POOL_PIN = 10;
-const HOLD_BOUND_MS = 50_000;
-const SAMPLE_MS = 400;
+const HOLD_LIMIT_MS = 35_000;
+const SAMPLE_MS = 1000;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -55,30 +55,50 @@ async function pollPool(admin, ready, label, deadlineMs, bounds) {
   }
 }
 
-function holdServer(release) {
-  const client = openAppClient('pooled');
-  let markReady;
-  let failReady;
-  const ready = new Promise((resolve, reject) => {
-    markReady = resolve;
-    failReady = reject;
-  });
+function startExecutor(index, saturated, release) {
+  const token = `sat-${index}-${randomUUID()}`;
+  const note = `sat-${index}`;
+  const entered = deferred();
+  const held = deferred();
+  const state = {
+    index,
+    id: null,
+    note,
+    entered,
+    held,
+    holdMs: 0,
+    beats: [],
+    result: null,
+  };
   const done = (async () => {
-    try {
-      await client.connect();
-      await client.query('BEGIN');
-      markReady();
+    state.id = await createExecution('t5c-saturated', token, true);
+    await dispatch(state.id, true);
+    state.result = await commitExecution(state.id, token, async (client) => {
+      await insertEffect(client, state.id, note);
+      entered.resolve();
+      await saturated.promise;
+      const opened = Date.now();
+      for (;;) {
+        if (isAborted()) throw new Error('aborted');
+        const row = await getStatus(state.id, true);
+        if (row?.status !== 'ACTIVE') throw new Error(`abandoned during saturation: ${row?.status}`);
+        const beat = new Date(row.heartbeat_at).getTime();
+        if (state.beats.at(-1) !== beat) state.beats.push(beat);
+        state.holdMs = Date.now() - opened;
+        if (state.holdMs > LEASE_MS && state.beats.length >= 5) break;
+        if (state.holdMs > HOLD_LIMIT_MS) {
+          throw new Error(`lease crossing missed for executor ${index} (${state.holdMs}ms, beats ${state.beats.length})`);
+        }
+        await sleep(SAMPLE_MS);
+      }
+      held.resolve();
       await release.promise;
-      await client.query('COMMIT');
-    } catch (err) {
-      failReady(err);
-      throw err;
-    } finally {
-      await client.end().catch(() => {});
-    }
+    }, false);
+    return state;
   })();
   done.catch(() => {});
-  return { ready, done };
+  state.done = done;
+  return state;
 }
 
 export async function saturatedPool() {
@@ -87,14 +107,16 @@ export async function saturatedPool() {
   const admin = openAdminClient();
   if (!admin) return { pass: false, detail: { error: 'no pgbouncer admin datasource', bounds: [] } };
   await timing.run(() => admin.connect(), 'admin connect');
-  const release = deferred();
-  const entered = deferred();
   const saturated = deferred();
-  const fillers = [];
+  const release = deferred();
+  const executors = [];
   let probe;
   let probeDone = Promise.resolve();
   let probeSettled = false;
-  let commitP = Promise.resolve(null);
+  let sweptDuring = 0;
+  let watch = false;
+  let watcherError = null;
+  let watcher = Promise.resolve();
   try {
     const configured = await timing.run(() => poolSize(admin), 'read pool size');
     if (configured !== POOL_PIN) {
@@ -103,52 +125,44 @@ export async function saturatedPool() {
         detail: { error: 'default_pool_size is not the pinned 10', configured, bounds: timing.bounds },
       };
     }
-    await pollPool(
-      admin,
-      (row) => row.clWaiting === 0 && row.svActive === 0,
+    await timing.run(
+      () => pollPool(
+        admin,
+        (row) => row.clWaiting === 0 && row.svActive === 0,
+        'pool idle',
+        20_000,
+        timing.bounds,
+      ),
       'pool idle',
-      20_000,
-      timing.bounds,
+      22_000,
     );
 
-    const token = `sat-${randomUUID()}`;
-    const id = await timing.run(() => createExecution('t5c-saturated', token, true), 'create');
-    await timing.run(() => dispatch(id, true), 'dispatch');
-    const beats = [];
-    let sweptDuring = 0;
-    let holdMs = 0;
-    let waitingAtEnd = 0;
-    commitP = commitExecution(id, token, async (client) => {
-      await insertEffect(client, id, 'sat');
-      entered.resolve();
-      await saturated.promise;
-      const opened = Date.now();
-      for (;;) {
-        if (isAborted()) throw new Error('aborted');
-        const row = await getStatus(id, true);
-        if (row?.status !== 'ACTIVE') throw new Error(`abandoned during saturation: ${row?.status}`);
-        const beat = new Date(row.heartbeat_at).getTime();
-        if (beats.at(-1) !== beat) beats.push(beat);
-        const swept = await sweepAbandoned(true);
-        if (swept.includes(id)) sweptDuring += 1;
-        holdMs = Date.now() - opened;
-        if (holdMs > LEASE_MS && beats.length >= 5) break;
-        if (holdMs > 35_000) {
-          throw new Error(`lease crossing missed (${holdMs}ms, beats ${beats.length})`);
+    for (let index = 0; index < configured; index += 1) {
+      executors.push(startExecutor(index, saturated, release));
+    }
+    await timing.run(
+      () => Promise.all(executors.map((item) => item.entered.promise)),
+      'executors entered',
+      15_000,
+    );
+    watch = true;
+    watcher = (async () => {
+      while (watch) {
+        if (isAborted()) return;
+        const swept = await withDeadline(
+          sweepAbandoned(true),
+          5_000,
+          'saturation sweep',
+          () => { abortInFlight().catch(() => {}); },
+        );
+        for (const item of executors) {
+          if (item.id && swept.includes(item.id)) sweptDuring += 1;
         }
         await sleep(SAMPLE_MS);
       }
-      const still = await poolRow(admin);
-      waitingAtEnd = still.clWaiting;
-      if (waitingAtEnd < 1 || probeSettled) {
-        throw new Error(`saturation dropped (cl_waiting=${waitingAtEnd}, probeSettled=${probeSettled})`);
-      }
-    }, false);
-    commitP.catch(() => {});
-
-    await timing.run(() => entered.promise, 'execution entered', 10_000);
-    for (let i = 0; i < configured - 1; i += 1) fillers.push(holdServer(release));
-    await timing.run(() => Promise.all(fillers.map((item) => item.ready)), 'fillers began', 10_000);
+    })().catch((err) => {
+      watcherError = err;
+    });
 
     probe = openAppClient('pooled');
     await timing.run(() => probe.connect(), 'probe connect');
@@ -157,61 +171,96 @@ export async function saturatedPool() {
     }, () => {
       probeSettled = true;
     });
-    const waiting = await pollPool(
-      admin,
-      (row) => row.clWaiting >= 1,
+    const waiting = await timing.run(
+      () => pollPool(
+        admin,
+        (row) => row.clWaiting >= 1,
+        'pooled probe entered cl_waiting',
+        5_000,
+        timing.bounds,
+      ),
       'pooled probe entered cl_waiting',
-      5_000,
-      timing.bounds,
+      7_000,
     );
     saturated.resolve();
 
-    const result = await timing.run(() => commitP, 'saturated commit', HOLD_BOUND_MS);
+    await timing.run(
+      () => Promise.all(executors.map((item) => item.held.promise)),
+      'lease crossing',
+      45_000,
+    );
+    const still = await timing.run(() => poolRow(admin), 'saturation still held');
+    if (still.clWaiting < 1 || probeSettled) {
+      throw new Error(`saturation dropped (cl_waiting=${still.clWaiting}, probeSettled=${probeSettled})`);
+    }
     release.resolve();
-    await timing.run(() => Promise.all(fillers.map((item) => item.done)), 'fillers drained', 10_000);
+    const finished = await timing.run(
+      () => Promise.all(executors.map((item) => item.done)),
+      'saturated commits',
+      15_000,
+    );
     await timing.run(() => probeDone, 'probe drained', 5_000);
 
-    const status = (await timing.run(() => getStatus(id, true), 'status'))?.status ?? null;
-    const effects = await timing.run(() => countEffects(id, 'sat'), 'effects');
-    const increasing = beats.every((beat, index) => index === 0 || beat > beats[index - 1]);
+    const reports = [];
+    for (const item of finished) {
+      const status = (await timing.run(() => getStatus(item.id, true), `status ${item.index}`))?.status ?? null;
+      const effects = await timing.run(() => countEffects(item.id, item.note), `effects ${item.index}`);
+      const increasing = item.beats.every((beat, index) => index === 0 || beat > item.beats[index - 1]);
+      reports.push({
+        index: item.index,
+        ...commitMetrics(item.result),
+        holdMs: item.holdMs,
+        beats: item.beats.length,
+        increasing,
+        status,
+        effects,
+      });
+    }
     const detail = {
       configured,
+      executors: reports.length,
       waiting: waiting.clWaiting,
-      waitingAtEnd,
-      holdMs,
-      beats: beats.length,
-      increasing,
-      ...commitMetrics(result),
+      waitingAtEnd: still.clWaiting,
       sweptDuring,
-      status,
-      effects,
       leaseMs: LEASE_MS,
+      reports,
       bounds: timing.bounds,
     };
+    if (watcherError) throw watcherError;
     assertBounds(detail.bounds);
     const pass = configured === POOL_PIN
+      && reports.length === POOL_PIN
       && waiting.clWaiting >= 1
-      && waitingAtEnd >= 1
-      && holdMs > LEASE_MS
-      && beats.length >= 5
-      && increasing
-      && result.renewals >= 4
-      && result.boundViolation === false
-      && Number.isFinite(result.lastRenewalToLockMs)
-      && result.lastRenewalToLockMs >= 0
-      && result.lastRenewalToLockMs <= result.bound
-      && commitReportHeld(result)
+      && still.clWaiting >= 1
       && sweptDuring === 0
-      && result.committed === true
-      && status === 'COMMITTED'
-      && effects === 1;
+      && reports.every((report) => report.holdMs > LEASE_MS
+        && report.beats >= 5
+        && report.increasing
+        && report.renewals >= 4
+        && report.boundViolation === false
+        && report.bound === CADENCE_MS
+        && Number.isFinite(report.lastRenewalToLockMs)
+        && report.lastRenewalToLockMs >= 0
+        && report.lastRenewalToLockMs <= CADENCE_MS
+        && commitReportHeld(report)
+        && report.committed === true
+        && report.status === 'COMMITTED'
+        && report.effects === 1);
     return { pass, detail };
   } finally {
-    entered.resolve();
+    watch = false;
     saturated.resolve();
     release.resolve();
-    await Promise.allSettled([commitP, probeDone, ...fillers.map((item) => item.done)]);
-    if (probe) await probe.end().catch(() => {});
-    await admin.end().catch(() => {});
+    try {
+      await withDeadline(
+        Promise.allSettled([watcher, probeDone, ...executors.map((item) => item.done)]),
+        8_000,
+        'saturation cleanup',
+        () => { abortInFlight().catch(() => {}); },
+      );
+    } finally {
+      if (probe) await probe.end().catch(() => {});
+      await admin.end().catch(() => {});
+    }
   }
 }

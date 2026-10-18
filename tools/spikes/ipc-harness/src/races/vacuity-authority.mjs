@@ -5,7 +5,7 @@
 
 import { vacuousCommit, vacuousSweep } from './control.mjs';
 import { productionRecoveryAuthority, runRecoveryRace } from './recovery-vs-live-commit.mjs';
-import { insertEffect } from './support.mjs';
+import { commitReportHeld, insertEffect } from './support.mjs';
 
 function vacuousRecoveryAuthority() {
   return {
@@ -24,5 +24,14 @@ function vacuousRecoveryAuthority() {
 export async function vacuityAuthority() {
   const real = await runRecoveryRace(productionRecoveryAuthority());
   const open = await runRecoveryRace(vacuousRecoveryAuthority());
-  return { real, open };
+  // The production winner is a real commitExecution. Score its renewal report
+  // the same way recovery-vs-live-commit does. The predicate-free variant
+  // returns no renewal fields, so that oracle stays on the production side.
+  return {
+    real: {
+      pass: real.pass && commitReportHeld(real.detail.executor),
+      detail: real.detail,
+    },
+    open,
+  };
 }

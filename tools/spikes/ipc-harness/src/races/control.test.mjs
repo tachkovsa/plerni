@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { CADENCE_MS, VACUOUS_COMMIT_SQL, VACUOUS_SWEEP_SQL } from './control.mjs';
 import { recoveryRaceHeld } from './recovery-vs-live-commit.mjs';
-import { appProbeReason, commitReportHeld, raceSkip, runningInCi } from './support.mjs';
+import { commitReportHeld, directProbeReason, probeConnection, raceSkip, runningInCi } from './support.mjs';
 
 const PRODUCTION_COMMIT = "UPDATE fencing_authority SET status = 'COMMITTED' WHERE id = $1 AND token = $2 AND status = 'ACTIVE' RETURNING clock_timestamp() AS locked_at";
 const PRODUCTION_SWEEP = "UPDATE fencing_authority SET status = 'ABANDONED' WHERE status = 'ACTIVE' AND heartbeat_at < now() - make_interval(secs => $1) RETURNING id";
@@ -47,9 +47,9 @@ test('an unreachable app database skips locally and stays runnable in CI', async
   process.env.HARNESS_DIRECT_DSN = 'postgresql://plerni_app:invalid@localhost:1/plerni';
   delete process.env.PLERNI_APP_PASSWORD;
   try {
-    const reason = await appProbeReason();
-    assert.equal(reason, 'harness database connection failed');
-    assert.equal(raceSkip([reason], false), 'harness database connection failed');
+    const reason = await directProbeReason();
+    assert.equal(reason, 'direct harness database connection failed');
+    assert.equal(raceSkip([reason], false), 'direct harness database connection failed');
     assert.equal(raceSkip([reason], true), false);
   } finally {
     if (saved.HARNESS_DIRECT_DSN === undefined) delete process.env.HARNESS_DIRECT_DSN;
@@ -57,6 +57,25 @@ test('an unreachable app database skips locally and stays runnable in CI', async
     if (saved.PLERNI_APP_PASSWORD === undefined) delete process.env.PLERNI_APP_PASSWORD;
     else process.env.PLERNI_APP_PASSWORD = saved.PLERNI_APP_PASSWORD;
   }
+});
+
+test('a probe query that stalls is bounded and destroys the client', async () => {
+  let destroyed = false;
+  const client = {
+    connection: { stream: { destroy() { destroyed = true; } } },
+    async connect() {},
+    query() {
+      return new Promise(() => {});
+    },
+    async end() {},
+  };
+  const started = Date.now();
+  const reason = await probeConnection(() => client, 'SELECT 1', 40);
+  assert.equal(reason, 'connection failed');
+  assert.equal(destroyed, true);
+  assert.ok(Date.now() - started < 500);
+  assert.equal(raceSkip([`pooled harness database ${reason}`], false), 'pooled harness database connection failed');
+  assert.equal(raceSkip([`pooled harness database ${reason}`], true), false);
 });
 
 test('a missing race service skips locally and fails closed in CI', () => {

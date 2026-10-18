@@ -52,18 +52,40 @@ export function openAdminClient(connectionTimeoutMillis = 0) {
 
 const PROBE_MS = 2000;
 
-async function probe(open, query) {
+// Connection timeout bounds dialing. This bound covers a server that accepts
+// the socket and then never answers the probe statement. Destroying the
+// socket is client-side: a pooled probe must not SET a session timeout,
+// because PgBouncer transaction mode would reuse that server connection.
+export async function probeConnection(open, query, boundMs = PROBE_MS) {
   const client = open();
   if (!client) return 'not configured';
+  let timer;
   try {
     await client.connect();
-    await client.query(query);
-    return null;
+    let settled = false;
+    const queryP = client.query(query).then(() => {
+      settled = true;
+      return null;
+    }, () => 'connection failed');
+    const timeoutP = new Promise((resolve) => {
+      timer = setTimeout(() => {
+        client.connection?.stream?.destroy();
+        resolve('connection failed');
+      }, boundMs);
+    });
+    const failed = await Promise.race([queryP, timeoutP]);
+    if (settled) return null;
+    return failed ?? 'connection failed';
   } catch {
     return 'connection failed';
   } finally {
+    clearTimeout(timer);
     await client.end().catch(() => {});
   }
+}
+
+function probe(open, query) {
+  return probeConnection(open, query, PROBE_MS);
 }
 
 export function rootConfigured() {
@@ -80,10 +102,20 @@ export function appConfigured() {
   return Boolean(process.env.HARNESS_DIRECT_DSN || process.env.PLERNI_APP_PASSWORD);
 }
 
-export async function appProbeReason() {
-  if (!appConfigured()) return 'no harness database in the environment';
+export async function directProbeReason() {
+  if (!appConfigured()) return 'no direct harness database configured';
   const failed = await probe(() => openAppClient('direct', PROBE_MS), 'SELECT 1');
-  return failed ? `harness database ${failed}` : null;
+  return failed ? `direct harness database ${failed}` : null;
+}
+
+export function pooledConfigured() {
+  return Boolean(process.env.HARNESS_POOLED_DSN || process.env.PLERNI_APP_PASSWORD);
+}
+
+export async function pooledProbeReason() {
+  if (!pooledConfigured()) return 'no pooled harness database configured';
+  const failed = await probe(() => openAppClient('pooled', PROBE_MS), 'SELECT 1');
+  return failed ? `pooled harness database ${failed}` : null;
 }
 
 export function adminConfigured() {
