@@ -10,7 +10,7 @@ One command, from a clean worktree of that SHA. Export `POSTGRES_PASSWORD`, `PLE
 cd tools/harness && ./reset.sh && cd ../.. && node tools/harness/seed.mjs && pnpm --filter @plerni-spike/db-invariant spike
 ```
 
-The scored run exited 0 in 6766 ms with `0 failing case(s)` and 38 JSONL rows. The evidence file is gitignored (`tools/spikes/*/evidence/`).
+The scored run exited 0 in 6766 ms with `0 failing case(s)` and 38 JSONL rows. JSONL stays gitignored (`tools/spikes/*/evidence/`). The command stdout is pasted in the pull request description. The reviewer reruns the command above on the reviewed head and writes the receipt in the pull request record.
 
 ## Environment
 
@@ -40,7 +40,7 @@ The filter was then set to accept compose-bridge forwarding. Three pooled probes
 
 | ID | Verdict | Where it leaves the plan |
 |---|---|---|
-| A1 | PASS | `pg_backend_pid()` constant across 3 statements in each of 8 concurrent transactions, direct and pooled. Raw-`pg` control matches. |
+| A1 | PASS | Kysely, direct and pooled: `pg_backend_pid()` constant across 3 statements in each of 8 concurrent transactions. The raw-`pg` control is a `pg.Client` on the direct app DSN and matches those direct runs. §3.0 uses that direct control to separate Kysely misuse from a driver failure. |
 | A2 | PASS | Clean-deny reads 0 rows and the app guard raises. Tenant B's positive control returns B's three labels. After commit, context is absent and the context-less follow-up reads 0 rows. Both datasources. |
 | A3 | PASS | A1+A2 through PgBouncer, including division-by-zero rollback (`22012`) and the contamination lifecycle. |
 | A4 | PASS on unnamed discipline. A4b stays open. | Every observed statement name was empty (75 statements, 0 non-empty). Unnamed-vs-named mean overhead 31.5% (unrounded 31.518, 95% interval 28.7–34.3), so the mean is above 20%. Issue #34 stays the named-statement experiment. `max_prepared_statements` stayed 0. |
