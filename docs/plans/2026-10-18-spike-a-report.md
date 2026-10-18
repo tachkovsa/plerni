@@ -10,7 +10,9 @@ One command, from a clean worktree of that SHA. Export `POSTGRES_PASSWORD`, `PLE
 cd tools/harness && ./reset.sh && cd ../.. && node tools/harness/seed.mjs && pnpm --filter @plerni-spike/db-invariant spike
 ```
 
-The scored run exited 0 in 6766 ms with `0 failing case(s)` and 38 JSONL rows. JSONL stays gitignored (`tools/spikes/*/evidence/`). The command stdout is pasted in the pull request description. The reviewer reruns the command above on the reviewed head and writes the receipt in the pull request record.
+The scored run exited 0 in 6766 ms with `0 failing case(s)` and 38 JSONL rows. JSONL stays gitignored (`tools/spikes/*/evidence/`). The lines that back these verdicts are in `docs/plans/2026-10-18-spike-rerun-evidence.md`.
+
+Review receipt: pending (δ, cross-family).
 
 ## Environment
 
@@ -40,7 +42,8 @@ The filter was then set to accept compose-bridge forwarding. Three pooled probes
 
 | ID | Verdict | Where it leaves the plan |
 |---|---|---|
-| A1 | PASS | Kysely, direct and pooled: `pg_backend_pid()` constant across 3 statements in each of 8 concurrent transactions. The raw-`pg` control is a `pg.Client` on the direct app DSN and matches those direct runs. §3.0 uses that direct control to separate Kysely misuse from a driver failure. |
+| A1 direct | PASS | Kysely and the raw-`pg` control, both on the direct app DSN: `pg_backend_pid()` constant across 3 statements in each of 8 concurrent transactions. The two result sets match. |
+| A1 pooled | NOT DEMONSTRATED | The Kysely pooled run printed constant pids. The identical raw-`pg` control did not. `rawApp()` always opens the direct DSN, and `pidsViaRawPg()` only calls `rawApp()`. `HARNESS_DIRECT_DSN` moves the direct path and the raw control together. No run-configuration switch adds a pooled raw client. |
 | A2 | PASS | Clean-deny reads 0 rows and the app guard raises. Tenant B's positive control returns B's three labels. After commit, context is absent and the context-less follow-up reads 0 rows. Both datasources. |
 | A3 | PASS | A1+A2 through PgBouncer, including division-by-zero rollback (`22012`) and the contamination lifecycle. |
 | A4 | PASS on unnamed discipline. A4b stays open. | Every observed statement name was empty (75 statements, 0 non-empty). Unnamed-vs-named mean overhead 31.5% (unrounded 31.518, 95% interval 28.7–34.3), so the mean is above 20%. Issue #34 stays the named-statement experiment. `max_prepared_statements` stayed 0. |
@@ -48,6 +51,12 @@ The filter was then set to accept compose-bridge forwarding. Three pooled probes
 | Battery | PASS | Terminations equal injected contaminations (8 and 8). Warm-tail terminations 0. |
 
 The vacuity control passed: skipping the context install reads 0 rows and raises `MissingTenantContextError`. The `ALTER ROLE` default injection ends in the designed loud failure after 2 retries (3 terminations, 3 injected logins) and is recorded as a pass.
+
+A3's pooled pinning rows are that case's own Kysely run. They do not fill in the missing A1 raw pooled control.
+
+## A1 pooled raw control
+
+Plan §8 opens the replacement-validation track when a verdict replaces the shipped substrate, and that track carries a revised capacity estimate. A1 pooled is NOT DEMONSTRATED because the raw control never traversed PgBouncer. That is a missing control, and the direct raw-`pg` result stays PASS. The consequence is a follow-up: add a raw `pg.Client` on the pooled DSN inside the A1 case, then rerun A1. The replacement track is not opened. No revised capacity estimate is attached here.
 
 ## A3 contamination lifecycle
 
@@ -107,4 +116,4 @@ The clean tree passed the gate on bands 50, 75, 200, and 400 in the T4b run (exi
 
 ## Replacement-validation track
 
-Plan §8 opens that track when a verdict flips to a Drizzle re-spike or a tenancy-substrate redesign, and the track carries a revised capacity estimate. Nothing in this rerun did that. A1–A3 stay on the transaction-local substrate. A4's unnamed discipline holds, and the overhead result keeps A4b (issue #34) as its own experiment. A5 stays inside the acceptance ceiling. No revised capacity estimate is attached here. The capacity annex remains T7.
+Plan §8 opens that track when a verdict replaces the shipped substrate, and the track carries a revised capacity estimate. A2, A3, A4's unnamed discipline, and A5 stay on the results the suite demonstrated. A4b stays issue #34. A1 pooled is the follow-up in the section above, not a driver-level failure and not this track. No revised capacity estimate is attached here. The capacity annex remains T7.
