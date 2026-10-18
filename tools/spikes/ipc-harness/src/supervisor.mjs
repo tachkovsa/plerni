@@ -2,6 +2,8 @@
 // before multiplexing, bind the per-plugin capability credential, run the sweeper.
 // Child-supplied plugin ids are untrusted hints (plan §4 B6, spec §4.4).
 // stampIdentity:false is the vacuity variant: it trusts the hint and must fail B6.
+// enforcePartial:false is the partial-cap vacuity variant: the unfinished frame
+// is flagged and kept, and only the framer's 1 MiB NdjsonOversizeError stops it.
 //
 // Caps are per plugin, with a global ceiling. Pending entries expire on a
 // deadline. The high-priority mux queue is per plugin and faults the child
@@ -41,6 +43,16 @@ function waitExit(child) {
 }
 
 export const HARD_FRAME = 1024 * 1024;
+
+// One stdout slice handed to the framer. An unfinished frame cannot shrink, so
+// bytes already read may pass the configured partial cap by at most this much.
+export const PARTIAL_READ_CHUNK = 4096;
+
+export function partialCapHolds(pendingBytes, cap) {
+  return Number.isFinite(pendingBytes)
+    && pendingBytes > cap
+    && pendingBytes <= cap + PARTIAL_READ_CHUNK;
+}
 
 export const DEFAULT_CAPS = Object.freeze({
   pending: 32,
@@ -129,6 +141,7 @@ export class Supervisor {
   constructor(socket, opts = {}) {
     this.socket = socket;
     this.stampIdentity = opts.stampIdentity !== false;
+    this.enforcePartial = opts.enforcePartial !== false;
     this.useDirect = opts.useDirect ?? useDirectFromEnv();
     this.capsConfig = { ...DEFAULT_CAPS, ...opts.caps };
     if (opts.caps?.pending != null && opts.caps.pendingGlobal == null) {
@@ -579,7 +592,7 @@ export class Supervisor {
         this.#retainTail(rec, incoming.subarray(offset));
         return;
       }
-      const end = Math.min(incoming.length, offset + 4096);
+      const end = Math.min(incoming.length, offset + PARTIAL_READ_CHUNK);
       const slice = incoming.subarray(offset, end);
       offset = end;
       let stopped = false;
@@ -684,11 +697,16 @@ export class Supervisor {
       this.caps.total = true;
       this.#pause(rec, 'total');
     }
-    if (rec.framer.pendingBytes() >= this.partialHighWater) {
+    // An unfinished frame cannot shrink. Pausing would wait for bytes that
+    // only make it larger. The slice already fed is the only overshoot past
+    // the configured cap. The framer still throws NdjsonOversizeError at its
+    // own ceiling when this cap sits at or above that ceiling.
+    if (rec.framer.pendingBytes() > this.partialHighWater) {
       this.caps.partial = true;
-      // Do not pause. The unfinished frame cannot shrink until more bytes
-      // arrive, and a pause would stall a legal frame or a never-terminated
-      // stream short of the framer's typed oversize error.
+      if (this.enforcePartial) {
+        this.#fault(rec, 'partial-cap');
+        return;
+      }
     }
     if (this.bufferedBytes() > this.capsConfig.totalGlobal) this.#pauseOverGlobal();
     this.#maybeResumeAll();

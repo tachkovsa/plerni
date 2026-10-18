@@ -13,7 +13,7 @@ import { applyScoredSkip, floodBound, floodScore, forgedFlood, hostileBattery, s
 import { assessEnvironment, delay, measureSeries, openLoop, preflight, treeRss, waitUntil } from './measure.mjs';
 import { MuxFramer, encodeMux, encodeNdjson } from './framing.mjs';
 import { FencedError } from './authority.mjs';
-import { connectPair, dbConfigured } from './supervisor.mjs';
+import { DEFAULT_CAPS, PARTIAL_READ_CHUNK, connectPair, dbConfigured, partialCapHolds } from './supervisor.mjs';
 
 const echoPath = fileURLToPath(new URL('./children/echo.mjs', import.meta.url));
 const floodPath = fileURLToPath(new URL('./children/flood.mjs', import.meta.url));
@@ -265,43 +265,80 @@ test('ignored cancels obey the pending cap and are reclaimed', { timeout: 10_000
   }
 });
 
-test('a frame above the partial high-water still completes', { timeout: 10_000 }, async () => {
+test('a frame past the partial cap faults within one read chunk', { timeout: 10_000 }, async () => {
+  const cap = DEFAULT_CAPS.partial;
   const pair = await connectPair({ sweeper: false });
   try {
     const kid = pair.sup.spawn({ pluginId: 'echo', script: echoPath });
-    const payload = 'q'.repeat(80_000);
-    const res = await pair.stub.call({
+    const pending = pair.stub.call({
       pluginId: 'echo',
       credential: kid.credential,
       correlationId: 1,
       port: 'db',
       method: 'get',
-      payload,
-    }, 5_000);
-    assert.equal(res.payload?.length, 80_000);
-    assert.equal(pair.sup.children.get('echo').dead, false);
+      payload: 'q'.repeat(80_000),
+    }, 5_000).catch((err) => err);
+    const faulted = await waitUntil(
+      () => pair.sup.faults.some((fault) => fault.pluginId === 'echo' && fault.code === 'partial-cap'),
+      5_000,
+    );
+    assert.equal(faulted, true);
+    const fault = pair.sup.faults.find((row) => row.pluginId === 'echo');
+    assert.equal(partialCapHolds(fault.pendingBytes, cap), true, String(fault.pendingBytes));
+    assert.ok(fault.pendingBytes > cap, String(fault.pendingBytes));
+    const rec = pair.sup.children.get('echo');
+    assert.equal(rec.dead, true);
+    assert.equal(rec.pauseReason, null);
+    const settled = await pending;
+    assert.equal(settled.code, 'partial-cap');
   } finally {
     await pair.close();
   }
 });
 
-test('partial cap exhaustion is a typed oversize error', { timeout: 15_000 }, async () => {
+test('partial cap exhaustion faults within one read chunk', { timeout: 15_000 }, async () => {
+  const cap = 4_096;
   const pair = await connectPair({
     sweeper: false,
-    caps: { partial: 4_096, total: 8 * 1024 * 1024, totalGlobal: 8 * 1024 * 1024 },
+    caps: { partial: cap, total: 8 * 1024 * 1024, totalGlobal: 8 * 1024 * 1024 },
   });
   try {
     pair.sup.spawn({ pluginId: 'partial', script: floodPath, env: { FLOOD_MODE: 'partial' } });
     const rec = pair.sup.children.get('partial');
+    const faulted = await waitUntil(
+      () => pair.sup.faults.some((fault) => fault.pluginId === 'partial' && fault.code === 'partial-cap'),
+      10_000,
+    );
+    assert.equal(faulted, true);
+    const fault = pair.sup.faults.find((row) => row.pluginId === 'partial');
+    assert.equal(partialCapHolds(fault.pendingBytes, cap), true, String(fault.pendingBytes));
+    assert.ok(fault.pendingBytes > cap, String(fault.pendingBytes));
+    assert.ok(fault.pendingBytes <= cap + PARTIAL_READ_CHUNK, String(fault.pendingBytes));
+    assert.equal(rec.dead, true);
+    assert.equal(rec.pauseReason, null);
+  } finally {
+    await pair.close();
+  }
+});
+
+test('partial cap bound fails when enforcement is removed', { timeout: 15_000 }, async () => {
+  const cap = 4_096;
+  const pair = await connectPair({
+    sweeper: false,
+    enforcePartial: false,
+    caps: { partial: cap, total: 8 * 1024 * 1024, totalGlobal: 8 * 1024 * 1024 },
+  });
+  try {
+    pair.sup.spawn({ pluginId: 'partial', script: floodPath, env: { FLOOD_MODE: 'partial' } });
     const faulted = await waitUntil(
       () => pair.sup.faults.some((fault) => fault.pluginId === 'partial' && fault.code === 'NdjsonOversizeError'),
       10_000,
     );
     assert.equal(faulted, true);
     const fault = pair.sup.faults.find((row) => row.pluginId === 'partial');
-    assert.ok(fault.pendingBytes < 2 * 1024 * 1024, String(fault.pendingBytes));
-    assert.equal(rec.dead, true);
-    assert.equal(rec.pauseReason, null);
+    assert.equal(fault.code, 'NdjsonOversizeError');
+    assert.equal(partialCapHolds(fault.pendingBytes, cap), false, String(fault.pendingBytes));
+    assert.ok(fault.pendingBytes > cap + PARTIAL_READ_CHUNK, String(fault.pendingBytes));
   } finally {
     await pair.close();
   }

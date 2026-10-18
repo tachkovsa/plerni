@@ -2,7 +2,7 @@
 // stays ≤64 MiB across the measurement window (plan §4 B3).
 
 import { fileURLToPath } from 'node:url';
-import { connectPair } from '../supervisor.mjs';
+import { connectPair, partialCapHolds } from '../supervisor.mjs';
 import { CONTRACT, RSS_GROWTH_LIMIT, delay, measureSeries, openLoop, preflight, treeRss, waitUntil } from '../measure.mjs';
 
 const floodPath = fileURLToPath(new URL('../children/flood.mjs', import.meta.url));
@@ -41,9 +41,10 @@ export async function tripCaps() {
     await pendingPair.close();
   }
 
+  const partialCap = 32 * 1024;
   const partialPair = await connectPair({
     sweeper: false,
-    caps: { pending: 32, partial: 32 * 1024, total: 8 * 1024 * 1024 },
+    caps: { pending: 32, partial: partialCap, total: 8 * 1024 * 1024 },
   });
   try {
     partialPair.sup.spawn({ pluginId: 'partial', script: floodPath, env: { FLOOD_MODE: 'partial' } });
@@ -56,7 +57,7 @@ export async function tripCaps() {
       tripped: tripped && partialPair.sup.caps.partial === true,
       pendingBytes: fault?.pendingBytes ?? null,
       code: fault?.code ?? null,
-      bound: Boolean(fault) && fault.code === 'NdjsonOversizeError' && fault.pendingBytes < 2 * 1024 * 1024,
+      bound: Boolean(fault) && fault.code === 'partial-cap' && partialCapHolds(fault.pendingBytes, partialCap),
     };
   } finally {
     await partialPair.close();
@@ -220,7 +221,7 @@ async function holdRep({ warmupMs, windowMs, readRss }) {
     }, 120_000).catch((err) => err);
     const filled = await until(() => {
       const pending = pair.sup.queueDepth('silent').pending >= PENDING_CAP;
-      const partialBytes = pair.sup.faults.some((fault) => fault.pluginId === 'partial' && fault.code === 'NdjsonOversizeError');
+      const partialBytes = pair.sup.faults.some((fault) => fault.pluginId === 'partial' && fault.code === 'partial-cap');
       const byteFault = pair.sup.faults.some((fault) => fault.pluginId === 'bytes' && fault.code === 'total-cap');
       const byteBytes = byteFault || pair.sup.queueDepth('bytes').pluginBytes >= BYTE_CAP;
       const lo = pair.sup.queueDepth('frames').lo >= LO_CAP;
@@ -276,7 +277,7 @@ async function holdRep({ warmupMs, windowMs, readRss }) {
         samples.push({
           pending: pair.sup.queueDepth('silent').pending,
           partial: pair.sup.queueDepth('partial').partial,
-          partialFault: pair.sup.faults.some((fault) => fault.pluginId === 'partial' && fault.code === 'NdjsonOversizeError'),
+          partialFault: pair.sup.faults.some((fault) => fault.pluginId === 'partial' && fault.code === 'partial-cap'),
           bytes: pair.sup.queueDepth('bytes').pluginBytes,
           bytesFault: pair.sup.faults.some((fault) => fault.pluginId === 'bytes' && fault.code === 'total-cap'),
           lo: pair.sup.queueDepth('frames').lo,

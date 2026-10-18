@@ -29,12 +29,12 @@ async function roundTrip(stub, credential) {
 
 export async function b4() {
   const detail = {};
-  // Production partial high-water (64 KiB). Total is above the 1 MiB hard cap
-  // so the framer's typed oversize error, not the per-plugin byte pause, is
-  // what rejects the never-terminated stream.
+  // The partial cap sits on the framer ceiling. This case proves the framer's
+  // typed NdjsonOversizeError. A lower cap faults earlier as partial-cap.
+  // Total is above 1 MiB so the per-plugin byte pause is not what rejects it.
   const pair = await connectPair({
     sweeper: false,
-    caps: { total: 8 * 1024 * 1024, totalGlobal: 8 * 1024 * 1024 },
+    caps: { partial: HARD_FRAME, total: 8 * 1024 * 1024, totalGlobal: 8 * 1024 * 1024 },
   });
   try {
     const good = pair.sup.spawn({ pluginId: 'good', script: echoPath });
