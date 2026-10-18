@@ -54,6 +54,16 @@ export function partialCapHolds(pendingBytes, cap) {
     && pendingBytes <= cap + PARTIAL_READ_CHUNK;
 }
 
+// Unread stdout can still sit in the pipe when a cap faults. One pipe of 64 KiB
+// plus the slice already fed is the overshoot past the total cap.
+export const TOTAL_PIPE_BURST = 64 * 1024;
+
+export function totalCapHolds(bufferedBytes, cap) {
+  return Number.isFinite(bufferedBytes)
+    && bufferedBytes > cap
+    && bufferedBytes <= cap + PARTIAL_READ_CHUNK + TOTAL_PIPE_BURST;
+}
+
 export const DEFAULT_CAPS = Object.freeze({
   pending: 32,
   pendingGlobal: 256,
@@ -162,6 +172,7 @@ export class Supervisor {
     this.cancelPendingTotal = 0;
     this.retiredTokens = new Set();
     this.faults = [];
+    this.bufferedHighWater = 0;
     this.caps = { pending: false, partial: false, total: false, lo: false, hi: false };
     this.hi = new Map();
     this.lo = new Map();
@@ -950,11 +961,17 @@ export class Supervisor {
 
   #fault(rec, code) {
     if (rec.dead) return;
+    // bufferedBytes() skips dead children. Read it before the cleanup below,
+    // or the scored total is the empty framer rather than the high-water.
+    const bufferedBytes = this.bufferedBytes();
+    if (bufferedBytes > this.bufferedHighWater) this.bufferedHighWater = bufferedBytes;
+    const pendingBytes = rec.framer.pendingBytes();
     rec.dead = true;
     this.faults.push({
       pluginId: rec.credential.pluginId,
       code,
-      pendingBytes: rec.framer.pendingBytes(),
+      pendingBytes,
+      bufferedBytes,
     });
     if (code === 'hi-cap') this.caps.hi = true;
     // Queued frames already left the pending table. Dropping them here strands

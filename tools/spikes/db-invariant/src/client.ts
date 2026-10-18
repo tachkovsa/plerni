@@ -73,11 +73,17 @@ export const rawRoot = () => {
 
 // Raw client as the APP role on the direct DSN — controls must run on the application path
 // (γ-m4), never as superuser.
-export const rawApp = () => {
-  const c = new pg.Client({ connectionString: DIRECT });
+export const rawApp = () => rawClient(DIRECT);
+
+// Same app role through PgBouncer (transaction mode). A1's raw control on the pooled
+// datasource has to open this client; the direct control does not stand in for it.
+export const rawAppPooled = () => rawClient(POOLED);
+
+function rawClient(connectionString: string): pg.Client {
+  const c = new pg.Client({ connectionString });
   c.on('error', (e) => { idlePoolErrors.push(String(e)); });
   return c;
-};
+}
 
 // The privileged termination path (γ-M1): in the spike, harness root; in production this is the
 // broker's maintenance identity (pg_signal_backend / membership), never the compromised session.

@@ -2,7 +2,7 @@
 // stays ≤64 MiB across the measurement window (plan §4 B3).
 
 import { fileURLToPath } from 'node:url';
-import { connectPair, partialCapHolds } from '../supervisor.mjs';
+import { connectPair, partialCapHolds, totalCapHolds } from '../supervisor.mjs';
 import { CONTRACT, RSS_GROWTH_LIMIT, delay, measureSeries, openLoop, preflight, treeRss, waitUntil } from '../measure.mjs';
 
 const floodPath = fileURLToPath(new URL('../children/flood.mjs', import.meta.url));
@@ -63,18 +63,29 @@ export async function tripCaps() {
     await partialPair.close();
   }
 
+  const totalCap = 48 * 1024;
   const totalPair = await connectPair({
     sweeper: false,
-    caps: { pending: 64, partial: 1024 * 1024, total: 48 * 1024 },
+    caps: { pending: 64, partial: 1024 * 1024, total: totalCap },
     partialHighWater: 1024 * 1024,
   });
   try {
     totalPair.sup.spawn({ pluginId: 'total', script: floodPath, env: { FLOOD_MODE: 'partial' } });
-    const tripped = await until(() => totalPair.sup.caps.total, 3_000);
-    const buffered = totalPair.sup.bufferedBytes();
-    // readableLength holds stdout already pulled when pause() takes effect.
-    // That tail is counted, so the ceiling is the cap plus one pipe burst.
-    detail.total = { tripped, buffered, bound: buffered <= 48 * 1024 + 192 * 1024 };
+    const tripped = await until(
+      () => totalPair.sup.faults.some((fault) => fault.pluginId === 'total' && fault.code === 'total-cap'),
+      3_000,
+    );
+    const fault = totalPair.sup.faults.find((row) => row.pluginId === 'total' && row.code === 'total-cap');
+    const buffered = fault?.bufferedBytes ?? null;
+    const afterCleanup = totalPair.sup.bufferedBytes();
+    detail.total = {
+      tripped: tripped && totalPair.sup.caps.total === true,
+      buffered,
+      afterCleanup,
+      bound: totalCapHolds(buffered, totalCap),
+      // The post-cleanup count is the old oracle. It must not satisfy the bound.
+      vacuity: totalCapHolds(afterCleanup, totalCap) === false,
+    };
   } finally {
     await totalPair.close();
   }
@@ -139,7 +150,7 @@ export async function tripCaps() {
 
   const pass = detail.pending.tripped && detail.pending.rejected > 0 && detail.pending.admitted === 4
     && detail.partial.tripped && detail.partial.bound
-    && detail.total.tripped && detail.total.bound
+    && detail.total.tripped && detail.total.bound && detail.total.vacuity
     && detail.kernel.tripped && detail.kernel.bound
     && detail.kernelBytes.tripped && detail.kernelBytes.bound;
   return { pass, detail };

@@ -13,7 +13,7 @@ import { applyScoredSkip, floodBound, floodScore, forgedFlood, hostileBattery, s
 import { assessEnvironment, delay, measureSeries, openLoop, preflight, treeRss, waitUntil } from './measure.mjs';
 import { MuxFramer, encodeMux, encodeNdjson } from './framing.mjs';
 import { FencedError } from './authority.mjs';
-import { DEFAULT_CAPS, PARTIAL_READ_CHUNK, connectPair, dbConfigured, partialCapHolds } from './supervisor.mjs';
+import { DEFAULT_CAPS, PARTIAL_READ_CHUNK, connectPair, dbConfigured, partialCapHolds, totalCapHolds } from './supervisor.mjs';
 
 const echoPath = fileURLToPath(new URL('./children/echo.mjs', import.meta.url));
 const floodPath = fileURLToPath(new URL('./children/flood.mjs', import.meta.url));
@@ -316,6 +316,30 @@ test('partial cap exhaustion faults within one read chunk', { timeout: 15_000 },
     assert.ok(fault.pendingBytes <= cap + PARTIAL_READ_CHUNK, String(fault.pendingBytes));
     assert.equal(rec.dead, true);
     assert.equal(rec.pauseReason, null);
+  } finally {
+    await pair.close();
+  }
+});
+
+test('total-buffer bound fails when read after fault cleanup', { timeout: 15_000 }, async () => {
+  const cap = 48 * 1024;
+  const pair = await connectPair({
+    sweeper: false,
+    caps: { pending: 64, partial: 1024 * 1024, total: cap, totalGlobal: 8 * 1024 * 1024 },
+    partialHighWater: 1024 * 1024,
+  });
+  try {
+    pair.sup.spawn({ pluginId: 'total', script: floodPath, env: { FLOOD_MODE: 'partial' } });
+    const faulted = await waitUntil(
+      () => pair.sup.faults.some((fault) => fault.pluginId === 'total' && fault.code === 'total-cap'),
+      10_000,
+    );
+    assert.equal(faulted, true);
+    const fault = pair.sup.faults.find((row) => row.pluginId === 'total');
+    assert.equal(totalCapHolds(fault.bufferedBytes, cap), true, String(fault.bufferedBytes));
+    assert.ok(fault.bufferedBytes > cap, String(fault.bufferedBytes));
+    assert.equal(pair.sup.children.get('total').dead, true);
+    assert.equal(totalCapHolds(pair.sup.bufferedBytes(), cap), false, String(pair.sup.bufferedBytes()));
   } finally {
     await pair.close();
   }

@@ -26,4 +26,6 @@ Any unset variable fails the script with a named message. Passwords are never co
 
 Spike heartbeat traffic (plan §4 B2) uses a **dedicated direct connection on 54320**, never the main pooled datasource — renewals sharing the main pool can starve under load.
 
+The host firewall must allow forwarded traffic on the compose network. A drop rule there makes the pooled port fail before a query (`client_login_timeout` or `query_wait_timeout`) while the direct port and the admin console can still answer. That failure is environmental. It is not a spike verdict.
+
 Image digests are recorded here at implementation time: postgres:18 `@sha256:74935e72…fc4336` · edoburu/pgbouncer:v1.26.0-p0 `@sha256:b17551c7…95b711` (full values in docker-compose.yml).
