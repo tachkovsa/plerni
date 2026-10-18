@@ -2,7 +2,8 @@
 # drift-gate.sh — plan §3.1 A5 drift gate (R1#5).
 # Apply the committed per-band schema.sql to the live database spike_bench_<N>,
 # regenerate database-types.ts with the pinned kysely-codegen flags, and
-# git diff --exit-code that interface. This is not a required check.
+# git diff --exit-code HEAD on that interface. A staged copy is not the commit.
+# This is not a required check.
 # gen-schema.mjs is not used: it rewrites schema.sql from the generator and
 # would erase a migration edit before codegen.
 set -euo pipefail
@@ -93,6 +94,13 @@ for band in "${bands[@]}"; do
     echo "drift-gate: missing committed interface for band ${band}" >&2
     exit 1
   fi
+  # Index and worktree must both match the commit before codegen overwrites the file.
+  # A staged regeneration would otherwise hide a stale HEAD from a worktree-vs-index diff.
+  if ! git -C "$root" --no-pager diff --exit-code --color=never HEAD -- "$rel" >/dev/null \
+    || ! git -C "$root" --no-pager diff --cached --exit-code --color=never -- "$rel" >/dev/null; then
+    echo "drift-gate: band ${band} interface already differs from HEAD" >&2
+    exit 1
+  fi
 
   echo "drift-gate: migrate band ${band} onto ${db}"
   psql "host=${host} port=${port} user=${user} dbname=postgres" --no-psqlrc --set=ON_ERROR_STOP=1 \
@@ -142,7 +150,7 @@ for band in "${bands[@]}"; do
   fi
 
   set +e
-  diff_log=$(git -C "$root" --no-pager diff --exit-code --color=never -- "$rel" 2>&1)
+  diff_log=$(git -C "$root" --no-pager diff --exit-code --color=never HEAD -- "$rel" 2>&1)
   diff_status=$?
   set -e
   if [[ $diff_status -eq 0 ]]; then
