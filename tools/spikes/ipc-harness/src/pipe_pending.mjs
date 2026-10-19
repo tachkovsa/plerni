@@ -21,14 +21,23 @@ let helper = null;
 let failed = false;
 
 function headerDir() {
-  const prefix = dirname(dirname(process.execPath));
-  const bundled = join(prefix, 'include', 'node');
-  try {
-    lstatSync(join(bundled, 'node_api.h'));
-    return bundled;
-  } catch {
-    return null;
+  const version = process.version.startsWith('v') ? process.version.slice(1) : process.version;
+  const candidates = [
+    join(dirname(dirname(process.execPath)), 'include', 'node'),
+    join(homedir(), '.cache', 'node-gyp', version, 'include', 'node'),
+    join(homedir(), '.nvm', 'versions', 'node', process.version, 'include', 'node'),
+  ];
+  for (const dir of candidates) {
+    try {
+      const st = lstatSync(join(dir, 'node_api.h'));
+      if (typeof st.isSymbolicLink === 'function' && st.isSymbolicLink()) continue;
+      if (!st.isFile()) continue;
+      return dir;
+    } catch {
+      /* next candidate */
+    }
   }
+  return null;
 }
 
 // `kind` is 'file' or 'dir'. Group and other permission bits must be clear,

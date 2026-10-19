@@ -3,6 +3,8 @@
 
 import { fileURLToPath } from 'node:url';
 import { connectPair, HARD_FRAME } from '../supervisor.mjs';
+import { MAX_RESIDUAL } from '../framing.mjs';
+import { measureFlowReserve } from '../flow_socket.mjs';
 import { delay } from '../measure.mjs';
 
 function child(name) {
@@ -29,11 +31,13 @@ async function roundTrip(stub, credential) {
 
 export async function b4() {
   const detail = {};
-  // The framer throws only once the residual is greater than HARD_FRAME + 1.
-  // The partial cap is that same threshold, so feed() throws NdjsonOversizeError
-  // before the supervisor can fault partial-cap, for any stdout chunk size.
-  // Total is above 1 MiB so the per-plugin byte pause is not what rejects it.
-  const partialCap = HARD_FRAME + 1;
+  // P = MAX_RESIDUAL + K_in + C, so B_p = MAX_RESIDUAL. The last admitted read
+  // can push the framer past that threshold. partial-cap before the framer has
+  // seen more than MAX_RESIDUAL fails this case. Buffering exactly
+  // MAX_RESIDUAL unterminated bytes does not throw.
+  const reserved = measureFlowReserve();
+  if (!reserved) return { pass: false, detail: { reason: 'reservation-unavailable' } };
+  const partialCap = MAX_RESIDUAL + reserved.kIn + reserved.readBytes;
   const pair = await connectPair({
     sweeper: false,
     caps: { partial: partialCap, total: 8 * 1024 * 1024, totalGlobal: 8 * 1024 * 1024 },

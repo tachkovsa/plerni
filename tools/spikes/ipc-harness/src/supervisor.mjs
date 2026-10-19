@@ -13,10 +13,15 @@
 import { spawn } from 'node:child_process';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
-import { MuxFramer, NdjsonFramer, encodeNdjson, encodeMux } from './framing.mjs';
+import { Socket } from 'node:net';
+import { MuxFramer, NdjsonFramer, MAX_RESIDUAL, encodeNdjson, encodeMux } from './framing.mjs';
 import { PendingTable, socketPair, KernelStub } from './kernel-stub.mjs';
 import { FencedError, commitExecution, startSweeper } from './authority.mjs';
 import { pipePending } from './pipe_pending.mjs';
+import { FLOW_READ_BYTES, PROBE_INTERVAL_MS, WRITER_OVERRUN, writerOverrun } from './flow_budget.mjs';
+import { closeEnds, closeFd, createChildEnds, fionread } from './flow_socket.mjs';
+
+export { partialCapHolds, totalCapHolds } from './flow_budget.mjs';
 
 function waitExit(child) {
   return new Promise((resolve) => {
@@ -45,26 +50,10 @@ function waitExit(child) {
 
 export const HARD_FRAME = 1024 * 1024;
 
-// One stdout slice handed to the framer. An unfinished frame cannot shrink, so
-// bytes already read may pass the configured partial cap by at most this much.
-export const PARTIAL_READ_CHUNK = 4096;
-
-export function partialCapHolds(pendingBytes, cap) {
-  return Number.isFinite(pendingBytes)
-    && pendingBytes > cap
-    && pendingBytes <= cap + PARTIAL_READ_CHUNK;
-}
-
-// The scored total is bufferedBytes(), including the unprocessed rest of the
-// current stdout chunk, plus FIONREAD on that stdout fd. Child stdio here is
-// a socket, so the unread count's ceiling is the measured SO_RCVBUF (a pipe
-// uses F_GETPIPE_SZ). The only overshoot past the configured cap is the one
-// slice already handed to the framer.
-export function totalCapHolds(accountedBytes, cap) {
-  return Number.isFinite(accountedBytes)
-    && accountedBytes > cap
-    && accountedBytes <= cap + PARTIAL_READ_CHUNK;
-}
+// One stdout slice handed to the framer. With flow control this is C, the
+// onread buffer. The cap reserves K plus this slice; it is not an allowance
+// to pass the cap.
+export const PARTIAL_READ_CHUNK = FLOW_READ_BYTES;
 
 export const DEFAULT_CAPS = Object.freeze({
   pending: 32,
@@ -154,7 +143,12 @@ export class Supervisor {
     this.socket = socket;
     this.stampIdentity = opts.stampIdentity !== false;
     this.enforcePartial = opts.enforcePartial !== false;
+    // enforceFlow:false is the vacuity variant: default stdio sockets and
+    // libuv's 64 KiB reads. That run must fail the reserved-cap bound.
+    this.enforceFlow = opts.enforceFlow !== false;
+    this.readBytes = FLOW_READ_BYTES;
     this.pipeProbe = typeof opts.pipeProbe === 'function' ? opts.pipeProbe : pipePending;
+    this.flowPending = typeof opts.flowPending === 'function' ? opts.flowPending : fionread;
     this.useDirect = opts.useDirect ?? useDirectFromEnv();
     this.capsConfig = { ...DEFAULT_CAPS, ...opts.caps };
     if (opts.caps?.pending != null && opts.caps.pendingGlobal == null) {
@@ -219,20 +213,39 @@ export class Supervisor {
       secret: randomBytes(16).toString('hex'),
     };
     const token = randomBytes(16).toString('hex');
-    const child = spawn(process.execPath, [spec.script], {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env: childEnv({ ...spec.env, PLERNI_PLUGIN_ID: envText(spec.pluginId) }),
-    });
+    const limits = {
+      pending: spec.pending ?? this.capsConfig.pending,
+      total: spec.total ?? this.capsConfig.total,
+    };
+    const flow = this.enforceFlow ? this.#openFlowEnds(limits) : null;
+    if (this.enforceFlow && !flow) {
+      const err = new Error('flow-control helper unavailable');
+      err.code = 'flow-unavailable';
+      throw err;
+    }
+    let child;
+    try {
+      child = spawn(process.execPath, [spec.script], {
+        stdio: flow ? [flow.childStdin, flow.childStdout, 'pipe'] : ['pipe', 'pipe', 'pipe'],
+        env: childEnv({ ...spec.env, PLERNI_PLUGIN_ID: envText(spec.pluginId) }),
+      });
+    } catch (err) {
+      closeEnds(flow);
+      throw err;
+    }
+    if (flow) {
+      closeFd(flow.childStdin);
+      closeFd(flow.childStdout);
+      flow.childStdin = -1;
+      flow.childStdout = -1;
+    }
     const rec = {
       child,
       credential,
       token,
       script: spec.script,
       env: spec.env,
-      limits: {
-        pending: spec.pending ?? this.capsConfig.pending,
-        total: spec.total ?? this.capsConfig.total,
-      },
+      limits,
       framer: new NdjsonFramer(),
       outbound: 0,
       stash: null,
@@ -250,15 +263,75 @@ export class Supervisor {
       exitCode: null,
       rejectQueued: false,
       rejectsCoalesced: 0,
+      flow,
+      kIn: flow?.kIn ?? null,
+      kOut: flow?.kOut ?? null,
+      bP: flow?.bP ?? null,
+      bT: flow?.bT ?? null,
+      flowOk: Boolean(flow?.flowOk),
+      stdoutFd: flow?.parentStdout ?? null,
+      stdinProbe: flow?.stdinProbe ?? null,
+      probeTimer: null,
     };
-    child.stdout.on('data', (chunk) => this.#onChild(rec, chunk));
+    if (flow) this.#attachFlowSockets(rec, flow);
+    else {
+      child.stdout.on('data', (chunk) => this.#onChild(rec, chunk));
+      child.stdout.on('error', () => {});
+      child.stdin.on('error', () => {});
+    }
     child.stderr.on('data', () => {});
-    child.stdin.on('error', () => {});
-    child.stdout.on('error', () => {});
     child.on('error', (err) => this.#onSpawnError(rec, err));
     child.on('exit', (code, signal) => this.#onExit(rec, code, signal));
     this.children.set(spec.pluginId, rec);
+    if (rec.flowOk) this.#armProbe(rec);
     return { credential: detachCredential(credential), token, pid: child.pid };
+  }
+
+  // Budgets use the measured SO_SNDBUF. A non-positive per-skb term or a
+  // negative B_p / B_t leaves flowOk false: the cap cannot be enforced, and
+  // the scorer must report unsatisfiable rather than a pass.
+  #openFlowEnds(limits) {
+    const ends = createChildEnds();
+    if (!ends) return null;
+    const bP = this.partialHighWater - ends.kIn - this.readBytes;
+    const bT = limits.total - ends.kIn - ends.kOut - this.readBytes;
+    const flowOk = bP >= 0 && bT >= 0;
+    return { ...ends, bP, bT, flowOk };
+  }
+
+  #attachFlowSockets(rec, flow) {
+    const stdout = new Socket({
+      fd: flow.parentStdout,
+      readable: true,
+      writable: false,
+      onread: {
+        buffer: Buffer.alloc(this.readBytes),
+        callback: (nread, buf) => this.#onStdoutRead(rec, nread, buf),
+      },
+    });
+    const stdin = new Socket({
+      fd: flow.parentStdin,
+      readable: false,
+      writable: true,
+    });
+    stdout.on('error', () => {});
+    stdin.on('error', () => {});
+    // Real reads arrive through onread and do not emit 'data'. A manual
+    // 'data' event is how tests inject bytes.
+    stdout.on('data', (chunk) => this.#onChild(rec, chunk));
+    rec.child.stdout = stdout;
+    rec.child.stdin = stdin;
+    rec.stdoutSocket = stdout;
+    rec.stdinSocket = stdin;
+  }
+
+  #onStdoutRead(rec, nread, buf) {
+    if (rec.dead || this.closed) return false;
+    if (typeof nread !== 'number' || nread <= 0) return false;
+    if (this.#noteOverrun(rec)) return false;
+    const chunk = Buffer.from(buf.subarray(0, nread));
+    this.#onChild(rec, chunk);
+    return !(rec.dead || rec.paused);
   }
 
   async respawn(pluginId) {
@@ -370,6 +443,7 @@ export class Supervisor {
   async close() {
     this.closed = true;
     this.stopSweeper();
+    for (const rec of this.children.values()) this.#releaseFlow(rec);
     for (const pending of this.pending.values()) clearTimeout(pending.timer);
     this.pending.clear();
     const waits = [];
@@ -493,7 +567,8 @@ export class Supervisor {
   }
 
   #overBytes(rec, bytes) {
-    return this.#pluginBytes(rec) + bytes > rec.limits.total
+    const ceiling = this.enforceFlow && rec.flowOk ? rec.bT : rec.limits.total;
+    return this.#pluginBytes(rec) + bytes > ceiling
       || this.bufferedBytes() + bytes > this.capsConfig.totalGlobal;
   }
 
@@ -711,6 +786,11 @@ export class Supervisor {
   }
 
   #accountCaps(rec) {
+    if (this.#noteOverrun(rec)) return;
+    if (this.enforceFlow && rec.flowOk) {
+      this.#accountReserved(rec);
+      return;
+    }
     // An unfinished frame cannot shrink while stdout is paused, so crossing
     // the room left beside the retained ids is a typed fault. Pausing instead
     // would wait for bytes that make the frame larger.
@@ -724,11 +804,8 @@ export class Supervisor {
       this.caps.total = true;
       this.#pause(rec, 'total');
     }
-    // An unfinished frame cannot shrink. Pausing would wait for bytes that
-    // only make it larger. The slice already fed is the only overshoot past
-    // the configured cap. The framer throws NdjsonOversizeError only once the
-    // residual is greater than HARD_FRAME + 1, so a cap of at least that
-    // value makes feed() throw before this fault, for any chunk size.
+    // An unfinished frame cannot shrink. The framer throws NdjsonOversizeError
+    // only once unterminated bytes are more than MAX_RESIDUAL.
     if (rec.framer.pendingBytes() > this.partialHighWater) {
       this.caps.partial = true;
       if (this.enforcePartial) {
@@ -738,6 +815,87 @@ export class Supervisor {
     }
     if (this.bufferedBytes() > this.capsConfig.totalGlobal) this.#pauseOverGlobal();
     this.#maybeResumeAll();
+  }
+
+  // Read admission already stopped at B_p and B_t. One posted read of C bytes
+  // may have crossed. An unterminated frame cannot shrink, so that crossing is
+  // a typed fault. Bytes at or under MAX_RESIDUAL are partial-cap. The framer
+  // throws NdjsonOversizeError only once the residual is greater than that.
+  #accountReserved(rec) {
+    const pending = rec.framer.pendingBytes();
+    const noNewline = !rec.framer.hasPendingNewline();
+    if (noNewline && pending > rec.bP) {
+      this.caps.partial = true;
+      if (this.enforcePartial) {
+        const consumed = pending + (rec.inFlightTailBytes || 0);
+        this.#fault(rec, consumed > MAX_RESIDUAL ? 'NdjsonOversizeError' : 'partial-cap');
+        return;
+      }
+    } else if (noNewline && this.#pluginBytes(rec) > rec.bT) {
+      this.caps.total = true;
+      this.#fault(rec, 'total-cap');
+      return;
+    } else if (this.#pluginBytes(rec) > rec.bT) {
+      this.caps.total = true;
+      this.#pause(rec, 'total');
+    }
+    if (this.bufferedBytes() > this.capsConfig.totalGlobal) this.#pauseOverGlobal();
+    this.#maybeResumeAll();
+  }
+
+  #noteOverrun(rec) {
+    if (!this.enforceFlow || !rec.flowOk || rec.dead) return false;
+    const unread = this.#stdoutUnread(rec);
+    if (!writerOverrun(unread, rec.kIn)) return false;
+    this.#fault(rec, WRITER_OVERRUN);
+    return true;
+  }
+
+  #stdoutUnread(rec) {
+    if (!Number.isInteger(rec.stdoutFd)) return null;
+    try {
+      return this.flowPending(rec.stdoutFd);
+    } catch {
+      return null;
+    }
+  }
+
+  #stdinQueued(rec) {
+    if (!Number.isInteger(rec.stdinProbe)) return null;
+    try {
+      return this.flowPending(rec.stdinProbe);
+    } catch {
+      return null;
+    }
+  }
+
+  #armProbe(rec) {
+    if (!this.enforceFlow || !rec.flowOk || rec.probeTimer || rec.dead) return;
+    rec.probeTimer = setInterval(() => {
+      if (rec.dead) {
+        this.#disarmProbe(rec);
+        return;
+      }
+      // A paused socket emits no read. The timer is the probe that still runs.
+      if (!rec.paused) return;
+      this.#noteOverrun(rec);
+    }, PROBE_INTERVAL_MS);
+  }
+
+  #disarmProbe(rec) {
+    if (!rec.probeTimer) return;
+    clearInterval(rec.probeTimer);
+    rec.probeTimer = null;
+  }
+
+  #releaseFlow(rec) {
+    this.#disarmProbe(rec);
+    if (Number.isInteger(rec.stdinProbe) && rec.stdinProbe >= 0) closeFd(rec.stdinProbe);
+    rec.stdinProbe = null;
+    rec.stdoutSocket?.destroy();
+    rec.stdinSocket?.destroy();
+    rec.stdoutSocket = null;
+    rec.stdinSocket = null;
   }
 
   #pauseOverGlobal() {
@@ -770,6 +928,7 @@ export class Supervisor {
     rec.paused = true;
     rec.pauseReason = reason;
     rec.child.stdout.pause();
+    this.#armProbe(rec);
     if (this.bufferedBytes() > this.capsConfig.totalGlobal) this.#pauseOverGlobal();
   }
 
@@ -777,6 +936,7 @@ export class Supervisor {
     if (!rec.paused || rec.dead) return;
     rec.paused = false;
     rec.pauseReason = null;
+    this.#disarmProbe(rec);
     rec.child.stdout.resume();
     let stopped = false;
     try {
@@ -988,27 +1148,41 @@ export class Supervisor {
   #fault(rec, code) {
     if (rec.dead) return;
     // bufferedBytes() skips dead children and #retainTail drops a dead child's
-    // chunk tail. Read both, and the kernel pipe, before that cleanup.
+    // chunk tail. Read both, and the kernel queues, before that cleanup.
     const inFlightTailBytes = rec.inFlightTailBytes || 0;
-    // The chunk tail is still a local buffer here. bufferedBytes() does not
-    // see it, and #retainTail will drop it after rec.dead is set.
+    const pluginBytes = this.#pluginBytes(rec);
+    // The chunk tail is still a local buffer here. bufferedBytes() and
+    // #pluginBytes() do not see it, and #retainTail drops it after rec.dead.
     const bufferedBytes = this.bufferedBytes() + inFlightTailBytes;
-    const pipe = this.#pipePending(rec);
-    const pipeUnread = pipe ? pipe.unread : null;
-    const pipeCapacity = pipe ? pipe.capacity : null;
-    const accountedBytes = pipeUnread == null ? null : bufferedBytes + pipeUnread;
+    const stdoutUnread = this.enforceFlow && rec.flowOk ? this.#stdoutUnread(rec) : null;
+    const stdinQueued = this.enforceFlow && rec.flowOk ? this.#stdinQueued(rec) : null;
+    const pipe = stdoutUnread == null ? this.#pipePending(rec) : null;
+    const pipeUnread = stdoutUnread ?? (pipe ? pipe.unread : null);
+    const pipeCapacity = rec.kIn ?? (pipe ? pipe.capacity : null);
+    const kernelKnown = pipeUnread != null && (stdinQueued != null || !rec.flowOk);
+    const accountedBytes = !kernelKnown
+      ? null
+      : (rec.flowOk
+        ? pluginBytes + inFlightTailBytes + pipeUnread + (stdinQueued ?? 0)
+        : bufferedBytes + pipeUnread);
     if (bufferedBytes > this.bufferedHighWater) this.bufferedHighWater = bufferedBytes;
     const pendingBytes = rec.framer.pendingBytes();
     rec.inFlightTailBytes = 0;
     rec.dead = true;
+    this.#releaseFlow(rec);
     this.faults.push({
       pluginId: rec.credential.pluginId,
       code,
       pendingBytes,
       bufferedBytes,
+      pluginBytes,
       inFlightTailBytes,
       pipeUnread,
       pipeCapacity,
+      stdoutUnread: pipeUnread,
+      stdinQueued: rec.flowOk ? stdinQueued : 0,
+      kIn: rec.kIn,
+      kOut: rec.kOut,
       accountedBytes,
     });
     if (code === 'hi-cap') this.caps.hi = true;
@@ -1027,6 +1201,7 @@ export class Supervisor {
 
   #onSpawnError(rec, err) {
     if (rec.dead) return;
+    this.#releaseFlow(rec);
     rec.dead = true;
     rec.stash = null;
     rec.deferred = [];
@@ -1040,6 +1215,7 @@ export class Supervisor {
     rec.exitCode = code;
     rec.signal = signal;
     rec.stash = null;
+    this.#releaseFlow(rec);
     if (rec.dead) return;
     rec.dead = true;
     rec.deferred = [];

@@ -4,8 +4,10 @@
 
 const MAX_FRAME_SIZE = 1024 * 1024; // 1 MiB
 // A partial line one byte past the maximum frame (plus the extra byte the
-// delimiter would occupy) cannot become a legal frame.
-const MAX_RESIDUAL = MAX_FRAME_SIZE + 1;
+// delimiter would occupy) cannot become a legal frame. Buffering exactly
+// this many unterminated bytes does not throw. The framer throws only once
+// the residual is greater than MAX_RESIDUAL (ADR-0006).
+export const MAX_RESIDUAL = MAX_FRAME_SIZE + 1;
 
 // Contiguous buffer with power-of-two growth. Appending a chunk copies only the
 // new bytes into spare capacity; the prefix is copied only when capacity doubles,
@@ -154,6 +156,12 @@ export class NdjsonFramer {
 
   pendingBytes() {
     return this.#bytes.length;
+  }
+
+  // True when a complete line is still buffered. The partial-cap fault is
+  // only for bytes that contain no newline.
+  hasPendingNewline() {
+    return this.#firstNewline >= 0;
   }
 }
 

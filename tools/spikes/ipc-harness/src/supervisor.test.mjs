@@ -15,6 +15,7 @@ import { MuxFramer, encodeMux, encodeNdjson } from './framing.mjs';
 import { FencedError } from './authority.mjs';
 import { DEFAULT_CAPS, PARTIAL_READ_CHUNK, connectPair, dbConfigured, partialCapHolds, totalCapHolds } from './supervisor.mjs';
 import { entryIsPrivate, resolveCacheDir } from './pipe_pending.mjs';
+import { measureFlowReserve } from './flow_socket.mjs';
 import { lstatSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -67,10 +68,16 @@ test('B3 caps trip', { timeout: 20_000 }, async () => {
   assert.equal(result.detail.pending.admitted, 4);
   assert.ok(result.detail.pending.rejected > 0);
   const partial = result.detail.partial;
-  assert.equal(partial.highWater, partialFrameHighWater(partial.pendingBytes, partial.inFlightTailBytes));
+  assert.equal(
+    partial.highWater,
+    partialFrameHighWater(partial.pendingBytes, partial.inFlightTailBytes, partial.stdoutUnread),
+  );
   assert.equal(
     partial.bound,
-    partial.code === 'partial-cap' && partialCapHolds(partial.highWater, 32 * 1024),
+    partial.code === 'partial-cap'
+      && partial.stdoutUnread <= partial.kIn
+      && partialCapHolds(partial.highWater, 32 * 1024)
+      && partialCapHolds(36864 + 32768, 32 * 1024) === false,
   );
   assert.equal(total.tripped, true);
   assert.equal(total.vacuity, true);
@@ -91,12 +98,13 @@ test('B3 caps trip', { timeout: 20_000 }, async () => {
   );
 });
 
-test('partial high-water counts the in-flight tail', () => {
+test('partial high-water counts the tail and the kernel unread bytes', () => {
   const cap = 32 * 1024;
-  assert.equal(partialFrameHighWater(36864, 0), 36864);
-  assert.equal(partialCapHolds(partialFrameHighWater(36864, 0), cap), true);
-  assert.equal(partialFrameHighWater(36864, 4096), 40960);
-  assert.equal(partialCapHolds(partialFrameHighWater(36864, 4096), cap), false);
+  assert.equal(partialFrameHighWater(36864, 32768, 0), 69632);
+  assert.equal(partialCapHolds(partialFrameHighWater(36864, 32768, 0), cap), false);
+  assert.equal(partialCapHolds(cap + 4096, cap), false);
+  assert.equal(partialCapHolds(cap, cap), true);
+  assert.equal(partialCapHolds(0, cap, { afterCleanup: true }), false);
   assert.equal(partialFrameHighWater(36864, null), null);
   assert.equal(partialCapHolds(partialFrameHighWater(36864, null), cap), false);
 });
@@ -372,12 +380,10 @@ test('a frame past the partial cap faults within one read chunk', { timeout: 10_
     );
     assert.equal(faulted, true);
     const fault = pair.sup.faults.find((row) => row.pluginId === 'echo');
-    assert.equal(partialCapHolds(fault.pendingBytes, cap), true, String(fault.pendingBytes));
-    assert.equal(
-      partialFrameHighWater(fault.pendingBytes, fault.inFlightTailBytes),
-      fault.pendingBytes + fault.inFlightTailBytes,
-    );
-    assert.ok(fault.pendingBytes > cap, String(fault.pendingBytes));
+    const highWater = partialFrameHighWater(fault.pendingBytes, fault.inFlightTailBytes, fault.stdoutUnread);
+    assert.equal(highWater, fault.pendingBytes + fault.inFlightTailBytes + fault.stdoutUnread);
+    assert.equal(partialCapHolds(highWater, cap), true, JSON.stringify(fault));
+    assert.ok(fault.stdoutUnread <= fault.kIn, String(fault.stdoutUnread));
     const rec = pair.sup.children.get('echo');
     assert.equal(rec.dead, true);
     assert.equal(rec.pauseReason, null);
@@ -388,8 +394,8 @@ test('a frame past the partial cap faults within one read chunk', { timeout: 10_
   }
 });
 
-test('partial cap exhaustion faults within one read chunk', { timeout: 15_000 }, async () => {
-  const cap = 4_096;
+test('partial cap exhaustion stays inside the reserved cap', { timeout: 15_000 }, async () => {
+  const cap = 32 * 1024;
   const pair = await connectPair({
     sweeper: false,
     caps: { partial: cap, total: 8 * 1024 * 1024, totalGlobal: 8 * 1024 * 1024 },
@@ -403,13 +409,10 @@ test('partial cap exhaustion faults within one read chunk', { timeout: 15_000 },
     );
     assert.equal(faulted, true);
     const fault = pair.sup.faults.find((row) => row.pluginId === 'partial');
-    assert.equal(partialCapHolds(fault.pendingBytes, cap), true, String(fault.pendingBytes));
-    assert.equal(
-      partialFrameHighWater(fault.pendingBytes, fault.inFlightTailBytes),
-      fault.pendingBytes + fault.inFlightTailBytes,
-    );
-    assert.ok(fault.pendingBytes > cap, String(fault.pendingBytes));
-    assert.ok(fault.pendingBytes <= cap + PARTIAL_READ_CHUNK, String(fault.pendingBytes));
+    const highWater = partialFrameHighWater(fault.pendingBytes, fault.inFlightTailBytes, fault.stdoutUnread);
+    assert.equal(partialCapHolds(highWater, cap), true, JSON.stringify(fault));
+    assert.ok(fault.stdoutUnread <= fault.kIn, String(fault.stdoutUnread));
+    assert.ok(fault.pendingBytes <= cap, String(fault.pendingBytes));
     assert.equal(rec.dead, true);
     assert.equal(rec.pauseReason, null);
   } finally {
@@ -432,21 +435,29 @@ test('total-buffer bound fails when read after fault cleanup', { timeout: 15_000
     );
     assert.equal(faulted, true);
     const fault = pair.sup.faults.find((row) => row.pluginId === 'total');
-    assert.equal(fault.accountedBytes, fault.bufferedBytes + fault.pipeUnread);
-    assert.ok(fault.pipeCapacity > 0, String(fault.pipeCapacity));
-    assert.ok(fault.pipeUnread <= fault.pipeCapacity, String(fault.pipeUnread));
-    assert.ok(fault.bufferedBytes >= fault.pendingBytes + fault.inFlightTailBytes, String(fault.bufferedBytes));
+    assert.equal(
+      fault.accountedBytes,
+      fault.pluginBytes + fault.inFlightTailBytes + fault.stdoutUnread + fault.stdinQueued,
+    );
+    assert.ok(fault.kIn > 0, String(fault.kIn));
+    assert.ok(fault.stdoutUnread <= fault.kIn, String(fault.stdoutUnread));
+    assert.equal(totalCapHolds(fault.accountedBytes, cap, {
+      stdoutUnread: fault.stdoutUnread,
+      stdinQueued: fault.stdinQueued,
+      kIn: fault.kIn,
+      kOut: fault.kOut,
+    }), true, JSON.stringify(fault));
     assert.equal(pair.sup.children.get('total').dead, true);
-    assert.equal(totalCapHolds(cap + PARTIAL_READ_CHUNK, cap), true);
-    assert.equal(totalCapHolds(cap + PARTIAL_READ_CHUNK + 1, cap), false);
-    assert.equal(totalCapHolds(pair.sup.bufferedBytes(), cap), false, String(pair.sup.bufferedBytes()));
+    assert.equal(totalCapHolds(cap + 1, cap), false);
+    assert.equal(totalCapHolds(0, cap, { afterCleanup: true }), false);
+    assert.equal(totalCapHolds(pair.sup.bufferedBytes(), cap, { afterCleanup: true }), false);
   } finally {
     await pair.close();
   }
 });
 
-test('total-cap snapshot keeps the unread chunk tail', { timeout: 15_000 }, async () => {
-  const cap = 1024;
+test('total-cap snapshot counts kernel unread bytes and stays inside the cap', { timeout: 15_000 }, async () => {
+  const cap = 48 * 1024;
   const pair = await connectPair({
     sweeper: false,
     caps: { pending: 64, partial: 1024 * 1024, total: cap, totalGlobal: 8 * 1024 * 1024 },
@@ -464,20 +475,24 @@ test('total-cap snapshot keeps the unread chunk tail', { timeout: 15_000 }, asyn
     );
     assert.equal(faulted, true);
     const fault = pair.sup.faults.find((row) => row.pluginId === 'total');
-    assert.ok(fault.inFlightTailBytes > 0, String(fault.inFlightTailBytes));
-    assert.ok(
-      fault.bufferedBytes >= fault.pendingBytes + fault.inFlightTailBytes,
-      `${fault.bufferedBytes} vs ${fault.pendingBytes}+${fault.inFlightTailBytes}`,
+    assert.equal(
+      fault.accountedBytes,
+      fault.pluginBytes + fault.inFlightTailBytes + fault.stdoutUnread + fault.stdinQueued,
     );
-    assert.equal(fault.accountedBytes, fault.bufferedBytes + fault.pipeUnread);
-    assert.equal(totalCapHolds(pair.sup.bufferedBytes(), cap), false);
+    assert.equal(totalCapHolds(fault.accountedBytes, cap, {
+      stdoutUnread: fault.stdoutUnread,
+      stdinQueued: fault.stdinQueued,
+      kIn: fault.kIn,
+      kOut: fault.kOut,
+    }), true, JSON.stringify(fault));
+    assert.equal(totalCapHolds(pair.sup.bufferedBytes(), cap, { afterCleanup: true }), false);
   } finally {
     await pair.close();
   }
 });
 
-test('a coalesced partial chunk leaves a tail in the high-water', { timeout: 15_000 }, async () => {
-  const cap = 1024;
+test('a large child write still keeps the partial high-water inside the cap', { timeout: 15_000 }, async () => {
+  const cap = 32 * 1024;
   const pair = await connectPair({
     sweeper: false,
     caps: { pending: 64, partial: cap, total: 8 * 1024 * 1024, totalGlobal: 8 * 1024 * 1024 },
@@ -494,11 +509,10 @@ test('a coalesced partial chunk leaves a tail in the high-water', { timeout: 15_
     );
     assert.equal(faulted, true);
     const fault = pair.sup.faults.find((row) => row.pluginId === 'partial');
-    const highWater = partialFrameHighWater(fault.pendingBytes, fault.inFlightTailBytes);
-    assert.ok(fault.inFlightTailBytes > 0, String(fault.inFlightTailBytes));
-    assert.equal(highWater, fault.pendingBytes + fault.inFlightTailBytes);
-    assert.equal(partialCapHolds(fault.pendingBytes, cap), true, String(fault.pendingBytes));
-    assert.equal(partialCapHolds(highWater, cap), false, String(highWater));
+    const highWater = partialFrameHighWater(fault.pendingBytes, fault.inFlightTailBytes, fault.stdoutUnread);
+    assert.equal(highWater, fault.pendingBytes + fault.inFlightTailBytes + fault.stdoutUnread);
+    assert.equal(partialCapHolds(highWater, cap), true, JSON.stringify(fault));
+    assert.equal(partialCapHolds(36864 + 32768, cap), false);
   } finally {
     await pair.close();
   }
@@ -1794,14 +1808,22 @@ test('one plugin cannot fill the kernel ahead of a sibling cancel', async () => 
 });
 
 test('pending identifiers stay charged after the child reads them', async () => {
+  const reserved = measureFlowReserve();
+  assert.ok(reserved);
+  // The userspace room stays 20_000 / 40_000. The kernel reservation is added
+  // on top so B_t is that room rather than 20_000 minus K_in + K_out + C.
+  const userspace = 20_000;
+  const globalUserspace = 40_000;
+  const total = userspace + reserved.perChild;
+  const totalGlobal = globalUserspace + reserved.perChild;
   const pair = await connectPair({
     sweeper: false,
-    caps: { total: 20_000, totalGlobal: 40_000, pending: 8 },
+    caps: { total, totalGlobal, pending: 8 },
     kernel: { pendingCap: 32, byteCap: 200_000 },
   });
   let first;
   try {
-    const kid = pair.sup.spawn({ pluginId: 'ig', script: ignorePath, total: 20_000 });
+    const kid = pair.sup.spawn({ pluginId: 'ig', script: ignorePath, total });
     const id = 'z'.repeat(6_000);
     const floor = Buffer.byteLength(JSON.stringify(id));
     first = pair.stub.cancel({
