@@ -7,9 +7,11 @@ import { setSndbuf } from '../flow_socket.mjs';
 import { encodeNdjson } from '../framing.mjs';
 
 const go = process.env.ENLARGE_GO;
+const ready = process.env.ENLARGE_READY;
+const block = process.env.ENLARGE_BLOCK;
 const mark = process.env.ENLARGE_MARK;
 const reserved = Number(process.env.RESERVED_K);
-if (!go || !mark || !Number.isInteger(reserved) || reserved <= 0) process.exit(2);
+if (!go || !ready || !block || !mark || !Number.isInteger(reserved) || reserved <= 0) process.exit(2);
 
 process.stdin.on('error', () => {});
 process.stdout.on('error', () => {});
@@ -22,6 +24,13 @@ while (!existsSync(go)) {
 
 const raised = setSndbuf(1, 1024 * 1024);
 if (!raised) process.exit(4);
+writeFileSync(ready, '1');
+const holdDeadline = Date.now() + 5_000;
+while (!existsSync(block)) {
+  if (Date.now() > holdDeadline) process.exit(5);
+}
+const spinUntil = Date.now() + 20;
+while (Date.now() < spinUntil) { /* stay scheduled across the parent's block */ }
 
 const chunk = Buffer.alloc(4096, 0x62);
 let written = 0;

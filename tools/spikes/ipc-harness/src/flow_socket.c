@@ -5,6 +5,8 @@
 #include <netinet/in.h>
 #include <linux/seccomp.h>
 #include <linux/sockios.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <node_api.h>
 #include <pthread.h>
 #include <signal.h>
@@ -22,6 +24,25 @@
 
 #ifndef __X32_SYSCALL_BIT
 #define __X32_SYSCALL_BIT 0x40000000
+#endif
+
+#ifndef F_ADD_SEALS
+#define F_ADD_SEALS 1033
+#endif
+#ifndef F_GET_SEALS
+#define F_GET_SEALS 1034
+#endif
+#ifndef F_SEAL_SEAL
+#define F_SEAL_SEAL 0x0001
+#endif
+#ifndef F_SEAL_SHRINK
+#define F_SEAL_SHRINK 0x0002
+#endif
+#ifndef F_SEAL_GROW
+#define F_SEAL_GROW 0x0004
+#endif
+#ifndef F_SEAL_WRITE
+#define F_SEAL_WRITE 0x0008
 #endif
 
 /* Child stdio ends for the flow-control reservation.
@@ -552,6 +573,16 @@ static napi_value ProbeConfinement(napi_env env, napi_callback_info info) {
 #ifdef __NR_kcmp
   if (!prop_call(env, obj, "kcmp", __NR_kcmp, -1, -1)) return NULL;
 #endif
+  {
+    int before = prctl(PR_GET_DUMPABLE, 0, 0, 0, 0);
+    errno = 0;
+    int raised = prctl(PR_SET_DUMPABLE, 1, 0, 0, 0);
+    int raisedErrno = raised == 0 ? 0 : errno;
+    int after = prctl(PR_GET_DUMPABLE, 0, 0, 0, 0);
+    if (!int_prop(env, obj, "dumpable", before)) return NULL;
+    if (!int_prop(env, obj, "setDumpable", raisedErrno)) return NULL;
+    if (!int_prop(env, obj, "dumpableAfter", after)) return NULL;
+  }
 #ifdef __x86_64__
   /* Same numbers with the x32 bit. EPERM is the filter; ENOSYS would be the
      kernel rejecting an x32 ABI it was built without. */
@@ -694,6 +725,94 @@ static napi_value GetDumpable(napi_env env, napi_callback_info info) {
   return out;
 }
 
+/* Copy a private regular file into a sealed memfd. The seal sticks to the
+   inode, so a later replace of the cache path cannot change the bytes the
+   supervisor executes. The fd stays CLOEXEC in this process; spawn dup2s it
+   onto the child. */
+static napi_value SealFile(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1];
+  napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
+  char path[4096];
+  size_t len = 0;
+  if (argc < 1
+      || napi_get_value_string_utf8(env, argv[0], path, sizeof(path), &len) != napi_ok
+      || len == 0
+      || len >= sizeof(path) - 1) {
+    napi_throw_type_error(env, NULL, "path");
+    return NULL;
+  }
+  int src = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+  if (src < 0) {
+    napi_throw_error(env, NULL, "open");
+    return NULL;
+  }
+  struct stat st;
+  if (fstat(src, &st) != 0
+      || !S_ISREG(st.st_mode)
+      || st.st_uid != getuid()
+      || (st.st_mode & 077) != 0
+      || st.st_size <= 0
+      || st.st_size > 8 * 1024 * 1024) {
+    close(src);
+    napi_throw_error(env, NULL, "stat");
+    return NULL;
+  }
+  int mem = memfd_create("plerni", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+  if (mem < 0) {
+    close(src);
+    napi_throw_error(env, NULL, "memfd");
+    return NULL;
+  }
+  char buf[8192];
+  for (;;) {
+    ssize_t n = read(src, buf, sizeof(buf));
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      close(src);
+      close(mem);
+      napi_throw_error(env, NULL, "read");
+      return NULL;
+    }
+    if (n == 0) break;
+    ssize_t off = 0;
+    while (off < n) {
+      ssize_t w = write(mem, buf + off, (size_t)(n - off));
+      if (w < 0) {
+        if (errno == EINTR) continue;
+        close(src);
+        close(mem);
+        napi_throw_error(env, NULL, "write");
+        return NULL;
+      }
+      off += w;
+    }
+  }
+  close(src);
+  if (lseek(mem, 0, SEEK_SET) != 0
+      || fcntl(mem, F_ADD_SEALS, F_SEAL_WRITE | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL) != 0) {
+    close(mem);
+    napi_throw_error(env, NULL, "seal");
+    return NULL;
+  }
+  napi_value out;
+  if (napi_create_int32(env, mem, &out) != napi_ok) return NULL;
+  return out;
+}
+
+static napi_value FileSeals(napi_env env, napi_callback_info info) {
+  int32_t fd = -1;
+  if (!one_fd(env, info, &fd) || fd < 0) return NULL;
+  int seals = fcntl(fd, F_GET_SEALS);
+  if (seals < 0) {
+    napi_throw_error(env, NULL, "seals");
+    return NULL;
+  }
+  napi_value out;
+  if (napi_create_int32(env, seals, &out) != napi_ok) return NULL;
+  return out;
+}
+
 static void export_fn(napi_env env, napi_value exports, const char *name, napi_callback cb) {
   napi_value fn;
   napi_create_function(env, name, NAPI_AUTO_LENGTH, cb, NULL, &fn);
@@ -719,5 +838,7 @@ NAPI_MODULE_INIT() {
   export_fn(env, exports, "spawnSleeper", SpawnSleeper);
   export_fn(env, exports, "probeConfinement", ProbeConfinement);
   export_fn(env, exports, "burstWriters", BurstWriters);
+  export_fn(env, exports, "sealFile", SealFile);
+  export_fn(env, exports, "fileSeals", FileSeals);
   return exports;
 }

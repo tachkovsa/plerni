@@ -101,6 +101,18 @@ static int install_filter(void) {
 #ifdef __NR_kcmp
     DENY_NR(__NR_kcmp, EPERM),
 #endif
+#ifdef __NR_prctl
+    /* PR_SET_DUMPABLE(0) stays allowed so the preload can clear dumpable
+       after exec. Any other value is EPERM. Other prctl operations pass. */
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_prctl, 0, 7),
+    BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[0])),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, PR_SET_DUMPABLE, 0, 4),
+    BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[1])),
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 1),
+    ALLOW,
+    DENY_ERRNO(EPERM),
+    ALLOW,
+#endif
 #ifdef __NR_clone
     /* Allow only threads. A new process shares the stdio sockets. */
     BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_clone, 0, 5),

@@ -70,6 +70,53 @@ function probeOpts(pipeProbe) {
 
 const TRIP_PARTIAL = 32 * 1024;
 const TRIP_TOTAL = 48 * 1024;
+const DEFAULT_PARTIAL = 64 * 1024;
+const DEFAULT_TOTAL = 256 * 1024;
+const DEFAULT_GLOBAL = 1024 * 1024;
+
+// ADR-0006 Consequences, filled from the measured kernel terms. S is the
+// zero-child userspace ceiling: shared bytes are admitted inside B_g, and
+// with no child reserved that ceiling is totalGlobal minus the mux terms.
+export function t7Estimate(measured, caps = {}) {
+  const kIn = measured?.kIn;
+  const kOut = measured?.kOut;
+  const kMuxIn = measured?.kMuxIn;
+  const kMuxOut = measured?.kMuxOut;
+  const c = measured?.readBytes;
+  const terms = [kIn, kOut, kMuxIn, kMuxOut, c];
+  if (!terms.every((value) => Number.isInteger(value) && value > 0)) return null;
+  const r = Number.isInteger(caps.runners) && caps.runners > 0 ? caps.runners : 1;
+  const n = Number.isInteger(caps.childCount) && caps.childCount > 0 ? caps.childCount : 1;
+  const fill = (name, p, t, totalGlobal) => {
+    const s = totalGlobal - kMuxIn - kMuxOut - c;
+    const summed = n * t + s + kMuxIn + kMuxOut + c;
+    const perProcess = Math.min(summed, totalGlobal);
+    return {
+      name,
+      p,
+      t,
+      s,
+      n,
+      totalGlobal,
+      partialWithin: kIn + c <= p,
+      totalWithin: kIn + kOut + c <= t,
+      perProcess,
+      perHost: r * perProcess,
+    };
+  };
+  return {
+    kIn,
+    kOut,
+    kMuxIn,
+    kMuxOut,
+    c,
+    r,
+    rows: [
+      fill('default', caps.partial ?? DEFAULT_PARTIAL, caps.total ?? DEFAULT_TOTAL, caps.totalGlobal ?? DEFAULT_GLOBAL),
+      fill('trip', TRIP_PARTIAL, TRIP_TOTAL, caps.totalGlobal ?? DEFAULT_GLOBAL),
+    ],
+  };
+}
 
 function muxDetail(measured) {
   if (!measured || !Number.isInteger(measured.kMuxIn) || !Number.isInteger(measured.kMuxOut)) return null;
@@ -99,6 +146,7 @@ export async function tripCaps(opts = {}) {
   const measured = opts.reserve ?? measureFlowReserve();
   const mux = muxDetail(measured);
   if (mux) detail.mux = mux;
+  if (measured) detail.t7 = t7Estimate(measured);
   if (enforceFlow && opts.pipeProbe == null) {
     if (!measured) {
       return { pass: null, outcome: 'invalid', detail: { reason: 'reservation-unavailable', mux } };
@@ -126,6 +174,7 @@ export async function tripCaps(opts = {}) {
           protocol: '3.0',
           cause: verdict.reason,
           flip: 'unsatisfiable budget on the shipping runtime',
+          t7: detail.t7 ?? null,
           ...verdict,
         },
       };
@@ -800,6 +849,7 @@ export async function b3(opts = {}) {
       unenforcedPass: unenforced ? false : null,
       vacuity: unenforced,
       mux: tripped.detail?.mux ?? null,
+      t7: tripped.detail?.t7 ?? null,
       growth: holds.map((row) => row.growth),
       holds,
       frozen: { warmupMs, windowMs, reps: repsN },

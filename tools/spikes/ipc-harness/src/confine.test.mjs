@@ -10,7 +10,6 @@ import {
   fionread,
   measureFlowReserve,
   processGroup,
-  reapGroup,
   rcvbuf,
   sndbuf,
   spawnSleeper,
@@ -18,8 +17,8 @@ import {
 import { waitUntil } from './measure.mjs';
 
 const probePath = fileURLToPath(new URL('./children/confine-probe.mjs', import.meta.url));
-const stderrPath = fileURLToPath(new URL('./children/stderr-flood.mjs', import.meta.url));
 const echoPath = fileURLToPath(new URL('./children/echo.mjs', import.meta.url));
+const stderrPath = fileURLToPath(new URL('./children/stderr-flood.mjs', import.meta.url));
 
 function alive(pid) {
   try {
@@ -34,7 +33,12 @@ test('a forbidden syscall is rejected and a process in the plugin group is kille
   const pair = await connectPair({ sweeper: false });
   let sleeper = null;
   try {
-    const kid = pair.sup.spawn({ pluginId: 'probe', script: probePath });
+    const sibling = pair.sup.spawn({ pluginId: 'sibling', script: echoPath });
+    const kid = pair.sup.spawn({
+      pluginId: 'probe',
+      script: probePath,
+      env: { MEM_PID: String(sibling.pid) },
+    });
     const grouped = await waitUntil(() => processGroup(kid.pid) === kid.pid, 2_000);
     assert.equal(grouped, true, String(processGroup(kid.pid)));
     const reported = await pair.stub.call({
@@ -72,6 +76,10 @@ test('a forbidden syscall is rejected and a process in the plugin group is kille
       assert.notEqual(got.x32Splice, constants.errno.ENOSYS);
     }
     assert.equal(got.reverse, 'EPIPE');
+    assert.equal(got.dumpable, 0);
+    assert.equal(got.setDumpable, constants.errno.EPERM);
+    assert.equal(got.dumpableAfter, 0);
+    assert.ok(got.mem === 'EACCES' || got.mem === 'EPERM', String(got.mem));
     const rec = pair.sup.children.get('probe');
     assert.equal(fionread(rec.stdinFd), 0);
     assert.equal(dumpable(), 0);
@@ -89,10 +97,7 @@ test('a forbidden syscall is rejected and a process in the plugin group is kille
       payload: { exit: true },
     }, 2_000);
     assert.equal(done.payload?.ok, true);
-    const killed = await waitUntil(() => {
-      reapGroup(kid.pid);
-      return alive(sleeper) === false;
-    }, 2_000);
+    const killed = await waitUntil(() => alive(sleeper) === false, 2_000);
     assert.equal(killed, true);
     sleeper = null;
   } finally {

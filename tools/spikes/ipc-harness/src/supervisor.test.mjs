@@ -15,8 +15,8 @@ import { MuxFramer, encodeMux, encodeNdjson } from './framing.mjs';
 import { FencedError } from './authority.mjs';
 import { DEFAULT_CAPS, PARTIAL_READ_CHUNK, connectPair, dbConfigured, partialCapHolds, totalCapHolds } from './supervisor.mjs';
 import { entryIsPrivate, resolveCacheDir } from './pipe_pending.mjs';
-import { fionread, measureFlowReserve } from './flow_socket.mjs';
-import { lstatSync } from 'node:fs';
+import { closeFd, dupFd, fionread, measureFlowReserve } from './flow_socket.mjs';
+import { lstatSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -2419,4 +2419,109 @@ test('B6 counts skipped scored cancellations as failures', () => {
   assert.equal(tally.skipped, 1);
   assert.equal(tally.offered, tally.issued + tally.skipped);
   assert.equal(floodScore({ ...clean, ...tally, p99: 40, samples: 3 }), false);
+});
+
+test('respawn keeps the old reservation until the stdout drain finishes', async () => {
+  const reserved = measureFlowReserve();
+  assert.ok(reserved);
+  const pair = await connectPair({
+    sweeper: false,
+    caps: {
+      partial: 1024 * 1024,
+      total: 1024 * 1024,
+      totalGlobal: reserved.perChild + reserved.muxReserve,
+    },
+  });
+  let held = null;
+  try {
+    const first = pair.sup.spawn({ pluginId: 'echo', script: echoPath });
+    const rec = pair.sup.children.get('echo');
+    held = dupFd(rec.stdoutWriter);
+    assert.equal(typeof held, 'number');
+    const respawning = pair.sup.respawn('echo');
+    const draining = await waitUntil(() => rec.exited === true && rec.exitFinished === false, 2_000);
+    assert.equal(draining, true);
+    assert.equal(pair.sup.children.get('echo')?.child.pid, first.pid);
+    assert.throws(
+      () => pair.sup.spawn({ pluginId: 'other', script: echoPath }),
+      (err) => err?.code === 'unsatisfiable' || err?.code === 'spawn-rejected',
+    );
+    closeFd(held);
+    held = null;
+    const next = await respawning;
+    assert.notEqual(next.pid, first.pid);
+    assert.equal(pair.sup.children.get('echo')?.child.pid, next.pid);
+    assert.equal(pair.sup.children.has('other'), false);
+  } finally {
+    closeFd(held);
+    await pair.close();
+  }
+});
+
+test('a call during the stdout drain is rejected', async () => {
+  const pair = await connectPair({ sweeper: false });
+  let held = null;
+  try {
+    const kid = pair.sup.spawn({ pluginId: 'echo', script: echoPath });
+    const rec = pair.sup.children.get('echo');
+    held = dupFd(rec.stdoutWriter);
+    process.kill(kid.pid, 'SIGKILL');
+    const draining = await waitUntil(() => rec.exited === true && rec.dead === false, 2_000);
+    assert.equal(draining, true);
+    const rejected = await pair.stub.call({
+      pluginId: 'echo',
+      credential: kid.credential,
+      correlationId: 1,
+      port: 'db',
+      method: 'get',
+      payload: {},
+    }, 1_000).catch((err) => err);
+    assert.equal(rejected.code, 'unknown-plugin');
+    closeFd(held);
+    held = null;
+  } finally {
+    closeFd(held);
+    await pair.close();
+  }
+});
+
+test('exit cleanup does not queue terminal errors past the global cap', async () => {
+  const pair = await connectPair({
+    sweeper: false,
+    caps: { pending: 16, partial: 1024 * 1024, total: 1024 * 1024, totalGlobal: 8 * 1024 * 1024 },
+  });
+  const calls = [];
+  try {
+    const kid = pair.sup.spawn({ pluginId: 'echo', script: echoPath });
+    const stopped = await waitUntil(() => {
+      try {
+        process.kill(kid.pid, 'SIGSTOP');
+        return readFileSync(`/proc/${kid.pid}/status`, 'utf8').includes('\tT');
+      } catch {
+        return false;
+      }
+    }, 2_000);
+    assert.equal(stopped, true);
+    for (let i = 0; i < 6; i++) {
+      calls.push(pair.stub.call({
+        pluginId: 'echo',
+        credential: kid.credential,
+        correlationId: i + 1,
+        port: 'db',
+        method: 'get',
+        payload: { i },
+      }, 400).catch((err) => err));
+    }
+    const armed = await waitUntil(() => pair.sup.pending.size === 6, 2_000);
+    assert.equal(armed, true);
+    pair.sup.capsConfig.totalGlobal = 1;
+    process.kill(kid.pid, 'SIGKILL');
+    const finished = await waitUntil(() => pair.sup.children.get('echo')?.exitFinished === true, 3_000);
+    assert.equal(finished, true);
+    assert.ok(pair.sup.terminalCoalesced >= 6, String(pair.sup.terminalCoalesced));
+    assert.ok(pair.sup.bufferedBytes() <= 1, String(pair.sup.bufferedBytes()));
+  } finally {
+    await Promise.allSettled(calls);
+    await pair.close();
+  }
 });

@@ -1,16 +1,20 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { lstatSync, readSync, writeSync } from 'node:fs';
+import { chmodSync, lstatSync, readFileSync, readSync, writeFileSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   closeEnds,
   createChildEnds,
   fionread,
+  fileSeals,
   headerDir,
+  sealedUndumpFd,
+  sealedWrapperFd,
   sndbuf,
   measureFlowReserve,
   resolveCacheDir,
   sourceHash,
+  wrapperPath,
 } from './flow_socket.mjs';
 import { writerCeiling } from './flow_budget.mjs';
 
@@ -27,6 +31,29 @@ test('the helper cache is private and keyed by the source hash', () => {
   assert.equal(lstatSync(dir).mode & 0o077, 0);
   const headers = headerDir();
   assert.equal(typeof headers, 'string');
+});
+
+test('the wrapper and the preload are sealed memfds, not the cache path', () => {
+  const wrapperFd = sealedWrapperFd();
+  const undumpFd = sealedUndumpFd();
+  assert.equal(typeof wrapperFd, 'number');
+  assert.equal(typeof undumpFd, 'number');
+  const seals = fileSeals(wrapperFd);
+  assert.equal(typeof seals, 'number');
+  assert.notEqual(seals & 0x0008, 0);
+  assert.notEqual(seals & 0x0001, 0);
+  assert.throws(() => writeSync(wrapperFd, Buffer.from([0])), (err) => err?.code === 'EPERM' || err?.code === 'EBADF');
+  const path = wrapperPath();
+  const original = readFileSync(path);
+  try {
+    writeFileSync(path, Buffer.from('swapped-wrapper'));
+    const live = readFileSync(`/proc/self/fd/${wrapperFd}`);
+    assert.equal(live[0], 0x7f);
+    assert.notEqual(live.subarray(0, 15).toString(), 'swapped-wrapper');
+  } finally {
+    writeFileSync(path, original);
+    chmodSync(path, 0o700);
+  }
 });
 
 test('socketpair sets the writer buffer, shuts unused directions, and reads FIONREAD', () => {

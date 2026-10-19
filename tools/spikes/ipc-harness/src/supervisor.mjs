@@ -29,7 +29,8 @@ import {
   reapGroup,
   siocoutq,
   sndbuf,
-  wrapperPath,
+  sealedUndumpFd,
+  sealedWrapperFd,
 } from './flow_socket.mjs';
 
 export { partialCapHolds, totalCapHolds } from './flow_budget.mjs';
@@ -231,6 +232,7 @@ export class Supervisor {
     this.hiTurn = 0;
     this.loTurn = 0;
     this.terminal = [];
+    this.terminalCoalesced = 0;
     this.queuedBytes = 0;
     // Bytes accepted by socket.write until the flush callback. They have left
     // the mux queues and are not visible in queuedBytes.
@@ -245,8 +247,12 @@ export class Supervisor {
     this.bulkSeen = 0;
     this.answered = 0;
     this.bridge = new MuxFramer();
-    this.wrapper = wrapperPath();
-    this.confined = ensureSubreaper();
+    this.wrapperFd = sealedWrapperFd();
+    this.undumpFd = sealedUndumpFd();
+    // Child fd 3 is the sealed wrapper. Child fd 4 is the sealed preload.
+    // The cache path is not an exec target: a same-uid plugin can replace it.
+    this.wrapper = this.wrapperFd != null && this.undumpFd != null ? '/proc/self/fd/3' : null;
+    this.confined = ensureSubreaper() && this.wrapper != null;
     const sweep = opts.sweeper ?? false;
     this.stopSweeper = sweep ? startSweeper(this.useDirect) : () => {};
     this.socket.on('error', () => {});
@@ -292,8 +298,18 @@ export class Supervisor {
       // fd 2 is /dev/null. The wrapper sets the process group, NO_NEW_PRIVS,
       // and the seccomp filter, then execs the runtime.
       child = spawn(this.wrapper, [process.execPath, spec.script], {
-        stdio: flow ? [flow.childStdin, flow.childStdout, 'ignore'] : ['pipe', 'pipe', 'ignore'],
-        env: childEnv({ ...spec.env, PLERNI_PLUGIN_ID: envText(spec.pluginId) }),
+        stdio: [
+          flow ? flow.childStdin : 'pipe',
+          flow ? flow.childStdout : 'pipe',
+          'ignore',
+          this.wrapperFd,
+          this.undumpFd,
+        ],
+        env: childEnv({
+          ...spec.env,
+          PLERNI_PLUGIN_ID: envText(spec.pluginId),
+          LD_PRELOAD: '/proc/self/fd/4',
+        }),
       });
     } catch (err) {
       closeEnds(flow);
@@ -348,7 +364,10 @@ export class Supervisor {
       exitFinished: false,
       exitDrainTimer: null,
       exitOverrun: null,
+      reapTimer: null,
+      resolveExit: () => {},
     };
+    rec.exitDone = new Promise((resolve) => { rec.resolveExit = resolve; });
     if (flow) this.#attachFlowSockets(rec, flow);
     else {
       child.stdout.on('data', (chunk) => this.#onChild(rec, chunk));
@@ -575,6 +594,10 @@ export class Supervisor {
         this.#signalGroup(prev);
         await waitExit(prev.child);
       }
+      // The exit event leaves the stdout reservation in place until EOF or
+      // the drain deadline. Deleting the record before that lets the next
+      // spawn overlap the old kernel terms inside totalGlobal.
+      if (!prev.exitFinished) await prev.exitDone;
       // Completed replies already left the pending table. Discarding them
       // here leaves the kernel waiter with nothing but a later timeout.
       const hiBytes = prev.hiBytes;
@@ -666,7 +689,13 @@ export class Supervisor {
     }
     this.socket.destroy();
     await Promise.all(waits);
-    for (const rec of this.children.values()) this.#reapGroup(rec);
+    for (const rec of this.children.values()) {
+      if (rec.reapTimer) {
+        clearInterval(rec.reapTimer);
+        rec.reapTimer = null;
+      }
+      this.#reapGroup(rec);
+    }
   }
 
   // Bytes pushed back with stdout.unshift sit in readableLength, not in stash.
@@ -955,7 +984,7 @@ export class Supervisor {
   }
 
   #authz(rec, msg) {
-    if (!rec || rec.dead) return 'unknown-plugin';
+    if (!rec || rec.dead || rec.exited) return 'unknown-plugin';
     const credential = msg.credential;
     if (!credential || typeof credential !== 'object') return 'credential-mismatch';
     if (credential.pluginId !== msg.pluginId || credential.pluginId !== rec.credential.pluginId) {
@@ -1642,8 +1671,29 @@ export class Supervisor {
 
   #reapGroup(rec) {
     const pid = rec?.child?.pid;
-    if (!Number.isInteger(pid) || pid <= 1) return;
-    reapGroup(pid);
+    if (!Number.isInteger(pid) || pid <= 1) return 0;
+    const n = reapGroup(pid);
+    return Number.isInteger(n) ? n : 0;
+  }
+
+  // The first waitpid can run before SIGKILL has made a descendant a zombie.
+  // Keep sweeping until several empty passes follow the last reap.
+  #armReap(rec) {
+    const pid = rec?.child?.pid;
+    if (!Number.isInteger(pid) || pid <= 1 || rec.reapTimer) return;
+    let idle = 0;
+    const tick = () => {
+      const n = this.#reapGroup(rec);
+      if (n > 0) idle = 0;
+      else idle += 1;
+      if (idle < 8) return;
+      clearInterval(rec.reapTimer);
+      rec.reapTimer = null;
+    };
+    tick();
+    if (rec.reapTimer) return;
+    rec.reapTimer = setInterval(tick, 25);
+    rec.reapTimer.unref();
   }
 
   #onExit(rec, code, signal) {
@@ -1651,7 +1701,7 @@ export class Supervisor {
     rec.signal = signal;
     rec.exited = true;
     this.#signalGroup(rec);
-    this.#reapGroup(rec);
+    this.#armReap(rec);
     // The process exit event arrives before stdout EOF. Dropping the read
     // socket here discards a response still queued in the kernel. Keep the
     // record accounted, close the writer dup so EOF can arrive, and read
@@ -1697,8 +1747,17 @@ export class Supervisor {
     this.#considerRead(rec);
   }
 
+  #settleExit(rec) {
+    if (rec.exitSettled) return;
+    rec.exitSettled = true;
+    rec.resolveExit();
+  }
+
   #finishExit(rec, why = 'eof') {
-    if (rec.exitFinished) return;
+    if (rec.exitFinished) {
+      this.#settleExit(rec);
+      return;
+    }
     rec.exitFinished = true;
     this.#clearDrainTimer(rec);
     if (why === 'timeout') {
@@ -1707,12 +1766,14 @@ export class Supervisor {
       if (!rec.dead) this.#pushFault(rec, 'drain-timeout');
     }
     this.#releaseFlow(rec);
-    if (rec.dead) return;
-    rec.dead = true;
-    rec.deferred = [];
-    rec.deferredBytes = 0;
-    this.#dropStale(rec.credential.pluginId, rec.credential.generation);
-    this.#failPending(rec, why === 'timeout' ? 'drain-timeout' : 'child-exited');
+    if (!rec.dead) {
+      rec.dead = true;
+      rec.deferred = [];
+      rec.deferredBytes = 0;
+      this.#dropStale(rec.credential.pluginId, rec.credential.generation);
+      this.#failPending(rec, why === 'timeout' ? 'drain-timeout' : 'child-exited');
+    }
+    this.#settleExit(rec);
   }
 
   #failPending(rec, code) {
@@ -1737,6 +1798,11 @@ export class Supervisor {
     try {
       buf = encodeMux(frame);
     } catch {
+      return;
+    }
+    if (this.queuedBytes + this.socketOutbound + buf.length > this.#globalCap()) {
+      this.terminalCoalesced++;
+      this.caps.total = true;
       return;
     }
     this.terminal.push(buf);

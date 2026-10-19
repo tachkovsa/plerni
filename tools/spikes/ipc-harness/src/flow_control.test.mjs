@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, writeSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, writeSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -8,10 +8,10 @@ import { fileURLToPath } from 'node:url';
 import { connectPair } from './supervisor.mjs';
 import { assessFlow, classifyWriterOverrun, FLOW_READ_BYTES, PROBE_INTERVAL_MS, OVERRUN_DEADLINE_MS } from './flow_budget.mjs';
 import { fionread, measureFlowReserve, rcvbuf, siocoutq, sndbuf } from './flow_socket.mjs';
-import { b3, partialSnapshotInvalid, scoreUnenforced, tripCaps } from './cases/b3-backpressure.mjs';
+import { b3, partialSnapshotInvalid, scoreUnenforced, t7Estimate, tripCaps } from './cases/b3-backpressure.mjs';
 import { b4 } from './cases/b4-bounds.mjs';
 import { encodeMux, encodeNdjson } from './framing.mjs';
-import { waitUntil } from './measure.mjs';
+import { delay, waitUntil } from './measure.mjs';
 
 const enlargePath = fileURLToPath(new URL('./children/enlarge-stdout.mjs', import.meta.url));
 const echoPath = fileURLToPath(new URL('./children/echo.mjs', import.meta.url));
@@ -29,9 +29,35 @@ function stdoutPending(pair, pluginId, reserved) {
 
 function block(ms) {
   const start = Date.now();
-  while (Date.now() - start < ms) { /* hold the event loop across the crossing */ }
+  // Block the event loop without spinning, so the child can run the crossing
+  // while this thread is held.
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
   return Date.now() - start;
 }
+
+test('the revised T7 estimate fills the measured kernel terms', () => {
+  const reserved = measureFlowReserve();
+  assert.ok(reserved);
+  const est = t7Estimate(reserved);
+  assert.ok(est);
+  assert.equal(est.kIn, reserved.kIn);
+  assert.equal(est.kOut, reserved.kOut);
+  assert.equal(est.kMuxIn, reserved.kMuxIn);
+  assert.equal(est.kMuxOut, reserved.kMuxOut);
+  assert.equal(est.c, reserved.readBytes);
+  assert.equal(est.r, 1);
+  for (const row of est.rows) {
+    assert.equal(row.s, row.totalGlobal - est.kMuxIn - est.kMuxOut - est.c);
+    assert.equal(row.perProcess, Math.min(row.n * row.t + row.s + est.kMuxIn + est.kMuxOut + est.c, row.totalGlobal));
+    assert.equal(row.perHost, est.r * row.perProcess);
+    assert.equal(row.partialWithin, est.kIn + est.c <= row.p);
+    assert.equal(row.totalWithin, est.kIn + est.kOut + est.c <= row.t);
+  }
+  const tripped = tripCaps({ hold: false });
+  return tripped.then((row) => {
+    assert.equal(row.detail?.t7?.kIn, reserved.kIn);
+  });
+});
 
 test('same-host vacuity pair: enforcement off fails and enforced passes', { timeout: 40_000 }, async () => {
   const off = await tripCaps({ enforceFlow: false });
@@ -147,6 +173,8 @@ test('paused probe faults a buffer enlarger within 100 ms', { timeout: 15_000 },
   assert.ok(reserved, 'helper unavailable');
   const dir = mkdtempSync(join(tmpdir(), 'plerni-enlarge-'));
   const go = join(dir, 'go');
+  const ready = join(dir, 'ready');
+  const held = join(dir, 'block');
   const mark = join(dir, 'mark');
   const pair = await connectPair({
     sweeper: false,
@@ -156,7 +184,13 @@ test('paused probe faults a buffer enlarger within 100 ms', { timeout: 15_000 },
     pair.sup.spawn({
       pluginId: 'enlarge',
       script: enlargePath,
-      env: { ENLARGE_GO: go, ENLARGE_MARK: mark, RESERVED_K: String(reserved.kIn) },
+      env: {
+        ENLARGE_GO: go,
+        ENLARGE_READY: ready,
+        ENLARGE_BLOCK: held,
+        ENLARGE_MARK: mark,
+        RESERVED_K: String(reserved.kIn),
+      },
     });
     const rec = pair.sup.children.get('enlarge');
     // Pause before the event loop reads. The 20 ms probe is what has to see
@@ -165,7 +199,12 @@ test('paused probe faults a buffer enlarger within 100 ms', { timeout: 15_000 },
     rec.pauseReason = 'bulk';
     rec.child.stdout.pause();
     writeFileSync(go, '1');
+    const poised = await waitUntil(() => existsSync(ready), 2_000);
+    assert.equal(poised, true, 'child did not reach the pre-crossing wait');
+    const blockStart = Date.now();
+    writeFileSync(held, '1');
     const lag = block(50);
+    const blockEnd = Date.now();
     const faulted = await waitUntil(
       () => pair.sup.faults.some((fault) => fault.pluginId === 'enlarge' && fault.code === 'buffer-enlarged'),
       1_000,
@@ -175,6 +214,7 @@ test('paused probe faults a buffer enlarger within 100 ms', { timeout: 15_000 },
     const text = readFileSync(mark, 'utf8').trim().split(/\s+/);
     assert.equal(classifyWriterOverrun(text[0]), 'enlarger');
     const marked = Number(text[1]);
+    assert.ok(marked >= blockStart && marked <= blockEnd, JSON.stringify({ marked, blockStart, blockEnd }));
     const elapsed = observed - marked;
     assert.ok(elapsed >= 0 && elapsed < OVERRUN_DEADLINE_MS, String(elapsed));
     assert.ok(PROBE_INTERVAL_MS + lag < OVERRUN_DEADLINE_MS, String(lag));
@@ -563,7 +603,7 @@ test('a reply that does not fit beside charged bytes is rejected and not retaine
   }
 });
 
-test('two child threads are scored from the live queue within 100 ms', { timeout: 15_000 }, async () => {
+test('two child threads are classified as a thread writer and scored when the live queue crosses K_in', { timeout: 15_000 }, async () => {
   const reserved = measureFlowReserve();
   assert.ok(reserved);
   const dir = mkdtempSync(join(tmpdir(), 'plerni-threads-'));
@@ -591,11 +631,14 @@ test('two child threads are scored from the live queue within 100 ms', { timeout
       const unread = fionread(rec.stdoutFd) ?? 0;
       if (unread > peak) peak = unread;
       if (pair.sup.faults.some((fault) => fault.code === 'thread-writer')) break;
+      let markedDone = false;
       if (peak > 0) {
         try {
-          if (readFileSync(mark, 'utf8').includes('threads')) break;
+          markedDone = readFileSync(mark, 'utf8').includes('threads');
         } catch { /* the mark is written when the burst finishes */ }
       }
+      if (markedDone && (peak > reserved.kIn || pair.sup.faults.some((fault) => fault.code === 'thread-writer'))) break;
+      await delay(5);
     }
     const text = readFileSync(mark, 'utf8').trim().split(/\s+/);
     assert.equal(classifyWriterOverrun(text[0]), 'thread-writer');

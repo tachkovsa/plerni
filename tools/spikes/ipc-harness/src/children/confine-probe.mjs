@@ -2,7 +2,7 @@
 // probeConfinement refuses to run unless the wrapper installed the filter.
 // A write to fd 0 must fail: the wrapper half-closes that direction.
 
-import { writeSync } from 'node:fs';
+import { closeSync, openSync, writeSync } from 'node:fs';
 import { NdjsonFramer, encodeNdjson } from '../framing.mjs';
 import { probeConfinement } from '../flow_socket.mjs';
 
@@ -16,7 +16,19 @@ try {
   reverse = err?.code || 'error';
 }
 
-const report = { ...(probeConfinement() ?? {}), reverse };
+let mem = 'absent';
+const target = process.env.MEM_PID;
+if (typeof target === 'string' && /^[1-9][0-9]*$/.test(target)) {
+  try {
+    const fd = openSync(`/proc/${target}/mem`, 'r');
+    mem = 'open';
+    closeSync(fd);
+  } catch (err) {
+    mem = err?.code || 'error';
+  }
+}
+
+const report = { ...(probeConfinement() ?? {}), reverse, mem };
 const framer = new NdjsonFramer();
 
 process.stdin.on('data', (chunk) => {

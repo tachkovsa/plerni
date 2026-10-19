@@ -21,6 +21,7 @@ import { FLOW_READ_BYTES, writerCeiling } from './flow_budget.mjs';
 const require = createRequire(import.meta.url);
 const socketSource = fileURLToPath(new URL('./flow_socket.c', import.meta.url));
 const confineSource = fileURLToPath(new URL('./confine.c', import.meta.url));
+const undumpSource = fileURLToPath(new URL('./undump.c', import.meta.url));
 
 let helper = null;
 let failed = false;
@@ -28,7 +29,13 @@ let reserve = null;
 
 export function sourceHash(text = null) {
   const body = text == null
-    ? Buffer.concat([readFileSync(socketSource), Buffer.from('\0'), readFileSync(confineSource)])
+    ? Buffer.concat([
+      readFileSync(socketSource),
+      Buffer.from('\0'),
+      readFileSync(confineSource),
+      Buffer.from('\0'),
+      readFileSync(undumpSource),
+    ])
     : text;
   return createHash('sha256').update(body).digest('hex');
 }
@@ -136,6 +143,29 @@ function publishWrapper(dir) {
   return publishFile(dir, finalName, tmpName, ['-O2', '-o', tmpName, confineSource]);
 }
 
+function publishUndump(dir) {
+  const finalName = join(dir, 'undump.so');
+  const tmpName = join(dir, `.undump.${process.pid}.${randomBytes(8).toString('hex')}.so`);
+  return publishFile(dir, finalName, tmpName, ['-shared', '-fPIC', '-O2', '-o', tmpName, undumpSource]);
+}
+
+function sealVerified(fn, path) {
+  if (!fn || typeof fn.sealFile !== 'function' || typeof path !== 'string') return null;
+  try {
+    const fd = fn.sealFile(path);
+    if (!Number.isInteger(fd) || fd < 0) return null;
+    const seals = fn.fileSeals(fd);
+    // F_SEAL_WRITE | F_SEAL_SEAL. A later write to this inode must fail.
+    if (!Number.isInteger(seals) || (seals & 0x0008) === 0 || (seals & 0x0001) === 0) {
+      closeSync(fd);
+      return null;
+    }
+    return fd;
+  } catch {
+    return null;
+  }
+}
+
 function loadHelper() {
   if (helper) return helper;
   if (failed) return null;
@@ -146,11 +176,13 @@ function loadHelper() {
     failed = true;
     return null;
   }
-  const binary = join(dir, 'flow_socket.node');
-  const wrapper = join(dir, 'confine');
-  try {
+    const binary = join(dir, 'flow_socket.node');
+    const wrapper = join(dir, 'confine');
+    const preload = join(dir, 'undump.so');
+    try {
     let target = null;
     let confine = null;
+    let undump = null;
     try {
       if (entryIsPrivate(lstatSync(binary), uid, 'file')) target = binary;
     } catch {
@@ -161,16 +193,32 @@ function loadHelper() {
     } catch {
       confine = null;
     }
+    try {
+      if (entryIsPrivate(lstatSync(preload), uid, 'file')) undump = preload;
+    } catch {
+      undump = null;
+    }
     if (!target) target = publishBinary(dir, headers);
     if (!confine) confine = publishWrapper(dir);
-    if (!target || !confine
+    if (!undump) undump = publishUndump(dir);
+    if (!target || !confine || !undump
         || !entryIsPrivate(lstatSync(target), uid, 'file')
-        || !entryIsPrivate(lstatSync(confine), uid, 'file')) {
+        || !entryIsPrivate(lstatSync(confine), uid, 'file')
+        || !entryIsPrivate(lstatSync(undump), uid, 'file')) {
       failed = true;
       return null;
     }
-    helper = require(target);
-    helper.wrapper = confine;
+    const loaded = require(target);
+    const wrapperFd = sealVerified(loaded, confine);
+    const undumpFd = sealVerified(loaded, undump);
+    if (wrapperFd == null || undumpFd == null) {
+      failed = true;
+      return null;
+    }
+    loaded.wrapper = confine;
+    loaded.wrapperFd = wrapperFd;
+    loaded.undumpFd = undumpFd;
+    helper = loaded;
     return helper;
   } catch {
     failed = true;
@@ -352,6 +400,27 @@ export function rcvbuf(fd) {
 export function wrapperPath() {
   const fn = loadHelper();
   return typeof fn?.wrapper === 'string' ? fn.wrapper : null;
+}
+
+export function sealedWrapperFd() {
+  const fn = loadHelper();
+  return asFd(fn?.wrapperFd);
+}
+
+export function sealedUndumpFd() {
+  const fn = loadHelper();
+  return asFd(fn?.undumpFd);
+}
+
+export function fileSeals(fd) {
+  const fn = loadHelper();
+  if (!fn || typeof fn.fileSeals !== 'function' || !Number.isInteger(fd) || fd < 0) return null;
+  try {
+    const seals = fn.fileSeals(fd);
+    return Number.isInteger(seals) && seals >= 0 ? seals : null;
+  } catch {
+    return null;
+  }
 }
 
 let subreaperOn = false;
