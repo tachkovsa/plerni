@@ -461,3 +461,87 @@ test('an overrun at the reserved SO_SNDBUF is thread-writer', async () => {
     await pair.close();
   }
 });
+
+test('an overrun is typed when the child exits before the paused probe', async () => {
+  const reserved = measureFlowReserve();
+  assert.ok(reserved);
+  const pair = await connectPair({
+    sweeper: false,
+    flowPending: () => reserved.kIn + 1,
+    readSndbuf: () => reserved.sndbufIn + 4096,
+    caps: { partial: 1024 * 1024, total: 1024 * 1024, totalGlobal: 8 * 1024 * 1024 },
+  });
+  try {
+    pair.sup.spawn({ pluginId: 'echo', script: echoPath });
+    const rec = pair.sup.children.get('echo');
+    rec.paused = true;
+    rec.pauseReason = 'bulk';
+    rec.stdoutSocket.pause();
+    rec.child.kill('SIGKILL');
+    const faulted = await waitUntil(
+      () => pair.sup.faults.some((fault) => fault.code === 'buffer-enlarged'),
+      1_000,
+    );
+    assert.equal(faulted, true, JSON.stringify({
+      faults: pair.sup.faults,
+      invalid: pair.sup.invalidReason,
+    }));
+    const fault = pair.sup.faults.find((row) => row.code === 'buffer-enlarged');
+    assert.ok(fault.stdoutUnread > fault.kIn, JSON.stringify(fault));
+    const released = await waitUntil(
+      () => rec.dead === true && rec.stdinProbe == null && rec.stdoutSocket == null,
+      1_000,
+    );
+    assert.equal(released, true);
+    assert.equal(pair.sup.invalidReason, null);
+  } finally {
+    await pair.close();
+  }
+});
+
+test('a reply that does not fit beside charged bytes is rejected and not retained', async () => {
+  const reserved = measureFlowReserve();
+  assert.ok(reserved);
+  const userspace = 8192;
+  const pair = await connectPair({
+    sweeper: false,
+    caps: {
+      partial: 64 * 1024,
+      total: reserved.perChild + userspace,
+      totalGlobal: 1024 * 1024,
+    },
+  });
+  try {
+    const kid = pair.sup.spawn({
+      pluginId: 'echo',
+      script: echoPath,
+      total: reserved.perChild + userspace,
+    });
+    const rec = pair.sup.children.get('echo');
+    assert.equal(rec.bT, userspace);
+    rec.paused = true;
+    rec.child.kill('SIGSTOP');
+    const call = pair.stub.call({
+      pluginId: 'echo',
+      credential: kid.credential,
+      correlationId: 1,
+      port: 'db',
+      method: 'get',
+      payload: { n: 1 },
+    }, 1_000).catch((err) => err);
+    const armed = await waitUntil(() => rec.callPending === 1, 1_000);
+    assert.equal(armed, true);
+    rec.loBytes = rec.bT;
+    const line = encodeNdjson({ kind: 'result', correlationId: 1, payload: { n: 1 } });
+    rec.paused = false;
+    rec.child.stdout.emit('data', Buffer.from(line));
+    const settled = await call;
+    assert.equal(settled.code, 'total-cap', JSON.stringify(settled));
+    assert.equal(rec.deferred.length, 0);
+    assert.equal(rec.dead, false);
+  } finally {
+    const rec = pair.sup.children.get('echo');
+    if (rec && rec.child.exitCode == null && rec.child.signalCode == null) rec.child.kill('SIGKILL');
+    await pair.close();
+  }
+});

@@ -287,6 +287,7 @@ export class Supervisor {
       exitDrain: false,
       exitFinished: false,
       exitDrainTimer: null,
+      exitOverrun: null,
     };
     if (flow) this.#attachFlowSockets(rec, flow);
     else {
@@ -876,12 +877,11 @@ export class Supervisor {
   }
 
   // `front` keeps a replayed hold ahead of anything parked in the same pass.
-  // A null buffer is a parsed line whose encoding did not fit; only `need`
-  // is remembered, so the bytes are not charged twice and are not retained
-  // past B_t. The retry encodes them again.
+  // A missing buffer still charges `need`. The parsed object is retained for
+  // the retry, and an uncharged copy would sit outside B_t and totalGlobal.
   #park(rec, msg, buf, front, need = null) {
     const size = buf ? buf.length : (need ?? 0);
-    const held = { msg, buf: buf ?? null, bytes: buf ? buf.length : 0, need: size };
+    const held = { msg, buf: buf ?? null, bytes: size, need: size };
     if (front) rec.deferred.unshift(held);
     else rec.deferred.push(held);
     rec.deferredBytes += held.bytes;
@@ -1000,8 +1000,11 @@ export class Supervisor {
 
   // A null probe is not a retry. Ignoring it stalls the read, and a later
   // scored miss would treat the missing measurement as a cap failure.
-  #noteOverrun(rec) {
+  // release:false records the typed fault and leaves the sockets up, so an
+  // exit drain can still read the queue that crossed K_in.
+  #noteOverrun(rec, release = true) {
     if (!this.enforceFlow || !rec.flowOk || rec.dead || this.invalidReason) return false;
+    if (!release && rec.exitOverrun) return false;
     const unread = this.#stdoutUnread(rec);
     if (this.invalidReason) return true;
     if (!writerOverrun(unread, rec.kIn)) return false;
@@ -1010,7 +1013,13 @@ export class Supervisor {
       this.#invalidate('sndbuf-unavailable');
       return true;
     }
-    this.#fault(rec, now > rec.sndbufIn ? BUFFER_ENLARGED : THREAD_WRITER);
+    const code = now > rec.sndbufIn ? BUFFER_ENLARGED : THREAD_WRITER;
+    if (!release) {
+      rec.exitOverrun = code;
+      this.#pushFault(rec, code);
+      return true;
+    }
+    this.#fault(rec, code);
     return true;
   }
 
@@ -1267,31 +1276,25 @@ export class Supervisor {
     // Grants and timestamps are attached here, so the mux frame can be larger
     // than the child's line. Admit it only when the resulting #pluginBytes
     // (this frame in place of the pending identifiers) stays ≤ B_t. A frame
-    // larger than the ceiling can never be admitted and is not retained.
-    // A smaller one waits as a parsed line and is encoded again once the
-    // other charged bytes leave: parking the encoding now would itself push
-    // #pluginBytes over B_t.
+    // that does not fit is rejected and dropped. Parking the parsed object
+    // or its encoding would keep bytes the cap is not allowed to miss.
     const ceiling = this.#childCeiling(rec);
     const pendingIds = pending.idBytes ?? 0;
     const resulting = this.#pluginBytes(rec) - pendingIds + buf.length;
     if (resulting > ceiling) {
       this.caps.total = true;
-      if (buf.length > ceiling) {
-        const still = this.#take(pluginId, msg.correlationId, lane);
-        if (still) {
-          this.#enqueueTerminal({
-            kind: 'error',
-            code: 'total-cap',
-            for: lane,
-            pluginId: still.pluginId,
-            correlationId: still.correlationId,
-            generation: still.generation,
-          });
-        }
-        return false;
+      const still = this.#take(pluginId, msg.correlationId, lane);
+      if (still) {
+        this.#enqueueTerminal({
+          kind: 'error',
+          code: 'total-cap',
+          for: lane,
+          pluginId: still.pluginId,
+          correlationId: still.correlationId,
+          generation: still.generation,
+        });
       }
-      this.#pause(rec, 'total');
-      return { defer: true, buf: null, need: buf.length };
+      return false;
     }
     // One stdout chunk can carry many results. Pause does not stop this loop.
     // A reply that does not fit stays with its waiter and is charged; taking
@@ -1360,14 +1363,12 @@ export class Supervisor {
     }
   }
 
-  #fault(rec, code) {
-    if (rec.dead) return;
-    // bufferedBytes() skips dead children and #retainTail drops a dead child's
-    // chunk tail. Read both, and the kernel queues, before that cleanup.
+  // The snapshot is taken before the record is marked dead. Exit drain uses
+  // it alone: the typed overrun has to be visible, and the read socket has
+  // to stay up until stdout reaches EOF.
+  #pushFault(rec, code) {
     const inFlightTailBytes = rec.inFlightTailBytes || 0;
     const pluginBytes = this.#pluginBytes(rec);
-    // The chunk tail is still a local buffer here. bufferedBytes() and
-    // #pluginBytes() do not see it, and #retainTail drops it after rec.dead.
     const bufferedBytes = this.bufferedBytes() + inFlightTailBytes;
     const stdoutUnread = this.enforceFlow && rec.flowOk ? this.#stdoutUnread(rec) : null;
     const stdinQueued = this.enforceFlow && rec.flowOk ? this.#stdinQueued(rec) : null;
@@ -1381,14 +1382,10 @@ export class Supervisor {
         ? pluginBytes + inFlightTailBytes + pipeUnread + (stdinQueued ?? 0)
         : bufferedBytes + pipeUnread);
     if (bufferedBytes > this.bufferedHighWater) this.bufferedHighWater = bufferedBytes;
-    const pendingBytes = rec.framer.pendingBytes();
-    rec.inFlightTailBytes = 0;
-    rec.dead = true;
-    this.#releaseFlow(rec);
     this.faults.push({
       pluginId: rec.credential.pluginId,
       code,
-      pendingBytes,
+      pendingBytes: rec.framer.pendingBytes(),
       bufferedBytes,
       pluginBytes,
       inFlightTailBytes,
@@ -1400,6 +1397,16 @@ export class Supervisor {
       kOut: rec.kOut,
       accountedBytes,
     });
+  }
+
+  #fault(rec, code) {
+    if (rec.dead) return;
+    // bufferedBytes() skips dead children and #retainTail drops a dead child's
+    // chunk tail. Read both, and the kernel queues, before that cleanup.
+    this.#pushFault(rec, code);
+    rec.inFlightTailBytes = 0;
+    rec.dead = true;
+    this.#releaseFlow(rec);
     if (code === 'hi-cap') this.caps.hi = true;
     // Queued frames already left the pending table. Dropping them here strands
     // the kernel waiter. Frames with no waiter (floods) are bounded by the
@@ -1451,6 +1458,10 @@ export class Supervisor {
   #drainStdoutToEnd(rec) {
     if (rec.exitDrain || rec.exitFinished) return;
     rec.exitDrain = true;
+    // The paused probe may not have run. Classify while the writer dup is
+    // still open and the queue is still unread, then keep reading.
+    this.#noteOverrun(rec, false);
+    if (rec.dead || rec.exitFinished) return;
     if (Number.isInteger(rec.stdoutWriter) && rec.stdoutWriter >= 0) {
       closeFd(rec.stdoutWriter);
       rec.stdoutWriter = null;
