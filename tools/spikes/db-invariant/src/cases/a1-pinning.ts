@@ -2,7 +2,8 @@
 // whole life. Pass: pg_backend_pid() constant across ≥3 statements per transaction under
 // concurrent load, on the Kysely path AND an identical raw-pg control. Both main datasources.
 import { sql, type Kysely } from 'kysely';
-import { direct, pooled, rawApp, type Db } from '../client.ts';
+import pg from 'pg';
+import { direct, pooled, rawApp, rawAppPooled, type Db } from '../client.ts';
 import { record } from '../evidence.ts';
 
 const CONCURRENT = 8;
@@ -20,9 +21,9 @@ async function pidsViaKysely(db: Kysely<Db>): Promise<number[][]> {
     })));
 }
 
-async function pidsViaRawPg(): Promise<number[][]> {
+async function pidsViaRawPg(open: () => pg.Client): Promise<number[][]> {
   return Promise.all(Array.from({ length: CONCURRENT }, async () => {
-    const c = rawApp(); // app role on the direct DSN — controls isolate Kysely-misuse vs driver on the app path (§3.0①)
+    const c = open();
     await c.connect();
     const pids: number[] = [];
     try {
@@ -47,6 +48,18 @@ export async function a1Pinning(): Promise<void> {
     record({ case: 'A1', datasource: label, pass: allConstant(k), detail: { via: 'kysely', runs: k } });
     await db.destroy();
   }
-  const raw = await pidsViaRawPg();
-  record({ case: 'A1', datasource: 'direct (raw-pg control)', pass: allConstant(raw), detail: { via: 'raw-pg', runs: raw } });
+  const rawDirect = await pidsViaRawPg(rawApp);
+  record({
+    case: 'A1',
+    datasource: 'direct (raw-pg control)',
+    pass: allConstant(rawDirect),
+    detail: { via: 'raw-pg', runs: rawDirect },
+  });
+  const rawPooled = await pidsViaRawPg(rawAppPooled);
+  record({
+    case: 'A1',
+    datasource: 'pooled (raw-pg control)',
+    pass: allConstant(rawPooled),
+    detail: { via: 'raw-pg', runs: rawPooled },
+  });
 }

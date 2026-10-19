@@ -6,14 +6,18 @@ import os from 'node:os';
 import { b4, childAlive } from './cases/b4-bounds.mjs';
 import { b5 } from './cases/b5-crash.mjs';
 import { b2 } from './cases/b2-fencing.mjs';
-import { b3, tripCaps } from './cases/b3-backpressure.mjs';
+import { b3, partialFrameHighWater, scoreTotalProbe, tripCaps } from './cases/b3-backpressure.mjs';
 import { fileURLToPath } from 'node:url';
 import { b1 } from './cases/b1-throughput.mjs';
 import { applyScoredSkip, floodBound, floodScore, forgedFlood, hostileBattery, starvation } from './cases/b6-mux-identity.mjs';
 import { assessEnvironment, delay, measureSeries, openLoop, preflight, treeRss, waitUntil } from './measure.mjs';
 import { MuxFramer, encodeMux, encodeNdjson } from './framing.mjs';
 import { FencedError } from './authority.mjs';
-import { DEFAULT_CAPS, PARTIAL_READ_CHUNK, connectPair, dbConfigured, partialCapHolds } from './supervisor.mjs';
+import { DEFAULT_CAPS, PARTIAL_READ_CHUNK, connectPair, dbConfigured, partialCapHolds, totalCapHolds } from './supervisor.mjs';
+import { entryIsPrivate, resolveCacheDir } from './pipe_pending.mjs';
+import { lstatSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 const echoPath = fileURLToPath(new URL('./children/echo.mjs', import.meta.url));
 const floodPath = fileURLToPath(new URL('./children/flood.mjs', import.meta.url));
@@ -58,7 +62,91 @@ test('B5 crash typed error', { timeout: 20_000, skip: dbConfigured() ? false : '
 
 test('B3 caps trip', { timeout: 20_000 }, async () => {
   const result = await tripCaps();
-  assert.equal(result.pass, true, JSON.stringify(result.detail));
+  const total = result.detail.total;
+  const cap = 48 * 1024;
+  assert.equal(result.detail.pending.admitted, 4);
+  assert.ok(result.detail.pending.rejected > 0);
+  const partial = result.detail.partial;
+  assert.equal(partial.highWater, partialFrameHighWater(partial.pendingBytes, partial.inFlightTailBytes));
+  assert.equal(
+    partial.bound,
+    partial.code === 'partial-cap' && partialCapHolds(partial.highWater, 32 * 1024),
+  );
+  assert.equal(total.tripped, true);
+  assert.equal(total.vacuity, true);
+  assert.equal(total.accounted, total.buffered + total.pipeUnread);
+  assert.ok(total.pipeCapacity > 0, String(total.pipeCapacity));
+  assert.ok(total.pipeUnread <= total.pipeCapacity, String(total.pipeUnread));
+  assert.equal(total.bound, totalCapHolds(total.accounted, cap));
+  assert.equal(result.detail.kernel.bound, true);
+  assert.equal(result.detail.kernelBytes.tripped, true);
+  assert.equal(result.outcome, 'scored');
+  assert.equal(
+    result.pass,
+    Boolean(result.detail.pending.tripped && result.detail.pending.rejected > 0 && result.detail.pending.admitted === 4
+      && partial.tripped && partial.bound
+      && total.tripped && total.bound && total.vacuity
+      && result.detail.kernel.tripped && result.detail.kernel.bound
+      && result.detail.kernelBytes.tripped && result.detail.kernelBytes.bound),
+  );
+});
+
+test('partial high-water counts the in-flight tail', () => {
+  const cap = 32 * 1024;
+  assert.equal(partialFrameHighWater(36864, 0), 36864);
+  assert.equal(partialCapHolds(partialFrameHighWater(36864, 0), cap), true);
+  assert.equal(partialFrameHighWater(36864, 4096), 40960);
+  assert.equal(partialCapHolds(partialFrameHighWater(36864, 4096), cap), false);
+  assert.equal(partialFrameHighWater(36864, null), null);
+  assert.equal(partialCapHolds(partialFrameHighWater(36864, null), cap), false);
+});
+
+test('a missing pipe probe is an invalid run', { timeout: 20_000 }, async () => {
+  const missing = scoreTotalProbe({
+    pipeUnread: null,
+    pipeCapacity: null,
+    accounted: null,
+    cap: 48 * 1024,
+    afterCleanup: 0,
+  });
+  assert.equal(missing.outcome, 'invalid');
+  assert.equal(missing.bound, null);
+  const noUnread = scoreTotalProbe({
+    pipeUnread: null,
+    pipeCapacity: 131072,
+    accounted: 106496,
+    cap: 48 * 1024,
+    afterCleanup: 0,
+  });
+  assert.equal(noUnread.outcome, 'invalid');
+  assert.equal(noUnread.bound, null);
+  const measuredMiss = scoreTotalProbe({
+    pipeUnread: 8192,
+    pipeCapacity: 131072,
+    accounted: 106496,
+    cap: 48 * 1024,
+    afterCleanup: 0,
+  });
+  assert.equal(measuredMiss.outcome, 'scored');
+  assert.equal(measuredMiss.bound, false);
+  const result = await b3({ hold: false, pipeProbe: () => null });
+  assert.equal(result.pass, null);
+  assert.equal(result.outcome, 'invalid');
+  assert.equal(result.detail.caps.total.bound, null);
+  assert.notEqual(result.detail.caps.total.bound, false);
+});
+
+test('pipe helper cache is a private directory', () => {
+  const dir = resolveCacheDir();
+  assert.equal(typeof dir, 'string');
+  const shared = join(tmpdir(), `plerni-pipe-pending-${process.versions.modules}`);
+  assert.notEqual(dir, shared);
+  assert.equal(entryIsPrivate(lstatSync(dir), process.getuid(), 'dir'), true);
+  const uid = process.getuid();
+  assert.equal(entryIsPrivate({ isFile: () => true, isDirectory: () => false, isSymbolicLink: () => false, uid, mode: 0o100700 }, uid, 'file'), true);
+  assert.equal(entryIsPrivate({ isFile: () => true, isDirectory: () => false, isSymbolicLink: () => false, uid, mode: 0o100644 }, uid, 'file'), false);
+  assert.equal(entryIsPrivate({ isFile: () => true, isDirectory: () => false, isSymbolicLink: () => true, uid, mode: 0o100700 }, uid, 'file'), false);
+  assert.equal(entryIsPrivate({ isFile: () => true, isDirectory: () => false, isSymbolicLink: () => false, uid: uid + 1, mode: 0o100700 }, uid, 'file'), false);
 });
 
 test('B6 hostile battery rejects forged identity', { timeout: 20_000 }, async () => {
@@ -285,6 +373,10 @@ test('a frame past the partial cap faults within one read chunk', { timeout: 10_
     assert.equal(faulted, true);
     const fault = pair.sup.faults.find((row) => row.pluginId === 'echo');
     assert.equal(partialCapHolds(fault.pendingBytes, cap), true, String(fault.pendingBytes));
+    assert.equal(
+      partialFrameHighWater(fault.pendingBytes, fault.inFlightTailBytes),
+      fault.pendingBytes + fault.inFlightTailBytes,
+    );
     assert.ok(fault.pendingBytes > cap, String(fault.pendingBytes));
     const rec = pair.sup.children.get('echo');
     assert.equal(rec.dead, true);
@@ -312,10 +404,101 @@ test('partial cap exhaustion faults within one read chunk', { timeout: 15_000 },
     assert.equal(faulted, true);
     const fault = pair.sup.faults.find((row) => row.pluginId === 'partial');
     assert.equal(partialCapHolds(fault.pendingBytes, cap), true, String(fault.pendingBytes));
+    assert.equal(
+      partialFrameHighWater(fault.pendingBytes, fault.inFlightTailBytes),
+      fault.pendingBytes + fault.inFlightTailBytes,
+    );
     assert.ok(fault.pendingBytes > cap, String(fault.pendingBytes));
     assert.ok(fault.pendingBytes <= cap + PARTIAL_READ_CHUNK, String(fault.pendingBytes));
     assert.equal(rec.dead, true);
     assert.equal(rec.pauseReason, null);
+  } finally {
+    await pair.close();
+  }
+});
+
+test('total-buffer bound fails when read after fault cleanup', { timeout: 15_000 }, async () => {
+  const cap = 48 * 1024;
+  const pair = await connectPair({
+    sweeper: false,
+    caps: { pending: 64, partial: 1024 * 1024, total: cap, totalGlobal: 8 * 1024 * 1024 },
+    partialHighWater: 1024 * 1024,
+  });
+  try {
+    pair.sup.spawn({ pluginId: 'total', script: floodPath, env: { FLOOD_MODE: 'partial' } });
+    const faulted = await waitUntil(
+      () => pair.sup.faults.some((fault) => fault.pluginId === 'total' && fault.code === 'total-cap'),
+      10_000,
+    );
+    assert.equal(faulted, true);
+    const fault = pair.sup.faults.find((row) => row.pluginId === 'total');
+    assert.equal(fault.accountedBytes, fault.bufferedBytes + fault.pipeUnread);
+    assert.ok(fault.pipeCapacity > 0, String(fault.pipeCapacity));
+    assert.ok(fault.pipeUnread <= fault.pipeCapacity, String(fault.pipeUnread));
+    assert.ok(fault.bufferedBytes >= fault.pendingBytes + fault.inFlightTailBytes, String(fault.bufferedBytes));
+    assert.equal(pair.sup.children.get('total').dead, true);
+    assert.equal(totalCapHolds(cap + PARTIAL_READ_CHUNK, cap), true);
+    assert.equal(totalCapHolds(cap + PARTIAL_READ_CHUNK + 1, cap), false);
+    assert.equal(totalCapHolds(pair.sup.bufferedBytes(), cap), false, String(pair.sup.bufferedBytes()));
+  } finally {
+    await pair.close();
+  }
+});
+
+test('total-cap snapshot keeps the unread chunk tail', { timeout: 15_000 }, async () => {
+  const cap = 1024;
+  const pair = await connectPair({
+    sweeper: false,
+    caps: { pending: 64, partial: 1024 * 1024, total: cap, totalGlobal: 8 * 1024 * 1024 },
+    partialHighWater: 1024 * 1024,
+  });
+  try {
+    pair.sup.spawn({
+      pluginId: 'total',
+      script: floodPath,
+      env: { FLOOD_MODE: 'partial', FLOOD_CHUNK: '32768' },
+    });
+    const faulted = await waitUntil(
+      () => pair.sup.faults.some((fault) => fault.pluginId === 'total' && fault.code === 'total-cap'),
+      10_000,
+    );
+    assert.equal(faulted, true);
+    const fault = pair.sup.faults.find((row) => row.pluginId === 'total');
+    assert.ok(fault.inFlightTailBytes > 0, String(fault.inFlightTailBytes));
+    assert.ok(
+      fault.bufferedBytes >= fault.pendingBytes + fault.inFlightTailBytes,
+      `${fault.bufferedBytes} vs ${fault.pendingBytes}+${fault.inFlightTailBytes}`,
+    );
+    assert.equal(fault.accountedBytes, fault.bufferedBytes + fault.pipeUnread);
+    assert.equal(totalCapHolds(pair.sup.bufferedBytes(), cap), false);
+  } finally {
+    await pair.close();
+  }
+});
+
+test('a coalesced partial chunk leaves a tail in the high-water', { timeout: 15_000 }, async () => {
+  const cap = 1024;
+  const pair = await connectPair({
+    sweeper: false,
+    caps: { pending: 64, partial: cap, total: 8 * 1024 * 1024, totalGlobal: 8 * 1024 * 1024 },
+  });
+  try {
+    pair.sup.spawn({
+      pluginId: 'partial',
+      script: floodPath,
+      env: { FLOOD_MODE: 'partial', FLOOD_CHUNK: '32768' },
+    });
+    const faulted = await waitUntil(
+      () => pair.sup.faults.some((fault) => fault.pluginId === 'partial' && fault.code === 'partial-cap'),
+      10_000,
+    );
+    assert.equal(faulted, true);
+    const fault = pair.sup.faults.find((row) => row.pluginId === 'partial');
+    const highWater = partialFrameHighWater(fault.pendingBytes, fault.inFlightTailBytes);
+    assert.ok(fault.inFlightTailBytes > 0, String(fault.inFlightTailBytes));
+    assert.equal(highWater, fault.pendingBytes + fault.inFlightTailBytes);
+    assert.equal(partialCapHolds(fault.pendingBytes, cap), true, String(fault.pendingBytes));
+    assert.equal(partialCapHolds(highWater, cap), false, String(highWater));
   } finally {
     await pair.close();
   }

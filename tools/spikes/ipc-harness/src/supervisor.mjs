@@ -16,6 +16,7 @@ import { performance } from 'node:perf_hooks';
 import { MuxFramer, NdjsonFramer, encodeNdjson, encodeMux } from './framing.mjs';
 import { PendingTable, socketPair, KernelStub } from './kernel-stub.mjs';
 import { FencedError, commitExecution, startSweeper } from './authority.mjs';
+import { pipePending } from './pipe_pending.mjs';
 
 function waitExit(child) {
   return new Promise((resolve) => {
@@ -52,6 +53,17 @@ export function partialCapHolds(pendingBytes, cap) {
   return Number.isFinite(pendingBytes)
     && pendingBytes > cap
     && pendingBytes <= cap + PARTIAL_READ_CHUNK;
+}
+
+// The scored total is bufferedBytes(), including the unprocessed rest of the
+// current stdout chunk, plus FIONREAD on that stdout fd. Child stdio here is
+// a socket, so the unread count's ceiling is the measured SO_RCVBUF (a pipe
+// uses F_GETPIPE_SZ). The only overshoot past the configured cap is the one
+// slice already handed to the framer.
+export function totalCapHolds(accountedBytes, cap) {
+  return Number.isFinite(accountedBytes)
+    && accountedBytes > cap
+    && accountedBytes <= cap + PARTIAL_READ_CHUNK;
 }
 
 export const DEFAULT_CAPS = Object.freeze({
@@ -142,6 +154,7 @@ export class Supervisor {
     this.socket = socket;
     this.stampIdentity = opts.stampIdentity !== false;
     this.enforcePartial = opts.enforcePartial !== false;
+    this.pipeProbe = typeof opts.pipeProbe === 'function' ? opts.pipeProbe : pipePending;
     this.useDirect = opts.useDirect ?? useDirectFromEnv();
     this.capsConfig = { ...DEFAULT_CAPS, ...opts.caps };
     if (opts.caps?.pending != null && opts.caps.pendingGlobal == null) {
@@ -162,6 +175,7 @@ export class Supervisor {
     this.cancelPendingTotal = 0;
     this.retiredTokens = new Set();
     this.faults = [];
+    this.bufferedHighWater = 0;
     this.caps = { pending: false, partial: false, total: false, lo: false, hi: false };
     this.hi = new Map();
     this.lo = new Map();
@@ -222,6 +236,7 @@ export class Supervisor {
       framer: new NdjsonFramer(),
       outbound: 0,
       stash: null,
+      inFlightTailBytes: 0,
       hiBytes: 0,
       loBytes: 0,
       callPending: 0,
@@ -586,30 +601,40 @@ export class Supervisor {
     if (rec.dead || this.closed) return;
     const incoming = rec.stash ? Buffer.concat([rec.stash, chunk]) : chunk;
     rec.stash = null;
+    rec.inFlightTailBytes = 0;
     let offset = 0;
-    while (offset < incoming.length) {
-      if (rec.paused || rec.dead) {
-        this.#retainTail(rec, incoming.subarray(offset));
-        return;
+    try {
+      while (offset < incoming.length) {
+        if (rec.paused || rec.dead) {
+          this.#retainTail(rec, incoming.subarray(offset));
+          return;
+        }
+        const end = Math.min(incoming.length, offset + PARTIAL_READ_CHUNK);
+        const slice = incoming.subarray(offset, end);
+        offset = end;
+        // The rest of this chunk is not in the framer and not in readableLength.
+        // #retainTail drops it once the child is dead, so the fault snapshot
+        // has to see it first.
+        rec.inFlightTailBytes = incoming.length - offset;
+        let stopped = false;
+        try {
+          rec.framer.feed(slice);
+          stopped = this.#pullFrames(rec);
+        } catch (err) {
+          const code = err.constructor?.name || 'framing-error';
+          if (code === 'NdjsonOversizeError') this.caps.partial = true;
+          this.#fault(rec, code);
+          return;
+        }
+        this.#accountCaps(rec);
+        if (stopped || rec.paused || rec.dead) {
+          this.#retainTail(rec, incoming.subarray(offset));
+          return;
+        }
+        rec.inFlightTailBytes = 0;
       }
-      const end = Math.min(incoming.length, offset + PARTIAL_READ_CHUNK);
-      const slice = incoming.subarray(offset, end);
-      offset = end;
-      let stopped = false;
-      try {
-        rec.framer.feed(slice);
-        stopped = this.#pullFrames(rec);
-      } catch (err) {
-        const code = err.constructor?.name || 'framing-error';
-        if (code === 'NdjsonOversizeError') this.caps.partial = true;
-        this.#fault(rec, code);
-        return;
-      }
-      this.#accountCaps(rec);
-      if (stopped || rec.paused || rec.dead) {
-        this.#retainTail(rec, incoming.subarray(offset));
-        return;
-      }
+    } finally {
+      if (!rec.dead) rec.inFlightTailBytes = 0;
     }
   }
 
@@ -670,6 +695,7 @@ export class Supervisor {
     );
     if (tail.length <= room) {
       rec.stash = Buffer.from(tail);
+      rec.inFlightTailBytes = 0;
       return;
     }
     this.caps.total = true;
@@ -677,6 +703,7 @@ export class Supervisor {
     else rec.child.stdout.pause();
     try {
       rec.child.stdout.unshift(Buffer.from(tail));
+      rec.inFlightTailBytes = 0;
     } catch {
       this.#fault(rec, 'total-cap');
     }
@@ -948,13 +975,41 @@ export class Supervisor {
     }
   }
 
+  #pipePending(rec) {
+    const fd = rec.child?.stdout?._handle?.fd;
+    if (!Number.isInteger(fd)) return null;
+    try {
+      return this.pipeProbe(fd);
+    } catch {
+      return null;
+    }
+  }
+
   #fault(rec, code) {
     if (rec.dead) return;
+    // bufferedBytes() skips dead children and #retainTail drops a dead child's
+    // chunk tail. Read both, and the kernel pipe, before that cleanup.
+    const inFlightTailBytes = rec.inFlightTailBytes || 0;
+    // The chunk tail is still a local buffer here. bufferedBytes() does not
+    // see it, and #retainTail will drop it after rec.dead is set.
+    const bufferedBytes = this.bufferedBytes() + inFlightTailBytes;
+    const pipe = this.#pipePending(rec);
+    const pipeUnread = pipe ? pipe.unread : null;
+    const pipeCapacity = pipe ? pipe.capacity : null;
+    const accountedBytes = pipeUnread == null ? null : bufferedBytes + pipeUnread;
+    if (bufferedBytes > this.bufferedHighWater) this.bufferedHighWater = bufferedBytes;
+    const pendingBytes = rec.framer.pendingBytes();
+    rec.inFlightTailBytes = 0;
     rec.dead = true;
     this.faults.push({
       pluginId: rec.credential.pluginId,
       code,
-      pendingBytes: rec.framer.pendingBytes(),
+      pendingBytes,
+      bufferedBytes,
+      inFlightTailBytes,
+      pipeUnread,
+      pipeCapacity,
+      accountedBytes,
     });
     if (code === 'hi-cap') this.caps.hi = true;
     // Queued frames already left the pending table. Dropping them here strands
