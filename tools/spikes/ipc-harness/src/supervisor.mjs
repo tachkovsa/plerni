@@ -19,7 +19,16 @@ import { PendingTable, socketPair, KernelStub } from './kernel-stub.mjs';
 import { FencedError, commitExecution, startSweeper } from './authority.mjs';
 import { pipePending } from './pipe_pending.mjs';
 import { BUFFER_ENLARGED, FLOW_READ_BYTES, PROBE_INTERVAL_MS, THREAD_WRITER, writerOverrun } from './flow_budget.mjs';
-import { closeEnds, closeFd, createChildEnds, fionread, sndbuf } from './flow_socket.mjs';
+import {
+  closeEnds,
+  closeFd,
+  createChildEnds,
+  ensureSubreaper,
+  fionread,
+  reapGroup,
+  sndbuf,
+  wrapperPath,
+} from './flow_socket.mjs';
 
 export { partialCapHolds, totalCapHolds } from './flow_budget.mjs';
 
@@ -142,15 +151,42 @@ function envText(value) {
   return String(value).replaceAll('\0', '');
 }
 
+function positiveInt(value) {
+  return Number.isInteger(value) && value > 0 ? value : null;
+}
+
 export class Supervisor {
-  constructor(socket, opts = {}) {
-    this.socket = socket;
+  constructor(mux, opts = {}) {
+    const muxFd = positiveInt(mux?.fd) != null && mux.fd >= 0 ? mux.fd : null;
+    this.kMuxIn = positiveInt(mux?.kMuxIn);
+    this.kMuxOut = positiveInt(mux?.kMuxOut);
+    this.muxSndbuf = positiveInt(mux?.muxSndbuf);
+    this.muxRcvbuf = positiveInt(mux?.muxRcvbuf);
+    if (muxFd == null || this.kMuxIn == null || this.kMuxOut == null
+        || this.muxSndbuf == null || this.muxRcvbuf == null) {
+      const err = new Error('mux reservation unavailable');
+      err.code = 'flow-unavailable';
+      throw err;
+    }
+    this.muxFd = muxFd;
+    this.muxReadHigh = 0;
     this.stampIdentity = opts.stampIdentity !== false;
     this.enforcePartial = opts.enforcePartial !== false;
     // enforceFlow:false is the vacuity variant: default stdio sockets and
     // libuv's 64 KiB reads. That run must fail the reserved-cap bound.
     this.enforceFlow = opts.enforceFlow !== false;
     this.readBytes = FLOW_READ_BYTES;
+    this.socket = new Socket({
+      fd: muxFd,
+      allowHalfOpen: true,
+      readable: true,
+      writable: true,
+      onread: {
+        buffer: Buffer.alloc(this.readBytes),
+        callback: (nread, buf) => this.#onMuxRead(nread, buf),
+      },
+    });
+    this.socket.setNoDelay(true);
     this.pipeProbe = typeof opts.pipeProbe === 'function' ? opts.pipeProbe : pipePending;
     this.flowPending = typeof opts.flowPending === 'function' ? opts.flowPending : fionread;
     this.readSndbuf = typeof opts.readSndbuf === 'function' ? opts.readSndbuf : sndbuf;
@@ -201,10 +237,12 @@ export class Supervisor {
     this.bulkSeen = 0;
     this.answered = 0;
     this.bridge = new MuxFramer();
+    this.wrapper = wrapperPath();
+    this.confined = ensureSubreaper();
     const sweep = opts.sweeper ?? false;
     this.stopSweeper = sweep ? startSweeper(this.useDirect) : () => {};
-    socket.on('data', (chunk) => this.#onSocket(chunk));
-    socket.on('error', () => {});
+    this.socket.on('error', () => {});
+    this.socket.resume();
   }
 
   spawn(spec) {
@@ -226,6 +264,11 @@ export class Supervisor {
       pending: spec.pending ?? this.capsConfig.pending,
       total: spec.total ?? this.capsConfig.total,
     };
+    if (!this.wrapper || !this.confined) {
+      const err = new Error('confinement wrapper unavailable');
+      err.code = 'flow-unavailable';
+      throw err;
+    }
     const flow = this.enforceFlow ? this.#openFlowEnds(limits) : null;
     if (this.enforceFlow && !flow) {
       const err = new Error('flow-control helper unavailable');
@@ -234,8 +277,10 @@ export class Supervisor {
     }
     let child;
     try {
-      child = spawn(process.execPath, [spec.script], {
-        stdio: flow ? [flow.childStdin, flow.childStdout, 'pipe'] : ['pipe', 'pipe', 'pipe'],
+      // fd 2 is /dev/null. The wrapper sets the process group, NO_NEW_PRIVS,
+      // and the seccomp filter, then execs the runtime.
+      child = spawn(this.wrapper, [process.execPath, spec.script], {
+        stdio: flow ? [flow.childStdin, flow.childStdout, 'ignore'] : ['pipe', 'pipe', 'ignore'],
         env: childEnv({ ...spec.env, PLERNI_PLUGIN_ID: envText(spec.pluginId) }),
       });
     } catch (err) {
@@ -295,7 +340,6 @@ export class Supervisor {
       child.stdout.on('error', () => {});
       child.stdin.on('error', () => {});
     }
-    child.stderr.on('data', () => {});
     child.on('error', (err) => this.#onSpawnError(rec, err));
     child.on('exit', (code, signal) => this.#onExit(rec, code, signal));
     this.children.set(spec.pluginId, rec);
@@ -311,28 +355,37 @@ export class Supervisor {
   // A negative B_p, B_t, or B_g closes the ends and does not start the child.
   // That rejection is unsatisfiable when the kernel terms alone do not fit.
   // A live process that is already too full is spawn-rejected, which is not
-  // a B3 cap failure. Mux buffers are not part of this sum: an unset mux
-  // reading is not a ceiling.
+  // a B3 cap failure. K_mux_in + K_mux_out + C is reserved once for the process.
   #openFlowEnds(limits) {
     const ends = createChildEnds();
     if (!ends) return null;
+    const muxReserve = this.#muxReserve();
+    if (muxReserve <= 0) {
+      closeEnds(ends);
+      return null;
+    }
     const bP = this.partialHighWater - ends.kIn - this.readBytes;
     const bT = limits.total - ends.kIn - ends.kOut - this.readBytes;
     const reserve = ends.kIn + ends.kOut + this.readBytes;
     const already = this.#kernelReserved();
-    if (bP < 0 || bT < 0 || already + reserve > this.capsConfig.totalGlobal) {
+    if (bP < 0 || bT < 0 || already + reserve + muxReserve > this.capsConfig.totalGlobal) {
       closeEnds(ends);
       const err = new Error('flow reservation does not fit the configured caps');
       err.code = 'unsatisfiable';
       throw err;
     }
-    if (this.#occupiedBytes() + reserve > this.capsConfig.totalGlobal) {
+    if (this.#occupiedBytes() + reserve + muxReserve > this.capsConfig.totalGlobal) {
       closeEnds(ends);
       const err = new Error('flow reservation does not fit the live process');
       err.code = 'spawn-rejected';
       throw err;
     }
     return { ...ends, bP, bT };
+  }
+
+  #muxReserve() {
+    if (this.kMuxIn == null || this.kMuxOut == null) return 0;
+    return this.kMuxIn + this.kMuxOut + this.readBytes;
   }
 
   #childReserve(rec) {
@@ -346,9 +399,10 @@ export class Supervisor {
     return sum;
   }
 
-  // Userspace room after every live child's K_in + K_out + C.
+  // Userspace room after every live child's K_in + K_out + C and the mux
+  // reservation K_mux_in + K_mux_out + C.
   #globalCap() {
-    return this.capsConfig.totalGlobal - this.#kernelReserved();
+    return this.capsConfig.totalGlobal - this.#kernelReserved() - this.#muxReserve();
   }
 
   #occupiedBytes() {
@@ -499,7 +553,7 @@ export class Supervisor {
     const total = prev.limits.total;
     try {
       if (prev.child.exitCode == null && prev.child.signalCode == null) {
-        prev.child.kill();
+        this.#signalGroup(prev);
         await waitExit(prev.child);
       }
       // Completed replies already left the pending table. Discarding them
@@ -583,11 +637,12 @@ export class Supervisor {
     this.pending.clear();
     const waits = [];
     for (const rec of this.children.values()) {
-      if (rec.child.exitCode == null && rec.child.signalCode == null) rec.child.kill();
+      if (rec.child.exitCode == null && rec.child.signalCode == null) this.#signalGroup(rec);
       waits.push(waitExit(rec.child));
     }
     this.socket.destroy();
     await Promise.all(waits);
+    for (const rec of this.children.values()) this.#reapGroup(rec);
   }
 
   // Bytes pushed back with stdout.unshift sit in readableLength, not in stash.
@@ -611,6 +666,17 @@ export class Supervisor {
   // B_t while flow control is on. The configured total is the vacuity ceiling.
   #childCeiling(rec) {
     return this.enforceFlow && rec.flowOk ? rec.bT : rec.limits.total;
+  }
+
+  // One mux read is at most C. Returning false stops the handle while the
+  // shared input is paused; resume() starts it again below the low water.
+  #onMuxRead(nread, buf) {
+    if (nread > 0) {
+      if (nread > this.muxReadHigh) this.muxReadHigh = nread;
+      this.#onSocket(buf.subarray(0, nread));
+    }
+    if (this.inputPaused || this.closed || this.framingFault) return false;
+    return true;
   }
 
   #onSocket(chunk) {
@@ -1418,7 +1484,7 @@ export class Supervisor {
     rec.outbound = 0;
     this.#dropStale(rec.credential.pluginId, rec.credential.generation);
     this.#failPending(rec, code);
-    if (rec.child.exitCode == null && rec.child.signalCode == null) rec.child.kill();
+    if (rec.child.exitCode == null && rec.child.signalCode == null) this.#signalGroup(rec);
   }
 
   #onSpawnError(rec, err) {
@@ -1430,12 +1496,29 @@ export class Supervisor {
     rec.deferredBytes = 0;
     this.#dropStale(rec.credential.pluginId, rec.credential.generation);
     this.#failPending(rec, err?.code || 'spawn-error');
-    if (rec.child.exitCode == null && rec.child.signalCode == null) rec.child.kill('SIGKILL');
+    if (rec.child.exitCode == null && rec.child.signalCode == null) this.#signalGroup(rec);
+  }
+
+  // The plugin's pid is its process group. SIGKILL reaches a grandchild that
+  // joined the group. Reap runs after libuv has collected the leader.
+  #signalGroup(rec) {
+    const pid = rec?.child?.pid;
+    if (!Number.isInteger(pid) || pid <= 1 || rec.groupSignaled) return;
+    rec.groupSignaled = true;
+    try { process.kill(-pid, 'SIGKILL'); } catch { /* the group is already empty */ }
+  }
+
+  #reapGroup(rec) {
+    const pid = rec?.child?.pid;
+    if (!Number.isInteger(pid) || pid <= 1) return;
+    reapGroup(pid);
   }
 
   #onExit(rec, code, signal) {
     rec.exitCode = code;
     rec.signal = signal;
+    this.#signalGroup(rec);
+    this.#reapGroup(rec);
     // The process exit event arrives before stdout EOF. Dropping the read
     // socket here discards a response still queued in the kernel. Keep the
     // record accounted, close the writer dup so EOF can arrive, and read
@@ -1797,7 +1880,13 @@ function normalizeEcho(msg) {
 
 export async function connectPair(opts = {}) {
   const ends = await socketPair();
-  const sup = new Supervisor(ends.supervisor, opts);
+  const sup = new Supervisor({
+    fd: ends.supervisorFd,
+    kMuxIn: ends.kMuxIn,
+    kMuxOut: ends.kMuxOut,
+    muxSndbuf: ends.muxSndbuf,
+    muxRcvbuf: ends.muxRcvbuf,
+  }, opts);
   const stub = new KernelStub(ends.kernel, opts.kernel);
   return {
     sup,

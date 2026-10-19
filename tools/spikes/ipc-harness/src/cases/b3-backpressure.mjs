@@ -79,6 +79,10 @@ export async function tripCaps(opts = {}) {
     if (!measured) {
       return { pass: null, outcome: 'invalid', detail: { reason: 'reservation-unavailable' } };
     }
+    const injected = opts.reserve != null;
+    if (!injected && (!Number.isInteger(measured.kMuxIn) || !Number.isInteger(measured.kMuxOut))) {
+      return { pass: null, outcome: 'invalid', detail: { reason: 'reservation-unavailable' } };
+    }
     const verdict = assessFlow({
       partialCap: TRIP_PARTIAL,
       totalCap: TRIP_TOTAL,
@@ -87,6 +91,8 @@ export async function tripCaps(opts = {}) {
       sndbufOut: measured.sndbufOut,
       readBytes: measured.readBytes,
       childCount: 1,
+      muxIn: Number.isInteger(measured.kMuxIn) ? measured.kMuxIn : 0,
+      muxOut: Number.isInteger(measured.kMuxOut) ? measured.kMuxOut : 0,
     });
     if (verdict.outcome !== 'ok') {
       return {

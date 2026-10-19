@@ -323,7 +323,7 @@ test('a drain that never reaches EOF releases on the deadline', async () => {
     caps: {
       partial: 64 * 1024,
       total: reserved.perChild + userspace,
-      totalGlobal: reserved.perChild + userspace,
+      totalGlobal: reserved.perChild + reserved.muxReserve + userspace,
     },
   });
   let held = null;

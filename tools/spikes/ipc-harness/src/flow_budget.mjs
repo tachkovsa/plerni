@@ -77,7 +77,7 @@ export function totalCapHolds(accounted, cap, snapshot = {}) {
 // stdoutUnread > K_in. getsockopt(SO_SNDBUF) on the parent's writer dup tells
 // the two accepted controls apart. A raise is buffer-enlarged. The reserved
 // value left in place is thread-writer. A splice that escapes confinement
-// looks like thread-writer; that confinement is a separate change.
+// looks like thread-writer. The exec wrapper's filter is what rejects splice.
 export const BUFFER_ENLARGED = 'buffer-enlarged';
 export const THREAD_WRITER = 'thread-writer';
 

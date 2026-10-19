@@ -19,14 +19,18 @@ import { entryIsPrivate } from './pipe_pending.mjs';
 import { FLOW_READ_BYTES, writerCeiling } from './flow_budget.mjs';
 
 const require = createRequire(import.meta.url);
-const source = fileURLToPath(new URL('./flow_socket.c', import.meta.url));
+const socketSource = fileURLToPath(new URL('./flow_socket.c', import.meta.url));
+const confineSource = fileURLToPath(new URL('./confine.c', import.meta.url));
 
 let helper = null;
 let failed = false;
 let reserve = null;
 
-export function sourceHash(text = readFileSync(source)) {
-  return createHash('sha256').update(text).digest('hex');
+export function sourceHash(text = null) {
+  const body = text == null
+    ? Buffer.concat([readFileSync(socketSource), Buffer.from('\0'), readFileSync(confineSource)])
+    : text;
+  return createHash('sha256').update(body).digest('hex');
 }
 
 export function headerDir() {
@@ -93,19 +97,10 @@ export function resolveCacheDir(hash = sourceHash()) {
   return null;
 }
 
-function publishBinary(dir, headers) {
+function publishFile(dir, finalName, tmpName, args) {
   const uid = process.getuid();
-  const finalName = join(dir, 'flow_socket.node');
-  const tmpName = join(dir, `.flow_socket.${process.pid}.${randomBytes(8).toString('hex')}.node`);
   try {
-    execFileSync('gcc', [
-      '-shared',
-      '-fPIC',
-      `-I${headers}`,
-      '-o',
-      tmpName,
-      source,
-    ], { stdio: 'ignore' });
+    execFileSync('gcc', args, { stdio: 'ignore' });
     chmodSync(tmpName, 0o700);
     if (!entryIsPrivate(lstatSync(tmpName), uid, 'file')) {
       rmSync(tmpName, { force: true });
@@ -121,6 +116,25 @@ function publishBinary(dir, headers) {
   }
 }
 
+function publishBinary(dir, headers) {
+  const finalName = join(dir, 'flow_socket.node');
+  const tmpName = join(dir, `.flow_socket.${process.pid}.${randomBytes(8).toString('hex')}.node`);
+  return publishFile(dir, finalName, tmpName, [
+    '-shared',
+    '-fPIC',
+    `-I${headers}`,
+    '-o',
+    tmpName,
+    socketSource,
+  ]);
+}
+
+function publishWrapper(dir) {
+  const finalName = join(dir, 'confine');
+  const tmpName = join(dir, `.confine.${process.pid}.${randomBytes(8).toString('hex')}`);
+  return publishFile(dir, finalName, tmpName, ['-O2', '-o', tmpName, confineSource]);
+}
+
 function loadHelper() {
   if (helper) return helper;
   if (failed) return null;
@@ -132,19 +146,30 @@ function loadHelper() {
     return null;
   }
   const binary = join(dir, 'flow_socket.node');
+  const wrapper = join(dir, 'confine');
   try {
     let target = null;
+    let confine = null;
     try {
       if (entryIsPrivate(lstatSync(binary), uid, 'file')) target = binary;
     } catch {
       target = null;
     }
+    try {
+      if (entryIsPrivate(lstatSync(wrapper), uid, 'file')) confine = wrapper;
+    } catch {
+      confine = null;
+    }
     if (!target) target = publishBinary(dir, headers);
-    if (!target || !entryIsPrivate(lstatSync(target), uid, 'file')) {
+    if (!confine) confine = publishWrapper(dir);
+    if (!target || !confine
+        || !entryIsPrivate(lstatSync(target), uid, 'file')
+        || !entryIsPrivate(lstatSync(confine), uid, 'file')) {
       failed = true;
       return null;
     }
     helper = require(target);
+    helper.wrapper = confine;
     return helper;
   } catch {
     failed = true;
@@ -244,10 +269,165 @@ export function setSndbuf(fd, request) {
   }
 }
 
+function positive(value) {
+  return Number.isInteger(value) && value > 0 ? value : null;
+}
+
+function muxRow(row) {
+  const fd = asFd(row?.fd);
+  const snd = positive(row?.sndbuf);
+  const rcv = positive(row?.rcvbuf);
+  if (fd == null || snd == null || rcv == null) {
+    closeFd(fd);
+    return null;
+  }
+  const kOut = writerCeiling(snd);
+  const kIn = writerCeiling(rcv);
+  if (kIn == null || kOut == null) {
+    closeFd(fd);
+    return null;
+  }
+  return { fd, sndbuf: snd, rcvbuf: rcv, kIn, kOut };
+}
+
+// Bound socket, not yet listening. SO_SNDBUF and SO_RCVBUF are already the
+// read-back. The caller listens; an accepted socket inherits these values.
+export function openMuxListener(request = SNDBUF_REQUEST) {
+  const fn = loadHelper();
+  if (!fn || typeof fn.pinListen !== 'function') return null;
+  let raw = null;
+  try {
+    raw = fn.pinListen(request);
+  } catch {
+    return null;
+  }
+  const row = muxRow(raw);
+  if (!row) return null;
+  const port = positive(raw?.port);
+  if (port == null) {
+    closeFd(row.fd);
+    return null;
+  }
+  return { ...row, port };
+}
+
+export function connectMux(port, request = SNDBUF_REQUEST) {
+  const fn = loadHelper();
+  if (!fn || typeof fn.connectPinned !== 'function' || !positive(port)) return null;
+  try {
+    return muxRow(fn.connectPinned(port, request));
+  } catch {
+    return null;
+  }
+}
+
+export function dupFd(fd) {
+  if (!Number.isInteger(fd) || fd < 0) return null;
+  const fn = loadHelper();
+  if (!fn || typeof fn.dupFd !== 'function') return null;
+  try {
+    return asFd(fn.dupFd(fd));
+  } catch {
+    return null;
+  }
+}
+
+export function rcvbuf(fd) {
+  if (!Number.isInteger(fd) || fd < 0) return null;
+  const fn = loadHelper();
+  if (!fn || typeof fn.rcvbuf !== 'function') return null;
+  try {
+    return positive(fn.rcvbuf(fd));
+  } catch {
+    return null;
+  }
+}
+
+export function wrapperPath() {
+  const fn = loadHelper();
+  return typeof fn?.wrapper === 'string' ? fn.wrapper : null;
+}
+
+let subreaperOn = false;
+
+export function ensureSubreaper() {
+  if (subreaperOn) return true;
+  const fn = loadHelper();
+  if (!fn || typeof fn.setSubreaper !== 'function') return false;
+  try {
+    fn.setSubreaper();
+    subreaperOn = true;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function setGroup(pid, pgid) {
+  if (!Number.isInteger(pid) || pid < 0 || !positive(pgid)) return false;
+  const fn = loadHelper();
+  if (!fn || typeof fn.setGroup !== 'function') return false;
+  try {
+    fn.setGroup(pid, pgid);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function processGroup(pid) {
+  if (!Number.isInteger(pid) || pid < 0) return null;
+  const fn = loadHelper();
+  if (!fn || typeof fn.processGroup !== 'function') return null;
+  try {
+    return positive(fn.processGroup(pid));
+  } catch {
+    return null;
+  }
+}
+
+export function reapGroup(pgid) {
+  if (!positive(pgid)) return null;
+  const fn = loadHelper();
+  if (!fn || typeof fn.reapGroup !== 'function') return null;
+  try {
+    const n = fn.reapGroup(pgid);
+    return Number.isInteger(n) && n >= 0 ? n : null;
+  } catch {
+    return null;
+  }
+}
+
+export function spawnSleeper(pgid) {
+  if (!positive(pgid)) return null;
+  const fn = loadHelper();
+  if (!fn || typeof fn.spawnSleeper !== 'function') return null;
+  try {
+    return positive(fn.spawnSleeper(pgid));
+  } catch {
+    return null;
+  }
+}
+
+export function probeConfinement() {
+  const fn = loadHelper();
+  if (!fn || typeof fn.probeConfinement !== 'function') return null;
+  try {
+    return fn.probeConfinement();
+  } catch {
+    return null;
+  }
+}
+
 export function measureFlowReserve() {
   if (reserve) return reserve;
   const ends = createChildEnds();
-  if (!ends) return null;
+  const mux = openMuxListener();
+  if (!ends || !mux) {
+    closeEnds(ends);
+    closeFd(mux?.fd);
+    return null;
+  }
   reserve = {
     sndbufIn: ends.sndbufIn,
     sndbufOut: ends.sndbufOut,
@@ -255,7 +435,13 @@ export function measureFlowReserve() {
     kOut: ends.kOut,
     readBytes: FLOW_READ_BYTES,
     perChild: ends.kIn + ends.kOut + FLOW_READ_BYTES,
+    muxSndbuf: mux.sndbuf,
+    muxRcvbuf: mux.rcvbuf,
+    kMuxIn: mux.kIn,
+    kMuxOut: mux.kOut,
+    muxReserve: mux.kIn + mux.kOut + FLOW_READ_BYTES,
   };
   closeEnds(ends);
+  closeFd(mux.fd);
   return reserve;
 }

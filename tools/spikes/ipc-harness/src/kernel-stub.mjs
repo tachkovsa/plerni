@@ -6,6 +6,7 @@ import net from 'node:net';
 import { performance } from 'node:perf_hooks';
 import { MuxFramer, encodeMux } from './framing.mjs';
 import { cancelExecution } from './authority.mjs';
+import { closeFd, connectMux, dupFd, openMuxListener, SNDBUF_REQUEST } from './flow_socket.mjs';
 
 // Nested maps keep plugin id `1` distinct from `"1"`, and a correlation id that
 // contains NUL distinct from a neighbouring id. A joined string aliases both.
@@ -90,28 +91,72 @@ export class PendingTable {
   }
 }
 
+function unavailable(message) {
+  const err = new Error(message);
+  err.code = 'flow-unavailable';
+  return err;
+}
+
+// SO_SNDBUF and SO_RCVBUF are set and read back before listen and before
+// connect. Those read-backs are K_mux_out and K_mux_in. The supervisor socket
+// is a dup of the accepted fd so its buffers stay the listener's.
 export function socketPair() {
+  const pinned = openMuxListener(SNDBUF_REQUEST);
+  if (!pinned) return Promise.reject(unavailable('mux pin unavailable'));
   return new Promise((resolve, reject) => {
     const server = net.createServer();
+    let settled = false;
     const fail = (err) => {
+      if (settled) return;
+      settled = true;
       server.close();
+      closeFd(pinned.fd);
       reject(err);
     };
     server.once('error', fail);
-    server.listen(0, '127.0.0.1', () => {
-      const { port } = server.address();
-      const kernel = net.connect({ host: '127.0.0.1', port });
-      kernel.once('error', fail);
-      server.once('connection', (supervisor) => {
-        server.close();
-        kernel.removeListener('error', fail);
-        kernel.setNoDelay(true);
-        supervisor.setNoDelay(true);
-        kernel.on('error', () => {});
-        supervisor.on('error', () => {});
-        resolve({ kernel, supervisor });
+    let listening = false;
+    try {
+      server.listen({ fd: pinned.fd }, () => {
+        listening = true;
+        const kernelEnd = connectMux(pinned.port, SNDBUF_REQUEST);
+        if (!kernelEnd) {
+          fail(unavailable('mux connect unavailable'));
+          return;
+        }
+        const kernel = new net.Socket({ fd: kernelEnd.fd, allowHalfOpen: true });
+        kernel.once('error', fail);
+        server.once('connection', (accepted) => {
+          const raw = accepted._handle ? accepted._handle.fd : -1;
+          const supervisorFd = dupFd(raw);
+          accepted.destroy();
+          server.close();
+          if (supervisorFd == null) {
+            kernel.destroy();
+            fail(unavailable('mux dup unavailable'));
+            return;
+          }
+          if (settled) {
+            closeFd(supervisorFd);
+            kernel.destroy();
+            return;
+          }
+          settled = true;
+          kernel.removeListener('error', fail);
+          kernel.setNoDelay(true);
+          kernel.on('error', () => {});
+          resolve({
+            kernel,
+            supervisorFd,
+            kMuxIn: pinned.kIn,
+            kMuxOut: pinned.kOut,
+            muxSndbuf: pinned.sndbuf,
+            muxRcvbuf: pinned.rcvbuf,
+          });
+        });
       });
-    });
+    } catch (err) {
+      if (!listening) fail(err);
+    }
   });
 }
 
