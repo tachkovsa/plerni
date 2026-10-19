@@ -3,8 +3,11 @@
    Sets the process group, drops the ability to gain privileges, installs a
    seccomp filter, then execs the runtime. The filter rejects fork, vfork,
    and clone without CLONE_THREAD, rejects splice, vmsplice, tee, sendfile,
-   and io_uring, and makes clone3 return ENOSYS so glibc falls back to clone.
-   No shell. The supervisor publishes this binary beside the flow helper. */
+   and io_uring, rejects cross-process memory and fd calls, and makes clone3
+   return ENOSYS so glibc falls back to clone. On x86_64 an nr with the x32
+   bit set is rejected before any allow, so nr | __X32_SYSCALL_BIT cannot
+   skip a deny. No shell. The supervisor publishes this binary beside the
+   flow helper. */
 
 #include <errno.h>
 #include <linux/audit.h>
@@ -17,6 +20,9 @@
 
 #if defined(__x86_64__)
 #define CONFINED_ARCH AUDIT_ARCH_X86_64
+#ifndef __X32_SYSCALL_BIT
+#define __X32_SYSCALL_BIT 0x40000000
+#endif
 #elif defined(__aarch64__)
 #define CONFINED_ARCH AUDIT_ARCH_AARCH64
 #else
@@ -41,6 +47,12 @@ static int install_filter(void) {
     BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, CONFINED_ARCH, 1, 0),
     BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
     BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+#ifdef __x86_64__
+    /* The kernel's own miss for an x32 number is ENOSYS. EPERM is the
+       filter, so a probe can tell the two apart when x32 is compiled out. */
+    BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, __X32_SYSCALL_BIT, 0, 1),
+    DENY_ERRNO(EPERM),
+#endif
 #ifdef __NR_fork
     DENY_NR(__NR_fork, EPERM),
 #endif
@@ -70,6 +82,24 @@ static int install_filter(void) {
 #endif
 #ifdef __NR_io_uring_register
     DENY_NR(__NR_io_uring_register, EPERM),
+#endif
+#ifdef __NR_pidfd_open
+    DENY_NR(__NR_pidfd_open, EPERM),
+#endif
+#ifdef __NR_pidfd_getfd
+    DENY_NR(__NR_pidfd_getfd, EPERM),
+#endif
+#ifdef __NR_ptrace
+    DENY_NR(__NR_ptrace, EPERM),
+#endif
+#ifdef __NR_process_vm_readv
+    DENY_NR(__NR_process_vm_readv, EPERM),
+#endif
+#ifdef __NR_process_vm_writev
+    DENY_NR(__NR_process_vm_writev, EPERM),
+#endif
+#ifdef __NR_kcmp
+    DENY_NR(__NR_kcmp, EPERM),
 #endif
 #ifdef __NR_clone
     /* Allow only threads. A new process shares the stdio sockets. */

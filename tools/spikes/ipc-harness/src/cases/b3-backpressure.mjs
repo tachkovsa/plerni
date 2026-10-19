@@ -4,7 +4,7 @@
 import { fileURLToPath } from 'node:url';
 import { connectPair, partialCapHolds, totalCapHolds } from '../supervisor.mjs';
 import { assessFlow } from '../flow_budget.mjs';
-import { measureFlowReserve } from '../flow_socket.mjs';
+import { flowHelperAvailable, measureFlowReserve } from '../flow_socket.mjs';
 import { CONTRACT, RSS_GROWTH_LIMIT, delay, measureSeries, openLoop, preflight, treeRss, waitUntil } from '../measure.mjs';
 
 const floodPath = fileURLToPath(new URL('../children/flood.mjs', import.meta.url));
@@ -71,13 +71,37 @@ function probeOpts(pipeProbe) {
 const TRIP_PARTIAL = 32 * 1024;
 const TRIP_TOTAL = 48 * 1024;
 
+function muxDetail(measured) {
+  if (!measured || !Number.isInteger(measured.kMuxIn) || !Number.isInteger(measured.kMuxOut)) return null;
+  const readBytes = Number.isInteger(measured.readBytes) ? measured.readBytes : 0;
+  return {
+    kMuxIn: measured.kMuxIn,
+    kMuxOut: measured.kMuxOut,
+    muxReserve: Number.isInteger(measured.muxReserve)
+      ? measured.muxReserve
+      : measured.kMuxIn + measured.kMuxOut + readBytes,
+    muxSndbuf: Number.isInteger(measured.muxSndbuf) ? measured.muxSndbuf : null,
+    muxRcvbuf: Number.isInteger(measured.muxRcvbuf) ? measured.muxRcvbuf : null,
+  };
+}
+
+function helperReady(opts) {
+  if (typeof opts.helperAvailable === 'function') return opts.helperAvailable() === true;
+  return flowHelperAvailable();
+}
+
 export async function tripCaps(opts = {}) {
+  if (!helperReady(opts)) {
+    return { pass: null, outcome: 'invalid', detail: { reason: 'reservation-unavailable' } };
+  }
   const detail = {};
   const enforceFlow = opts.enforceFlow !== false;
+  const measured = opts.reserve ?? measureFlowReserve();
+  const mux = muxDetail(measured);
+  if (mux) detail.mux = mux;
   if (enforceFlow && opts.pipeProbe == null) {
-    const measured = opts.reserve ?? measureFlowReserve();
     if (!measured) {
-      return { pass: null, outcome: 'invalid', detail: { reason: 'reservation-unavailable' } };
+      return { pass: null, outcome: 'invalid', detail: { reason: 'reservation-unavailable', mux } };
     }
     const injected = opts.reserve != null;
     if (!injected && (!Number.isInteger(measured.kMuxIn) || !Number.isInteger(measured.kMuxOut))) {
@@ -132,8 +156,11 @@ export async function tripCaps(opts = {}) {
     const rejected = settled.filter((result) => result.code === 'pending-cap').length;
     const admitted = settled.length - rejected;
     detail.pending = { tripped: pendingPair.sup.caps.pending, admitted, rejected };
+    if (pendingPair.sup.flip) {
+      return { pass: false, outcome: 'scored', detail: { ...detail, flip: pendingPair.sup.flip, reason: pendingPair.sup.flip } };
+    }
     if (pendingPair.sup.invalidReason) {
-      return { pass: null, outcome: 'invalid', detail: { reason: pendingPair.sup.invalidReason } };
+      return { pass: null, outcome: 'invalid', detail: { reason: pendingPair.sup.invalidReason, mux: detail.mux ?? null } };
     }
   } finally {
     await pendingPair.close();
@@ -152,8 +179,11 @@ export async function tripCaps(opts = {}) {
         || partialPair.sup.faults.some((fault) => fault.pluginId === 'partial'),
       5_000,
     );
+    if (partialPair.sup.flip) {
+      return { pass: false, outcome: 'scored', detail: { ...detail, flip: partialPair.sup.flip, reason: partialPair.sup.flip } };
+    }
     if (partialPair.sup.invalidReason) {
-      return { pass: null, outcome: 'invalid', detail: { reason: partialPair.sup.invalidReason } };
+      return { pass: null, outcome: 'invalid', detail: { reason: partialPair.sup.invalidReason, mux: detail.mux ?? null } };
     }
     const fault = partialPair.sup.faults.find((row) => row.pluginId === 'partial');
     const pendingBytes = fault?.pendingBytes ?? null;
@@ -219,8 +249,11 @@ export async function tripCaps(opts = {}) {
         || totalPair.sup.faults.some((fault) => fault.pluginId === 'total' && fault.code === 'total-cap'),
       3_000,
     );
+    if (totalPair.sup.flip) {
+      return { pass: false, outcome: 'scored', detail: { ...detail, flip: totalPair.sup.flip, reason: totalPair.sup.flip } };
+    }
     if (totalPair.sup.invalidReason) {
-      return { pass: null, outcome: 'invalid', detail: { reason: totalPair.sup.invalidReason } };
+      return { pass: null, outcome: 'invalid', detail: { reason: totalPair.sup.invalidReason, mux: detail.mux ?? null } };
     }
     const fault = totalPair.sup.faults.find((row) => row.pluginId === 'total' && row.code === 'total-cap');
     const buffered = fault?.bufferedBytes ?? null;
@@ -417,7 +450,7 @@ async function holdRep({ warmupMs, windowMs, readRss }) {
       payload: { who: 'sib' },
     }, 120_000).catch((err) => err);
     const filled = await until(() => {
-      if (pair.sup.invalidReason) return true;
+      if (pair.sup.invalidReason || pair.sup.flip) return true;
       const pending = pair.sup.queueDepth('silent').pending >= PENDING_CAP;
       const partialBytes = pair.sup.faults.some((fault) => fault.pluginId === 'partial' && fault.code === 'partial-cap');
       const byteFault = pair.sup.faults.some((fault) => fault.pluginId === 'bytes' && fault.code === 'total-cap');
@@ -426,6 +459,25 @@ async function holdRep({ warmupMs, windowMs, readRss }) {
       const hi = pair.sup.faults.some((fault) => fault.pluginId === 'forger' && fault.code === 'hi-cap');
       return pending && partialBytes && byteBytes && lo && hi;
     }, FILL_MS);
+    if (pair.sup.flip) {
+      return {
+        flip: pair.sup.flip,
+        growth: null,
+        measurable: false,
+        rss0: null,
+        maxRss: null,
+        arrivals: 0,
+        filled: false,
+        warmedMs: 0,
+        offered: 0,
+        issued: 0,
+        skipped: 0,
+        answered: false,
+        caps: { ...pair.sup.caps },
+        near: { pending: false, partial: false, bytes: false, lo: false },
+        samples: 0,
+      };
+    }
     if (pair.sup.invalidReason) {
       return {
         invalidReason: pair.sup.invalidReason,
@@ -480,7 +532,7 @@ async function holdRep({ warmupMs, windowMs, readRss }) {
     const loop = await openLoop({
       ms: windowMs,
       rate: OFFERED_RATE,
-      stop: () => pair.sup.invalidReason != null,
+      stop: () => pair.sup.invalidReason != null || pair.sup.flip != null,
       tick: () => {
         if (rssLost || pair.sup.invalidReason) return;
         arrivals++;
@@ -552,6 +604,24 @@ async function holdRep({ warmupMs, windowMs, readRss }) {
       siblingCall,
       delay(2_000).then(() => null),
     ]);
+    if (pair.sup.flip) {
+      return {
+        flip: pair.sup.flip,
+        growth: maxRss - rss0,
+        rss0,
+        maxRss,
+        arrivals,
+        filled,
+        warmedMs,
+        offered: loop.offered,
+        issued: loop.issued,
+        skipped: loop.skipped,
+        answered: false,
+        caps: { ...pair.sup.caps },
+        near: { pending: false, partial: false, bytes: false, lo: false },
+        samples: samples.length,
+      };
+    }
     const near = (pred) => samples.length > 0 && samples.filter(pred).length / samples.length >= 0.8;
     return {
       growth: maxRss - rss0,
@@ -636,12 +706,17 @@ export async function b3(opts = {}) {
   if (readRss([process.pid]) == null) {
     return { pass: null, outcome: 'invalid', detail: { reason: 'rss-unreadable', limit: RSS_GROWTH_LIMIT } };
   }
+  if (!helperReady(opts)) {
+    return { pass: null, outcome: 'invalid', detail: { reason: 'reservation-unavailable' } };
+  }
   // Same host, same trip caps. The unenforced run is scored on highWater > P
   // or accounted > T. Numbers that stay inside the caps fail this control.
   // A missing measurement is invalid, not a scored miss.
   let unenforced = null;
   if (opts.unenforced !== undefined || (opts.pipeProbe == null && opts.enforceFlow !== false)) {
-    const trip = opts.unenforced !== undefined ? opts.unenforced : await tripCaps({ enforceFlow: false });
+    const trip = opts.unenforced !== undefined
+      ? opts.unenforced
+      : await tripCaps({ enforceFlow: false, helperAvailable: opts.helperAvailable });
     if (trip?.outcome === 'invalid') {
       return { pass: null, outcome: 'invalid', detail: { reason: 'unenforced-unscored', vacuity: trip.detail } };
     }
@@ -660,7 +735,12 @@ export async function b3(opts = {}) {
       };
     }
   }
-  const tripped = await tripCaps({ pipeProbe: opts.pipeProbe, enforceFlow: opts.enforceFlow });
+  const tripped = await tripCaps({
+    pipeProbe: opts.pipeProbe,
+    enforceFlow: opts.enforceFlow,
+    helperAvailable: opts.helperAvailable,
+    reserve: opts.reserve,
+  });
   if (tripped.outcome === 'invalid') {
     return { pass: null, outcome: 'invalid', detail: { reason: 'pipe-probe-unavailable', caps: tripped.detail, vacuity: unenforced } };
   }
@@ -690,6 +770,14 @@ export async function b3(opts = {}) {
     return { pass: null, outcome: 'invalid', detail: { env: series.env, caps: tripped, holds: series.rows, rerun: series.rerun } };
   }
   const holds = series.rows;
+  const flipped = holds.find((row) => row.flip);
+  if (flipped) {
+    return {
+      pass: false,
+      outcome: 'scored',
+      detail: { reason: flipped.flip, flip: flipped.flip, env: series.env, caps: tripped.detail, holds, mux: tripped.detail?.mux ?? null },
+    };
+  }
   const probeLost = holds.find((row) => row.invalidReason);
   if (probeLost) {
     return {
@@ -711,6 +799,7 @@ export async function b3(opts = {}) {
       caps: tripped.detail,
       unenforcedPass: unenforced ? false : null,
       vacuity: unenforced,
+      mux: tripped.detail?.mux ?? null,
       growth: holds.map((row) => row.growth),
       holds,
       frozen: { warmupMs, windowMs, reps: repsN },

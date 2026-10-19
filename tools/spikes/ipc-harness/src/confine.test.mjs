@@ -6,6 +6,8 @@ import { connectPair } from './supervisor.mjs';
 import { FLOW_READ_BYTES } from './flow_budget.mjs';
 import { encodeMux } from './framing.mjs';
 import {
+  dumpable,
+  fionread,
   measureFlowReserve,
   processGroup,
   reapGroup,
@@ -50,8 +52,29 @@ test('a forbidden syscall is rejected and a process in the plugin group is kille
     assert.equal(got.vfork, constants.errno.EPERM);
     assert.equal(got.clone, constants.errno.EPERM);
     assert.equal(got.splice, constants.errno.EPERM);
+    assert.equal(got.vmsplice, constants.errno.EPERM);
+    assert.equal(got.tee, constants.errno.EPERM);
     assert.equal(got.sendfile, constants.errno.EPERM);
     assert.equal(got.io_uring_setup, constants.errno.EPERM);
+    assert.equal(got.io_uring_enter, constants.errno.EPERM);
+    assert.equal(got.io_uring_register, constants.errno.EPERM);
+    assert.equal(got.cloneThread, 0);
+    assert.equal(got.pidfd_open, constants.errno.EPERM);
+    assert.equal(got.pidfd_getfd, constants.errno.EPERM);
+    assert.equal(got.ptrace, constants.errno.EPERM);
+    assert.equal(got.process_vm_readv, constants.errno.EPERM);
+    assert.equal(got.process_vm_writev, constants.errno.EPERM);
+    assert.equal(got.kcmp, constants.errno.EPERM);
+    if (process.arch === 'x64') {
+      assert.equal(got.x32Fork, constants.errno.EPERM);
+      assert.equal(got.x32Splice, constants.errno.EPERM);
+      assert.notEqual(got.x32Fork, constants.errno.ENOSYS);
+      assert.notEqual(got.x32Splice, constants.errno.ENOSYS);
+    }
+    assert.equal(got.reverse, 'EPIPE');
+    const rec = pair.sup.children.get('probe');
+    assert.equal(fionread(rec.stdinFd), 0);
+    assert.equal(dumpable(), 0);
     sleeper = spawnSleeper(kid.pid);
     assert.equal(typeof sleeper, 'number');
     const joined = await waitUntil(() => processGroup(sleeper) === kid.pid, 2_000);
@@ -127,7 +150,7 @@ test('mux buffers are pinned, reserved, and read in C-byte chunks', async () => 
 
   const pair = await connectPair({
     sweeper: false,
-    caps: { partial: 1024 * 1024, total: 1024 * 1024, totalGlobal: tight },
+    caps: { partial: 1024 * 1024, total: 1024 * 1024, totalGlobal: tight + FLOW_READ_BYTES },
   });
   try {
     const kid = pair.sup.spawn({ pluginId: 'echo', script: echoPath, total: 1024 * 1024 });

@@ -15,7 +15,7 @@ import { MuxFramer, encodeMux, encodeNdjson } from './framing.mjs';
 import { FencedError } from './authority.mjs';
 import { DEFAULT_CAPS, PARTIAL_READ_CHUNK, connectPair, dbConfigured, partialCapHolds, totalCapHolds } from './supervisor.mjs';
 import { entryIsPrivate, resolveCacheDir } from './pipe_pending.mjs';
-import { measureFlowReserve } from './flow_socket.mjs';
+import { fionread, measureFlowReserve } from './flow_socket.mjs';
 import { lstatSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -1207,13 +1207,20 @@ test('an unfinished mux frame pauses the shared input at the global ceiling', as
     prefix.writeUInt32BE(200, 0);
     pair.stub.socket.write(Buffer.concat([prefix, Buffer.alloc(80, 0x61)]));
     await delay(30);
-    const buffered = pair.sup.bufferedBytes();
-    assert.ok(buffered >= 84, String(buffered));
+    // B_g is below C, so the read never starts. The unfinished frame stays in
+    // the kernel reservation and a later write does not enter userspace.
+    assert.equal(pair.sup.bufferedBytes(), 0);
     assert.equal(pair.sup.caps.total, true);
     assert.equal(pair.sup.inputPaused, true);
+    const queued = fionread(pair.sup.muxFd);
+    assert.ok(queued >= 84, String(queued));
+    assert.ok(queued <= pair.sup.kMuxIn, String(queued));
     pair.stub.socket.write(Buffer.alloc(1_000, 0x62));
     await delay(40);
-    assert.equal(pair.sup.bufferedBytes(), buffered);
+    assert.equal(pair.sup.bufferedBytes(), 0);
+    const again = fionread(pair.sup.muxFd);
+    assert.ok(again >= queued, String(again));
+    assert.ok(again <= pair.sup.kMuxIn, String(again));
   } finally {
     await pair.close();
   }
@@ -2096,16 +2103,17 @@ test('a deferred reply stays inside the byte caps', async () => {
     });
     const recA = pair.sup.children.get('a');
     recA.child.kill('SIGSTOP');
-    const pending = [];
+    // Longer than the denied call. Expiry flushes the parked reply and would
+    // reopen the mux read onto the canary bytes.
     for (const id of [1, 2]) {
-      pending.push(pair.stub.call({
+      pair.stub.call({
         pluginId: 'a',
         credential: a.credential,
         correlationId: id,
         port: 'db',
         method: 'get',
         payload: { id },
-      }, 1_000).catch((err) => err));
+      }, 5_000).catch(() => {});
     }
     const armed = await waitUntil(() => pair.sup.pending.size >= 2, 2_000);
     assert.equal(armed, true);
@@ -2153,7 +2161,6 @@ test('a deferred reply stays inside the byte caps', async () => {
     assert.equal(pair.sup.bufferedBytes(), held);
     const settled = await denied;
     assert.equal(settled.code, 'timeout');
-    await Promise.all(pending);
   } finally {
     for (const rec of pair.sup.children.values()) {
       if (rec.child.exitCode == null && rec.child.signalCode == null) rec.child.kill('SIGKILL');

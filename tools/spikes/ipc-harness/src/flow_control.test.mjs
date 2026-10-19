@@ -1,13 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, writeFileSync, writeSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync, writeSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { connectPair } from './supervisor.mjs';
-import { assessFlow, classifyWriterOverrun, PROBE_INTERVAL_MS, OVERRUN_DEADLINE_MS } from './flow_budget.mjs';
-import { measureFlowReserve } from './flow_socket.mjs';
+import { assessFlow, classifyWriterOverrun, FLOW_READ_BYTES, PROBE_INTERVAL_MS, OVERRUN_DEADLINE_MS } from './flow_budget.mjs';
+import { fionread, measureFlowReserve, rcvbuf, siocoutq, sndbuf } from './flow_socket.mjs';
 import { b3, partialSnapshotInvalid, scoreUnenforced, tripCaps } from './cases/b3-backpressure.mjs';
 import { b4 } from './cases/b4-bounds.mjs';
 import { encodeMux, encodeNdjson } from './framing.mjs';
@@ -17,6 +17,15 @@ const enlargePath = fileURLToPath(new URL('./children/enlarge-stdout.mjs', impor
 const echoPath = fileURLToPath(new URL('./children/echo.mjs', import.meta.url));
 const replyExitPath = fileURLToPath(new URL('./children/reply-exit.mjs', import.meta.url));
 const crashPath = fileURLToPath(new URL('./children/crash-mid-call.mjs', import.meta.url));
+const threadPath = fileURLToPath(new URL('./children/thread-writers.mjs', import.meta.url));
+
+function stdoutPending(pair, pluginId, reserved) {
+  return (fd) => {
+    const rec = pair.sup.children.get(pluginId);
+    if (rec && fd === rec.stdoutFd) return reserved.kIn + 1;
+    return fionread(fd);
+  };
+}
 
 function block(ms) {
   const start = Date.now();
@@ -42,6 +51,10 @@ test('same-host vacuity pair: enforcement off fails and enforced passes', { time
   assert.equal(off.pass, false, JSON.stringify(off.detail));
   assert.equal(on.outcome, 'scored', JSON.stringify(on.detail));
   assert.equal(on.pass, true, JSON.stringify(on.detail));
+  assert.equal(on.detail.mux.kMuxIn, on.detail.mux.muxRcvbuf);
+  assert.equal(on.detail.mux.kMuxOut, on.detail.mux.muxSndbuf);
+  assert.ok(on.detail.mux.kMuxIn > 0);
+  assert.equal(on.detail.mux.muxReserve, on.detail.mux.kMuxIn + on.detail.mux.kMuxOut + FLOW_READ_BYTES);
 });
 
 test('the unenforced control fails when enforcement makes no difference', async () => {
@@ -287,6 +300,8 @@ test('a child that writes its reply and exits is delivered', async () => {
     rec.child.on('exit', () => {
       heldOnExit = rec.exitDrain === true
         && rec.dead === false
+        && rec.exited === true
+        && pair.sup.tokenIsLive(kid.token) === false
         && Number.isInteger(rec.stdinProbe)
         && rec.stdoutSocket != null
         && rec.stdoutSocket.destroyed === false;
@@ -371,7 +386,9 @@ test('a drain that never reaches EOF releases on the deadline', async () => {
     assert.equal(released, true);
     assert.ok(elapsed >= drainMs - 20, String(elapsed));
     const settled = await call;
-    assert.equal(settled.code, 'child-exited', JSON.stringify(settled));
+    assert.equal(settled.code, 'drain-timeout', JSON.stringify(settled));
+    assert.equal(pair.sup.flip, 'drain-timeout');
+    assert.equal(pair.sup.faults.some((fault) => fault.code === 'drain-timeout'), true);
     const second = pair.sup.spawn({
       pluginId: 'other',
       script: echoPath,
@@ -413,7 +430,7 @@ test('a null writer SO_SNDBUF on overrun is invalid', async () => {
   assert.ok(reserved);
   const pair = await connectPair({
     sweeper: false,
-    flowPending: () => reserved.kIn + 1,
+    flowPending: (fd) => stdoutPending(pair, 'echo', reserved)(fd),
     readSndbuf: () => null,
     caps: { lo: 1, partial: 1024 * 1024, total: 1024 * 1024, totalGlobal: 8 * 1024 * 1024 },
   });
@@ -434,12 +451,12 @@ test('a null writer SO_SNDBUF on overrun is invalid', async () => {
 test('an overrun at the reserved SO_SNDBUF is thread-writer', async () => {
   const reserved = measureFlowReserve();
   assert.ok(reserved);
-  // Unread is injected above K. The buffer size is the live getsockopt on
-  // the writer dup, which the child has not raised, so the fault is
-  // thread-writer rather than buffer-enlarged.
+  // Unread is injected above K on stdout only. The buffer size is the live
+  // getsockopt on the writer dup, which the child has not raised, so the
+  // fault is thread-writer rather than buffer-enlarged.
   const pair = await connectPair({
     sweeper: false,
-    flowPending: () => reserved.kIn + 1,
+    flowPending: (fd) => stdoutPending(pair, 'echo', reserved)(fd),
     caps: { lo: 1, partial: 1024 * 1024, total: 1024 * 1024, totalGlobal: 8 * 1024 * 1024 },
   });
   try {
@@ -467,7 +484,7 @@ test('an overrun is typed when the child exits before the paused probe', async (
   assert.ok(reserved);
   const pair = await connectPair({
     sweeper: false,
-    flowPending: () => reserved.kIn + 1,
+    flowPending: (fd) => stdoutPending(pair, 'echo', reserved)(fd),
     readSndbuf: () => reserved.sndbufIn + 4096,
     caps: { partial: 1024 * 1024, total: 1024 * 1024, totalGlobal: 8 * 1024 * 1024 },
   });
@@ -544,4 +561,198 @@ test('a reply that does not fit beside charged bytes is rejected and not retaine
     if (rec && rec.child.exitCode == null && rec.child.signalCode == null) rec.child.kill('SIGKILL');
     await pair.close();
   }
+});
+
+test('two child threads are scored from the live queue within 100 ms', { timeout: 15_000 }, async () => {
+  const reserved = measureFlowReserve();
+  assert.ok(reserved);
+  const dir = mkdtempSync(join(tmpdir(), 'plerni-threads-'));
+  const go = join(dir, 'go');
+  const mark = join(dir, 'mark');
+  const pair = await connectPair({
+    sweeper: false,
+    caps: { lo: 1, partial: 1024 * 1024, total: 1024 * 1024, totalGlobal: 8 * 1024 * 1024 },
+  });
+  try {
+    pair.sup.spawn({
+      pluginId: 'threads',
+      script: threadPath,
+      env: { THREAD_GO: go, THREAD_MARK: mark, RESERVED_K: String(reserved.kIn) },
+    });
+    const rec = pair.sup.children.get('threads');
+    rec.paused = true;
+    rec.pauseReason = 'bulk';
+    rec.child.stdout.pause();
+    writeFileSync(go, '1');
+    const lag = block(50);
+    let peak = 0;
+    const sampleUntil = Date.now() + 1_000;
+    while (Date.now() < sampleUntil) {
+      const unread = fionread(rec.stdoutFd) ?? 0;
+      if (unread > peak) peak = unread;
+      if (pair.sup.faults.some((fault) => fault.code === 'thread-writer')) break;
+      if (peak > 0) {
+        try {
+          if (readFileSync(mark, 'utf8').includes('threads')) break;
+        } catch { /* the mark is written when the burst finishes */ }
+      }
+    }
+    const text = readFileSync(mark, 'utf8').trim().split(/\s+/);
+    assert.equal(classifyWriterOverrun(text[0]), 'thread-writer');
+    const marked = Number(text[1]);
+    const written = Number(text[2]);
+    const forkErrno = Number(text[3]);
+    assert.equal(forkErrno, 1);
+    assert.ok(written > 0, String(written));
+    assert.equal(pair.sup.faults.some((row) => row.code === 'buffer-enlarged'), false);
+    const fault = pair.sup.faults.find((row) => row.code === 'thread-writer');
+    if (written > reserved.kIn || peak > reserved.kIn) {
+      assert.ok(fault, JSON.stringify({ peak, written, kIn: reserved.kIn, faults: pair.sup.faults }));
+      const elapsed = Date.now() - marked;
+      assert.ok(elapsed >= 0 && elapsed < OVERRUN_DEADLINE_MS, String(elapsed));
+      assert.ok(PROBE_INTERVAL_MS + lag < OVERRUN_DEADLINE_MS, String(lag));
+      assert.ok(fault.stdoutUnread > fault.kIn, JSON.stringify(fault));
+      assert.equal(fault.kIn, reserved.kIn);
+    } else {
+      assert.equal(fault, undefined, JSON.stringify({ peak, written, kIn: reserved.kIn }));
+      assert.ok(peak <= reserved.kIn, `${peak} > ${reserved.kIn}`);
+      assert.ok(peak > 0, String(peak));
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    await pair.close();
+  }
+});
+
+test('a blocked stdin write stays inside K_out', async () => {
+  const reserved = measureFlowReserve();
+  assert.ok(reserved);
+  const pair = await connectPair({
+    sweeper: false,
+    caps: { partial: 1024 * 1024, total: 1024 * 1024, totalGlobal: 8 * 1024 * 1024 },
+  });
+  try {
+    pair.sup.spawn({ pluginId: 'echo', script: echoPath });
+    const rec = pair.sup.children.get('echo');
+    rec.child.kill('SIGSTOP');
+    await new Promise((resolve, reject) => {
+      rec.child.stdin.write(Buffer.alloc(1024, 0x61), (err) => (err ? reject(err) : resolve()));
+    });
+    const queued = fionread(rec.stdinProbe);
+    assert.ok(Number.isInteger(queued) && queued > 0 && queued <= rec.kOut, String(queued));
+    assert.equal(pair.sup.flip, null);
+    rec.child.kill('SIGKILL');
+  } finally {
+    await pair.close();
+  }
+});
+
+test('stdin queued above K_out is a flip', async () => {
+  const reserved = measureFlowReserve();
+  assert.ok(reserved);
+  const pair = await connectPair({
+    sweeper: false,
+    flowPending: (fd) => {
+      const rec = pair.sup.children.get('echo');
+      if (rec && fd === rec.stdinProbe) return rec.kOut + 1;
+      return fionread(fd);
+    },
+    caps: { partial: 1024 * 1024, total: 1024 * 1024, totalGlobal: 8 * 1024 * 1024 },
+  });
+  try {
+    pair.sup.spawn({ pluginId: 'echo', script: echoPath });
+    const rec = pair.sup.children.get('echo');
+    await new Promise((resolve, reject) => {
+      rec.child.stdin.write(Buffer.from('x'), (err) => (err ? reject(err) : resolve()));
+    });
+    const flipped = await waitUntil(() => pair.sup.flip === 'stdin-overrun', 1_000);
+    assert.equal(flipped, true, JSON.stringify({ flip: pair.sup.flip, faults: pair.sup.faults }));
+    const fault = pair.sup.faults.find((row) => row.code === 'stdin-overrun');
+    assert.ok(fault);
+    assert.ok(fault.stdinQueued > fault.kOut, JSON.stringify(fault));
+  } finally {
+    await pair.close();
+  }
+});
+
+test('a mux read waits for FIONREAD inside K_mux_in and room for C', async () => {
+  const reserved = measureFlowReserve();
+  assert.ok(reserved);
+  const tight = await connectPair({
+    sweeper: false,
+    caps: { partial: 1024 * 1024, total: 1024 * 1024, totalGlobal: reserved.muxReserve },
+  });
+  try {
+    tight.stub.socket.write(Buffer.alloc(64, 0x61));
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    assert.equal(tight.sup.muxReadHigh, 0);
+    const queued = fionread(tight.sup.muxFd);
+    assert.ok(queued > 0, String(queued));
+    assert.equal(tight.sup.flip, null);
+  } finally {
+    await tight.close();
+  }
+  const holder = { block: false };
+  const pair = await connectPair({
+    sweeper: false,
+    muxPending: (fd) => (holder.block ? pair.sup.kMuxIn + 1 : fionread(fd)),
+    caps: { partial: 1024 * 1024, total: 1024 * 1024, totalGlobal: 8 * 1024 * 1024 },
+  });
+  try {
+    holder.block = true;
+    pair.sup.socket.pause();
+    pair.sup.muxReadPosted = false;
+    const flipped = await waitUntil(() => pair.sup.flip === 'mux-unread', 1_000);
+    assert.equal(flipped, true, pair.sup.flip);
+    assert.equal(pair.sup.muxReadPosted, false);
+  } finally {
+    await pair.close();
+  }
+});
+
+test('mux open-loop queues stay inside the read-back buffers', async () => {
+  const pair = await connectPair({
+    sweeper: false,
+    caps: { partial: 1024 * 1024, total: 1024 * 1024, totalGlobal: 8 * 1024 * 1024 },
+  });
+  try {
+    const sup = pair.sup;
+    assert.equal(sup.kMuxIn, sup.muxRcvbuf);
+    assert.equal(sup.kMuxOut, sup.muxSndbuf);
+    sup.socket.pause();
+    sup.muxReadPosted = false;
+    pair.stub.socket.pause();
+    const chunk = Buffer.alloc(16 * 1024, 0x6d);
+    let unread = 0;
+    for (let i = 0; i < 64; i++) {
+      const ok = pair.stub.socket.write(chunk);
+      unread = fionread(sup.muxFd) ?? 0;
+      if (!ok || unread >= sup.kMuxIn) break;
+    }
+    assert.ok(unread > 0, String(unread));
+    assert.ok(unread <= sup.kMuxIn, `${unread} > ${sup.kMuxIn}`);
+    let outq = 0;
+    for (let i = 0; i < 64; i++) {
+      const ok = sup.socket.write(chunk);
+      outq = siocoutq(sup.muxFd) ?? 0;
+      if (!ok || outq >= sup.kMuxOut) break;
+    }
+    assert.ok(outq > 0, String(outq));
+    assert.ok(outq <= sup.kMuxOut, `${outq} > ${sup.kMuxOut}`);
+    assert.ok(sndbuf(sup.muxFd) <= sup.muxSndbuf);
+    assert.ok(rcvbuf(sup.muxFd) <= sup.muxRcvbuf);
+    assert.ok(sup.muxReadHigh <= FLOW_READ_BYTES);
+    const sum = sup.bufferedBytes() + (fionread(sup.muxFd) ?? 0) + (siocoutq(sup.muxFd) ?? 0);
+    assert.ok(sum <= sup.capsConfig.totalGlobal, String(sum));
+    assert.equal(sup.flip, null);
+  } finally {
+    await pair.close();
+  }
+});
+
+test('unenforced b3 classifies a missing helper as invalid', async () => {
+  const result = await b3({ hold: false, helperAvailable: () => false });
+  assert.equal(result.pass, null);
+  assert.equal(result.outcome, 'invalid');
+  assert.equal(result.detail.reason, 'reservation-unavailable');
 });

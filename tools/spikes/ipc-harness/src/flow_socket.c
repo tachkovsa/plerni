@@ -4,16 +4,25 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <linux/seccomp.h>
+#include <linux/sockios.h>
 #include <node_api.h>
+#include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
+
+#ifndef __X32_SYSCALL_BIT
+#define __X32_SYSCALL_BIT 0x40000000
+#endif
 
 /* Child stdio ends for the flow-control reservation.
    socketpair, SO_SNDBUF on each writer, a dup of the stdin read end for
@@ -129,7 +138,7 @@ static napi_value Create(napi_env env, napi_callback_info info) {
   return obj;
 }
 
-static napi_value Pending(napi_env env, napi_callback_info info) {
+static napi_value ioctl_count(napi_env env, napi_callback_info info, unsigned long req) {
   size_t argc = 1;
   napi_value argv[1];
   napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
@@ -138,14 +147,24 @@ static napi_value Pending(napi_env env, napi_callback_info info) {
     napi_throw_type_error(env, NULL, "fd");
     return NULL;
   }
-  int unread = 0;
-  if (ioctl(fd, FIONREAD, &unread) != 0 || unread < 0) {
+  int count = 0;
+  if (ioctl(fd, req, &count) != 0 || count < 0) {
     napi_throw_error(env, NULL, "ioctl");
     return NULL;
   }
   napi_value out;
-  if (napi_create_int32(env, unread, &out) != napi_ok) return NULL;
+  if (napi_create_int32(env, count, &out) != napi_ok) return NULL;
   return out;
+}
+
+static napi_value Pending(napi_env env, napi_callback_info info) {
+  return ioctl_count(env, info, FIONREAD);
+}
+
+/* TCP SIOCOUTQ is unacknowledged data bytes. Unix SIOCOUTQ is truesize and
+   is not a child-stdio term; the mux socket is the TCP caller. */
+static napi_value Outq(napi_env env, napi_callback_info info) {
+  return ioctl_count(env, info, SIOCOUTQ);
 }
 
 static napi_value SetSndbuf(napi_env env, napi_callback_info info) {
@@ -446,6 +465,25 @@ static int call_errno(long nr, long a0, long a1) {
   return 0;
 }
 
+static void *thread_ok(void *arg) {
+  (void)arg;
+  return NULL;
+}
+
+/* Positive control: CLONE_THREAD must still succeed under the filter.
+   glibc uses clone3 and falls back when the filter returns ENOSYS. */
+static int clone_thread_errno(void) {
+  pthread_t thread;
+  int rc = pthread_create(&thread, NULL, thread_ok, NULL);
+  if (rc != 0) return rc;
+  if (pthread_join(thread, NULL) != 0) return EAGAIN;
+  return 0;
+}
+
+static int prop_call(napi_env env, napi_value obj, const char *name, long nr, long a0, long a1) {
+  return int_prop(env, obj, name, call_errno(nr, a0, a1)) != NULL;
+}
+
 static napi_value ProbeConfinement(napi_env env, napi_callback_info info) {
   (void)info;
   int nnp = prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0);
@@ -457,31 +495,203 @@ static napi_value ProbeConfinement(napi_env env, napi_callback_info info) {
   napi_value obj;
   if (napi_create_object(env, &obj) != napi_ok) return NULL;
   if (!int_prop(env, obj, "confined", 1)) return NULL;
+  if (!int_prop(env, obj, "cloneThread", clone_thread_errno())) return NULL;
 #ifdef __NR_fork
-  if (!int_prop(env, obj, "fork", call_errno(__NR_fork, 0, 0))) return NULL;
+  if (!prop_call(env, obj, "fork", __NR_fork, 0, 0)) return NULL;
 #endif
 #ifdef __NR_vfork
-  if (!int_prop(env, obj, "vfork", call_errno(__NR_vfork, 0, 0))) return NULL;
+  if (!prop_call(env, obj, "vfork", __NR_vfork, 0, 0)) return NULL;
 #endif
 #ifdef __NR_clone
-  if (!int_prop(env, obj, "clone", call_errno(__NR_clone, 0, 0))) return NULL;
+  if (!prop_call(env, obj, "clone", __NR_clone, 0, 0)) return NULL;
 #endif
 #ifdef __NR_clone3
   struct clone_args_min args;
   memset(&args, 0, sizeof(args));
   args.exit_signal = SIGCHLD;
-  if (!int_prop(env, obj, "clone3", call_errno(__NR_clone3, (long)&args, (long)sizeof(args)))) return NULL;
+  if (!prop_call(env, obj, "clone3", __NR_clone3, (long)&args, (long)sizeof(args))) return NULL;
 #endif
 #ifdef __NR_splice
-  if (!int_prop(env, obj, "splice", call_errno(__NR_splice, -1, -1))) return NULL;
+  if (!prop_call(env, obj, "splice", __NR_splice, -1, -1)) return NULL;
+#endif
+#ifdef __NR_vmsplice
+  if (!prop_call(env, obj, "vmsplice", __NR_vmsplice, -1, 0)) return NULL;
+#endif
+#ifdef __NR_tee
+  if (!prop_call(env, obj, "tee", __NR_tee, -1, -1)) return NULL;
 #endif
 #ifdef __NR_sendfile
-  if (!int_prop(env, obj, "sendfile", call_errno(__NR_sendfile, -1, -1))) return NULL;
+  if (!prop_call(env, obj, "sendfile", __NR_sendfile, -1, -1)) return NULL;
 #endif
 #ifdef __NR_io_uring_setup
-  if (!int_prop(env, obj, "io_uring_setup", call_errno(__NR_io_uring_setup, 1, 0))) return NULL;
+  if (!prop_call(env, obj, "io_uring_setup", __NR_io_uring_setup, 1, 0)) return NULL;
+#endif
+#ifdef __NR_io_uring_enter
+  /* IORING_OP_SPLICE is submitted through io_uring_enter. The filter rejects
+     the enter, so the opcode never reaches the kernel. */
+  if (!prop_call(env, obj, "io_uring_enter", __NR_io_uring_enter, -1, 0)) return NULL;
+#endif
+#ifdef __NR_io_uring_register
+  if (!prop_call(env, obj, "io_uring_register", __NR_io_uring_register, -1, 0)) return NULL;
+#endif
+#ifdef __NR_pidfd_open
+  if (!prop_call(env, obj, "pidfd_open", __NR_pidfd_open, -1, 0)) return NULL;
+#endif
+#ifdef __NR_pidfd_getfd
+  if (!prop_call(env, obj, "pidfd_getfd", __NR_pidfd_getfd, -1, 0)) return NULL;
+#endif
+#ifdef __NR_ptrace
+  if (!prop_call(env, obj, "ptrace", __NR_ptrace, 16, -1)) return NULL;
+#endif
+#ifdef __NR_process_vm_readv
+  if (!prop_call(env, obj, "process_vm_readv", __NR_process_vm_readv, -1, 0)) return NULL;
+#endif
+#ifdef __NR_process_vm_writev
+  if (!prop_call(env, obj, "process_vm_writev", __NR_process_vm_writev, -1, 0)) return NULL;
+#endif
+#ifdef __NR_kcmp
+  if (!prop_call(env, obj, "kcmp", __NR_kcmp, -1, -1)) return NULL;
+#endif
+#ifdef __x86_64__
+  /* Same numbers with the x32 bit. EPERM is the filter; ENOSYS would be the
+     kernel rejecting an x32 ABI it was built without. */
+  if (!prop_call(env, obj, "x32Fork", __NR_fork | __X32_SYSCALL_BIT, 0, 0)) return NULL;
+  if (!prop_call(env, obj, "x32Splice", __NR_splice | __X32_SYSCALL_BIT, -1, -1)) return NULL;
 #endif
   return obj;
+}
+
+struct burst_state {
+  int fd;
+  int ceiling;
+  int fork_errno;
+  char path[4096];
+  atomic_int written;
+  atomic_int crossed;
+  int64_t crossed_ms;
+};
+
+static int64_t wall_ms(void) {
+  struct timespec ts;
+  if (clock_gettime(CLOCK_REALTIME, &ts) != 0) return 0;
+  return (int64_t)ts.tv_sec * 1000 + (int64_t)ts.tv_nsec / 1000000;
+}
+
+static void write_mark(struct burst_state *state, int written, int64_t ms) {
+  char line[160];
+  int n = snprintf(line, sizeof(line), "threads %lld %d %d\n",
+    (long long)ms, written, state->fork_errno);
+  if (n <= 0 || n >= (int)sizeof(line)) return;
+  int out = open(state->path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+  if (out < 0) return;
+  ssize_t put = write(out, line, (size_t)n);
+  (void)put;
+  close(out);
+}
+
+static void *burst_worker(void *arg) {
+  struct burst_state *state = arg;
+  char buf[8192];
+  memset(buf, 'T', sizeof(buf));
+  for (;;) {
+    ssize_t n = send(state->fd, buf, sizeof(buf), MSG_DONTWAIT);
+    if (n <= 0) break;
+    int total = atomic_fetch_add(&state->written, (int)n) + (int)n;
+    if (total > state->ceiling) {
+      int expected = 0;
+      if (atomic_compare_exchange_strong(&state->crossed, &expected, 1)) {
+        int64_t ms = wall_ms();
+        state->crossed_ms = ms;
+        write_mark(state, total, ms);
+      }
+    }
+  }
+  return NULL;
+}
+
+/* Two pthreads write one stdout fd. The mark is written on the crossing,
+   before either thread returns, so a later SIGKILL still leaves the clock. */
+static napi_value BurstWriters(napi_env env, napi_callback_info info) {
+  size_t argc = 3;
+  napi_value argv[3];
+  napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
+  int32_t fd = -1;
+  int32_t ceiling = 0;
+  if (argc < 3
+      || napi_get_value_int32(env, argv[0], &fd) != napi_ok
+      || napi_get_value_int32(env, argv[1], &ceiling) != napi_ok
+      || fd < 0
+      || ceiling <= 0) {
+    napi_throw_type_error(env, NULL, "burst");
+    return NULL;
+  }
+  struct burst_state state;
+  memset(&state, 0, sizeof(state));
+  state.fd = fd;
+  state.ceiling = ceiling;
+  state.fork_errno = -1;
+  size_t path_len = 0;
+  if (napi_get_value_string_utf8(env, argv[2], state.path, sizeof(state.path), &path_len) != napi_ok
+      || path_len == 0) {
+    napi_throw_type_error(env, NULL, "mark");
+    return NULL;
+  }
+  int nnp = prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0);
+  int mode = prctl(PR_GET_SECCOMP, 0, 0, 0, 0);
+  if (nnp == 1 && mode == SECCOMP_MODE_FILTER) {
+#ifdef __NR_fork
+    state.fork_errno = call_errno(__NR_fork, 0, 0);
+#endif
+  }
+  atomic_init(&state.written, 0);
+  atomic_init(&state.crossed, 0);
+  pthread_t first;
+  pthread_t second;
+  if (pthread_create(&first, NULL, burst_worker, &state) != 0) {
+    napi_throw_error(env, NULL, "thread");
+    return NULL;
+  }
+  if (pthread_create(&second, NULL, burst_worker, &state) != 0) {
+    pthread_join(first, NULL);
+    napi_throw_error(env, NULL, "thread");
+    return NULL;
+  }
+  pthread_join(first, NULL);
+  pthread_join(second, NULL);
+  napi_value obj;
+  if (napi_create_object(env, &obj) != napi_ok) return NULL;
+  int written = atomic_load(&state.written);
+  int crossed = atomic_load(&state.crossed);
+  if (!int_prop(env, obj, "written", written)) return NULL;
+  if (!int_prop(env, obj, "crossed", crossed)) return NULL;
+  if (!int_prop(env, obj, "fork", state.fork_errno)) return NULL;
+  napi_value at;
+  if (napi_create_double(env, (double)state.crossed_ms, &at) != napi_ok) return NULL;
+  if (napi_set_named_property(env, obj, "crossedAt", at) != napi_ok) return NULL;
+  return obj;
+}
+
+static napi_value SetDumpable(napi_env env, napi_callback_info info) {
+  (void)info;
+  if (prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) != 0) {
+    napi_throw_error(env, NULL, "dumpable");
+    return NULL;
+  }
+  napi_value undef;
+  if (napi_get_undefined(env, &undef) != napi_ok) return NULL;
+  return undef;
+}
+
+static napi_value GetDumpable(napi_env env, napi_callback_info info) {
+  (void)info;
+  int value = prctl(PR_GET_DUMPABLE, 0, 0, 0, 0);
+  if (value < 0) {
+    napi_throw_error(env, NULL, "dumpable");
+    return NULL;
+  }
+  napi_value out;
+  if (napi_create_int32(env, value, &out) != napi_ok) return NULL;
+  return out;
 }
 
 static void export_fn(napi_env env, napi_value exports, const char *name, napi_callback cb) {
@@ -493,6 +703,7 @@ static void export_fn(napi_env env, napi_value exports, const char *name, napi_c
 NAPI_MODULE_INIT() {
   export_fn(env, exports, "create", Create);
   export_fn(env, exports, "pending", Pending);
+  export_fn(env, exports, "outq", Outq);
   export_fn(env, exports, "setSndbuf", SetSndbuf);
   export_fn(env, exports, "sndbuf", GetSndbuf);
   export_fn(env, exports, "rcvbuf", GetRcvbuf);
@@ -500,10 +711,13 @@ NAPI_MODULE_INIT() {
   export_fn(env, exports, "connectPinned", ConnectPinned);
   export_fn(env, exports, "dupFd", DupFd);
   export_fn(env, exports, "setSubreaper", SetSubreaper);
+  export_fn(env, exports, "setDumpable", SetDumpable);
+  export_fn(env, exports, "dumpable", GetDumpable);
   export_fn(env, exports, "setGroup", SetGroup);
   export_fn(env, exports, "processGroup", ProcessGroup);
   export_fn(env, exports, "reapGroup", ReapGroup);
   export_fn(env, exports, "spawnSleeper", SpawnSleeper);
   export_fn(env, exports, "probeConfinement", ProbeConfinement);
+  export_fn(env, exports, "burstWriters", BurstWriters);
   return exports;
 }

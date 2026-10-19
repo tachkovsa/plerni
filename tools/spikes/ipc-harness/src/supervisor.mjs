@@ -25,7 +25,9 @@ import {
   createChildEnds,
   ensureSubreaper,
   fionread,
+  rcvbuf,
   reapGroup,
+  siocoutq,
   sndbuf,
   wrapperPath,
 } from './flow_socket.mjs';
@@ -189,11 +191,17 @@ export class Supervisor {
     this.socket.setNoDelay(true);
     this.pipeProbe = typeof opts.pipeProbe === 'function' ? opts.pipeProbe : pipePending;
     this.flowPending = typeof opts.flowPending === 'function' ? opts.flowPending : fionread;
+    this.muxPending = typeof opts.muxPending === 'function' ? opts.muxPending : fionread;
+    this.muxOutq = typeof opts.muxOutq === 'function' ? opts.muxOutq : siocoutq;
     this.readSndbuf = typeof opts.readSndbuf === 'function' ? opts.readSndbuf : sndbuf;
+    this.readRcvbuf = typeof opts.readRcvbuf === 'function' ? opts.readRcvbuf : rcvbuf;
+    this.readMuxSndbuf = typeof opts.readMuxSndbuf === 'function' ? opts.readMuxSndbuf : sndbuf;
+    this.readMuxRcvbuf = typeof opts.readMuxRcvbuf === 'function' ? opts.readMuxRcvbuf : rcvbuf;
     this.exitDrainMs = Number.isInteger(opts.exitDrainMs) && opts.exitDrainMs >= 0
       ? opts.exitDrainMs
       : EXIT_DRAIN_MS;
     this.invalidReason = null;
+    this.flip = null;
     this.useDirect = opts.useDirect ?? useDirectFromEnv();
     this.capsConfig = { ...DEFAULT_CAPS, ...opts.caps };
     if (opts.caps?.pending != null && opts.caps.pendingGlobal == null) {
@@ -242,7 +250,11 @@ export class Supervisor {
     const sweep = opts.sweeper ?? false;
     this.stopSweeper = sweep ? startSweeper(this.useDirect) : () => {};
     this.socket.on('error', () => {});
-    this.socket.resume();
+    this.muxReadPosted = false;
+    this.muxProbeTimer = null;
+    this.socket.pause();
+    this.#armMuxProbe();
+    setImmediate(() => this.#considerMuxRead());
   }
 
   spawn(spec) {
@@ -312,6 +324,7 @@ export class Supervisor {
       deferred: [],
       deferredBytes: 0,
       dead: false,
+      exited: false,
       paused: false,
       pauseReason: null,
       exitCode: null,
@@ -321,6 +334,8 @@ export class Supervisor {
       kIn: flow?.kIn ?? null,
       kOut: flow?.kOut ?? null,
       sndbufIn: flow?.sndbufIn ?? null,
+      sndbufOut: flow?.sndbufOut ?? null,
+      stdinFd: flow?.parentStdin ?? null,
       bP: flow?.bP ?? null,
       bT: flow?.bT ?? null,
       flowOk: Boolean(flow),
@@ -414,6 +429,10 @@ export class Supervisor {
       if (Number.isInteger(unread)) total += unread;
       if (Number.isInteger(queued)) total += queued;
     }
+    const muxUnread = this.#muxCount(this.muxPending);
+    const muxSendQueued = this.#muxCount(this.muxOutq);
+    if (Number.isInteger(muxUnread)) total += muxUnread;
+    if (Number.isInteger(muxSendQueued)) total += muxSendQueued;
     return total;
   }
 
@@ -577,18 +596,22 @@ export class Supervisor {
 
   #tokenLive(token) {
     for (const rec of this.children.values()) {
-      if (rec.token === token && !rec.dead) return true;
+      if (rec.token === token && !rec.dead && !rec.exited) return true;
     }
     return false;
   }
 
+  tokenIsLive(token) {
+    return this.#tokenLive(token);
+  }
+
   // Refuses a token the crashed child held, and a token that is not the live spawn token.
+  // The credential stops being live at the exit event, including while stdout is still draining.
   async commitIfLive(id, token, effects) {
     if (this.retiredTokens.has(token)) {
       throw new FencedError(`retired fencing token for id=${id}`);
     }
-    const live = [...this.children.values()].some((rec) => rec.token === token && !rec.dead);
-    if (!live) throw new FencedError(`token is not a live spawn credential for id=${id}`);
+    if (!this.#tokenLive(token)) throw new FencedError(`token is not a live spawn credential for id=${id}`);
     return commitExecution(id, token, effects, this.useDirect);
   }
 
@@ -631,6 +654,7 @@ export class Supervisor {
 
   async close() {
     this.closed = true;
+    this.#clearMuxProbe();
     this.stopSweeper();
     for (const rec of this.children.values()) this.#releaseFlow(rec);
     for (const pending of this.pending.values()) clearTimeout(pending.timer);
@@ -668,15 +692,95 @@ export class Supervisor {
     return this.enforceFlow && rec.flowOk ? rec.bT : rec.limits.total;
   }
 
-  // One mux read is at most C. Returning false stops the handle while the
-  // shared input is paused; resume() starts it again below the low water.
+  // One mux read is at most C. A read is posted only when muxUnread is inside
+  // K_mux_in and the userspace sum has room for C. Returning false stops the
+  // handle; the probe starts it again when the gate opens.
   #onMuxRead(nread, buf) {
-    if (nread > 0) {
+    this.muxReadPosted = false;
+    if (typeof nread === 'number' && nread > 0) {
+      if (nread > this.readBytes) this.#flipMux('mux-read');
       if (nread > this.muxReadHigh) this.muxReadHigh = nread;
       this.#onSocket(buf.subarray(0, nread));
     }
-    if (this.inputPaused || this.closed || this.framingFault) return false;
+    if (this.flip || this.invalidReason || !this.#muxReadPermitted()) return false;
+    this.muxReadPosted = true;
     return true;
+  }
+
+  #muxCount(probe) {
+    if (typeof probe !== 'function' || !Number.isInteger(this.muxFd)) return null;
+    try {
+      const count = probe(this.muxFd);
+      return Number.isInteger(count) && count >= 0 ? count : null;
+    } catch {
+      return null;
+    }
+  }
+
+  #flipMux(reason) {
+    if (!this.flip) this.flip = reason;
+  }
+
+  #muxReadPermitted() {
+    if (this.inputPaused || this.closed || this.framingFault || this.flip || this.invalidReason) return false;
+    const unread = this.#muxCount(this.muxPending);
+    if (unread == null) {
+      this.#invalidate('fionread-unavailable');
+      return false;
+    }
+    if (unread > this.kMuxIn) {
+      this.#flipMux('mux-unread');
+      return false;
+    }
+    const queued = this.#muxCount(this.muxOutq);
+    if (queued == null) {
+      this.#invalidate('siocoutq-unavailable');
+      return false;
+    }
+    if (queued > this.kMuxOut) {
+      this.#flipMux('mux-send');
+      return false;
+    }
+    const liveRcv = this.readMuxRcvbuf(this.muxFd);
+    const liveSnd = this.readMuxSndbuf(this.muxFd);
+    if (!Number.isInteger(liveRcv) || liveRcv <= 0 || !Number.isInteger(liveSnd) || liveSnd <= 0) {
+      this.#invalidate('mux-buf-unavailable');
+      return false;
+    }
+    if (liveRcv > this.muxRcvbuf || liveSnd > this.muxSndbuf) {
+      this.#flipMux('mux-buffer');
+      return false;
+    }
+    if (this.bufferedBytes() + this.readBytes > this.#globalCap()) {
+      this.#pauseInput();
+      return false;
+    }
+    return true;
+  }
+
+  #considerMuxRead() {
+    if (this.muxReadPosted || this.closed || this.framingFault || this.flip) return;
+    if (!this.#muxReadPermitted()) return;
+    this.muxReadPosted = true;
+    this.socket.resume();
+  }
+
+  #armMuxProbe() {
+    if (this.muxProbeTimer) return;
+    this.muxProbeTimer = setInterval(() => {
+      if (this.closed || this.flip || this.invalidReason) {
+        this.#clearMuxProbe();
+        return;
+      }
+      if (this.muxReadPosted) return;
+      this.#considerMuxRead();
+    }, PROBE_INTERVAL_MS);
+  }
+
+  #clearMuxProbe() {
+    if (!this.muxProbeTimer) return;
+    clearInterval(this.muxProbeTimer);
+    this.muxProbeTimer = null;
   }
 
   #onSocket(chunk) {
@@ -764,6 +868,7 @@ export class Supervisor {
   #releaseOutbound(rec, bytes) {
     if (rec.dead) return;
     rec.outbound = Math.max(0, rec.outbound - bytes);
+    this.#noteStdinCeiling(rec);
     this.#maybeResumeAll();
   }
 
@@ -1106,20 +1211,45 @@ export class Supervisor {
 
   #stdinQueued(rec) {
     if (!Number.isInteger(rec.stdinProbe)) return null;
+    let queued = null;
     try {
-      return this.flowPending(rec.stdinProbe);
+      queued = this.flowPending(rec.stdinProbe);
     } catch {
+      queued = null;
+    }
+    if ((!Number.isInteger(queued) || queued < 0) && rec.flowOk && !rec.dead && !this.closed) {
+      this.#invalidate('fionread-unavailable');
       return null;
     }
+    return queued;
+  }
+
+  // stdinQueued > K_out from a parent that did not raise SO_SNDBUF is a flip.
+  // The measured queue is not adopted as a new K_out.
+  #noteStdinCeiling(rec) {
+    if (!this.enforceFlow || !rec.flowOk || rec.dead || this.invalidReason || this.flip) return false;
+    const queued = this.#stdinQueued(rec);
+    if (this.invalidReason) return true;
+    if (!Number.isInteger(queued) || queued <= rec.kOut) return false;
+    const now = this.readSndbuf(rec.stdinFd);
+    if (!Number.isInteger(now) || now <= 0) {
+      this.#invalidate('sndbuf-unavailable');
+      return true;
+    }
+    if (now > rec.sndbufOut) return false;
+    this.flip = 'stdin-overrun';
+    this.#fault(rec, 'stdin-overrun');
+    return true;
   }
 
   #armProbe(rec) {
     if (!this.enforceFlow || !rec.flowOk || rec.probeTimer || rec.dead) return;
     rec.probeTimer = setInterval(() => {
-      if (rec.dead || this.invalidReason) {
+      if (rec.dead || this.invalidReason || this.flip) {
         this.#disarmProbe(rec);
         return;
       }
+      this.#noteStdinCeiling(rec);
       // A paused socket emits no read. The timer is the probe that still runs.
       if (!rec.paused) return;
       this.#noteOverrun(rec);
@@ -1160,6 +1290,7 @@ export class Supervisor {
     if (this.inputPaused || this.closed || this.framingFault) return;
     this.inputPaused = true;
     this.caps.total = true;
+    this.muxReadPosted = false;
     this.socket.pause();
   }
 
@@ -1167,7 +1298,7 @@ export class Supervisor {
     if (!this.inputPaused || this.closed || this.framingFault) return;
     if (this.bufferedBytes() > this.#globalCap() / 2) return;
     this.inputPaused = false;
-    this.socket.resume();
+    this.#considerMuxRead();
   }
 
   #pause(rec, reason) {
@@ -1209,6 +1340,7 @@ export class Supervisor {
   // Resume does not wait for another stdout 'data' event. A paused stream emits none.
   #maybeResumeAll() {
     this.#resumeInput();
+    this.#considerMuxRead();
     const buffered = this.bufferedBytes();
     const globalLow = buffered <= this.#globalCap() / 2;
     const globalOpen = buffered <= this.#globalCap();
@@ -1517,6 +1649,7 @@ export class Supervisor {
   #onExit(rec, code, signal) {
     rec.exitCode = code;
     rec.signal = signal;
+    rec.exited = true;
     this.#signalGroup(rec);
     this.#reapGroup(rec);
     // The process exit event arrives before stdout EOF. Dropping the read
@@ -1549,11 +1682,11 @@ export class Supervisor {
       closeFd(rec.stdoutWriter);
       rec.stdoutWriter = null;
     }
-    const done = () => this.#finishExit(rec);
-    rec.stdoutSocket.once('end', done);
-    rec.stdoutSocket.once('close', done);
-    rec.stdoutSocket.once('error', done);
-    rec.exitDrainTimer = setTimeout(done, this.exitDrainMs);
+    const done = (why) => this.#finishExit(rec, why);
+    rec.stdoutSocket.once('end', () => done('eof'));
+    rec.stdoutSocket.once('close', () => done('eof'));
+    rec.stdoutSocket.once('error', () => done('eof'));
+    rec.exitDrainTimer = setTimeout(() => done('timeout'), this.exitDrainMs);
     rec.paused = false;
     rec.pauseReason = null;
     rec.readPosted = false;
@@ -1564,17 +1697,22 @@ export class Supervisor {
     this.#considerRead(rec);
   }
 
-  #finishExit(rec) {
+  #finishExit(rec, why = 'eof') {
     if (rec.exitFinished) return;
     rec.exitFinished = true;
     this.#clearDrainTimer(rec);
+    if (why === 'timeout') {
+      rec.drainTimeout = true;
+      if (!this.flip) this.flip = 'drain-timeout';
+      if (!rec.dead) this.#pushFault(rec, 'drain-timeout');
+    }
     this.#releaseFlow(rec);
     if (rec.dead) return;
     rec.dead = true;
     rec.deferred = [];
     rec.deferredBytes = 0;
     this.#dropStale(rec.credential.pluginId, rec.credential.generation);
-    this.#failPending(rec, 'child-exited');
+    this.#failPending(rec, why === 'timeout' ? 'drain-timeout' : 'child-exited');
   }
 
   #failPending(rec, code) {

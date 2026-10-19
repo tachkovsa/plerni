@@ -122,6 +122,7 @@ function publishBinary(dir, headers) {
   return publishFile(dir, finalName, tmpName, [
     '-shared',
     '-fPIC',
+    '-pthread',
     `-I${headers}`,
     '-o',
     tmpName,
@@ -230,17 +231,25 @@ export function createChildEnds(request = SNDBUF_REQUEST) {
   return { ...ends, kIn, kOut, readBytes: FLOW_READ_BYTES };
 }
 
-export function fionread(fd) {
+function ioctlCount(fd, method) {
   if (!Number.isInteger(fd) || fd < 0) return null;
   const fn = loadHelper();
-  if (!fn || typeof fn.pending !== 'function') return null;
+  if (!fn || typeof fn[method] !== 'function') return null;
   try {
-    const unread = fn.pending(fd);
-    if (!Number.isInteger(unread) || unread < 0) return null;
-    return unread;
+    const count = fn[method](fd);
+    if (!Number.isInteger(count) || count < 0) return null;
+    return count;
   } catch {
     return null;
   }
+}
+
+export function fionread(fd) {
+  return ioctlCount(fd, 'pending');
+}
+
+export function siocoutq(fd) {
+  return ioctlCount(fd, 'outq');
 }
 
 export function sndbuf(fd) {
@@ -281,13 +290,10 @@ function muxRow(row) {
     closeFd(fd);
     return null;
   }
-  const kOut = writerCeiling(snd);
-  const kIn = writerCeiling(rcv);
-  if (kIn == null || kOut == null) {
-    closeFd(fd);
-    return null;
-  }
-  return { fd, sndbuf: snd, rcvbuf: rcv, kIn, kOut };
+  // Loopback TCP: the getsockopt read-back is K_mux. tcp(7) requires the
+  // size before connect or listen, and the doubled value is what getsockopt
+  // returns. The AF_UNIX half-skb formula is not this ceiling (ADR-0006).
+  return { fd, sndbuf: snd, rcvbuf: rcv, kIn: rcv, kOut: snd };
 }
 
 // Bound socket, not yet listening. SO_SNDBUF and SO_RCVBUF are already the
@@ -353,13 +359,44 @@ let subreaperOn = false;
 export function ensureSubreaper() {
   if (subreaperOn) return true;
   const fn = loadHelper();
-  if (!fn || typeof fn.setSubreaper !== 'function') return false;
+  if (!fn || typeof fn.setSubreaper !== 'function' || typeof fn.setDumpable !== 'function') return false;
   try {
     fn.setSubreaper();
+    fn.setDumpable();
     subreaperOn = true;
     return true;
   } catch {
     return false;
+  }
+}
+
+export function dumpable() {
+  const fn = loadHelper();
+  if (!fn || typeof fn.dumpable !== 'function') return null;
+  try {
+    const value = fn.dumpable();
+    return Number.isInteger(value) && value >= 0 ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+export function flowHelperAvailable() {
+  const fn = loadHelper();
+  return Boolean(fn && typeof fn.create === 'function' && typeof fn.pinListen === 'function');
+}
+
+export function burstWriters(fd, ceiling, mark) {
+  if (!Number.isInteger(fd) || fd < 0 || !Number.isInteger(ceiling) || ceiling <= 0) return null;
+  if (typeof mark !== 'string' || mark.length === 0) return null;
+  const fn = loadHelper();
+  if (!fn || typeof fn.burstWriters !== 'function') return null;
+  try {
+    const row = fn.burstWriters(fd, ceiling, mark);
+    if (!row || !Number.isInteger(row.written) || row.written < 0) return null;
+    return row;
+  } catch {
+    return null;
   }
 }
 

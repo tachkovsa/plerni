@@ -58,6 +58,10 @@ test('socketpair sets the writer buffer, shuts unused directions, and reads FION
     const again = measureFlowReserve();
     assert.equal(again.kIn, ends.kIn);
     assert.equal(again.sndbufIn, ends.sndbufIn);
+    assert.equal(again.kMuxIn, again.muxRcvbuf);
+    assert.equal(again.kMuxOut, again.muxSndbuf);
+    assert.notEqual(again.kMuxIn, writerCeiling(again.muxRcvbuf));
+    assert.equal(again.muxReserve, again.kMuxIn + again.kMuxOut + again.readBytes);
   } finally {
     closeEnds(ends);
   }
