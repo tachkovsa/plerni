@@ -79,7 +79,7 @@ export function resolveCacheDir(hash = sourceHash()) {
   const home = homedir();
   if (home) {
     const root = join(home, '.cache', 'plerni-flow-socket');
-    const abi = join(root, String(process.versions.modules));
+    const abi = join(root, `${process.platform}-${process.arch}-${process.versions.modules}`);
     const dir = join(abi, hash);
     if (prepareDir(root) && prepareDir(abi) && prepareDir(dir)) return dir;
   }
@@ -163,7 +163,7 @@ export function closeFd(fd) {
 
 export function closeEnds(ends) {
   if (!ends) return;
-  for (const fd of [ends.parentStdin, ends.childStdin, ends.stdinProbe, ends.childStdout, ends.parentStdout]) {
+  for (const fd of [ends.parentStdin, ends.childStdin, ends.stdinProbe, ends.stdoutWriter, ends.childStdout, ends.parentStdout]) {
     closeFd(fd);
   }
 }
@@ -185,12 +185,13 @@ export function createChildEnds(request = SNDBUF_REQUEST) {
     parentStdin: asFd(row?.parentStdin),
     childStdin: asFd(row?.childStdin),
     stdinProbe: asFd(row?.stdinProbe),
+    stdoutWriter: asFd(row?.stdoutWriter),
     childStdout: asFd(row?.childStdout),
     parentStdout: asFd(row?.parentStdout),
     sndbufIn: Number.isInteger(row?.sndbufIn) && row.sndbufIn > 0 ? row.sndbufIn : null,
     sndbufOut: Number.isInteger(row?.sndbufOut) && row.sndbufOut > 0 ? row.sndbufOut : null,
   };
-  const fds = [ends.parentStdin, ends.childStdin, ends.stdinProbe, ends.childStdout, ends.parentStdout];
+  const fds = [ends.parentStdin, ends.childStdin, ends.stdinProbe, ends.stdoutWriter, ends.childStdout, ends.parentStdout];
   if (fds.some((fd) => fd == null) || ends.sndbufIn == null || ends.sndbufOut == null) {
     closeEnds(ends);
     return null;
@@ -212,6 +213,19 @@ export function fionread(fd) {
     const unread = fn.pending(fd);
     if (!Number.isInteger(unread) || unread < 0) return null;
     return unread;
+  } catch {
+    return null;
+  }
+}
+
+export function sndbuf(fd) {
+  if (!Number.isInteger(fd) || fd < 0) return null;
+  const fn = loadHelper();
+  if (!fn || typeof fn.sndbuf !== 'function') return null;
+  try {
+    const got = fn.sndbuf(fd);
+    if (!Number.isInteger(got) || got <= 0) return null;
+    return got;
   } catch {
     return null;
   }

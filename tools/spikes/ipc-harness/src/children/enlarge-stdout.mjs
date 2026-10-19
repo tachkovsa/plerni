@@ -1,6 +1,6 @@
 // enlarge-stdout.mjs — raise SO_SNDBUF, then write past the reserved ceiling.
-// The supervisor cannot tell this child from a thread writer. The test
-// classifies the single writer-overrun fault from the mark file.
+// The supervisor types buffer-enlarged from the raised SO_SNDBUF. The mark
+// file is the test's clock for when the write crossed K.
 
 import { existsSync, writeFileSync } from 'node:fs';
 import { setSndbuf } from '../flow_socket.mjs';

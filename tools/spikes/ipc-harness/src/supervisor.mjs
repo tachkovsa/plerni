@@ -18,8 +18,8 @@ import { MuxFramer, NdjsonFramer, MAX_RESIDUAL, encodeNdjson, encodeMux } from '
 import { PendingTable, socketPair, KernelStub } from './kernel-stub.mjs';
 import { FencedError, commitExecution, startSweeper } from './authority.mjs';
 import { pipePending } from './pipe_pending.mjs';
-import { FLOW_READ_BYTES, PROBE_INTERVAL_MS, WRITER_OVERRUN, writerOverrun } from './flow_budget.mjs';
-import { closeEnds, closeFd, createChildEnds, fionread } from './flow_socket.mjs';
+import { BUFFER_ENLARGED, FLOW_READ_BYTES, PROBE_INTERVAL_MS, THREAD_WRITER, writerOverrun } from './flow_budget.mjs';
+import { closeEnds, closeFd, createChildEnds, fionread, sndbuf } from './flow_socket.mjs';
 
 export { partialCapHolds, totalCapHolds } from './flow_budget.mjs';
 
@@ -266,12 +266,15 @@ export class Supervisor {
       flow,
       kIn: flow?.kIn ?? null,
       kOut: flow?.kOut ?? null,
+      sndbufIn: flow?.sndbufIn ?? null,
       bP: flow?.bP ?? null,
       bT: flow?.bT ?? null,
-      flowOk: Boolean(flow?.flowOk),
+      flowOk: Boolean(flow),
       stdoutFd: flow?.parentStdout ?? null,
       stdinProbe: flow?.stdinProbe ?? null,
+      stdoutWriter: flow?.stdoutWriter ?? null,
       probeTimer: null,
+      readPosted: false,
     };
     if (flow) this.#attachFlowSockets(rec, flow);
     else {
@@ -283,20 +286,68 @@ export class Supervisor {
     child.on('error', (err) => this.#onSpawnError(rec, err));
     child.on('exit', (code, signal) => this.#onExit(rec, code, signal));
     this.children.set(spec.pluginId, rec);
-    if (rec.flowOk) this.#armProbe(rec);
+    if (rec.flowOk) {
+      this.#armProbe(rec);
+      // The caller can pause before this turn ends. The read is posted only
+      // after the gate, on a later turn.
+      setImmediate(() => this.#considerRead(rec));
+    }
     return { credential: detachCredential(credential), token, pid: child.pid };
   }
 
-  // Budgets use the measured SO_SNDBUF. A non-positive per-skb term or a
-  // negative B_p / B_t leaves flowOk false: the cap cannot be enforced, and
-  // the scorer must report unsatisfiable rather than a pass.
+  // A negative B_p, B_t, or B_g closes the ends and does not start the child.
+  // That rejection is unsatisfiable when the kernel terms alone do not fit.
+  // A live process that is already too full is spawn-rejected, which is not
+  // a B3 cap failure. Mux buffers are not part of this sum: an unset mux
+  // reading is not a ceiling.
   #openFlowEnds(limits) {
     const ends = createChildEnds();
     if (!ends) return null;
     const bP = this.partialHighWater - ends.kIn - this.readBytes;
     const bT = limits.total - ends.kIn - ends.kOut - this.readBytes;
-    const flowOk = bP >= 0 && bT >= 0;
-    return { ...ends, bP, bT, flowOk };
+    const reserve = ends.kIn + ends.kOut + this.readBytes;
+    const already = this.#kernelReserved();
+    if (bP < 0 || bT < 0 || already + reserve > this.capsConfig.totalGlobal) {
+      closeEnds(ends);
+      const err = new Error('flow reservation does not fit the configured caps');
+      err.code = 'unsatisfiable';
+      throw err;
+    }
+    if (this.#occupiedBytes() + reserve > this.capsConfig.totalGlobal) {
+      closeEnds(ends);
+      const err = new Error('flow reservation does not fit the live process');
+      err.code = 'spawn-rejected';
+      throw err;
+    }
+    return { ...ends, bP, bT };
+  }
+
+  #childReserve(rec) {
+    if (!rec?.flowOk || rec.dead) return 0;
+    return rec.kIn + rec.kOut + this.readBytes;
+  }
+
+  #kernelReserved() {
+    let sum = 0;
+    for (const rec of this.children.values()) sum += this.#childReserve(rec);
+    return sum;
+  }
+
+  // Userspace room after every live child's K_in + K_out + C.
+  #globalCap() {
+    return this.capsConfig.totalGlobal - this.#kernelReserved();
+  }
+
+  #occupiedBytes() {
+    let total = this.bufferedBytes();
+    for (const rec of this.children.values()) {
+      if (!rec.flowOk || rec.dead) continue;
+      const unread = this.#stdoutUnread(rec);
+      const queued = this.#stdinQueued(rec);
+      if (Number.isInteger(unread)) total += unread;
+      if (Number.isInteger(queued)) total += queued;
+    }
+    return total;
   }
 
   #attachFlowSockets(rec, flow) {
@@ -317,7 +368,9 @@ export class Supervisor {
     stdout.on('error', () => {});
     stdin.on('error', () => {});
     // Real reads arrive through onread and do not emit 'data'. A manual
-    // 'data' event is how tests inject bytes.
+    // 'data' event is how tests inject bytes. Pause before the next turn so
+    // the first read is the gated one.
+    stdout.pause();
     stdout.on('data', (chunk) => this.#onChild(rec, chunk));
     rec.child.stdout = stdout;
     rec.child.stdin = stdin;
@@ -326,12 +379,64 @@ export class Supervisor {
   }
 
   #onStdoutRead(rec, nread, buf) {
-    if (rec.dead || this.closed) return false;
-    if (typeof nread !== 'number' || nread <= 0) return false;
+    rec.readPosted = false;
+    // Nested drain calls #considerRead. A resume() from there is cancelled
+    // when this callback returns false, and readPosted would stay set. The
+    // decision belongs at the end of this turn.
+    rec.inStdoutRead = true;
+    try {
+      if (rec.dead || this.closed) {
+        rec.stdoutSocket?.pause();
+        return false;
+      }
+      if (typeof nread === 'number' && nread > 0) {
+        const chunk = Buffer.from(buf.subarray(0, nread));
+        this.#onChild(rec, chunk);
+      }
+      // FIONREAD here is the queue before the next read. Returning true keeps
+      // that read in this I/O turn, so the mux drain cannot empty the
+      // low-priority queue between chunks. Returning false stops the handle
+      // without marking the stream paused, so pause() makes a later resume()
+      // post again.
+      if (this.#readPermitted(rec)) {
+        rec.readPosted = true;
+        return true;
+      }
+      rec.stdoutSocket?.pause();
+      return false;
+    } finally {
+      rec.inStdoutRead = false;
+    }
+  }
+
+  // Probe, then post at most one C-byte read. The onread turn returns true
+  // itself; resume() here is for a later turn, after the callback has stopped.
+  #considerRead(rec) {
+    if (rec.inStdoutRead) return;
+    if (!this.#readPermitted(rec)) return;
+    rec.readPosted = true;
+    rec.stdoutSocket.resume();
+  }
+
+  #readPermitted(rec) {
+    if (rec.dead || this.closed || !rec.flowOk || rec.paused || rec.readPosted) return false;
+    const unread = this.#stdoutUnread(rec);
+    if (unread == null) return false;
     if (this.#noteOverrun(rec)) return false;
-    const chunk = Buffer.from(buf.subarray(0, nread));
-    this.#onChild(rec, chunk);
-    return !(rec.dead || rec.paused);
+    const pending = rec.framer.pendingBytes();
+    if (!rec.framer.hasPendingNewline() && pending > rec.bP && this.enforcePartial) {
+      this.#accountReserved(rec);
+      return false;
+    }
+    if (this.#pluginBytes(rec) > rec.bT) {
+      this.#accountReserved(rec);
+      return false;
+    }
+    if (this.bufferedBytes() + this.readBytes > this.#globalCap()) {
+      if (this.#pluginBytes(rec) > 0) this.#pause(rec, 'global');
+      return false;
+    }
+    return true;
   }
 
   async respawn(pluginId) {
@@ -478,7 +583,7 @@ export class Supervisor {
     try {
       this.bridge.feed(chunk);
       for (const msg of this.bridge.frames()) this.#onMux(msg);
-      if (this.bufferedBytes() > this.capsConfig.totalGlobal) this.#pauseOverGlobal();
+      if (this.bufferedBytes() > this.#globalCap()) this.#pauseOverGlobal();
     } catch (err) {
       this.framingFault = err.constructor?.name || 'framing-error';
       this.#failAll(this.framingFault);
@@ -569,7 +674,7 @@ export class Supervisor {
   #overBytes(rec, bytes) {
     const ceiling = this.enforceFlow && rec.flowOk ? rec.bT : rec.limits.total;
     return this.#pluginBytes(rec) + bytes > ceiling
-      || this.bufferedBytes() + bytes > this.capsConfig.totalGlobal;
+      || this.bufferedBytes() + bytes > this.#globalCap();
   }
 
   #arm(rec, msg, extra) {
@@ -742,7 +847,7 @@ export class Supervisor {
     if (front) rec.deferred.unshift(held);
     else rec.deferred.push(held);
     rec.deferredBytes += held.bytes;
-    if (this.bufferedBytes() > this.capsConfig.totalGlobal) this.#pauseOverGlobal();
+    if (this.bufferedBytes() > this.#globalCap()) this.#pauseOverGlobal();
   }
 
   #unhold(rec, held) {
@@ -756,7 +861,7 @@ export class Supervisor {
     if (!held || rec.dead) return false;
     const loFull = (this.lo.get(rec.credential.pluginId)?.length ?? 0) >= this.capsConfig.lo;
     if (loFull && held.msg?.kind !== 'cancelled') return false;
-    return this.bufferedBytes() <= this.capsConfig.totalGlobal;
+    return this.bufferedBytes() <= this.#globalCap();
   }
 
   // Never discard unread bytes. A tail that fits stays in `stash`. A tail that
@@ -764,9 +869,10 @@ export class Supervisor {
   // stays paused, so the next resume sees the same bytes in order.
   #retainTail(rec, tail) {
     if (tail.length === 0 || rec.dead) return;
+    const perChild = rec.flowOk ? rec.bT : rec.limits.total;
     const room = Math.min(
-      Math.max(0, rec.limits.total - this.#pluginBytes(rec)),
-      Math.max(0, this.capsConfig.totalGlobal - this.bufferedBytes()),
+      Math.max(0, perChild - this.#pluginBytes(rec)),
+      Math.max(0, this.#globalCap() - this.bufferedBytes()),
     );
     if (tail.length <= room) {
       rec.stash = Buffer.from(tail);
@@ -782,11 +888,10 @@ export class Supervisor {
     } catch {
       this.#fault(rec, 'total-cap');
     }
-    if (this.bufferedBytes() > this.capsConfig.totalGlobal) this.#pauseOverGlobal();
+    if (this.bufferedBytes() > this.#globalCap()) this.#pauseOverGlobal();
   }
 
   #accountCaps(rec) {
-    if (this.#noteOverrun(rec)) return;
     if (this.enforceFlow && rec.flowOk) {
       this.#accountReserved(rec);
       return;
@@ -813,7 +918,7 @@ export class Supervisor {
         return;
       }
     }
-    if (this.bufferedBytes() > this.capsConfig.totalGlobal) this.#pauseOverGlobal();
+    if (this.bufferedBytes() > this.#globalCap()) this.#pauseOverGlobal();
     this.#maybeResumeAll();
   }
 
@@ -839,7 +944,7 @@ export class Supervisor {
       this.caps.total = true;
       this.#pause(rec, 'total');
     }
-    if (this.bufferedBytes() > this.capsConfig.totalGlobal) this.#pauseOverGlobal();
+    if (this.bufferedBytes() > this.#globalCap()) this.#pauseOverGlobal();
     this.#maybeResumeAll();
   }
 
@@ -847,7 +952,9 @@ export class Supervisor {
     if (!this.enforceFlow || !rec.flowOk || rec.dead) return false;
     const unread = this.#stdoutUnread(rec);
     if (!writerOverrun(unread, rec.kIn)) return false;
-    this.#fault(rec, WRITER_OVERRUN);
+    const now = sndbuf(rec.stdoutWriter);
+    if (!Number.isInteger(now) || now <= 0) return false;
+    this.#fault(rec, now > rec.sndbufIn ? BUFFER_ENLARGED : THREAD_WRITER);
     return true;
   }
 
@@ -892,6 +999,8 @@ export class Supervisor {
     this.#disarmProbe(rec);
     if (Number.isInteger(rec.stdinProbe) && rec.stdinProbe >= 0) closeFd(rec.stdinProbe);
     rec.stdinProbe = null;
+    if (Number.isInteger(rec.stdoutWriter) && rec.stdoutWriter >= 0) closeFd(rec.stdoutWriter);
+    rec.stdoutWriter = null;
     rec.stdoutSocket?.destroy();
     rec.stdinSocket?.destroy();
     rec.stdoutSocket = null;
@@ -918,7 +1027,7 @@ export class Supervisor {
 
   #resumeInput() {
     if (!this.inputPaused || this.closed || this.framingFault) return;
-    if (this.bufferedBytes() > this.capsConfig.totalGlobal / 2) return;
+    if (this.bufferedBytes() > this.#globalCap() / 2) return;
     this.inputPaused = false;
     this.socket.resume();
   }
@@ -929,7 +1038,7 @@ export class Supervisor {
     rec.pauseReason = reason;
     rec.child.stdout.pause();
     this.#armProbe(rec);
-    if (this.bufferedBytes() > this.capsConfig.totalGlobal) this.#pauseOverGlobal();
+    if (this.bufferedBytes() > this.#globalCap()) this.#pauseOverGlobal();
   }
 
   #unpause(rec) {
@@ -937,7 +1046,6 @@ export class Supervisor {
     rec.paused = false;
     rec.pauseReason = null;
     this.#disarmProbe(rec);
-    rec.child.stdout.resume();
     let stopped = false;
     try {
       stopped = this.#pullFrames(rec);
@@ -953,14 +1061,15 @@ export class Supervisor {
       rec.stash = null;
       this.#onChild(rec, stash);
     }
+    this.#considerRead(rec);
   }
 
   // Resume does not wait for another stdout 'data' event. A paused stream emits none.
   #maybeResumeAll() {
     this.#resumeInput();
     const buffered = this.bufferedBytes();
-    const globalLow = buffered <= this.capsConfig.totalGlobal / 2;
-    const globalOpen = buffered <= this.capsConfig.totalGlobal;
+    const globalLow = buffered <= this.#globalCap() / 2;
+    const globalOpen = buffered <= this.#globalCap();
     for (const rec of this.children.values()) {
       if (!rec.paused || rec.dead) continue;
       if (rec.pauseReason === 'global') {
@@ -970,6 +1079,9 @@ export class Supervisor {
       } else if (rec.pauseReason === 'total') {
         if (globalLow && this.#pluginBytes(rec) <= rec.limits.total / 2) this.#unpause(rec);
       }
+    }
+    for (const rec of this.children.values()) {
+      if (!rec.dead && rec.flowOk && !rec.paused) this.#considerRead(rec);
     }
   }
 
@@ -1086,7 +1198,7 @@ export class Supervisor {
       this.#pause(rec, 'bulk');
       return { defer: true, buf };
     }
-    if (this.bufferedBytes() + buf.length > this.capsConfig.totalGlobal) {
+    if (this.bufferedBytes() + buf.length > this.#globalCap()) {
       this.caps.total = true;
       this.#pause(rec, 'global');
       return { defer: true, buf };
@@ -1292,7 +1404,7 @@ export class Supervisor {
     } catch {
       return;
     }
-    if (!live && this.bufferedBytes() + buf.length > this.capsConfig.totalGlobal) {
+    if (!live && this.bufferedBytes() + buf.length > this.#globalCap()) {
       this.caps.total = true;
       this.#pauseInput();
       return;
@@ -1365,7 +1477,7 @@ export class Supervisor {
 
   #drain() {
     if (this.draining || this.closed || this.framingFault) return;
-    if (this.socketOutbound > this.capsConfig.totalGlobal) {
+    if (this.socketOutbound > this.#globalCap()) {
       this.#pauseOverGlobal();
       return;
     }
@@ -1387,17 +1499,17 @@ export class Supervisor {
         }
         // A frame larger than the ceiling can never be written without
         // exceeding it. Settle the waiter with a small error instead.
-        if (nextLen > this.capsConfig.totalGlobal) {
+        if (nextLen > this.#globalCap()) {
           const next = this.#shiftNext();
           const replacement = next ? this.#rejectOversized(next.buf) : null;
           this.caps.total = true;
-          if (replacement && replacement.length <= this.capsConfig.totalGlobal) {
+          if (replacement && replacement.length <= this.#globalCap()) {
             this.terminal.unshift(replacement);
             this.queuedBytes += replacement.length;
           }
           continue;
         }
-        if (this.socketOutbound + nextLen > this.capsConfig.totalGlobal) {
+        if (this.socketOutbound + nextLen > this.#globalCap()) {
           this.#pauseOverGlobal();
           this.draining = false;
           return;
@@ -1423,12 +1535,12 @@ export class Supervisor {
           this.draining = false;
           return;
         }
-        if (this.bufferedBytes() > this.capsConfig.totalGlobal) this.#pauseOverGlobal();
+        if (this.bufferedBytes() > this.#globalCap()) this.#pauseOverGlobal();
         if (!ok) {
           this.socket.once('drain', step);
           return;
         }
-        if (this.socketOutbound > this.capsConfig.totalGlobal) {
+        if (this.socketOutbound > this.#globalCap()) {
           this.draining = false;
           return;
         }
@@ -1497,7 +1609,7 @@ export class Supervisor {
 
   #resumeBulk() {
     if (this.#loLength() >= 8) return;
-    if (this.#acceptedBytes() > this.capsConfig.totalGlobal) {
+    if (this.#acceptedBytes() > this.#globalCap()) {
       this.#releaseFittingHolds('bulk');
       return;
     }

@@ -1,7 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  BUFFER_ENLARGED,
   FLOW_READ_BYTES,
+  THREAD_WRITER,
   assessFlow,
   classifyWriterOverrun,
   partialCapHolds,
@@ -56,9 +58,11 @@ test('a cleaned-up count and the recorded partial snapshot do not hold', () => {
   assert.equal(totalCapHolds(48 * 1024, 48 * 1024, { stdoutUnread: 100, kIn: 50 }), false);
 });
 
-test('the overrun fault is one code and the test classifies the child', () => {
+test('an overrun is buffer-enlarged or thread-writer from the reserved sndbuf', () => {
   assert.equal(writerOverrun(100, 99), true);
   assert.equal(writerOverrun(99, 99), false);
+  assert.equal(BUFFER_ENLARGED, 'buffer-enlarged');
+  assert.equal(THREAD_WRITER, 'thread-writer');
   assert.equal(classifyWriterOverrun('raised-sndbuf'), 'enlarger');
   assert.equal(classifyWriterOverrun('threads'), 'thread-writer');
   assert.equal(classifyWriterOverrun('flood'), null);

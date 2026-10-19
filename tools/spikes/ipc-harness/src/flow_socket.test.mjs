@@ -7,6 +7,7 @@ import {
   createChildEnds,
   fionread,
   headerDir,
+  sndbuf,
   measureFlowReserve,
   resolveCacheDir,
   sourceHash,
@@ -20,6 +21,7 @@ test('the helper cache is private and keyed by the source hash', () => {
   const dir = resolveCacheDir(hash);
   assert.equal(typeof dir, 'string');
   assert.ok(dir.endsWith(hash), dir);
+  assert.ok(dir.includes(`${process.platform}-${process.arch}-`), dir);
   assert.equal(lstatSync(dir).isSymbolicLink(), false);
   assert.equal(lstatSync(dir).uid, process.getuid());
   assert.equal(lstatSync(dir).mode & 0o077, 0);
@@ -36,6 +38,7 @@ test('socketpair sets the writer buffer, shuts unused directions, and reads FION
     assert.ok(ends.kIn > 0);
     assert.equal(fionread(ends.parentStdout), 0);
     assert.equal(fionread(ends.stdinProbe), 0);
+    assert.equal(sndbuf(ends.stdoutWriter), ends.sndbufIn);
     let writeFailed = false;
     try {
       writeSync(ends.childStdin, Buffer.from('x'));

@@ -15,12 +15,13 @@ static void close_quiet(int fd) {
   if (fd >= 0) close(fd);
 }
 
-static void close_all(int in0, int in1, int out0, int out1, int probe) {
+static void close_all(int in0, int in1, int out0, int out1, int probe, int writer) {
   close_quiet(in0);
   close_quiet(in1);
   close_quiet(out0);
   close_quiet(out1);
   close_quiet(probe);
+  close_quiet(writer);
 }
 
 static int set_sndbuf(int fd, int request, int *got) {
@@ -59,12 +60,13 @@ static napi_value Create(napi_env env, napi_callback_info info) {
   int in[2] = {-1, -1};
   int out[2] = {-1, -1};
   int probe = -1;
+  int writer = -1;
   if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, in) != 0) {
     napi_throw_error(env, NULL, "socketpair");
     return NULL;
   }
   if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, out) != 0) {
-    close_all(in[0], in[1], -1, -1, -1);
+    close_all(in[0], in[1], -1, -1, -1, -1);
     napi_throw_error(env, NULL, "socketpair");
     return NULL;
   }
@@ -72,37 +74,42 @@ static napi_value Create(napi_env env, napi_callback_info info) {
   int sndbuf_out = 0;
   int sndbuf_in = 0;
   if (set_sndbuf(in[0], request, &sndbuf_out) != 0 || set_sndbuf(out[0], request, &sndbuf_in) != 0) {
-    close_all(in[0], in[1], out[0], out[1], -1);
+    close_all(in[0], in[1], out[0], out[1], -1, -1);
     napi_throw_error(env, NULL, "sndbuf");
     return NULL;
   }
   probe = dup(in[1]);
-  if (probe < 0 || fcntl(probe, F_SETFD, FD_CLOEXEC) != 0) {
-    close_all(in[0], in[1], out[0], out[1], probe);
+  writer = dup(out[0]);
+  if (probe < 0 || writer < 0
+      || fcntl(probe, F_SETFD, FD_CLOEXEC) != 0
+      || fcntl(writer, F_SETFD, FD_CLOEXEC) != 0) {
+    close_all(in[0], in[1], out[0], out[1], probe, writer);
     napi_throw_error(env, NULL, "dup");
     return NULL;
   }
   /* The child inherits in[1] as fd 0 and out[0] as fd 1. Shut the directions
-     it must not use. shutdown is not reversible. */
+     it must not use. shutdown is not reversible. The writer dup shares that
+     socket, so a later SO_SNDBUF on the child's fd is visible here. */
   if (shutdown(in[1], SHUT_WR) != 0 || shutdown(out[0], SHUT_RD) != 0) {
-    close_all(in[0], in[1], out[0], out[1], probe);
+    close_all(in[0], in[1], out[0], out[1], probe, writer);
     napi_throw_error(env, NULL, "shutdown");
     return NULL;
   }
   napi_value obj;
   if (napi_create_object(env, &obj) != napi_ok) {
-    close_all(in[0], in[1], out[0], out[1], probe);
+    close_all(in[0], in[1], out[0], out[1], probe, writer);
     napi_throw_error(env, NULL, "object");
     return NULL;
   }
   if (!int_prop(env, obj, "parentStdin", in[0])
       || !int_prop(env, obj, "childStdin", in[1])
       || !int_prop(env, obj, "stdinProbe", probe)
+      || !int_prop(env, obj, "stdoutWriter", writer)
       || !int_prop(env, obj, "childStdout", out[0])
       || !int_prop(env, obj, "parentStdout", out[1])
       || !int_prop(env, obj, "sndbufIn", sndbuf_in)
       || !int_prop(env, obj, "sndbufOut", sndbuf_out)) {
-    close_all(in[0], in[1], out[0], out[1], probe);
+    close_all(in[0], in[1], out[0], out[1], probe, writer);
     napi_throw_error(env, NULL, "object");
     return NULL;
   }

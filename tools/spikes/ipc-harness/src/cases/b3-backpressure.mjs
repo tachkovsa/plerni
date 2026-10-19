@@ -46,6 +46,16 @@ export function scoreTotalProbe(row) {
   };
 }
 
+// A partial fault whose FIONREAD terms are missing cannot be scored. A missing
+// fault is a cap result, not an invalid run.
+export function partialSnapshotInvalid(enforceFlow, fault) {
+  if (!enforceFlow || !fault) return false;
+  return fault.stdoutUnread == null
+    || fault.kIn == null
+    || fault.pendingBytes == null
+    || fault.inFlightTailBytes == null;
+}
+
 function probeOpts(pipeProbe) {
   if (typeof pipeProbe !== 'function') return {};
   return {
@@ -93,6 +103,7 @@ export async function tripCaps(opts = {}) {
     detail.reserve = verdict;
   }
   const probe = { ...probeOpts(opts.pipeProbe), enforceFlow };
+  if (typeof opts.flowPending === 'function') probe.flowPending = opts.flowPending;
   const pendingPair = await connectPair({ ...probe, sweeper: false, caps: { pending: 4, partial: 1024 * 1024, total: 8 * 1024 * 1024 } });
   try {
     const silent = pendingPair.sup.spawn({
@@ -158,6 +169,19 @@ export async function tripCaps(opts = {}) {
     };
   } finally {
     await partialPair.close();
+  }
+  const partialFault = detail.partial.code == null ? null : {
+    stdoutUnread: detail.partial.stdoutUnread,
+    kIn: detail.partial.kIn,
+    pendingBytes: detail.partial.pendingBytes,
+    inFlightTailBytes: detail.partial.inFlightTailBytes,
+  };
+  if (partialSnapshotInvalid(enforceFlow, partialFault)) {
+    return {
+      pass: null,
+      outcome: 'invalid',
+      detail: { reason: 'partial-probe-unavailable', partial: detail.partial },
+    };
   }
 
   const totalCap = TRIP_TOTAL;

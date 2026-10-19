@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { connectPair } from './supervisor.mjs';
 import { assessFlow, classifyWriterOverrun, PROBE_INTERVAL_MS, OVERRUN_DEADLINE_MS } from './flow_budget.mjs';
 import { measureFlowReserve } from './flow_socket.mjs';
-import { tripCaps } from './cases/b3-backpressure.mjs';
+import { partialSnapshotInvalid, tripCaps } from './cases/b3-backpressure.mjs';
 import { waitUntil } from './measure.mjs';
 
 const enlargePath = fileURLToPath(new URL('./children/enlarge-stdout.mjs', import.meta.url));
@@ -26,6 +26,35 @@ test('same-host vacuity pair: enforcement off fails and enforced passes', { time
   assert.equal(off.pass, false, JSON.stringify(off.detail));
   assert.equal(on.outcome, 'scored', JSON.stringify(on.detail));
   assert.equal(on.pass, true, JSON.stringify(on.detail));
+});
+
+test('a per-child budget below the kernel reserve is rejected before spawn', async () => {
+  const pair = await connectPair({
+    sweeper: false,
+    caps: { partial: 64 * 1024, total: 1024 * 1024, totalGlobal: 1024 * 1024 },
+  });
+  try {
+    assert.throws(
+      () => pair.sup.spawn({ pluginId: 'echo', script: enlargePath, total: 1024 }),
+      (err) => err.code === 'unsatisfiable',
+    );
+    assert.equal(pair.sup.children.size, 0);
+  } finally {
+    await pair.close();
+  }
+});
+
+test('a missing partial snapshot is invalid and a missing fault is not', () => {
+  const fault = { stdoutUnread: null, kIn: 1, pendingBytes: 1, inFlightTailBytes: 0 };
+  assert.equal(partialSnapshotInvalid(true, fault), true);
+  assert.equal(partialSnapshotInvalid(false, fault), false);
+  assert.equal(partialSnapshotInvalid(true, null), false);
+  assert.equal(partialSnapshotInvalid(true, {
+    stdoutUnread: 0,
+    kIn: 1,
+    pendingBytes: 1,
+    inFlightTailBytes: 0,
+  }), false);
 });
 
 test('an injected reservation that does not fit is unsatisfiable, not invalid', async () => {
@@ -72,7 +101,7 @@ test('paused probe faults a buffer enlarger within 100 ms', { timeout: 15_000 },
     writeFileSync(go, '1');
     const lag = block(50);
     const faulted = await waitUntil(
-      () => pair.sup.faults.some((fault) => fault.pluginId === 'enlarge' && fault.code === 'writer-overrun'),
+      () => pair.sup.faults.some((fault) => fault.pluginId === 'enlarge' && fault.code === 'buffer-enlarged'),
       1_000,
     );
     assert.equal(faulted, true, JSON.stringify(pair.sup.faults));
@@ -83,7 +112,7 @@ test('paused probe faults a buffer enlarger within 100 ms', { timeout: 15_000 },
     const elapsed = observed - marked;
     assert.ok(elapsed >= 0 && elapsed < OVERRUN_DEADLINE_MS, String(elapsed));
     assert.ok(PROBE_INTERVAL_MS + lag < OVERRUN_DEADLINE_MS, String(lag));
-    const fault = pair.sup.faults.find((row) => row.code === 'writer-overrun');
+    const fault = pair.sup.faults.find((row) => row.code === 'buffer-enlarged');
     assert.ok(fault.stdoutUnread > fault.kIn, JSON.stringify(fault));
     assert.equal(fault.kIn, reserved.kIn);
   } finally {

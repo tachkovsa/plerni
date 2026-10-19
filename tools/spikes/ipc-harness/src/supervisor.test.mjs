@@ -262,7 +262,7 @@ test('respawn keeps grants, version, and per-plugin limits', async () => {
       grants: ['db'],
       version: '1.2.3',
       pending: 3,
-      total: 12_345,
+      total: 80_000,
     });
     const next = await pair.sup.respawn('echo');
     const rec = pair.sup.children.get('echo');
@@ -270,7 +270,7 @@ test('respawn keeps grants, version, and per-plugin limits', async () => {
     assert.equal(rec.credential.version, '1.2.3');
     assert.deepEqual([...rec.credential.grants], ['db']);
     assert.equal(rec.limits.pending, 3);
-    assert.equal(rec.limits.total, 12_345);
+    assert.equal(rec.limits.total, 80_000);
     assert.notEqual(next.credential.grants, rec.credential.grants);
   } finally {
     await pair.close();
@@ -519,7 +519,7 @@ test('a large child write still keeps the partial high-water inside the cap', { 
 });
 
 test('partial cap bound fails when enforcement is removed', { timeout: 15_000 }, async () => {
-  const cap = 4_096;
+  const cap = 32 * 1024;
   const pair = await connectPair({
     sweeper: false,
     enforcePartial: false,
@@ -703,16 +703,24 @@ test('calls count cancellation slots against the pending cap', async () => {
 });
 
 test('cancellation writes count against the byte caps', async () => {
+  const reserved = measureFlowReserve();
+  assert.ok(reserved);
+  const userspace = 4_096;
+  const globalUserspace = 8_192;
   const pair = await connectPair({
     sweeper: false,
-    caps: { total: 4_096, totalGlobal: 8_192, pending: 8 },
+    caps: {
+      total: userspace + reserved.perChild,
+      totalGlobal: globalUserspace + reserved.perChild,
+      pending: 8,
+    },
   });
   try {
     const kid = pair.sup.spawn({
       pluginId: 'silent',
       script: floodPath,
       env: { FLOOD_MODE: 'silent' },
-      total: 4_096,
+      total: userspace + reserved.perChild,
     });
     const big = 'y'.repeat(3_000);
     const settled = await Promise.all([0, 1, 2, 3].map((n) => pair.stub.cancel({
@@ -721,7 +729,7 @@ test('cancellation writes count against the byte caps', async () => {
       correlationId: `${big}-${n}`,
     }, 400).catch((err) => err)));
     assert.ok(settled.some((row) => row.code === 'total-cap'));
-    assert.ok(pair.sup.bufferedBytes() <= 8_192);
+    assert.ok(pair.sup.bufferedBytes() <= globalUserspace);
   } finally {
     await pair.close();
   }
@@ -893,10 +901,12 @@ test('kernel writes stop until drain and stay inside the byte cap', async () => 
 });
 
 test('a paused child keeps its unread tail and the buffer stops growing', { timeout: 10_000 }, async () => {
+  const reserved = measureFlowReserve();
+  assert.ok(reserved);
   const cap = 8 * 1024;
   const pair = await connectPair({
     sweeper: false,
-    caps: { total: 1024 * 1024, totalGlobal: cap, partial: 1024 * 1024 },
+    caps: { total: 1024 * 1024, totalGlobal: cap + reserved.perChild, partial: 1024 * 1024 },
     partialHighWater: 1024 * 1024,
   });
   try {
@@ -1184,7 +1194,12 @@ test('grant lists that contain a separator are not joined', async () => {
 });
 
 test('an unfinished mux frame pauses the shared input at the global ceiling', async () => {
-  const pair = await connectPair({ sweeper: false, caps: { totalGlobal: 64 } });
+  const reserved = measureFlowReserve();
+  assert.ok(reserved);
+  const pair = await connectPair({
+    sweeper: false,
+    caps: { totalGlobal: 64 + reserved.perChild },
+  });
   try {
     pair.sup.spawn({ pluginId: 'echo', script: echoPath });
     const prefix = Buffer.alloc(4);
@@ -1204,10 +1219,12 @@ test('an unfinished mux frame pauses the shared input at the global ceiling', as
 });
 
 test('the shared input resumes below the global low water', { timeout: 10_000 }, async () => {
+  const reserved = measureFlowReserve();
+  assert.ok(reserved);
   const cap = 64 * 1024;
   const pair = await connectPair({
     sweeper: false,
-    caps: { total: 1024 * 1024, totalGlobal: cap, partial: 1024 * 1024 },
+    caps: { total: 1024 * 1024, totalGlobal: cap + 2 * reserved.perChild, partial: 1024 * 1024 },
     partialHighWater: 1024 * 1024,
   });
   try {
@@ -1442,10 +1459,12 @@ test('a mux framing fault closes the kernel and rejects later sends', async () =
 });
 
 test('pushed-back stdout bytes count against the per-plugin and global caps', async () => {
+  const reserved = measureFlowReserve();
+  assert.ok(reserved);
   const cap = 1024;
   const pair = await connectPair({
     sweeper: false,
-    caps: { lo: 16, total: 64 * 1024, totalGlobal: cap, partial: 1024 * 1024 },
+    caps: { lo: 16, total: 64 * 1024, totalGlobal: cap + reserved.perChild, partial: 1024 * 1024 },
     partialHighWater: 1024 * 1024,
   });
   try {
@@ -1897,12 +1916,14 @@ test('an unknown rejection does not hi-cap a plugin id outside the unbound key',
 });
 
 test('a socket write does not start when it would pass the global cap', async () => {
+  const reserved = measureFlowReserve();
+  assert.ok(reserved);
   const cap = 8 * 1024;
   const pair = await connectPair({
     sweeper: false,
     caps: {
       total: 1024 * 1024,
-      totalGlobal: cap,
+      totalGlobal: cap + reserved.perChild,
       partial: 1024 * 1024,
       lo: 8,
       pending: 8,
@@ -2041,6 +2062,8 @@ test('retired tokens do not accumulate across respawns', async () => {
 });
 
 test('a deferred reply stays inside the byte caps', async () => {
+  const reserved = measureFlowReserve();
+  assert.ok(reserved);
   const cap = 30_000;
   const pair = await connectPair({
     sweeper: false,
@@ -2050,7 +2073,7 @@ test('a deferred reply stays inside the byte caps', async () => {
       pending: 8,
       pendingGlobal: 8,
       total: 2 * 1024 * 1024,
-      totalGlobal: cap,
+      totalGlobal: cap + 2 * reserved.perChild,
       partial: 2 * 1024 * 1024,
     },
     partialHighWater: 2 * 1024 * 1024,

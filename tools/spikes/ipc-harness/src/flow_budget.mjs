@@ -74,9 +74,12 @@ export function totalCapHolds(accounted, cap, snapshot = {}) {
   return accounted <= cap;
 }
 
-// The enlarger and a thread writer both look like stdoutUnread > K. The
-// supervisor emits one fault. The test classifies it from what the child did.
-export const WRITER_OVERRUN = 'writer-overrun';
+// stdoutUnread > K_in. getsockopt(SO_SNDBUF) on the parent's writer dup tells
+// the two accepted controls apart. A raise is buffer-enlarged. The reserved
+// value left in place is thread-writer. A splice that escapes confinement
+// looks like thread-writer; that confinement is a separate change.
+export const BUFFER_ENLARGED = 'buffer-enlarged';
+export const THREAD_WRITER = 'thread-writer';
 
 export function writerOverrun(unread, kIn) {
   return Number.isInteger(unread) && Number.isInteger(kIn) && unread > kIn;
