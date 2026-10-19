@@ -149,6 +149,8 @@ export class Supervisor {
     this.readBytes = FLOW_READ_BYTES;
     this.pipeProbe = typeof opts.pipeProbe === 'function' ? opts.pipeProbe : pipePending;
     this.flowPending = typeof opts.flowPending === 'function' ? opts.flowPending : fionread;
+    this.readSndbuf = typeof opts.readSndbuf === 'function' ? opts.readSndbuf : sndbuf;
+    this.invalidReason = null;
     this.useDirect = opts.useDirect ?? useDirectFromEnv();
     this.capsConfig = { ...DEFAULT_CAPS, ...opts.caps };
     if (opts.caps?.pending != null && opts.caps.pendingGlobal == null) {
@@ -393,6 +395,12 @@ export class Supervisor {
         const chunk = Buffer.from(buf.subarray(0, nread));
         this.#onChild(rec, chunk);
       }
+      // Exit drain keeps reading until EOF. A budget pause here would leave
+      // the final response in the kernel and the waiter on child-exited.
+      if (rec.exitDrain && !rec.dead && !this.closed) {
+        rec.readPosted = true;
+        return true;
+      }
       // FIONREAD here is the queue before the next read. Returning true keeps
       // that read in this I/O turn, so the mux drain cannot empty the
       // low-priority queue between chunks. Returning false stops the handle
@@ -413,6 +421,16 @@ export class Supervisor {
   // itself; resume() here is for a later turn, after the callback has stopped.
   #considerRead(rec) {
     if (rec.inStdoutRead) return;
+    if (rec.exitDrain) {
+      if (rec.dead || this.closed || rec.readPosted) return;
+      if (!rec.stdoutSocket || rec.stdoutSocket.destroyed) {
+        this.#finishExit(rec);
+        return;
+      }
+      rec.readPosted = true;
+      rec.stdoutSocket.resume();
+      return;
+    }
     if (!this.#readPermitted(rec)) return;
     rec.readPosted = true;
     rec.stdoutSocket.resume();
@@ -422,6 +440,7 @@ export class Supervisor {
     if (rec.dead || this.closed || !rec.flowOk || rec.paused || rec.readPosted) return false;
     const unread = this.#stdoutUnread(rec);
     if (unread == null) return false;
+    if (this.invalidReason) return false;
     if (this.#noteOverrun(rec)) return false;
     const pending = rec.framer.pendingBytes();
     if (!rec.framer.hasPendingNewline() && pending > rec.bP && this.enforcePartial) {
@@ -576,6 +595,11 @@ export class Supervisor {
       + rec.deferredBytes
       + (rec.stash?.length ?? 0)
       + this.#stdoutBuffered(rec);
+  }
+
+  // B_t while flow control is on. The configured total is the vacuity ceiling.
+  #childCeiling(rec) {
+    return this.enforceFlow && rec.flowOk ? rec.bT : rec.limits.total;
   }
 
   #onSocket(chunk) {
@@ -827,14 +851,14 @@ export class Supervisor {
       this.#unhold(rec, held);
       const outcome = this.#fromChild(rec, held.msg, held.buf);
       if (outcome?.defer) {
-        this.#park(rec, held.msg, outcome.buf, true);
+        this.#park(rec, held.msg, outcome.buf, true, outcome.need);
         return true;
       }
     }
     for (const msg of rec.framer.frames()) {
       const outcome = this.#fromChild(rec, msg, null);
       if (outcome?.defer) {
-        this.#park(rec, msg, outcome.buf, false);
+        this.#park(rec, msg, outcome.buf, false, outcome.need);
         return true;
       }
     }
@@ -842,8 +866,12 @@ export class Supervisor {
   }
 
   // `front` keeps a replayed hold ahead of anything parked in the same pass.
-  #park(rec, msg, buf, front) {
-    const held = { msg, buf, bytes: buf.length };
+  // A null buffer is a parsed line whose encoding did not fit; only `need`
+  // is remembered, so the bytes are not charged twice and are not retained
+  // past B_t. The retry encodes them again.
+  #park(rec, msg, buf, front, need = null) {
+    const size = buf ? buf.length : (need ?? 0);
+    const held = { msg, buf: buf ?? null, bytes: buf ? buf.length : 0, need: size };
     if (front) rec.deferred.unshift(held);
     else rec.deferred.push(held);
     rec.deferredBytes += held.bytes;
@@ -861,7 +889,14 @@ export class Supervisor {
     if (!held || rec.dead) return false;
     const loFull = (this.lo.get(rec.credential.pluginId)?.length ?? 0) >= this.capsConfig.lo;
     if (loFull && held.msg?.kind !== 'cancelled') return false;
-    return this.bufferedBytes() <= this.#globalCap();
+    const lane = held.msg?.kind === 'cancelled' ? 'cancel' : 'call';
+    const pending = this.pending.get(rec.credential.pluginId, held.msg?.correlationId, lane);
+    const ids = pending?.idBytes ?? 0;
+    const need = held.buf ? held.buf.length : (held.need ?? 0);
+    const resulting = this.#pluginBytes(rec) - held.bytes - ids + need;
+    if (resulting > this.#childCeiling(rec)) return false;
+    const queued = held.buf ? held.buf.length : 0;
+    return this.bufferedBytes() - held.bytes + queued <= this.#globalCap();
   }
 
   // Never discard unread bytes. A tail that fits stays in `stash`. A tail that
@@ -948,23 +983,40 @@ export class Supervisor {
     this.#maybeResumeAll();
   }
 
+  #invalidate(reason) {
+    if (this.invalidReason || this.closed) return;
+    this.invalidReason = reason;
+  }
+
+  // A null probe is not a retry. Ignoring it stalls the read, and a later
+  // scored miss would treat the missing measurement as a cap failure.
   #noteOverrun(rec) {
-    if (!this.enforceFlow || !rec.flowOk || rec.dead) return false;
+    if (!this.enforceFlow || !rec.flowOk || rec.dead || this.invalidReason) return false;
     const unread = this.#stdoutUnread(rec);
+    if (this.invalidReason) return true;
     if (!writerOverrun(unread, rec.kIn)) return false;
-    const now = sndbuf(rec.stdoutWriter);
-    if (!Number.isInteger(now) || now <= 0) return false;
+    const now = this.readSndbuf(rec.stdoutWriter);
+    if (!Number.isInteger(now) || now <= 0) {
+      this.#invalidate('sndbuf-unavailable');
+      return true;
+    }
     this.#fault(rec, now > rec.sndbufIn ? BUFFER_ENLARGED : THREAD_WRITER);
     return true;
   }
 
   #stdoutUnread(rec) {
     if (!Number.isInteger(rec.stdoutFd)) return null;
+    let unread = null;
     try {
-      return this.flowPending(rec.stdoutFd);
+      unread = this.flowPending(rec.stdoutFd);
     } catch {
+      unread = null;
+    }
+    if ((!Number.isInteger(unread) || unread < 0) && rec.flowOk && !rec.dead && !this.closed) {
+      this.#invalidate('fionread-unavailable');
       return null;
     }
+    return unread;
   }
 
   #stdinQueued(rec) {
@@ -979,7 +1031,7 @@ export class Supervisor {
   #armProbe(rec) {
     if (!this.enforceFlow || !rec.flowOk || rec.probeTimer || rec.dead) return;
     rec.probeTimer = setInterval(() => {
-      if (rec.dead) {
+      if (rec.dead || this.invalidReason) {
         this.#disarmProbe(rec);
         return;
       }
@@ -1033,6 +1085,10 @@ export class Supervisor {
   }
 
   #pause(rec, reason) {
+    // Exit drain has to read through EOF. A budget pause here stops the
+    // handle, and the callback's true return does not start it again, so
+    // the queued response never arrives and the record stays accounted.
+    if (rec.exitDrain || rec.exitFinished) return;
     if (rec.paused || rec.dead) return;
     rec.paused = true;
     rec.pauseReason = reason;
@@ -1077,7 +1133,14 @@ export class Supervisor {
       } else if (rec.pauseReason === 'partial') {
         if (globalOpen && rec.framer.pendingBytes() <= this.partialLowWater) this.#unpause(rec);
       } else if (rec.pauseReason === 'total') {
-        if (globalLow && this.#pluginBytes(rec) <= rec.limits.total / 2) this.#unpause(rec);
+        // A held reply resumes only once that reply fits. The half-ceiling
+        // path is for a pause with nothing waiting; using it while a reply
+        // is held spins, because the reply still does not fit.
+        if (rec.deferred.length > 0) {
+          if (this.#holdFits(rec)) this.#unpause(rec);
+        } else if (globalLow && this.#pluginBytes(rec) <= this.#childCeiling(rec) / 2) {
+          this.#unpause(rec);
+        }
       }
     }
     for (const rec of this.children.values()) {
@@ -1190,6 +1253,35 @@ export class Supervisor {
         return false;
       }
     }
+    // Grants and timestamps are attached here, so the mux frame can be larger
+    // than the child's line. Admit it only when the resulting #pluginBytes
+    // (this frame in place of the pending identifiers) stays ≤ B_t. A frame
+    // larger than the ceiling can never be admitted and is not retained.
+    // A smaller one waits as a parsed line and is encoded again once the
+    // other charged bytes leave: parking the encoding now would itself push
+    // #pluginBytes over B_t.
+    const ceiling = this.#childCeiling(rec);
+    const pendingIds = pending.idBytes ?? 0;
+    const resulting = this.#pluginBytes(rec) - pendingIds + buf.length;
+    if (resulting > ceiling) {
+      this.caps.total = true;
+      if (buf.length > ceiling) {
+        const still = this.#take(pluginId, msg.correlationId, lane);
+        if (still) {
+          this.#enqueueTerminal({
+            kind: 'error',
+            code: 'total-cap',
+            for: lane,
+            pluginId: still.pluginId,
+            correlationId: still.correlationId,
+            generation: still.generation,
+          });
+        }
+        return false;
+      }
+      this.#pause(rec, 'total');
+      return { defer: true, buf: null, need: buf.length };
+    }
     // One stdout chunk can carry many results. Pause does not stop this loop.
     // A reply that does not fit stays with its waiter and is charged; taking
     // it here would leave the kernel with a timeout and the bytes uncounted.
@@ -1198,7 +1290,7 @@ export class Supervisor {
       this.#pause(rec, 'bulk');
       return { defer: true, buf };
     }
-    if (this.bufferedBytes() + buf.length > this.#globalCap()) {
+    if (this.bufferedBytes() - pendingIds + buf.length > this.#globalCap()) {
       this.caps.total = true;
       this.#pause(rec, 'global');
       return { defer: true, buf };
@@ -1326,7 +1418,42 @@ export class Supervisor {
   #onExit(rec, code, signal) {
     rec.exitCode = code;
     rec.signal = signal;
+    // The process exit event arrives before stdout EOF. Dropping the read
+    // socket here discards a response still queued in the kernel. Keep the
+    // record accounted, close the writer dup so EOF can arrive, read until
+    // the socket ends, and only then release the probe and the sockets.
+    if (!rec.dead && rec.flowOk && rec.stdoutSocket && !rec.stdoutSocket.destroyed) {
+      this.#drainStdoutToEnd(rec);
+      return;
+    }
     rec.stash = null;
+    this.#finishExit(rec);
+  }
+
+  #drainStdoutToEnd(rec) {
+    if (rec.exitDrain || rec.exitFinished) return;
+    rec.exitDrain = true;
+    if (Number.isInteger(rec.stdoutWriter) && rec.stdoutWriter >= 0) {
+      closeFd(rec.stdoutWriter);
+      rec.stdoutWriter = null;
+    }
+    const done = () => this.#finishExit(rec);
+    rec.stdoutSocket.once('end', done);
+    rec.stdoutSocket.once('close', done);
+    rec.stdoutSocket.once('error', done);
+    rec.paused = false;
+    rec.pauseReason = null;
+    rec.readPosted = false;
+    const stash = rec.stash;
+    rec.stash = null;
+    if (stash && stash.length > 0) this.#onChild(rec, stash);
+    if (rec.dead || rec.exitFinished) return;
+    this.#considerRead(rec);
+  }
+
+  #finishExit(rec) {
+    if (rec.exitFinished) return;
+    rec.exitFinished = true;
     this.#releaseFlow(rec);
     if (rec.dead) return;
     rec.dead = true;

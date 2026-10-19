@@ -140,8 +140,9 @@ test('a missing pipe probe is an invalid run', { timeout: 20_000 }, async () => 
   const result = await b3({ hold: false, pipeProbe: () => null });
   assert.equal(result.pass, null);
   assert.equal(result.outcome, 'invalid');
-  assert.equal(result.detail.caps.total.bound, null);
-  assert.notEqual(result.detail.caps.total.bound, false);
+  assert.equal(result.detail.reason, 'pipe-probe-unavailable');
+  assert.equal(result.detail.caps.reason, 'fionread-unavailable');
+  assert.equal(result.detail.caps.total, undefined);
 });
 
 test('pipe helper cache is a private directory', () => {

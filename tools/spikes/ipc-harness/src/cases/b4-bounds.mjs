@@ -29,14 +29,16 @@ async function roundTrip(stub, credential) {
   return res.payload?.ok === true && res.pluginId === credential.pluginId;
 }
 
-export async function b4() {
+export async function b4(opts = {}) {
   const detail = {};
   // P = MAX_RESIDUAL + K_in + C, so B_p = MAX_RESIDUAL. The last admitted read
   // can push the framer past that threshold. partial-cap before the framer has
   // seen more than MAX_RESIDUAL fails this case. Buffering exactly
   // MAX_RESIDUAL unterminated bytes does not throw.
-  const reserved = measureFlowReserve();
-  if (!reserved) return { pass: false, detail: { reason: 'reservation-unavailable' } };
+  const reserved = opts.reserve === undefined ? measureFlowReserve() : opts.reserve;
+  if (!reserved) {
+    return { pass: null, outcome: 'invalid', detail: { reason: 'reservation-unavailable' } };
+  }
   const partialCap = MAX_RESIDUAL + reserved.kIn + reserved.readBytes;
   const pair = await connectPair({
     sweeper: false,
