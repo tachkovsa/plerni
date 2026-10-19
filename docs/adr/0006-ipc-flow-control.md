@@ -23,14 +23,14 @@ Item 11 and item 15 of the report state the oracle result: the hypothesis that t
 
 The bytes B3 counts are not the bytes the cap inspects.
 
-1. **The read chunk is already in userspace when the cap runs.** Node 22's default `highWaterMark` for a non-object-mode stream is 65536, and the option is a threshold, not a limit: it stops further reads, and it does not bound a chunk already delivered ([stream](https://nodejs.org/docs/latest-v22.x/api/stream.html), `stream.getDefaultHighWaterMark`, bumped in v22.0.0). 69632 = 4096 bytes already in the framer + one 65536-byte delivery. Feeding that delivery in 4096-byte slices crosses the 32768 cap on the slice that takes the framer to 36864 and leaves the other 32768 bytes as `inFlightTailBytes`. `pause()` does not drop them.
-2. **The kernel has already accepted more bytes than the cap.** Child stdio from `uv_spawn` with `UV_CREATE_PIPE` is a `socketpair(2)`, not a pipe ([libuv processes](https://docs.libuv.org/en/v1.x/guide/processes.html)). Node documents the same fact: spawn pipes "are not actual Unix pipes" and have a platform-specific capacity ([child_process](https://nodejs.org/docs/latest-v22.x/api/child_process.html)). The harness observes that capacity as `SO_RCVBUF` 131072. `FIONREAD` / `SIOCINQ` on that fd is the unread receive count ([unix(7)](https://man7.org/linux/man-pages/man7/unix.7.html)). Those bytes sit outside `bufferedBytes()` until a later read. Pausing the stream stops the next read; it does not shrink the queue the child has already filled. The flood child writes until `stdout.write` returns false and then waits for `drain`, so it already honors kernel backpressure — and the queue it fills is larger than either cap.
+1. **The read chunk is already in userspace when the cap runs.** Node 22's default `highWaterMark` for a non-object-mode stream is 65536 (`stream.getDefaultHighWaterMark`, bumped in v22.0.0). That option is a threshold, not a limit, and it does not set the read size ([stream](https://nodejs.org/docs/latest-v22.x/api/stream.html)). The 65536-byte delivery comes from libuv: `uv__read` calls `alloc_cb` with `64 * 1024` ([libuv v1.x `src/unix/stream.c`](https://github.com/libuv/libuv/blob/v1.x/src/unix/stream.c)). 69632 = 4096 bytes already in the framer + one 65536-byte delivery. Feeding that delivery in 4096-byte slices crosses the 32768 cap on the slice that takes the framer to 36864 and leaves the other 32768 bytes as `inFlightTailBytes`. `pause()` does not drop them.
+2. **The kernel has already accepted more bytes than the cap.** Child stdio from `uv_spawn` with `UV_CREATE_PIPE` is a `socketpair(2)`, not a pipe ([libuv processes](https://docs.libuv.org/en/v1.x/guide/processes.html)). Node documents the two facts separately ([child_process](https://nodejs.org/docs/latest-v22.x/api/child_process.html)): "These pipes have limited (and platform-specific) capacity." And: "These are not actual Unix pipes and therefore the child process can not use them by their descriptor files, e.g. `/dev/fd/2` or `/dev/stdout`." The harness observes that capacity as `SO_RCVBUF` 131072. `FIONREAD` / `SIOCINQ` on that fd is the unread receive count ([unix(7)](https://man7.org/linux/man-pages/man7/unix.7.html)). Those bytes sit outside `bufferedBytes()` until a later read. Pausing the stream stops the next read; it does not shrink the queue the child has already filled. The flood child writes until `stdout.write` returns false and then waits for `drain`, so it already honors kernel backpressure — and the queue it fills is larger than either cap.
 
 Userspace high-water marks therefore cannot be the enforcement point. They observe a copy, after the kernel queue and after the current read.
 
 ## Decision
 
-Compare the three live options, then adopt one formula.
+Compare the three live options, then adopt one formula. Acceptance of the formula is measured on Linux. macOS is a dev-only platform and is not a pass platform for this record. The skb ceiling below is a Linux `AF_UNIX` `SOCK_STREAM` fact and is not claimed on macOS.
 
 ### 1. Credit / window, on its own
 
@@ -50,109 +50,150 @@ That equality is real only for a sender that obeys. RFC 9113 puts the obligation
 
 Two different knobs are easy to conflate.
 
-**Socket buffer.** [socket(7)](https://man7.org/linux/man-pages/man7/socket.7.html) doubles `SO_RCVBUF` and `SO_SNDBUF` on `setsockopt`, returns the doubled value from `getsockopt`, and documents a minimum doubled value of 256 for `SO_RCVBUF` and 2048 for `SO_SNDBUF`. `SO_RCVBUFFORCE` / `SO_SNDBUFFORCE` need `CAP_NET_ADMIN`. On `AF_UNIX`, [unix(7)](https://man7.org/linux/man-pages/man7/unix.7.html) says the opposite of the obvious fix: "`SO_SNDBUF` does have an effect for UNIX domain sockets, but the `SO_RCVBUF` option does not." The datagram sentence that follows (doubled value minus 32) is about datagram size, not the stream queue. The stream ceiling is whatever a blocked writer actually fills, measured with `FIONREAD`, and it has to be ≤ the `getsockopt(SO_SNDBUF)` of the **writer** end. Setting `SO_RCVBUF` on the parent's stdout fd, which is the read end, is the knob the man page says has no effect. The 131072 reading is evidence of the current queue, not a control the supervisor can turn down from that end.
+**Socket buffer.** [socket(7)](https://man7.org/linux/man-pages/man7/socket.7.html) doubles `SO_RCVBUF` and `SO_SNDBUF` on `setsockopt`, returns the doubled value from `getsockopt`, and documents a minimum doubled value of 256 for `SO_RCVBUF` and 2048 for `SO_SNDBUF`. The unprivileged maximum is `/proc/sys/net/core/wmem_max` for `SO_SNDBUF` (and `rmem_max` for `SO_RCVBUF`). `SO_RCVBUFFORCE` / `SO_SNDBUFFORCE` need `CAP_NET_ADMIN`. On `AF_UNIX`, [unix(7)](https://man7.org/linux/man-pages/man7/unix.7.html) says the opposite of the obvious fix: "`SO_SNDBUF` does have an effect for UNIX domain sockets, but the `SO_RCVBUF` option does not." The datagram sentence that follows (doubled value minus 32) is about datagram size, not the stream queue. Setting `SO_RCVBUF` on the parent's stdout fd, which is the read end, does not shrink this queue. The 131072 reading is evidence of the current queue, not a control the supervisor can turn down from that end.
 
-The writer end for child stdout is the fd the child holds. libuv creates it inside `uv_spawn`, and a hostile child will not shrink it. The supervisor has to create the `socketpair`, call `setsockopt(SO_SNDBUF)` on the end that will become the child's stdout, and spawn with that fd inherited. The same call on the parent's stdin write end bounds parent→child kernel bytes. macOS [getsockopt(2)](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/getsockopt.2.html) allows `SO_SNDBUF` and `SO_RCVBUF` to be decreased "to limit the possible backlog of incoming data" and "places an absolute limit on these values." It does not say `SO_RCVBUF` is a no-op. The formula below uses the measured `getsockopt` result on the platform that produced it.
+`getsockopt(SO_SNDBUF)` is not itself the hard ceiling. In `unix_stream_sendmsg` the ordinary send path caps each skb at `(sk_sndbuf >> 1) - 64` ("Keep two messages in the pipe so it schedules better"), then further at `SKB_MAX_HEAD(0) + UNIX_SKB_FRAGS_SZ`, which can only shrink that skb ([`net/unix/af_unix.c`](https://github.com/torvalds/linux/blob/master/net/unix/af_unix.c)). `sock_alloc_send_pskb` allocates while `sk_wmem_alloc_get(sk) < sk_sndbuf` ([`net/core/sock.c`](https://github.com/torvalds/linux/blob/master/net/core/sock.c)), so a writer can add one more skb once usage is just under the limit. The reserved ceiling is therefore
 
-**Pipe capacity.** [F_SETPIPE_SZ](https://man7.org/linux/man-pages/man2/f_setpipe_sz.2const.html) changes the capacity of a pipe to at least `arg` bytes. An unprivileged process is limited to the range from the page size to `/proc/sys/fs/pipe-max-size`. A request below the page size is rounded up. The kernel may allocate the next higher power-of-two page multiple, and the return value is the capacity actually set. `EBUSY` if the new size is below the data already stored. The operation is Linux-only (Standards: Linux; History: Linux 2.6.35). The default pipe is 16 pages, 65536 bytes when the page is 4096 ([pipe(7)](https://man7.org/linux/man-pages/man7/pipe.7.html)). macOS does not have this operation; the XNU pipe buffer is fixed (`PIPE_SIZE` 16384, `BIG_PIPE_SIZE` 64 KiB, [bsd/sys/pipe.h](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/pipe.h)). It is also the wrong object for this fd: the spike's stdout is a socket, and `F_GETPIPE_SZ` does not apply. `F_SETPIPE_SZ` becomes the ceiling only on a platform where the fd is a real pipe and `F_GETPIPE_SZ` returns the capacity.
+```
+K = sndbuf + (sndbuf >> 1) - 64
+```
 
-**Smaller reads.** Setting the stdout `highWaterMark` (and the framer slice) down from 65536 removes the 32768-byte tail only for the next chunk. The kernel queue remains. A 4096-byte read plus a 131072-byte queue still misses both 36864 and 53248.
+where `sndbuf` is the `getsockopt(SO_SNDBUF)` value, already doubled. Queued usage before the extra skb is at most `sndbuf - 1`, and the extra skb is at most `(sndbuf >> 1) - 64`, so the occupancy is at most `sndbuf + (sndbuf >> 1) - 65`. `K` is one byte above that and is the reservation this record uses. A tighter expression would have to come from those two checks; `SKB_MAX_HEAD` only makes the extra skb smaller. The `MSG_SPLICE_PAGES` branch does not apply the per-skb cap. Any occupancy above `K`, splice included, is a failed ceiling (below), not a new value of `K`. If `(sndbuf >> 1) - 64` is not positive, the path has no usable extra-skb bound and the budget is unsatisfiable.
 
-Shrink-and-read can enforce the caps only when the measured ceilings fit inside them. On today's unshrunk socket they do not: 131072 is already greater than 32768 and 49152.
+The writer end for child stdout is the fd the child holds. libuv creates the pair inside `uv_spawn`, and a hostile child will not shrink it. Node has no public `socketpair` and no public `setsockopt(SO_SNDBUF)` on a `net.Socket`. The supervisor does both through a small N-API helper under the same rules as [`tools/spikes/ipc-harness/src/pipe_pending.mjs`](../../tools/spikes/ipc-harness/src/pipe_pending.mjs): compiled for this ABI on first use; the binary placed in a `0700` directory owned by the current uid; a symlink rejected; group and other permission bits clear; ownership and mode checked again before `require()`; a failed compile, check, or call returns null; a null result is never turned into a scored bound. The helper creates the `socketpair`, sets `SO_SNDBUF` on each writer end, and reads `FIONREAD` and `SIOCOUTQ`.
 
-### 3. Adopted: reserve the measured kernel ceilings and one read inside each cap
+The child end is passed to `spawn` as a positive integer stdio fd. Node's rule for that value is a separate sentence from the two quoted above: "The integer value is interpreted as a file descriptor that is open in the parent process. It is shared with the child process, similar to how objects can be shared. Passing sockets is not supported on Windows." The parent closes its copy of the child end after spawn. For stdout the parent keeps the read end, the child inherits the write end as fd 1, and `SO_SNDBUF` is set on that write end before spawn. For stdin the parent keeps the write end, the child inherits the read end as fd 0, and `SO_SNDBUF` is set on the parent's write end. The child does not hold the stdin writer, so it cannot raise `K_out`.
+
+**Pipe capacity.** [F_SETPIPE_SZ](https://man7.org/linux/man-pages/man2/f_setpipe_sz.2const.html) changes the capacity of a pipe to at least `arg` bytes. An unprivileged process is limited to the range from the page size to `/proc/sys/fs/pipe-max-size`. A request below the page size is rounded up. The kernel may allocate the next higher power-of-two page multiple, and the return value is the capacity actually set. `EBUSY` if the new size is below the data already stored. The operation is Linux-only (Standards: Linux; History: Linux 2.6.35). The default pipe is 16 pages, 65536 bytes when the page is 4096 ([pipe(7)](https://man7.org/linux/man-pages/man7/pipe.7.html)). macOS does not have this operation; the XNU pipe buffer is fixed (`PIPE_SIZE` 16384, `BIG_PIPE_SIZE` 64 KiB, [bsd/sys/pipe.h](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/pipe.h)). It is also the wrong object for this fd: the spike's stdout is a socket, and `F_GETPIPE_SZ` does not apply. `F_SETPIPE_SZ` becomes the ceiling only on a platform where the fd is a real pipe. There the reserved `K_in` is the `F_GETPIPE_SZ` return, with no skb overshoot added.
+
+**Smaller reads.** `highWaterMark` does not cap the buffer libuv delivers. The stdout read end is wrapped as
+
+```
+new net.Socket({ fd, onread: { buffer: Buffer.alloc(C), callback } })
+```
+
+with `readable: true`. That flag defaults to false when an `fd` is passed, and without it the socket does not read ([net](https://nodejs.org/docs/latest-v22.x/api/net.html), `onread` added in v12.10.0). Incoming data is stored in that single buffer and passed to the callback as the byte count and the buffer. Returning false from the callback pauses the socket. The streaming `'data'` path is not used, so a delivered chunk is at most `C` bytes. A smaller `C` without a shrunk writer buffer still leaves the kernel queue. A 4096-byte read plus the unshrunk queue still misses both 36864 and 53248.
+
+macOS [getsockopt(2)](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/getsockopt.2.html) allows `SO_SNDBUF` and `SO_RCVBUF` to be decreased "to limit the possible backlog of incoming data" and "places an absolute limit on these values." It does not say `SO_RCVBUF` is a no-op. A macOS dev run is not the acceptance measurement for the Linux formula.
+
+Shrink-and-read can enforce the caps only when `K_in + C` fits in `P` and `K_in + K_out + C` fits in `T`. On today's unshrunk socket they do not: 131072 is already greater than 32768 and 49152.
+
+### 3. Adopted: reserve the writer-end ceiling and one read inside each cap
 
 Use both mechanisms, with different jobs.
 
-- **Enforcement, which the oracle trusts,** is the kernel ceiling plus the read size. The flood child already stops when the kernel buffer fills. The supervisor makes that buffer small enough, and stops reading early enough, that the filled buffer plus one read still lands inside the configured cap.
+- **Enforcement, which the oracle trusts,** is the writer-end ceiling plus the `onread` buffer. The flood child already stops when the kernel buffer fills. The supervisor makes that buffer small enough, and posts reads of at most `C`, that the filled buffer plus one read still lands inside the configured cap.
 - **Credit, which a correct plugin trusts,** is the same budget advertised to the child and replenished only after consumption. Cancels and grant messages do not consume the child's send window, for the reason in RFC 9113 §5.2.1 item 5. The B3 flood is not required to honor the grant. B1's in-flight window is the userspace budget below, which can be most of a default cap, rather than the kernel ceiling alone.
 
-The supervisor owns the socketpair and sets `SO_SNDBUF` on each writer end before the child starts. `K_in` is the measured child→parent ceiling: `getsockopt(SO_SNDBUF)` on the child's stdout end, confirmed by the maximum `FIONREAD` while a writer is blocked. If the occupancy exceeds the getsockopt value, the occupancy is the ceiling. `K_out` is the same measurement on the parent's stdin write end. `C` is the maximum stdout read (highWaterMark and framer slice, set equal). `P` is the configured partial cap (the trip test uses 32768). `T` is the configured per-child total cap (the trip test uses 49152).
+`sndbuf_in` is `getsockopt(SO_SNDBUF)` on the child stdout writer, taken from the supervisor's own `setsockopt` before spawn. `sndbuf_out` is the same call on the parent's stdin writer. `K_in` and `K_out` are each `sndbuf + (sndbuf >> 1) - 64` for that end. On a real pipe the corresponding `K` is the `F_GETPIPE_SZ` return and the half-skb term is absent. `C` is the `onread` buffer size, and the framer slice is set equal to it. `P` is the configured partial cap (the trip test uses 32768). `T` is the configured per-child total cap (the trip test uses 49152). `S` is the configured ceiling for the shared bytes that `#pluginBytes` does not charge to a child: the mux framer (`bridge.pendingBytes()`), the unbound queue, and the shared socket outbound buffer (`socketOutbound`). Per-child hi/lo queue bytes stay inside `T` and are not counted again in `S`.
 
-The configuration is satisfiable only when both budgets are non-negative:
+The configuration is satisfiable only when every budget is non-negative and each socket's per-skb term is positive:
 
 ```
+(sndbuf_in  >> 1) - 64 > 0
+(sndbuf_out >> 1) - 64 > 0
 B_p = P - K_in - C ≥ 0
 B_t = T - K_in - K_out - C ≥ 0
+B_g = totalGlobal - Σ K_in - Σ K_out - Σ C ≥ 0
 ```
 
-Otherwise the run is **invalid**. It is not a pass, and it is not permission to publish `K_in` as the accepted bound. The maintainer already refused that bound.
+`Σ` runs over live children. `Σ C` counts a child that may have a read posted. A pipe end skips the per-skb test and contributes its `F_GETPIPE_SZ` return as `K`. If any required test fails, the outcome is **`unsatisfiable`**. That outcome is a B3 FAIL. The §3.0 record states the cause (the reservation does not fit the configured caps) and points at the flip condition below. Plan §3.0 keeps **`invalid`** for environmental noise: a failed preflight, and a null probe that cannot score. An unsatisfiable budget is not that outcome, and it is not permission to publish the unshrunk queue as the accepted bound.
 
-The supervisor starts a stdout read only when `pendingBytes ≤ B_p` and `bufferedBytes() ≤ B_t`. Each read is at most `C`. One read already posted may add at most `C` to the snapshot, split between bytes fed to the framer and the unprocessed tail. `stdoutUnread ≤ K_in`. `stdinQueued ≤ K_out`.
+Illustration only, using the socket(7) doubled minimum of 2048, which this record does not claim `AF_UNIX` will accept: `K = 2048 + 1024 - 64 = 3008`. With `C = 4096`, `K_in + C = 7104 ≤ 32768` and `K_in + K_out + C = 10112 ≤ 49152`. The re-spike uses the `getsockopt` values it actually gets back.
 
-**Assertion, both clauses, on the pre-cleanup snapshot:**
+**Admission.** The inequalities hold because every byte addition is gated, not because a stdout read happened to look first.
+
+- A stdout read is started only when `pendingBytes ≤ B_p`, the child's `#pluginBytes ≤ B_t`, and the process userspace sum has room for `C` inside `B_g`. Each read is at most `C`. One read already posted may add at most `C`, split between bytes fed to the framer and the unprocessed tail.
+- An outbound payload and its identifiers are admitted only when the resulting `#pluginBytes` stays ≤ `B_t` and the process userspace sum stays ≤ `B_g`. The pending-call map remains a count cap checked before the stdin write. It does not admit those bytes.
+- A shared-buffer write (mux framer, unbound queue, shared socket outbound) is admitted only when the shared total stays ≤ `S` and the process userspace sum stays ≤ `B_g`.
+
+**Parent write policy for a cancel.** The kernel cannot reserve room inside `K_out`. The parent does not admit payload that would leave either the userspace budget or the measured stdin queue without room for one cancel frame. If the measured outbound queue plus the cancel would exceed `K_out`, the parent writes the cancel before further payload. The cancel's own bytes still count: they sit in `rec.outbound` until the kernel accepts them, then in the measured queue.
+
+**Kernel terms are measured, and they are not redefined upward.** `stdoutUnread` is `FIONREAD` / `SIOCINQ` on the parent's stdout fd and must be ≤ `K_in` at the high-water snapshot. `stdinQueued` is `SIOCOUTQ` on the parent's stdin write end. Linux implements that ioctl for unix sockets as `unix_outq_len`, which is `sk_wmem_alloc_get` (`unix_ioctl` in `af_unix.c`). The parent→child queue is that reading. It is not assumed equal to `K_out`, and a child's read-credit message does not clear it. A null probe is `invalid` (the run cannot be scored). A reading above the reserved `K` is a B3 FAIL: `bound` false. The observed occupancy is not adopted as the ceiling.
+
+**Buffer-enlarger.** A child can raise `SO_SNDBUF` on its own stdout writer up to `wmem_max` without privileges ([socket(7)](https://man7.org/linux/man-pages/man7/socket.7.html)). On a real pipe it can raise `F_SETPIPE_SZ` up to `pipe-max-size`. The reserved `K` is the value from the supervisor's own call, not a later `getsockopt` the child may have changed. The adopted response is to fault the child as soon as its unread bytes exceed that reserved size, scored as a B3 FAIL. A sandbox or seccomp that rejects a later `SO_SNDBUF` raise and `F_SETPIPE_SZ` would instead let that child pass the cap; this record does not adopt that alternative. The flood child that does not enlarge its buffer can still pass. `SIOCOUTQ > K_out` is the same class of FAIL on the parent writer (the parent enlarged the buffer, or the probe disagrees with the reservation). It does not raise `K_out`.
+
+**Assertion, both clauses, on the pre-cleanup snapshot,** and only while `stdoutUnread ≤ K_in` and `stdinQueued ≤ K_out`:
 
 ```
 partial_high_water = pendingBytes + inFlightTailBytes + stdoutUnread ≤ P
 
-total_accounted = bufferedBytes() + inFlightTailBytes + stdoutUnread + stdinQueued ≤ T
+total_accounted = #pluginBytes + inFlightTailBytes + stdoutUnread + stdinQueued ≤ T
 ```
 
-`bufferedBytes()` is the userspace total the supervisor already sums (framer, stash, deferred, ids, outbound not yet accepted by the kernel, queue bytes, `readableLength`). The tail term is added only while it is still outside that sum: once it is stashed or pushed back onto the stream, `readableLength` or `stash` already holds it and the tail term is 0. `FIONREAD` is never inside `bufferedBytes()`. The current fault path already adds the tail and the unread count for the total clause; the partial clause gains the unread count too. `stdoutUnread` is `FIONREAD` / `SIOCINQ` on the parent's stdout fd. `stdinQueued` is a documented send-side occupancy when the platform provides one. [unix(7)](https://man7.org/linux/man-pages/man7/unix.7.html) lists `SIOCINQ` and does not list `SIOCOUTQ` (that ioctl is specified for TCP in [tcp(7)](https://man7.org/linux/man-pages/man7/tcp.7.html)). Where no send-side probe exists, `stdinQueued` is `K_out` if the parent has written since the child last returned read credit, and `0` only when no such write is outstanding. A missing `K_out` measurement is an invalid run, not a zero.
+`#pluginBytes` is the per-child userspace total (framer, stash, deferred, ids, hi/lo, outbound not yet accepted by the kernel, `readableLength`). The tail term is added only while it is still outside that sum: once it is stashed or pushed back onto the socket, the userspace term already holds it and the tail term is 0. `FIONREAD` is never inside `#pluginBytes`. The process-wide assertion is the same shape against `totalGlobal`: `bufferedBytes()` (which already includes the shared terms and every child's userspace bytes) plus tails not yet in that sum, plus each `stdoutUnread`, plus each `stdinQueued`.
 
-Those stop rules give:
+Those rules give:
 
 ```
 partial_high_water ≤ B_p + C + K_in = P
 total_accounted    ≤ B_t + C + K_in + K_out = T
+process            ≤ B_g + Σ K_in + Σ K_out + Σ C = totalGlobal
 ```
 
-The pending-call map stays a count cap enforced before the stdin write. It is not one of the two failed clauses. Outbound data bytes sit inside `T` through `rec.outbound` plus `stdinQueued`, which is the other direction of "at every queue".
+The partial inequality is per connection. The B3 trip test spawns one child for the byte caps, so that child's sum and the process reading move together. The pending-call map is not one of the two failed clauses.
 
-The partial inequality is per connection. The total inequality is applied to that child's `#pluginBytes` plus its own tail, `stdoutUnread`, and `stdinQueued`. It is also applied to the process-wide sum against `totalGlobal`, with `K_in` and `K_out` summed over the live children and one `C` reserved per child that may have a read posted. The B3 trip test spawns one child for the byte caps, so that child's sum and `bufferedBytes()` are the same reading. A global budget that goes negative is invalid for the same reason a per-child budget is.
+**Typed faults use the accounted sum.** The supervisor does not wait until `pendingBytes` alone reaches the cap, and it does not leave a never-terminated frame blocked in the kernel with no verdict.
 
-On a platform where stdout is a real pipe, `K_in` is the `F_SETPIPE_SZ` / `F_GETPIPE_SZ` return value instead of `SO_SNDBUF`. The inequalities do not change.
+- When `partial_high_water > P` and `P` is at or below the framer's 1 MiB ceiling (`MAX_FRAME_SIZE`, 1048576), the fault is `partial-cap`. A partial cap below 1 MiB faults here, not after the framer has buffered 1 MiB.
+- When the current frame has no newline, `P` is above that ceiling, and `partial_high_water > 1048576`, the fault is `NdjsonOversizeError`. The case that sets the partial cap to 1048577 still reaches that error: `B_p = P - K_in - C` sits below 1 MiB, so `pendingBytes` alone may never pass the ceiling, but the accounted sum (framer residual + tail + `stdoutUnread`) does once the writer has filled `K_in`. The re-spike's B4 check for "past the framer" is this sum, not `pendingBytes` alone. The fault still bounds the userspace residual (the supervisor does not pull the kernel queue into the framer to discover the oversize).
+- When both predicates would be true, the partial cap wins if `P ≤ 1048576`, and `NdjsonOversizeError` wins if `P` is above the ceiling.
 
 ### Vacuity control
 
 A cleaned-up count must not be able to satisfy the bound. Every scored total run already has `afterCleanup` 0, and `0 ≤ T` would be true. The bound function therefore refuses a snapshot that was taken after the child was marked dead and the framer, stash, and tail were dropped. The existing control stays: `totalCapHolds(afterCleanup, T)` is false, so the post-cleanup count is not "just over the cap".
 
-Two further controls keep the new terms load-bearing:
+Three further controls keep the new terms load-bearing:
 
 - Replaying the recorded partial snapshot (36864 + 32768, and `stdoutUnread` absent or zero) through `partial_high_water ≤ P` is false at `P = 32768`. A scorer that drops the tail, or that still allows `P + 4096`, fails this control.
-- A run whose `K_in` is the unshrunk 131072, or whose probe returned null, is invalid. It must not be reported as `bound: true`.
+- On one host, against the same `P` and `T`, a variant with enforcement removed (the default socket buffer and libuv's 64 KiB reads) scores **FAIL**. That result is not `invalid` and not `unsatisfiable`. The enforced variant on that same host scores pass. A scorer that marks the unenforced run `invalid`, or that lets it pass, fails this control.
+- The buffer-enlarger child (re-spike item below) scores FAIL. A scorer that raises `K` to the child's new buffer and then reports `bound: true` fails this control.
 
 ### Effect on B1, B2, and B4–B6
 
-Default caps stay where they are (partial 65536, per-child total 262144, global total 1048576). The trip test's 32768 and 49152 are the small caps that must still hold; they are not the B1 window. `B_t` under the default total is that total minus `K_in + K_out + C`. With `K_*` at the socket(7) `SO_SNDBUF` floor (doubled minimum 2048) and `C` at 4096, the 1024-byte / in-flight-128 B1 shape still fits in the userspace budget. The re-spike measures the real `K_*`. If they are larger, the budget shrinks by that amount and B1 is scored again, not assumed.
+Default caps stay where they are (partial 65536, per-child total 262144, global total 1048576). The trip test's 32768 and 49152 are the small caps that must still hold; they are not the B1 window. `B_t` under the default total is that total minus `K_in + K_out + C`. With both ends at the socket(7) doubled minimum, `K = 3008` and `C = 4096`, the 1024-byte / in-flight-128 B1 shape still fits in the userspace budget. The re-spike measures the real `K_*`. If they are larger, the budget shrinks by that amount and B1 is scored again, not assumed.
 
 - **B1.** Same frozen shape (2 children, in-flight 128, offered 8000/s, 1024-byte payload, warmup ≥ 5 s, window ≥ 60 s, ≥ 3 reps). Pass remains ≥ 5000 round-trip/s and p99 ≤ 10 ms. Extra blocking shows up there if `K_in` is so small that every response waits on the socket. That is a regression of this design, not a reason to drop `K_in` out of the formula.
-- **B2.** Authority transitions stay in PostgreSQL. Renewal traffic stays `active executions / cadence` UPDATE transactions per second. A cancel shares the child's stdin socket with data, so it can sit behind bytes already in `K_out`. Grant and cancel frames do not consume the data window, and the parent reserves room for one cancel inside `K_out` rather than filling that buffer with payload. The race battery reruns as specified.
-- **B4.** The 1 MiB typed error, the incremental oversize, and the never-terminated frame stay. A lower read size changes how many reads it takes to reach the cap; it must still fault the offending child with a typed error, and a partial cap below 1 MiB must fault at `P` rather than buffering to the framer's 1 MiB ceiling. The case that sets the partial cap to 1 MiB + 1 byte still reaches `NdjsonOversizeError`.
+- **B2.** Authority transitions stay in PostgreSQL. Renewal traffic stays `active executions / cadence` UPDATE transactions per second. A cancel shares the child's stdin socket with data. Grant and cancel frames do not consume the data window. Room for one cancel is the parent write policy above: the kernel does not hold that slice inside `K_out`. The race battery reruns as specified.
+- **B4.** The 1 MiB typed error, the incremental oversize, and the never-terminated frame stay. A lower read size changes how many reads it takes to reach the cap. The offending child still faults with a typed error, using the accounted-sum rules above. The case that sets the partial cap to 1 MiB + 1 byte still reaches `NdjsonOversizeError`.
 - **B5.** Crash mid-call still fails pending calls with a typed error. The fencing token stays unusable by the respawned child. No authority-row change.
-- **B6.** One socketpair per child, so a full stdout queue does not fill a sibling. Identity remains stamped from the spawn-time credential. Sibling cancel p99 ≤ 500 ms is remeasured under the flood. The path at risk is a cancel on the flooded child's own stdin, bounded by the `K_out` reservation above; the sibling's socket is the one the numeric bound is about.
+- **B6.** One socketpair per child, so a full stdout queue does not fill a sibling. Identity remains stamped from the spawn-time credential. Sibling cancel p99 ≤ 500 ms is remeasured under the flood. The sibling's socket is the numeric bound. The flooded child's own stdin is the parent-write-policy path.
 
 ## Consequences
 
-- The next PR in this series changes the harness to own the socketpair, set and measure `SO_SNDBUF` on the writer ends, cap the read at `C`, and score the two inequalities. This record does not.
+- The next PR in this series changes the harness: the native helper, the integer-fd spawn, the `onread` buffer, the admission gates, and the two inequalities. This record does not.
 - T7 does not adopt the failed numbers (partial high-water 69632, accounted totals 106496 / 57344 / 155648, `SO_RCVBUF` 131072). After a green re-spike the annex's buffer terms are:
 
 ```
 per child, partial ≤ P    only where K_in + C ≤ P
 per child, total   ≤ T    only where K_in + K_out + C ≤ T
-per host           ≤ min(N × T, totalGlobal)
+shared             ≤ S    mux framer, unbound queue, shared socket outbound
+per host           ≤ min(N × T + S, totalGlobal)
 ```
 
-with `P`, `T`, `K_in`, `K_out`, and `C` taken from that run. RSS stays ≤ 64 MiB over ≥ 60 s. Renewal traffic is unchanged.
+with `P`, `T`, `S`, `K_in`, `K_out`, and `C` taken from that run. `N × T` does not include the shared terms; those sit only in `S`. RSS stays ≤ 64 MiB over ≥ 60 s. Renewal traffic is unchanged.
 
-- A negative budget on the runtime the harness ships on sends the track back to the maintainer. The larger measured queue is not silently accepted.
+- An `unsatisfiable` budget on the runtime the harness ships on sends the track back to the maintainer. The larger measured queue is not silently accepted.
 
 ## Re-spike
 
-Plan §3.0 ③ and the §4 measurement contract, on the redesigned substrate:
+Plan §3.0 ③ and the §4 measurement contract, on the redesigned substrate. The pass/fail measurement is on Linux. A macOS dev run is not that measurement.
 
-1. **≥ 3 runs** of `pnpm --filter @plerni-spike/ipc-harness spike:b3`, each with preflight recorded (CPU count, load, throttle, overload, `valid`). Frozen warmup ≥ 5 s, window ≥ 60 s, ≥ 3 reps. An invalid environment is an invalid run, not a verdict.
-2. **Suites that rerun,** because the substrate moved: B1, B2, B4, B5, B6, and `test:races`, plus the B3 invocation above. Spike A does not rerun for this change.
-3. **Revised T7 estimate:** the three inequalities in Consequences, filled with the measured `K_in`, `K_out`, and `C`. No numeric buffer term is published from the failed substrate.
-4. **Cross-family rerun:** a reviewer from a different model family than every generator checks out the pinned revision, reruns the suites from scratch, and posts a revision-bound receipt (reviewed head SHA, reviewer role, accountable sponsor, verification summary, outcome, opaque evidence ID). This Proposed record is not that receipt.
+1. **≥ 3 runs** of `pnpm --filter @plerni-spike/ipc-harness spike:b3`, each with preflight recorded (CPU count, load, throttle, overload, `valid`). Frozen warmup ≥ 5 s, window ≥ 60 s, ≥ 3 reps. An invalid environment is an invalid run, not a verdict. An `unsatisfiable` budget is a B3 FAIL with a §3.0 record and the flip condition, not an invalid run.
+2. **Suites that rerun,** because the substrate moved: B1, B2, B4, B5, B6, and `test:races`, plus the B3 invocation above. Spike A does not rerun for this change. B4's never-terminated assertion uses `partial_high_water` against the 1 MiB ceiling, as specified above.
+3. **Same-host vacuity pair.** One run with enforcement removed (default socket buffer, 64 KiB reads) and one enforced run, same host, same `P` and `T`. The unenforced run is FAIL. The enforced run passes.
+4. **Buffer-enlarger.** An adversarial child raises `SO_SNDBUF` on its stdout writer up to `wmem_max` (or `F_SETPIPE_SZ` up to `pipe-max-size` when the fd is a pipe) after spawn. The supervisor faults it, and the cap bound is false. This child is a designed cap-failure. The flood child that does not enlarge its buffer is the pass case.
+5. **Revised T7 estimate:** the inequalities in Consequences, filled with the measured `K_in`, `K_out`, `C`, and the configured `S`. No numeric buffer term is published from the failed substrate.
+6. **Cross-family rerun:** a reviewer from a different model family than every generator checks out the pinned revision, reruns the suites from scratch, and posts a revision-bound receipt (reviewed head SHA, reviewer role, accountable sponsor, verification summary, outcome, opaque evidence ID). This Proposed record is not that receipt.
 
 The spike B report gains §3.0 diagnosis records for any FAIL along the way. P0 still closes only on green on the shipped substrate.
 
 ## Flip conditions
 
-- Measured `K_in + C > P`, or `K_in + K_out + C > T`, on the shipping runtime, and no portable `setsockopt` / `F_SETPIPE_SZ` reaches a non-negative budget. This reservation cannot enforce the configured caps. The track returns to the maintainer; the unshrunk queue is not adopted as the cap.
+- A budget is `unsatisfiable` on the shipping runtime: a per-skb term `(sndbuf >> 1) - 64` is not positive, or `B_p`, `B_t`, or `B_g` is negative, and no portable `setsockopt` / `F_SETPIPE_SZ` reaches a non-negative budget. This reservation cannot enforce the configured caps. The track returns to the maintainer. The unshrunk queue is not adopted as the cap.
+- A child that does not raise `SO_SNDBUF` or `F_SETPIPE_SZ` produces `stdoutUnread > K_in` or `stdinQueued > K_out`. The reservation is not a ceiling on this kernel. The track returns to the maintainer. The observed occupancy is not adopted as the new `K`.
 - B1 on the frozen shape misses ≥ 5000 round-trip/s or p99 ≤ 10 ms under the default caps. Revisit `C` and `K_*` inside the inequalities. Do not remove the kernel term.
-- B6 sibling cancel p99 exceeds 500 ms. The stdin reservation for a cancel is too small or too late.
+- B6 sibling cancel p99 exceeds 500 ms. The parent's cancel write is too late, or payload was admitted without leaving room for it.
 - A later substrate whose stdout is a real pipe records `F_GETPIPE_SZ` as `K_in`. The assertion stays `≤ P` and `≤ T`.
 
 ## Sources
@@ -162,10 +203,12 @@ Live documents this record relies on, retrieved 2026-10-19:
 - RFC 9113 §5.2, <https://www.rfc-editor.org/rfc/rfc9113.html#section-5.2>
 - Linux socket(7), <https://man7.org/linux/man-pages/man7/socket.7.html>
 - Linux unix(7), <https://man7.org/linux/man-pages/man7/unix.7.html>
-- Linux tcp(7) `SIOCOUTQ`, <https://man7.org/linux/man-pages/man7/tcp.7.html>
+- Linux `unix_stream_sendmsg` and `unix_outq_len` / `SIOCOUTQ`, <https://github.com/torvalds/linux/blob/master/net/unix/af_unix.c>
+- Linux `sock_alloc_send_pskb`, <https://github.com/torvalds/linux/blob/master/net/core/sock.c>
 - Linux F_SETPIPE_SZ, <https://man7.org/linux/man-pages/man2/f_setpipe_sz.2const.html> (man-pages 6.19)
 - Linux pipe(7), <https://man7.org/linux/man-pages/man7/pipe.7.html>
 - libuv processes guide, <https://docs.libuv.org/en/v1.x/guide/processes.html>
-- Node.js v22 stream and child_process, <https://nodejs.org/docs/latest-v22.x/api/stream.html>, <https://nodejs.org/docs/latest-v22.x/api/child_process.html>
+- libuv v1.x `uv__read` `alloc_cb` of `64 * 1024`, <https://github.com/libuv/libuv/blob/v1.x/src/unix/stream.c>
+- Node.js v22 stream, child_process, and net, <https://nodejs.org/docs/latest-v22.x/api/stream.html>, <https://nodejs.org/docs/latest-v22.x/api/child_process.html>, <https://nodejs.org/docs/latest-v22.x/api/net.html>
 - macOS getsockopt(2), <https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/getsockopt.2.html>
 - XNU `bsd/sys/pipe.h`, <https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/pipe.h>
