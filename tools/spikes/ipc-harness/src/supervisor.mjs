@@ -23,6 +23,10 @@ import { closeEnds, closeFd, createChildEnds, fionread, sndbuf } from './flow_so
 
 export { partialCapHolds, totalCapHolds } from './flow_budget.mjs';
 
+// A stuck write end must not hold the reservation forever. EOF or stream
+// close releases it first; this deadline is the bound when neither arrives.
+export const EXIT_DRAIN_MS = 1000;
+
 function waitExit(child) {
   return new Promise((resolve) => {
     if (child.exitCode != null || child.signalCode != null) {
@@ -150,6 +154,9 @@ export class Supervisor {
     this.pipeProbe = typeof opts.pipeProbe === 'function' ? opts.pipeProbe : pipePending;
     this.flowPending = typeof opts.flowPending === 'function' ? opts.flowPending : fionread;
     this.readSndbuf = typeof opts.readSndbuf === 'function' ? opts.readSndbuf : sndbuf;
+    this.exitDrainMs = Number.isInteger(opts.exitDrainMs) && opts.exitDrainMs >= 0
+      ? opts.exitDrainMs
+      : EXIT_DRAIN_MS;
     this.invalidReason = null;
     this.useDirect = opts.useDirect ?? useDirectFromEnv();
     this.capsConfig = { ...DEFAULT_CAPS, ...opts.caps };
@@ -277,6 +284,9 @@ export class Supervisor {
       stdoutWriter: flow?.stdoutWriter ?? null,
       probeTimer: null,
       readPosted: false,
+      exitDrain: false,
+      exitFinished: false,
+      exitDrainTimer: null,
     };
     if (flow) this.#attachFlowSockets(rec, flow);
     else {
@@ -1048,6 +1058,7 @@ export class Supervisor {
   }
 
   #releaseFlow(rec) {
+    this.#clearDrainTimer(rec);
     this.#disarmProbe(rec);
     if (Number.isInteger(rec.stdinProbe) && rec.stdinProbe >= 0) closeFd(rec.stdinProbe);
     rec.stdinProbe = null;
@@ -1420,14 +1431,21 @@ export class Supervisor {
     rec.signal = signal;
     // The process exit event arrives before stdout EOF. Dropping the read
     // socket here discards a response still queued in the kernel. Keep the
-    // record accounted, close the writer dup so EOF can arrive, read until
-    // the socket ends, and only then release the probe and the sockets.
+    // record accounted, close the writer dup so EOF can arrive, and read
+    // until the socket ends or the drain deadline. Only then release the
+    // stdin probe, the sockets, and the reservation.
     if (!rec.dead && rec.flowOk && rec.stdoutSocket && !rec.stdoutSocket.destroyed) {
       this.#drainStdoutToEnd(rec);
       return;
     }
     rec.stash = null;
     this.#finishExit(rec);
+  }
+
+  #clearDrainTimer(rec) {
+    if (!rec.exitDrainTimer) return;
+    clearTimeout(rec.exitDrainTimer);
+    rec.exitDrainTimer = null;
   }
 
   #drainStdoutToEnd(rec) {
@@ -1441,6 +1459,7 @@ export class Supervisor {
     rec.stdoutSocket.once('end', done);
     rec.stdoutSocket.once('close', done);
     rec.stdoutSocket.once('error', done);
+    rec.exitDrainTimer = setTimeout(done, this.exitDrainMs);
     rec.paused = false;
     rec.pauseReason = null;
     rec.readPosted = false;
@@ -1454,6 +1473,7 @@ export class Supervisor {
   #finishExit(rec) {
     if (rec.exitFinished) return;
     rec.exitFinished = true;
+    this.#clearDrainTimer(rec);
     this.#releaseFlow(rec);
     if (rec.dead) return;
     rec.dead = true;

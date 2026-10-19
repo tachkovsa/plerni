@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, writeFileSync, writeSync } from 'node:fs';
+import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -14,6 +15,8 @@ import { waitUntil } from './measure.mjs';
 
 const enlargePath = fileURLToPath(new URL('./children/enlarge-stdout.mjs', import.meta.url));
 const echoPath = fileURLToPath(new URL('./children/echo.mjs', import.meta.url));
+const replyExitPath = fileURLToPath(new URL('./children/reply-exit.mjs', import.meta.url));
+const crashPath = fileURLToPath(new URL('./children/crash-mid-call.mjs', import.meta.url));
 
 function block(ms) {
   const start = Date.now();
@@ -268,6 +271,115 @@ test('a result written before exit is delivered', async () => {
     const settled = await call;
     assert.equal(settled.payload?.ok, true, JSON.stringify(settled));
   } finally {
+    await pair.close();
+  }
+});
+
+test('a child that writes its reply and exits is delivered', async () => {
+  const pair = await connectPair({ sweeper: false });
+  try {
+    const kid = pair.sup.spawn({ pluginId: 'reply', script: replyExitPath });
+    const rec = pair.sup.children.get('reply');
+    rec.paused = true;
+    rec.pauseReason = 'bulk';
+    rec.stdoutSocket.pause();
+    let heldOnExit = false;
+    rec.child.on('exit', () => {
+      heldOnExit = rec.exitDrain === true
+        && rec.dead === false
+        && Number.isInteger(rec.stdinProbe)
+        && rec.stdoutSocket != null
+        && rec.stdoutSocket.destroyed === false;
+    });
+    const settled = await pair.stub.call({
+      pluginId: 'reply',
+      credential: kid.credential,
+      correlationId: 1,
+      port: 'db',
+      method: 'get',
+      payload: { n: 1 },
+    }, 2_000).catch((err) => err);
+    assert.equal(settled.payload?.ok, true, JSON.stringify(settled));
+    assert.equal(heldOnExit, true);
+    assert.equal(rec.exitCode, 0);
+    const released = await waitUntil(
+      () => rec.dead === true && rec.stdinProbe == null && rec.stdoutSocket == null && rec.stdoutWriter == null,
+      1_000,
+    );
+    assert.equal(released, true);
+  } finally {
+    await pair.close();
+  }
+});
+
+test('a drain that never reaches EOF releases on the deadline', async () => {
+  const reserved = measureFlowReserve();
+  assert.ok(reserved);
+  const drainMs = 80;
+  const userspace = 8192;
+  const pair = await connectPair({
+    sweeper: false,
+    exitDrainMs: drainMs,
+    caps: {
+      partial: 64 * 1024,
+      total: reserved.perChild + userspace,
+      totalGlobal: reserved.perChild + userspace,
+    },
+  });
+  let held = null;
+  try {
+    const kid = pair.sup.spawn({
+      pluginId: 'crash',
+      script: crashPath,
+      total: reserved.perChild + userspace,
+    });
+    const rec = pair.sup.children.get('crash');
+    let drainAt = 0;
+    rec.child.on('exit', () => {
+      drainAt = Date.now();
+    });
+    // A leftover write end is what keeps stdout from reaching EOF after the
+    // child and the supervisor's writer dup are both gone.
+    held = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1e9)'], {
+      stdio: ['ignore', 'ignore', 'ignore', rec.stdoutWriter],
+    });
+    const call = pair.stub.call({
+      pluginId: 'crash',
+      credential: kid.credential,
+      correlationId: 1,
+      port: 'db',
+      method: 'get',
+      payload: { n: 1 },
+    }, 2_000).catch((err) => err);
+    const draining = await waitUntil(() => rec.exitDrain === true && rec.dead === false, 1_000);
+    assert.equal(draining, true);
+    assert.equal(Number.isInteger(rec.stdinProbe), true);
+    assert.ok(rec.stdoutSocket);
+    assert.throws(
+      () => pair.sup.spawn({
+        pluginId: 'other',
+        script: echoPath,
+        total: reserved.perChild + userspace,
+      }),
+      (err) => err.code === 'unsatisfiable',
+    );
+    const released = await waitUntil(
+      () => rec.dead === true && rec.stdinProbe == null && rec.stdoutSocket == null && rec.stdoutWriter == null,
+      1_000,
+    );
+    const elapsed = Date.now() - drainAt;
+    assert.equal(released, true);
+    assert.ok(elapsed >= drainMs - 20, String(elapsed));
+    const settled = await call;
+    assert.equal(settled.code, 'child-exited', JSON.stringify(settled));
+    const second = pair.sup.spawn({
+      pluginId: 'other',
+      script: echoPath,
+      total: reserved.perChild + userspace,
+    });
+    assert.ok(second.pid);
+  } finally {
+    if (held && held.exitCode == null && held.signalCode == null) held.kill('SIGKILL');
     await pair.close();
   }
 });
