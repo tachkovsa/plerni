@@ -539,8 +539,12 @@ export class Supervisor {
       stdinPayload: [],
       stdinWriting: false,
       creditSent: 0,
+      // Bytes of advertised credit stdout has already consumed. sendWindow
+      // plus this is creditSent: the grant is not rewritten downward.
+      creditSpent: 0,
       // Bytes the child may still write. Grants raise it. Stdout reads lower
-      // it. Consumed output refills it up to the free room minus one call.
+      // it by the same amount. A refill adds new credit; it does not shrink
+      // credit the child has not spent.
       sendWindow: 0,
       // Largest call cost currently reserved. A rejected call does not keep
       // its cost. admitFloor is the largest cost that finished without rejection.
@@ -1243,14 +1247,16 @@ export class Supervisor {
   //
   // bufferedBytes() plus send credit already granted to other live
   // children is one sum (#globalHeld). The child's own window is overlap
-  // on a further call, not a second copy of K_out. A grant leaves one
-  // call free. After the child has spent some of that grant, bytes that
-  // land in the hole are pulled back out of this child's window
-  // (#releaseStaleWindow) before the next admission and before a parked
-  // call is promoted. A sibling window is not reduced. Generated
-  // rejection and terminal frames use #globalHeld(null), every live
-  // window, and are coalesced when they would spend that credit. A
-  // stdout read is posted
+  // on a further call, not a second copy of K_out. A grant leaves the
+  // shared call hole (#callHole) outside every window, so a later grant
+  // cannot spend it. sendWindow is advertised credit the child has not
+  // spent: grants raise it, stdout lowers it, and sendWindow + creditSpent
+  // stays equal to creditSent. A spent read is not its own grant. The
+  // unspent remainder stays advertised until half the room is gone, and
+  // that half comes back as one grant. Sibling admission reserves the
+  // full unspent window. Generated rejection and terminal frames use
+  // #globalHeld(null), every live window, and are coalesced when they
+  // would spend that credit. A stdout read is posted
   // only when bufferedBytes() plus the bytes it will pull fit B_g. A
   // waiting read can pull C. A kernel queue shorter than C is only that
   // tail. The open window is not subtracted: the credit is not in
@@ -1318,7 +1324,6 @@ export class Supervisor {
       this.#reject(msg, 'pending-cap', true);
       return;
     }
-    this.#releaseStaleWindow(rec);
     // Payload has to leave room for one cancel of this correlation id and
     // one grant. A numeric-id cancel is smaller than a string id.
     // Unspent send credit is stdout the child may still write. The first
@@ -1555,7 +1560,9 @@ export class Supervisor {
   // first, so a cancel acknowledgement in it can drop a parked call.
   #takeStdout(rec, n) {
     if (!Number.isInteger(n) || n <= 0 || rec.dead) return;
-    rec.sendWindow = Math.max(0, rec.sendWindow - n);
+    const spent = Math.min(rec.sendWindow, n);
+    rec.sendWindow -= spent;
+    rec.creditSpent += spent;
   }
 
   // Credit follows bytes already in the child's budget and the process
@@ -1566,7 +1573,7 @@ export class Supervisor {
     if (rec.dead || this.closed || !rec.flowOk || rec.refillArmed) return;
     const room = this.#creditRoom(rec);
     const keep = this.#creditKeep(rec, room);
-    if (room - keep <= rec.sendWindow) {
+    if (this.#replenishCredit(room, keep, rec.sendWindow) <= 0) {
       this.#drainPark(rec);
       return;
     }
@@ -1628,13 +1635,26 @@ export class Supervisor {
     rec.refillCalls = null;
     const room = this.#creditRoom(rec);
     const keep = this.#creditKeep(rec, room);
-    if (room - keep <= rec.sendWindow) {
+    const credit = this.#replenishCredit(room, keep, rec.sendWindow);
+    if (credit <= 0) {
       this.#drainPark(rec);
       return;
     }
-    const credit = Math.min(2147483647, room - keep - rec.sendWindow);
     this.#queueGrant(rec, credit);
     this.#drainPark(rec);
+  }
+
+  // New credit only. The advertised remainder is not reduced. While the
+  // child still holds at least half of the room, a spent chunk is not a
+  // grant. Crossing that half returns the spent half in one grant, so an
+  // open-loop response does not write a window update of its own. A window
+  // of zero is the first advertisement and takes the whole room.
+  #replenishCredit(room, keep, sendWindow) {
+    const budget = room - keep;
+    if (!Number.isFinite(budget) || budget <= sendWindow) return 0;
+    const deficit = budget - sendWindow;
+    if (sendWindow > 0 && deficit * 2 < budget) return 0;
+    return Math.min(2147483647, deficit);
   }
 
   // Send windows of other live children. This child's own window is subtracted
@@ -1698,47 +1718,57 @@ export class Supervisor {
     if ((rec.admitFloor || 0) > rec.admitKeep) rec.admitKeep = rec.admitFloor;
   }
 
+  // Bytes no grant may advertise. Calls use this hole; a later child's
+  // window does not. The tighter of B_g and B_t decides the batch. A room
+  // that cannot hold the batch keeps one call, so a response on a small
+  // ceiling is still granted. Above eight calls, a large cap keeps one
+  // slot per pending call. The hole is outside sendWindow. Stdout is the
+  // only spend.
+  #callHole() {
+    const one = ADMIT_KEEP;
+    let pending = this.capsConfig.pending;
+    let seen = false;
+    let space = Math.max(0, this.#globalCap());
+    for (const rec of this.children.values()) {
+      if (rec.dead) continue;
+      const limit = rec.limits?.pending;
+      if (Number.isInteger(limit) && limit > 0) {
+        pending = seen ? Math.min(pending, limit) : limit;
+        seen = true;
+      }
+      if (!rec.flowOk) continue;
+      const ceiling = this.#childCeiling(rec);
+      if (ceiling < space) space = ceiling;
+    }
+    pending = Math.max(1, Math.min(pending, this.capsConfig.pendingGlobal));
+    const classic = Math.min(8, pending);
+    let batch = 1;
+    if (space > one * (classic + 24)) batch = classic;
+    if (pending > classic && space > one * (pending + 24)) batch = pending;
+    return one * batch;
+  }
+
   #creditRoom(rec) {
-    const childRoom = this.#childCeiling(rec) - this.#pluginBytes(rec);
-    const globalRoom = this.#globalCap() - this.#globalHeld(rec);
+    const hole = this.#callHole();
+    const childRoom = this.#childCeiling(rec) - this.#pluginBytes(rec) - hole;
+    const globalRoom = this.#globalCap() - this.#globalHeld(rec) - hole;
     return Math.min(childRoom, globalRoom);
   }
 
-  // The largest window that still leaves one call free beside bytes
-  // already buffered and beside every other child's window. A noted
-  // admit cost can be a large response's request. Reserving that again
-  // would take the sibling's credit. The floor is the one call the grant
-  // always leaves.
-  #creditTarget(rec) {
-    const room = Math.max(0, this.#creditRoom(rec));
-    return Math.max(0, room - ADMIT_KEEP);
-  }
-
-  // A grant is not rewritten. Once the child has spent some of it, later
-  // bytes can land in the hole that grant left. Pull this child's window
-  // back to that hole. A sibling's window is untouched: that credit may
-  // still be written. A window that has not been spent is the grant the
-  // child is about to use, and it is not reduced.
-  #releaseStaleWindow(rec) {
-    if (!rec || rec.dead || !rec.flowOk) return;
-    if (!(rec.creditSent > rec.sendWindow)) return;
-    const target = this.#creditTarget(rec);
-    if (rec.sendWindow > target) rec.sendWindow = target;
-  }
-
-  // One more call always stays outside the advertised window, and the
-  // window itself stays inside B_g. A ceiling with room for a batch also
-  // keeps that many calls beside the credit. A ceiling sized to a few
-  // result lines does not: those calls are admitted before the grant.
-  // A cost that cannot fit an empty child is not headroom. Rejected
-  // calls never reach this value; this cap is the same bound at grant time.
+  // The shared hole is already out of `room`. A noted call larger than
+  // that hole still keeps the excess, so the next call of that size fits
+  // beside the credit. A cost above B_t or B_g is not headroom. Rejected
+  // calls never reach this value. A small ceiling keeps one call, not a batch.
   #creditKeep(rec, room) {
     let noted = rec.admitKeep || 0;
     const ceiling = Math.min(this.#childCeiling(rec), this.#globalCap());
     if (noted > ceiling) noted = rec.admitFloor || 0;
     const one = Math.max(noted, ADMIT_KEEP);
     const batch = Math.min(8, rec.limits.pending);
-    return room > one * (batch + 24) ? one * batch : one;
+    const spacious = Math.max(0, room) + this.#callHole();
+    const local = spacious > one * (batch + 24) ? one * batch : one;
+    const extra = Math.max(0, local - this.#callHole());
+    return Math.min(Math.max(0, room), extra);
   }
 
   #enqueueStdin(rec, line, bytes, lane, correlationId) {
@@ -2008,7 +2038,6 @@ export class Supervisor {
       rec.childReads -= 1;
       if (rec.childReads === 0 && !rec.dead) {
         rec.inFlightTailBytes = 0;
-        this.#releaseStaleWindow(rec);
         this.#refillCredit(rec);
         this.#drainPark(rec);
       }

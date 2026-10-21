@@ -1371,7 +1371,11 @@ test('a parked call is not sent after its caller times out', { timeout: 10_000 }
       return orig(chunk, enc, cb);
     };
     assert.equal(await stopChild(rec.child.pid), true);
-    for (let i = 0; i < 12; i++) {
+    const granted = await waitUntil(() => rec.grantSettled && rec.outbound === 0, 2_000);
+    assert.equal(granted, true, String(rec.creditSent));
+    // The grant leaves one pending slot per call outside the window. Fill
+    // that hole, then the next call has to park.
+    for (let i = 0; i < 48; i++) {
       pair.stub.call({
         pluginId: 'echo',
         credential: kid.credential,
@@ -1389,7 +1393,7 @@ test('a parked call is not sent after its caller times out', { timeout: 10_000 }
       port: 'db',
       method: 'get',
       payload: { n: 1 },
-    }, 80);
+    }, 80).catch((err) => err);
     const saw = await waitUntil(() => {
       const parked = rec.parked.some((entry) => entry.msg.correlationId === victimId);
       if (parked) holdPark(rec);
@@ -1399,7 +1403,7 @@ test('a parked call is not sent after its caller times out', { timeout: 10_000 }
       parked: rec.parked.map((entry) => entry.msg.correlationId),
       pending: pair.sup.pending.size,
     }));
-    const err = await victim.catch((e) => e);
+    const err = await victim;
     assert.equal(err.code, 'timeout', err?.code);
     const left = await waitUntil(
       () => !rec.parked.some((entry) => entry.msg.correlationId === victimId)
@@ -3923,6 +3927,97 @@ test('a compliant response is not stalled by a sibling grant', async () => {
   }
 });
 
+test('advertised credit stays reserved until stdout spends it', async () => {
+  const totalGlobal = 100_000;
+  const pad = 57_000;
+  const muxPartial = 32_000;
+  const lineBytes = Buffer.byteLength(encodeNdjson({
+    kind: 'result',
+    correlationId: 1,
+    payload: 'p'.repeat(pad),
+  }));
+  const pair = await connectPair({
+    sweeper: false,
+    caps: { pending: 8, partial: 1024 * 1024, total: 1024 * 1024, totalGlobal },
+  });
+  const stop = (id) => {
+    const proc = pair.sup.children.get(id)?.child;
+    if (proc && proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL');
+  };
+  try {
+    const kid = pair.sup.spawn({
+      pluginId: 'a',
+      script: responsePath,
+      env: { RESPONSE_PAD: String(pad) },
+      total: 1024 * 1024,
+    });
+    const rec = pair.sup.children.get('a');
+    const granted = await waitUntil(
+      () => rec.grantSettled && rec.outbound === 0 && rec.sendWindow >= lineBytes,
+      2_000,
+    );
+    assert.equal(granted, true, String(rec.sendWindow));
+    const advertised = rec.sendWindow;
+    assert.equal(rec.creditSent, advertised);
+    assert.equal(rec.creditSpent, 0);
+    // A retained partial mux frame used to shrink the local window once any
+    // stdout had been consumed. The child still holds the unspent grant.
+    pair.sup.queuedBytes += muxPartial;
+    const noise = Buffer.from('{"kind":"noop"}\n');
+    rec.stdoutSocket.emit('data', noise);
+    await delay(50);
+    const unspent = advertised - noise.length;
+    assert.equal(rec.creditSpent, noise.length);
+    assert.equal(rec.sendWindow, unspent, JSON.stringify({
+      window: rec.sendWindow,
+      granted: rec.creditSent,
+      spent: rec.creditSpent,
+    }));
+    assert.equal(rec.sendWindow + rec.creditSpent, rec.creditSent);
+    assert.ok(rec.sendWindow >= lineBytes - noise.length);
+    const globalCap = totalGlobal
+      - (rec.kIn + rec.kOut + pair.sup.readBytes)
+      - (pair.sup.kMuxIn + pair.sup.kMuxOut + pair.sup.readBytes);
+    // The old clamp set the window to the room left beside the partial frame.
+    assert.ok(
+      rec.sendWindow > globalCap - muxPartial,
+      `${rec.sendWindow} lost the partial frame from reserved credit (cap ${globalCap})`,
+    );
+    pair.sup.queuedBytes -= muxPartial;
+    assert.throws(
+      () => pair.sup.spawn({
+        pluginId: 'b',
+        script: responsePath,
+        env: { RESPONSE_PAD: String(pad) },
+        total: 1024 * 1024,
+      }),
+      (err) => err.code === 'spawn-rejected',
+    );
+    assert.equal(pair.sup.children.has('b'), false);
+    const res = await pair.stub.call({
+      pluginId: 'a',
+      credential: kid.credential,
+      correlationId: 1,
+      port: 'db',
+      method: 'get',
+      payload: { n: 1 },
+    }, 3_000).catch((err) => err);
+    assert.equal(res.payload?.length, pad, JSON.stringify({
+      code: res.code,
+      pause: rec.pauseReason,
+      window: rec.sendWindow,
+      spent: rec.creditSpent,
+      granted: rec.creditSent,
+    }));
+    assert.notEqual(rec.pauseReason, 'global');
+    assert.equal(rec.sendWindow + rec.creditSpent, rec.creditSent);
+  } finally {
+    stop('a');
+    stop('b');
+    await pair.close();
+  }
+});
+
 test('parked calls leave a sibling send window usable', async () => {
   const totalGlobal = 100_000;
   const pad = 40_000;
@@ -4084,6 +4179,11 @@ function assertAccountingInvariants(sup, rec) {
     floor: rec.admitFloor,
     live,
   }));
+  assert.equal(
+    rec.sendWindow + rec.creditSpent,
+    rec.creditSent,
+    `window ${rec.sendWindow} + spent ${rec.creditSpent} != granted ${rec.creditSent}`,
+  );
   let windows = 0;
   for (const child of sup.children.values()) {
     if (child.dead || !child.flowOk || !(child.sendWindow > 0)) continue;
@@ -4381,7 +4481,10 @@ test('a cancel acknowledgement is applied before a parked call is promoted', asy
     );
     assert.equal(cancelFourWritten, true);
     const ack = encodeNdjson({ kind: 'cancelled', correlationId: 4 });
+    // The ack is admitted only while the window covers it. The assignment
+    // is the test's budget, so the spent total stays equal to the grant.
     rec.sendWindow = Buffer.byteLength(ack);
+    rec.creditSpent = rec.creditSent - rec.sendWindow;
     rec.child.stdout.emit('data', Buffer.from(ack));
     assert.equal(
       stdinMessages(written).some((msg) => msg.kind === 'call' && msg.correlationId === 4),
