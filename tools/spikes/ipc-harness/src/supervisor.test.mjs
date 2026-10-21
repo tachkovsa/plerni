@@ -13,10 +13,10 @@ import { applyScoredSkip, floodBound, floodScore, forgedFlood, hostileBattery, s
 import { assessEnvironment, delay, measureSeries, openLoop, preflight, treeRss, waitUntil } from './measure.mjs';
 import { MuxFramer, encodeMux, encodeNdjson } from './framing.mjs';
 import { FencedError } from './authority.mjs';
-import { DEFAULT_CAPS, PARTIAL_READ_CHUNK, PLUGIN_ENV_MAX, Supervisor, connectEnds, connectPair, dbConfigured, partialCapHolds, pluginEnvBlock, stdinControlReserve, totalCapHolds } from './supervisor.mjs';
+import { DEFAULT_CAPS, PARTIAL_READ_CHUNK, PLUGIN_ENV_ENTRY_MAX, PLUGIN_ENV_MAX, Supervisor, connectEnds, connectPair, dbConfigured, partialCapHolds, pluginEnvBlock, stdinControlReserve, totalCapHolds, writePluginEnv } from './supervisor.mjs';
 import { socketPair } from './kernel-stub.mjs';
 import { entryIsPrivate, resolveCacheDir } from './pipe_pending.mjs';
-import { closeFd, dupFd, fionread, measureFlowReserve } from './flow_socket.mjs';
+import { closeFd, dupFd, fionread, measureFlowReserve, openEnvPipe, processGroup, spawnSleeper } from './flow_socket.mjs';
 import { execFile } from 'node:child_process';
 import { lstatSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -1513,10 +1513,13 @@ test('a mux framing fault closes the kernel and rejects later sends', async () =
 test('pushed-back stdout bytes count against the per-plugin and global caps', async () => {
   const reserved = measureFlowReserve();
   assert.ok(reserved);
-  const cap = 1024;
+  const envBytes = pluginEnvBlock({ FLOOD_MODE: 'silent' }, 'partial').length;
+  // The encoded block is reserved on the spawn turn. The extra headroom is
+  // only the flood frames that fill the low-priority queue.
+  const headroom = 1024;
   const pair = await connectPair({
     sweeper: false,
-    caps: { lo: 16, total: 64 * 1024, totalGlobal: cap + reserved.perChild + reserved.muxReserve, partial: 1024 * 1024 },
+    caps: { lo: 16, total: 64 * 1024, totalGlobal: envBytes + headroom + reserved.perChild + reserved.muxReserve, partial: 1024 * 1024 },
     partialHighWater: 1024 * 1024,
   });
   try {
@@ -3216,6 +3219,103 @@ test('a stalled mux reader leaves the low-priority queue at its cap', async () =
   }
 });
 
+test('send credit is granted from accounted room while the mux is unread', async () => {
+  const pair = await connectPair({
+    sweeper: false,
+    caps: { partial: 1024 * 1024, total: 1024 * 1024, totalGlobal: 4 * 1024 * 1024 },
+  });
+  try {
+    // A posted read with bytes still queued used to re-arm forever and never grant.
+    pair.sup.muxPending = () => 1;
+    pair.sup.muxReadPosted = true;
+    pair.sup.spawn({ pluginId: 'credit', script: creditPath });
+    const rec = pair.sup.children.get('credit');
+    const granted = await waitUntil(() => rec.creditSent > 0, 500);
+    assert.equal(granted, true, String(rec.creditSent));
+    assert.ok(rec.sendWindow < rec.bT, `${rec.sendWindow} filled ${rec.bT}`);
+    const sent = rec.creditSent;
+    await delay(80);
+    assert.equal(rec.creditSent, sent);
+  } finally {
+    await pair.close();
+  }
+});
+
+test('an environment write yields while the pipe is still full', async () => {
+  const ends = openEnvPipe();
+  assert.ok(ends);
+  const buf = Buffer.alloc(192 * 1024, 0x62);
+  let ticked = false;
+  setImmediate(() => { ticked = true; });
+  const writing = writePluginEnv(ends.writeFd, buf);
+  const yielded = await Promise.race([
+    delay(200).then(() => ticked),
+    writing.then(() => ticked),
+  ]);
+  assert.equal(yielded, true);
+  closeFd(ends.readFd);
+  closeFd(ends.probe);
+  await writing;
+});
+
+test('a spawn error settles while a large environment is still queued', async () => {
+  const env = { A: 'a'.repeat(100_000), B: 'b'.repeat(100_000) };
+  assert.ok(pluginEnvBlock(env, 'echo').length > 128 * 1024);
+  const pair = await connectPair({
+    sweeper: false,
+    caps: { partial: 1024 * 1024, total: 1024 * 1024, totalGlobal: 1024 * 1024 },
+  });
+  try {
+    const started = Date.now();
+    const kid = pair.sup.spawn({
+      pluginId: 'echo',
+      script: echoPath,
+      env,
+      total: 1024 * 1024,
+    });
+    assert.ok(Date.now() - started < 500, 'spawn blocked on the environment pipe');
+    const rec = pair.sup.children.get('echo');
+    rec.child.emit('error', Object.assign(new Error('eagain'), { code: 'EAGAIN' }));
+    assert.equal(rec.exitFinished, true);
+    const next = await Promise.race([
+      pair.sup.respawn('echo'),
+      delay(2_000).then(() => null),
+    ]);
+    assert.ok(next?.pid, 'respawn hung after a spawn error with a large environment');
+    assert.notEqual(next.pid, kid.pid);
+  } finally {
+    const proc = pair.sup.children.get('echo')?.child;
+    if (proc && proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL');
+    await pair.close();
+  }
+});
+
+test('close reaps a descendant that dies with the plugin group', async () => {
+  const pair = await connectPair({ sweeper: false });
+  let sleeper = null;
+  try {
+    const kid = pair.sup.spawn({ pluginId: 'echo', script: echoPath });
+    assert.equal(waitForRuntime(kid.pid), true);
+    sleeper = spawnSleeper(kid.pid);
+    assert.equal(typeof sleeper, 'number');
+    const joined = await waitUntil(() => processGroup(sleeper) === kid.pid, 2_000);
+    assert.equal(joined, true);
+  } finally {
+    const started = Date.now();
+    await pair.close();
+    assert.ok(Date.now() - started >= 150, 'close returned before the quiet reap');
+    if (sleeper != null) {
+      let reaped = false;
+      try { process.kill(sleeper, 0); }
+      catch (err) { reaped = err.code === 'ESRCH'; }
+      if (!reaped) {
+        try { process.kill(sleeper, 'SIGKILL'); } catch { /* already gone */ }
+      }
+      assert.equal(reaped, true);
+    }
+  }
+});
+
 test('an echo child does not turn a grant into more send credit', async () => {
   const pair = await connectPair({
     sweeper: false,
@@ -3407,19 +3507,36 @@ test('fd 0 is a valid mux handle and a rejected mux closes both ends', async () 
   assert.match(stdout, /ok/);
 });
 
-test('plugin environment rejects a block the wrapper cannot finish reading', () => {
-  const base = pluginEnvBlock({}, 'echo');
-  const overhead = Buffer.byteLength('PAD=\0');
-  const under = PLUGIN_ENV_MAX - 1 - base.length - overhead;
-  assert.ok(under > 0);
-  const accepted = pluginEnvBlock({ PAD: 'x'.repeat(under) }, 'echo');
-  assert.equal(accepted.length, PLUGIN_ENV_MAX - 1);
+test('plugin environment rejects one entry the kernel cannot exec', () => {
+  const key = 'PAD';
+  const overhead = Buffer.byteLength(`${key}=\0`);
+  const valueBytes = PLUGIN_ENV_ENTRY_MAX - 1 - overhead;
+  assert.ok(valueBytes > 0);
+  const accepted = pluginEnvBlock({ PAD: 'x'.repeat(valueBytes) }, 'echo');
+  assert.ok(accepted.length < PLUGIN_ENV_MAX);
   assert.throws(
-    () => pluginEnvBlock({ PAD: 'x'.repeat(under + 1) }, 'echo'),
-    (err) => err.code === 'env-rejected' && accepted.length + 1 === PLUGIN_ENV_MAX,
+    () => pluginEnvBlock({ PAD: 'x'.repeat(valueBytes + 1) }, 'echo'),
+    (err) => err.code === 'env-rejected',
   );
+});
+
+test('plugin environment rejects a block the wrapper cannot finish reading', () => {
+  const env = {};
+  for (let guard = 0; guard < 8; guard++) {
+    const len = pluginEnvBlock(env, 'echo').length;
+    const room = PLUGIN_ENV_MAX - 1 - len;
+    if (room === 0) break;
+    const key = `P${Object.keys(env).length}`;
+    const overhead = Buffer.byteLength(`${key}=\0`);
+    const valueBytes = Math.min(PLUGIN_ENV_ENTRY_MAX - 1 - overhead, room - overhead);
+    assert.ok(valueBytes > 0);
+    env[key] = 'x'.repeat(valueBytes);
+  }
+  const accepted = pluginEnvBlock(env, 'echo');
+  assert.equal(accepted.length, PLUGIN_ENV_MAX - 1);
+  const last = Object.keys(env).at(-1);
   assert.throws(
-    () => pluginEnvBlock({ PAD: 'x'.repeat(under + 2) }, 'echo'),
+    () => pluginEnvBlock({ ...env, [last]: env[last] + 'x' }, 'echo'),
     (err) => err.code === 'env-rejected',
   );
 });

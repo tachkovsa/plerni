@@ -13,7 +13,7 @@
 import { spawn } from 'node:child_process';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
-import { closeSync, writeSync } from 'node:fs';
+import { closeSync, write, writeSync } from 'node:fs';
 import { Socket } from 'node:net';
 import { MuxFramer, NdjsonFramer, MAX_RESIDUAL, encodeNdjson, encodeMux } from './framing.mjs';
 import { PendingTable, socketPair, KernelStub } from './kernel-stub.mjs';
@@ -157,12 +157,24 @@ export function wrapperLaunchEnv() {
 // read that would observe EOF. A block of that size is not readable.
 export const PLUGIN_ENV_MAX = 256 * 1024;
 
+// One exec string, including `key=`, the value, and the NUL. Linux rejects a
+// string longer than MAX_ARG_STRLEN (32 pages; 128 KiB when the page is 4 KiB).
+export const PLUGIN_ENV_ENTRY_MAX = 128 * 1024;
+
 export function pluginEnvBlock(specEnv, pluginId) {
   const entries = [];
   const push = (key, value) => {
     if (typeof key !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) return;
     if (LOADER_ENV.test(key)) return;
-    entries.push(`${key}=${envText(value)}\0`);
+    const entry = `${key}=${envText(value)}\0`;
+    // execve fails E2BIG for one string above MAX_ARG_STRLEN. Reject that
+    // before the wrapper is started, with the same code as an oversize block.
+    if (Buffer.byteLength(entry) >= PLUGIN_ENV_ENTRY_MAX) {
+      const err = new Error('plugin environment does not fit the wrapper');
+      err.code = 'env-rejected';
+      throw err;
+    }
+    entries.push(entry);
   };
   push('PATH', process.env.PATH || '');
   if (specEnv && typeof specEnv === 'object') {
@@ -176,6 +188,62 @@ export function pluginEnvBlock(specEnv, pluginId) {
     throw err;
   }
   return buf;
+}
+
+// A short block is written and closed before this returns, so the wrapper
+// sees EOF even if the caller then blocks the event loop. A block larger
+// than the pipe is finished on the threadpool: the event loop stays able
+// to observe a spawn error and close the fd, which ends the blocked write.
+export function writePluginEnv(fd, buf) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (err) => {
+      if (settled) return;
+      settled = true;
+      try { closeSync(fd); }
+      catch (closeErr) {
+        if (closeErr.code !== 'EBADF' && !(err && (err.code === 'EPIPE' || err.code === 'EBADF'))) {
+          reject(closeErr);
+          return;
+        }
+      }
+      if (err && err.code !== 'EPIPE' && err.code !== 'EBADF') reject(err);
+      else resolve();
+    };
+    const onChunk = (err, n) => {
+      if (err) {
+        finish(err);
+        return;
+      }
+      if (!Number.isInteger(n) || n <= 0) {
+        const error = new Error('plugin environment was not written');
+        error.code = 'env-rejected';
+        finish(error);
+        return;
+      }
+      off += n;
+      if (off >= buf.length) finish(null);
+      else write(fd, buf, off, buf.length - off, onChunk);
+    };
+    let off = 0;
+    try {
+      // One syscall. A larger request blocks until the reader drains it,
+      // which never happens when spawn fails before the wrapper runs.
+      const n = writeSync(fd, buf, 0, Math.min(buf.length, 4096));
+      if (!Number.isInteger(n) || n <= 0) {
+        const error = new Error('plugin environment was not written');
+        error.code = 'env-rejected';
+        finish(error);
+        return;
+      }
+      off = n;
+    } catch (err) {
+      finish(err);
+      return;
+    }
+    if (off >= buf.length) finish(null);
+    else write(fd, buf, off, buf.length - off, onChunk);
+  });
 }
 
 // One cancel and one window-update, reserved together. Credit is capped so
@@ -380,10 +448,15 @@ export class Supervisor {
     // unread block remains inside bufferedBytes() until the wrapper reads it.
     const envHold = {
       bytes: envBlock.length,
-      // A synchronous burst still owes the block. The next turn counts only
-      // what the probe still shows, after the wrapper has had a chance to read.
+      // A synchronous burst still owes the block. After the write has
+      // finished and the spawn turn has ended, only what the probe still
+      // shows is counted.
       settle: false,
+      written: false,
+      turnDone: false,
+      aborted: false,
       probe: envEnds.probe,
+      writeFd: envEnds.writeFd,
     };
     let child;
     try {
@@ -404,21 +477,6 @@ export class Supervisor {
       });
       closeFd(envEnds.readFd);
       envEnds.readFd = -1;
-      // The bytes and EOF are in the kernel before spawn returns, so the
-      // wrapper is not waiting on the parent to finish the read.
-      let off = 0;
-      while (off < envBlock.length) {
-        const n = writeSync(envEnds.writeFd, envBlock, off, envBlock.length - off);
-        if (n <= 0) break;
-        off += n;
-      }
-      if (off !== envBlock.length) {
-        const err = new Error('plugin environment was not written');
-        err.code = 'env-rejected';
-        throw err;
-      }
-      closeSync(envEnds.writeFd);
-      envEnds.writeFd = -1;
     } catch (err) {
       closeFd(envEnds.readFd);
       closeFd(envEnds.writeFd);
@@ -431,10 +489,13 @@ export class Supervisor {
       throw err;
     }
     setImmediate(() => {
-      envHold.settle = true;
+      envHold.turnDone = true;
       // The unread block can pause the mux before the wrapper reads it.
-      // Recounting here opens the input once that block is gone.
-      if (!this.closed) this.#maybeResumeAll();
+      // Recounting here opens the input once that block is gone. The full
+      // block stays reserved until the async write has finished.
+      if (!envHold.written || envHold.aborted || this.closed) return;
+      envHold.settle = true;
+      this.#maybeResumeAll();
     });
     if (flow) {
       closeFd(flow.childStdin);
@@ -496,10 +557,9 @@ export class Supervisor {
       stdoutWriter: flow?.stdoutWriter ?? null,
       probeTimer: null,
       readPosted: false,
-      // Two quiet mux observations are required before a grant. One empty
-      // gap between socket-buffer drains is not enough: the rest of a burst
-      // can still be in flight.
-      refillQuiet: false,
+      // One deferred grant per child. Same-turn admissions are in the
+      // accounted room before it runs. A short follow of a shrinking burst
+      // does not continue while the mux stays unread.
       refillArmed: false,
       envHold,
       groupSignaled: false,
@@ -520,6 +580,22 @@ export class Supervisor {
     child.on('error', (err) => this.#onSpawnError(rec, err));
     child.on('exit', (code, signal) => this.#onExit(rec, code, signal));
     this.children.set(spec.pluginId, rec);
+    // A full pipe must not block this turn. The wrapper reads fd 5 after
+    // the filter; if spawn then fails, closing the write end and the probe
+    // unblocks the threadpool write.
+    writePluginEnv(envHold.writeFd, envBlock).then(() => {
+      envHold.writeFd = -1;
+      if (envHold.aborted || this.closed) return;
+      envHold.written = true;
+      if (!envHold.turnDone) return;
+      envHold.settle = true;
+      this.#maybeResumeAll();
+    }, (err) => {
+      envHold.writeFd = -1;
+      if (envHold.aborted || this.closed || rec.dead) return;
+      if (!err.code) err.code = 'env-rejected';
+      this.#onSpawnError(rec, err);
+    });
     if (rec.flowOk) {
       this.#armProbe(rec);
       // The caller can pause before this turn ends. The read is posted only
@@ -836,10 +912,16 @@ export class Supervisor {
 
   #clearEnv(rec) {
     const hold = rec?.envHold;
-    if (hold) hold.bytes = 0;
+    if (hold) {
+      hold.aborted = true;
+      hold.bytes = 0;
+    }
     const probe = hold?.probe;
     if (hold) hold.probe = null;
     closeFd(probe);
+    const writeFd = hold?.writeFd;
+    if (hold) hold.writeFd = -1;
+    closeFd(writeFd);
     return 0;
   }
 
@@ -869,13 +951,15 @@ export class Supervisor {
     }
     this.socket.destroy();
     await Promise.all(waits);
+    const reaps = [];
     for (const rec of this.children.values()) {
-      if (rec.reapTimer) {
-        clearInterval(rec.reapTimer);
-        rec.reapTimer = null;
-      }
-      this.#reapGroup(rec);
+      // #onExit already started the quiet passes. Cancelling that timer
+      // left a descendant that was not yet waitable as a zombie.
+      if (!rec.reapDone) this.#armReap(rec);
+      if (rec.reapTimer) rec.reapTimer.ref();
+      if (rec.reapDone) reaps.push(rec.reapDone);
     }
+    await Promise.all(reaps);
   }
 
   // Bytes pushed back with stdout.unshift sit in readableLength, not in stash.
@@ -1276,56 +1360,95 @@ export class Supervisor {
     this.#drainPark(rec);
   }
 
-  // A burst written with spawn lands in several reads. The socket reports
-  // empty for one turn between those reads, and several refill calls can
-  // run in that same turn. Credit is promised only from a later turn that
-  // still sees an empty mux, so the rest of the burst is charged first.
+  // Credit follows bytes already in the child's budget and the process
+  // sum. One later turn lets calls issued with the spawn land in that sum.
+  // The grant then uses that room even while the mux is unread, so a plugin
+  // that waits for credit does not stall for the life of the socket.
   #refillCredit(rec) {
-    if (rec.dead || this.closed || !rec.flowOk) return;
-    const unread = this.#muxCount(this.muxPending);
-    if (Number.isInteger(unread) && unread > 0 && this.muxReadPosted) rec.refillQuiet = false;
-    this.#armRefill(rec);
+    if (rec.dead || this.closed || !rec.flowOk || rec.refillArmed) return;
+    const room = this.#creditRoom(rec);
+    const keep = this.#creditKeep(rec, room);
+    if (room - keep <= rec.sendWindow) {
+      this.#drainPark(rec);
+      return;
+    }
+    rec.refillArmed = true;
+    setImmediate(() => this.#finishRefill(rec));
   }
 
-  #armRefill(rec) {
-    if (rec.refillArmed || rec.dead || this.closed) return;
-    rec.refillArmed = true;
-    const quietAtSchedule = rec.refillQuiet === true;
-    setImmediate(() => {
-      rec.refillArmed = false;
-      if (rec.dead || this.closed || !rec.flowOk) return;
-      const unread = this.#muxCount(this.muxPending);
-      const bytesWaiting = Number.isInteger(unread) && unread > 0 && this.muxReadPosted;
-      if (bytesWaiting) {
-        rec.refillQuiet = false;
-        this.#armRefill(rec);
-        return;
-      }
-      if (!quietAtSchedule) {
-        rec.refillQuiet = true;
-        this.#armRefill(rec);
-        return;
-      }
-      rec.refillQuiet = false;
-      const childRoom = this.#childCeiling(rec) - this.#pluginBytes(rec);
-      const globalRoom = this.#globalCap() - this.bufferedBytes();
-      const room = Math.min(childRoom, globalRoom);
-      // One more call always stays outside the advertised window, and the
-      // window itself stays inside B_g. A ceiling with room for a batch also
-      // keeps that many calls beside the credit. A ceiling sized to a few
-      // result lines does not: those calls are admitted before the grant.
-      const one = Math.max(rec.admitKeep || 0, ADMIT_KEEP);
-      const batch = Math.min(8, rec.limits.pending);
-      const wide = one * batch;
-      const keep = room > one * (batch + 24) ? wide : one;
-      if (room - keep <= rec.sendWindow) {
-        this.#drainPark(rec);
-        return;
-      }
-      const credit = Math.min(2147483647, room - keep - rec.sendWindow);
-      this.#queueGrant(rec, credit);
+  // The first grant follows a finite burst for a few turns, so calls
+  // already written are in the budget before the window is promised. A
+  // queue that stays unread without new calls is live traffic, and the
+  // grant uses the room already accounted. A later refill does not follow
+  // again: the mux stays unread for the whole of an open-loop run, and
+  // another follow on every response is the spin. The follow is capped.
+  #finishRefill(rec) {
+    rec.refillArmed = false;
+    if (rec.dead || this.closed || !rec.flowOk) return;
+    if (rec.creditSent > 0) {
+      this.#grantFromRoom(rec);
+      return;
+    }
+    const unread = this.#muxCount(this.muxPending);
+    const readable = Number.isInteger(unread) && unread > 0 && this.muxReadPosted;
+    const waits = rec.refillWaits || 0;
+    const calls = rec.callPending + rec.parked.length;
+    const growing = Number.isInteger(rec.refillCalls) && calls > rec.refillCalls;
+    const shrinking = Number.isInteger(rec.refillUnread) && Number.isInteger(unread) && unread < rec.refillUnread;
+    const stuck = readable && Number.isInteger(rec.refillUnread) && unread >= rec.refillUnread;
+    rec.refillCalls = calls;
+    if (readable) {
+      rec.refillSeen = true;
+      rec.refillUnread = unread;
+      rec.refillGap = 0;
+    }
+    const burst = growing || shrinking || (readable && !stuck);
+    // One flat sample is the gap between two reads. Several flat samples
+    // with no new calls are traffic that will not drain.
+    const settling = readable && stuck && !growing && waits < 4;
+    const gap = !readable && rec.refillSeen && (rec.refillGap || 0) < 2;
+    if ((burst || settling || gap) && waits < 8) {
+      if (gap) rec.refillGap = (rec.refillGap || 0) + 1;
+      if (!readable) rec.refillUnread = null;
+      rec.refillWaits = waits + 1;
+      rec.refillArmed = true;
+      setImmediate(() => this.#finishRefill(rec));
+      return;
+    }
+    this.#grantFromRoom(rec);
+  }
+
+  #grantFromRoom(rec) {
+    rec.refillWaits = 0;
+    rec.refillUnread = null;
+    rec.refillGap = 0;
+    rec.refillSeen = false;
+    rec.refillCalls = null;
+    const room = this.#creditRoom(rec);
+    const keep = this.#creditKeep(rec, room);
+    if (room - keep <= rec.sendWindow) {
       this.#drainPark(rec);
-    });
+      return;
+    }
+    const credit = Math.min(2147483647, room - keep - rec.sendWindow);
+    this.#queueGrant(rec, credit);
+    this.#drainPark(rec);
+  }
+
+  #creditRoom(rec) {
+    const childRoom = this.#childCeiling(rec) - this.#pluginBytes(rec);
+    const globalRoom = this.#globalCap() - this.bufferedBytes();
+    return Math.min(childRoom, globalRoom);
+  }
+
+  // One more call always stays outside the advertised window, and the
+  // window itself stays inside B_g. A ceiling with room for a batch also
+  // keeps that many calls beside the credit. A ceiling sized to a few
+  // result lines does not: those calls are admitted before the grant.
+  #creditKeep(rec, room) {
+    const one = Math.max(rec.admitKeep || 0, ADMIT_KEEP);
+    const batch = Math.min(8, rec.limits.pending);
+    return room > one * (batch + 24) ? one * batch : one;
   }
 
   #enqueueStdin(rec, line, bytes, lane, correlationId) {
@@ -2235,23 +2358,32 @@ export class Supervisor {
   }
 
   // The first waitpid can run before SIGKILL has made a descendant a zombie.
-  // Keep sweeping until several empty passes follow the last reap.
+  // Keep sweeping until several empty passes follow the last reap. close()
+  // awaits this promise instead of cancelling the timer.
   #armReap(rec) {
     const pid = rec?.child?.pid;
-    if (!Number.isInteger(pid) || pid <= 1 || rec.reapTimer) return;
-    let idle = 0;
-    const tick = () => {
-      const n = this.#reapGroup(rec);
-      if (n > 0) idle = 0;
-      else idle += 1;
-      if (idle < 8) return;
-      clearInterval(rec.reapTimer);
-      rec.reapTimer = null;
-    };
-    tick();
-    if (rec.reapTimer) return;
-    rec.reapTimer = setInterval(tick, 25);
-    rec.reapTimer.unref();
+    if (rec.reapDone) return rec.reapDone;
+    if (!Number.isInteger(pid) || pid <= 1) {
+      rec.reapDone = Promise.resolve();
+      return rec.reapDone;
+    }
+    rec.reapDone = new Promise((resolve) => {
+      let idle = 0;
+      const tick = () => {
+        const n = this.#reapGroup(rec);
+        if (n > 0) idle = 0;
+        else idle += 1;
+        if (idle < 8) return;
+        if (rec.reapTimer) clearInterval(rec.reapTimer);
+        rec.reapTimer = null;
+        resolve();
+      };
+      tick();
+      if (idle >= 8) return;
+      rec.reapTimer = setInterval(tick, 25);
+      rec.reapTimer.unref();
+    });
+    return rec.reapDone;
   }
 
   #onExit(rec, code, signal) {
