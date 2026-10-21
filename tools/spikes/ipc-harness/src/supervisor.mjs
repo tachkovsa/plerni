@@ -290,7 +290,9 @@ function admissionKeepFloor() {
   const bytes = Buffer.byteLength(line);
   const idBytes = identifierBytes('echo-0', correlationId);
   const cancel = Buffer.byteLength(encodeNdjson({ kind: 'cancel', correlationId }));
-  return bytes + idBytes + CONTROL_RESERVE.grant + Math.max(CONTROL_RESERVE.cancel, cancel);
+  // The cancel lane retains its own copy of the identifiers. That copy is
+  // userspace, not a second stdin frame, and the idle grant still leaves it.
+  return bytes + idBytes + idBytes + CONTROL_RESERVE.grant + Math.max(CONTROL_RESERVE.cancel, cancel);
 }
 
 const ADMIT_KEEP = admissionKeepFloor();
@@ -540,7 +542,13 @@ export class Supervisor {
       // Bytes the child may still write. Grants raise it. Stdout reads lower
       // it. Consumed output refills it up to the free room minus one call.
       sendWindow: 0,
+      // Largest call cost currently reserved. A rejected call does not keep
+      // its cost. admitFloor is the largest cost that finished without rejection.
       admitKeep: 0,
+      admitFloor: 0,
+      // Stdout frames still being applied. Parked calls stay put until that
+      // read has been parsed, so a cancel ack in the same chunk is first.
+      childReads: 0,
       parked: [],
       parkedBytes: 0,
       parkTimer: null,
@@ -711,8 +719,7 @@ export class Supervisor {
     // the first read is the gated one.
     stdout.pause();
     stdout.on('data', (chunk) => {
-      this.#takeStdout(rec, chunk.length);
-      this.#onChild(rec, chunk);
+      this.#applyStdout(rec, chunk);
     });
     rec.child.stdout = stdout;
     rec.child.stdin = stdin;
@@ -732,9 +739,7 @@ export class Supervisor {
         return false;
       }
       if (typeof nread === 'number' && nread > 0) {
-        const chunk = Buffer.from(buf.subarray(0, nread));
-        this.#takeStdout(rec, nread);
-        this.#onChild(rec, chunk);
+        this.#applyStdout(rec, Buffer.from(buf.subarray(0, nread)));
       }
       // Exit drain keeps reading until EOF. A budget pause here would leave
       // the final response in the kernel and the waiter on child-exited.
@@ -805,11 +810,13 @@ export class Supervisor {
       this.#accountReserved(rec);
       return false;
     }
-    // Bytes the grant already promised are not a second charge. The read
-    // retires that much of the window as it lands. Only the part of C past
-    // the remaining window needs free room in B_g.
-    const promised = Math.min(this.readBytes, Math.max(0, rec.sendWindow));
-    if (this.bufferedBytes() + this.readBytes - promised > this.#globalCap()) {
+    // Credit is not in bufferedBytes(). Subtracting the open window from
+    // this slice treats the response as free and lets bufferedBytes() pass
+    // B_g once a mux frame already fills the room. A waiting read can pull
+    // a full C. A queue that is already shorter than C only needs room for
+    // that tail, so the last bytes of a response are not stuck behind C.
+    const incoming = unread > 0 ? Math.min(this.readBytes, unread) : this.readBytes;
+    if (this.bufferedBytes() + incoming > this.#globalCap()) {
       // A child with nothing in userspace is still held. Pausing it would
       // wait for bytes it does not have; the probe has to run anyway.
       if (this.#pluginBytes(rec) > 0) this.#pause(rec, 'global');
@@ -1211,6 +1218,44 @@ export class Supervisor {
     }
   }
 
+  // Call-lane invariants. Grants, spawn, admission, parking, promotion,
+  // and cancel all use this accounting:
+  //
+  // admitKeep is the largest cost actually reserved for a call that was
+  // admitted: line bytes, the call's identifier bytes, one grant, one
+  // cancel frame, and that cancel's identifier bytes. A
+  // cost above B_t or B_g is not admissible and is not stored. Rejecting
+  // a call drops that cost. The stored value is max(admitFloor, live
+  // costs). admitFloor is the largest cost that completed or timed out
+  // without being rejected. Credit headroom uses that value, so a
+  // rejected oversized call cannot stop replenishment.
+  //
+  // A call parks only when its own bytes fit B_t and B_g and the miss is
+  // this child's unspent window or K_out. Parked bytes are in pluginBytes
+  // and bufferedBytes, and the correlation id is pending exactly once.
+  // Promotion writes the line only when that window or queue has moved
+  // and no cancel for the id is still settling. Settling means the cancel
+  // lane is pending, or this take still holds that cancel. Stdout spends
+  // the window and then parses every frame in the chunk before any
+  // promotion, including a cancel acknowledgement in the same read. A
+  // cancel timeout leaves the call parked and then allows promotion. An
+  // acknowledgement drops the call and does not write it.
+  //
+  // bufferedBytes() plus send credit already granted to other live
+  // children is one sum (#globalHeld). The child's own window is overlap
+  // on a further call, not a second copy of K_out. A stdout read is posted
+  // only when bufferedBytes() plus the bytes it will pull fit B_g. A
+  // waiting read can pull C. A kernel queue shorter than C is only that
+  // tail. The open window is not subtracted: the credit is not in
+  // bufferedBytes(), and subtracting it admits the response on top of a
+  // mux frame that already fills the room. A mux read of C uses the same
+  // userspace check.
+  // Cancel and grant are queued ahead of payload and do not consume the
+  // send window. One cancel's encoded frame and one grant are the K_out
+  // hole. That cancel's identifier bytes are a separate userspace hole:
+  // the cancel lane retains them in addition to the call lane, and they
+  // are not a second stdin frame. A payload still in the unsent queue is
+  // dropped when its call or cancel expires.
   #onMux(msg) {
     if (msg.kind !== 'call' && msg.kind !== 'cancel') return;
     const rec = this.children.get(msg.pluginId);
@@ -1274,17 +1319,18 @@ export class Supervisor {
     // credit-respecting child fills the original window and the reply misses
     // B_t. The credit is not stdin, so it does not enter K_out.
     const cancelReserve = this.#maxCancelBytes(rec, msg.correlationId);
+    const cancelIds = this.#maxCancelIds(rec, msg.correlationId);
     const reserve = CONTROL_RESERVE.grant + cancelReserve;
-    const admitCost = bytes + idBytes + reserve;
-    if (admitCost > rec.admitKeep) rec.admitKeep = admitCost;
+    const admitCost = bytes + idBytes + reserve + cancelIds;
     const heldCredit = this.#overlapCredit(rec);
-    if (this.#overBudget(rec, bytes + idBytes + heldCredit, bytes, reserve)) {
+    if (this.#overBudget(rec, bytes + idBytes + heldCredit, bytes, reserve, cancelIds)) {
       // Own bytes fit B_t and the process ceiling, including credit promised
-      // to a sibling. The miss is this child's unspent window, a full K_out,
-      // or both. Hold the frame and write it once there is room. A probe that
-      // does not shrink is rejected; waiting would not help it.
-      if (!this.#bytesOver(rec, bytes + idBytes, reserve)) {
-        this.#parkCall(rec, msg, line, bytes, idBytes, ingressTs, reserve);
+      // to a sibling and the cancel lane's identifiers. The miss is this
+      // child's unspent window, a full K_out, or both. Hold the frame and
+      // write it once there is room. A probe that does not shrink is
+      // rejected; waiting would not help it.
+      if (!this.#bytesOver(rec, bytes + idBytes, reserve, cancelIds)) {
+        this.#parkCall(rec, msg, line, bytes, idBytes, ingressTs, reserve, cancelIds);
         return;
       }
       this.caps.total = true;
@@ -1293,22 +1339,26 @@ export class Supervisor {
     }
     this.#arm(rec, msg, { cancel: false, bytes, idBytes, ingressTs });
     this.#enqueueStdin(rec, line, bytes, 'call', msg.correlationId);
+    this.#noteAdmit(rec, msg.correlationId, admitCost);
   }
 
-  #parkCall(rec, msg, line, bytes, idBytes, ingressTs, reserve) {
+  #parkCall(rec, msg, line, bytes, idBytes, ingressTs, reserve, idReserve = 0) {
     const cost = bytes + idBytes;
+    const userspace = reserve + Math.max(0, idReserve);
     // The line is not in the sums yet. Identifier bytes join with the
     // reservation below, and the line joins parkedBytes, so a later check
-    // must not add either of them again.
-    if (this.#pluginBytes(rec) + cost + reserve > this.#childCeiling(rec)
-        || this.#globalHeld(rec) + cost + reserve > this.#globalCap()) {
+    // must not add either of them again. idReserve is the cancel lane's
+    // identifiers. It is userspace only and is not added to K_out.
+    if (this.#pluginBytes(rec) + cost + userspace > this.#childCeiling(rec)
+        || this.#globalHeld(rec) + cost + userspace > this.#globalCap()) {
       this.caps.total = true;
       this.#reject(msg, 'total-cap', true);
       return;
     }
     this.#arm(rec, msg, { cancel: false, bytes, idBytes, ingressTs });
-    rec.parked.push({ msg, line, bytes, ingressTs, reserve });
+    rec.parked.push({ msg, line, bytes, ingressTs, reserve, idReserve });
     rec.parkedBytes += bytes;
+    this.#noteAdmit(rec, msg.correlationId, bytes + idBytes + userspace);
     this.#armPark(rec);
   }
 
@@ -1332,15 +1382,24 @@ export class Supervisor {
     else clearImmediate(timer);
   }
 
+  // A cancel lane that is still pending, or a take that has not finished
+  // retiring that cancel. The parked payload stays unsent until the
+  // acknowledgement drops it or the cancel times out.
+  #cancelSettling(rec, correlationId) {
+    if (rec.parkHold && Object.is(correlationId, rec.parkHoldId)) return true;
+    return this.pending.has(rec.credential.pluginId, correlationId, 'cancel');
+  }
+
   #drainPark(rec) {
     if (rec.parkDraining || rec.dead || this.closed) return;
+    // This read still has frames to apply, or a partial line that may be
+    // the rest of a cancel acknowledgement. Promotion waits for that parse.
+    if (rec.childReads > 0 || rec.stash || rec.framer.pendingBytes() > 0) return;
     rec.parkDraining = true;
     try {
       while (rec.parked.length > 0) {
         const next = rec.parked[0];
-        // #take of a cancel sets this while the call lane is still pending.
-        // Promoting that line would write a payload #dropCall is about to retire.
-        if (rec.parkHold && Object.is(next.msg.correlationId, rec.parkHoldId)) return;
+        if (this.#cancelSettling(rec, next.msg.correlationId)) return;
         // The caller's deadline started at ingress. Promoting the call would
         // hand the child work the caller has already been told expired.
         if (this.#remainMs(next.msg, next.ingressTs) <= 0) {
@@ -1354,14 +1413,14 @@ export class Supervisor {
         // Line bytes and identifier bytes are already in the sums. The
         // overlap is other in-flight calls, not this parked one.
         const overlap = this.#overlapCredit(rec);
-        if (!this.#overBudget(rec, overlap, next.bytes, next.reserve)) {
+        if (!this.#overBudget(rec, overlap, next.bytes, next.reserve, next.idReserve || 0)) {
           rec.parked.shift();
           rec.parkedBytes = Math.max(0, rec.parkedBytes - next.bytes);
           if (rec.parked.length === 0) rec.parkSince = null;
           this.#enqueueStdin(rec, next.line, next.bytes, 'call', next.msg.correlationId);
           continue;
         }
-        if (this.#bytesOver(rec, 0, next.reserve)) {
+        if (this.#bytesOver(rec, 0, next.reserve, next.idReserve || 0)) {
           this.caps.total = true;
           this.#rejectParked(rec, 'total-cap');
           return;
@@ -1394,6 +1453,7 @@ export class Supervisor {
     const queued = rec.parked.splice(0);
     rec.parkedBytes = 0;
     for (const next of queued) {
+      this.#forgetAdmit(rec, next.msg.correlationId);
       this.#take(next.msg.pluginId, next.msg.correlationId, 'call');
       this.#reject(next.msg, code, true);
     }
@@ -1431,6 +1491,26 @@ export class Supervisor {
     }
   }
 
+  // Identifier bytes the cancel lane will retain for the largest call
+  // still owed. The call lane already holds its own copy. This hole is
+  // userspace only: K_out reserves the encoded cancel, not this copy.
+  #maxCancelIds(rec, alsoId) {
+    const pluginId = rec.credential.pluginId;
+    let max = identifierBytes(pluginId, 0);
+    const consider = (correlationId) => {
+      const n = identifierBytes(pluginId, correlationId);
+      if (n > max) max = n;
+    };
+    if (alsoId !== undefined) consider(alsoId);
+    for (const pending of this.pending.values()) {
+      if (pending.cancel) continue;
+      if (!Object.is(pending.pluginId, pluginId)) continue;
+      if (pending.generation !== rec.credential.generation) continue;
+      consider(pending.correlationId);
+    }
+    return max;
+  }
+
   // The largest cancel still owed for this child. The reserved hole has to
   // fit that frame, not the numeric-id sample.
   #maxCancelBytes(rec, alsoId) {
@@ -1454,7 +1534,7 @@ export class Supervisor {
     const line = encodeNdjson({ kind: 'grant', credit });
     const bytes = Buffer.byteLength(line);
     if (bytes > CONTROL_RESERVE.grant) return false;
-    if (this.#overBudget(rec, bytes, bytes, this.#maxCancelBytes(rec))) return false;
+    if (this.#overBudget(rec, bytes, bytes, this.#maxCancelBytes(rec), this.#maxCancelIds(rec))) return false;
     this.#enqueueStdin(rec, line, bytes, 'grant');
     rec.creditSent += credit;
     rec.sendWindow += credit;
@@ -1463,10 +1543,11 @@ export class Supervisor {
 
   // Stdout bytes spend the send window. The refill below gives them back
   // only once those bytes are no longer held in the child's budget.
+  // Promotion is not done here: the chunk that spent the window is parsed
+  // first, so a cancel acknowledgement in it can drop a parked call.
   #takeStdout(rec, n) {
     if (!Number.isInteger(n) || n <= 0 || rec.dead) return;
     rec.sendWindow = Math.max(0, rec.sendWindow - n);
-    this.#drainPark(rec);
   }
 
   // Credit follows bytes already in the child's budget and the process
@@ -1569,6 +1650,46 @@ export class Supervisor {
     return this.bufferedBytes() + this.#siblingCredit(except);
   }
 
+  // Record a call that was admitted. A cost that cannot fit an empty child
+  // is not headroom, and a call that is still only a candidate is not recorded.
+  #noteAdmit(rec, correlationId, cost) {
+    const ceiling = this.#childCeiling(rec);
+    const global = this.#globalCap();
+    if (!Number.isInteger(cost) || cost <= 0 || cost > ceiling || cost > global) return;
+    const pending = this.pending.get(rec.credential.pluginId, correlationId, 'call');
+    if (!pending || pending.cancel) return;
+    pending.admitCost = cost;
+    if (cost > rec.admitKeep) rec.admitKeep = cost;
+  }
+
+  // A rejected call drops its reservation. The keep falls back to the
+  // largest cost that was not rejected and is still live or already finished.
+  #forgetAdmit(rec, correlationId) {
+    const pending = this.pending.get(rec.credential.pluginId, correlationId, 'call');
+    const cost = pending?.admitCost || 0;
+    if (pending) pending.admitCost = 0;
+    if (!(cost > 0) || cost < rec.admitKeep) return;
+    let max = rec.admitFloor || 0;
+    for (const other of this.pending.values()) {
+      if (!(other.admitCost > max)) continue;
+      if (other.cancel) continue;
+      if (!Object.is(other.pluginId, rec.credential.pluginId)) continue;
+      if (other.generation !== rec.credential.generation) continue;
+      max = other.admitCost;
+    }
+    rec.admitKeep = max;
+  }
+
+  // A call that finished without rejection keeps its cost as headroom for
+  // the next admission of that size.
+  #retainAdmit(rec, pending) {
+    const cost = pending?.admitCost || 0;
+    if (!(cost > 0)) return;
+    pending.admitCost = 0;
+    if (cost > (rec.admitFloor || 0)) rec.admitFloor = cost;
+    if ((rec.admitFloor || 0) > rec.admitKeep) rec.admitKeep = rec.admitFloor;
+  }
+
   #creditRoom(rec) {
     const childRoom = this.#childCeiling(rec) - this.#pluginBytes(rec);
     const globalRoom = this.#globalCap() - this.#globalHeld(rec);
@@ -1579,8 +1700,13 @@ export class Supervisor {
   // window itself stays inside B_g. A ceiling with room for a batch also
   // keeps that many calls beside the credit. A ceiling sized to a few
   // result lines does not: those calls are admitted before the grant.
+  // A cost that cannot fit an empty child is not headroom. Rejected
+  // calls never reach this value; this cap is the same bound at grant time.
   #creditKeep(rec, room) {
-    const one = Math.max(rec.admitKeep || 0, ADMIT_KEEP);
+    let noted = rec.admitKeep || 0;
+    const ceiling = Math.min(this.#childCeiling(rec), this.#globalCap());
+    if (noted > ceiling) noted = rec.admitFloor || 0;
+    const one = Math.max(noted, ADMIT_KEEP);
     const batch = Math.min(8, rec.limits.pending);
     return room > one * (batch + 24) ? one * batch : one;
   }
@@ -1647,19 +1773,23 @@ export class Supervisor {
   // unspent window are not this check: a call that fails those can wait.
   // Credit promised to a sibling is part of the process ceiling. Parking
   // into that promise fills the bytes the sibling was told it may write.
-  #bytesOver(rec, accounted, reserve) {
-    if (this.#pluginBytes(rec) + accounted + reserve > this.#childCeiling(rec)) return true;
-    if (this.#globalHeld(rec) + accounted + reserve > this.#globalCap()) return true;
+  #bytesOver(rec, accounted, reserve, idReserve = 0) {
+    const userspace = reserve + Math.max(0, idReserve);
+    if (this.#pluginBytes(rec) + accounted + userspace > this.#childCeiling(rec)) return true;
+    if (this.#globalHeld(rec) + accounted + userspace > this.#globalCap()) return true;
     return false;
   }
 
   // `accounted` is charged to B_t and B_g. `stdinBytes` is what this write
-  // adds to K_out. `reserve` is control capacity that must still fit beside it.
+  // adds to K_out. `reserve` is the wire control capacity (one grant and one
+  // cancel frame) that must still fit beside it, in userspace and in K_out.
+  // `idReserve` is the cancel lane's identifiers. It fits in userspace only.
   // Sibling send credit is inside `#globalHeld` and is not part of `stdinBytes`.
-  #overBudget(rec, accounted, stdinBytes, reserve) {
+  #overBudget(rec, accounted, stdinBytes, reserve, idReserve = 0) {
     const ceiling = this.#childCeiling(rec);
-    if (this.#pluginBytes(rec) + accounted + reserve > ceiling) return true;
-    if (this.#globalHeld(rec) + accounted + reserve > this.#globalCap()) return true;
+    const userspace = reserve + Math.max(0, idReserve);
+    if (this.#pluginBytes(rec) + accounted + userspace > ceiling) return true;
+    if (this.#globalHeld(rec) + accounted + userspace > this.#globalCap()) return true;
     if (rec.flowOk && rec.kOut != null) {
       const kernel = this.#stdinQueued(rec);
       if (!Number.isInteger(kernel)) return true;
@@ -1708,6 +1838,12 @@ export class Supervisor {
       correlationId: pending.correlationId,
       generation: pending.generation,
     });
+    // #take does not promote a parked call while its cancel is the lane
+    // being retired: an acknowledgement that follows would still drop it.
+    // A timeout is that retirement. The payload may go out now.
+    if (!pending.cancel) return;
+    const rec = this.children.get(pending.pluginId);
+    if (rec && rec.credential.generation === pending.generation) this.#drainPark(rec);
   }
 
   #dropStale(pluginId, generation) {
@@ -1732,6 +1868,7 @@ export class Supervisor {
       this.cancelPendingTotal--;
       if (same) rec.cancelPending--;
     } else if (same) {
+      this.#retainAdmit(rec, pending);
       rec.callPending--;
       this.callPendingTotal--;
     } else {
@@ -1790,8 +1927,19 @@ export class Supervisor {
     }, 10, coalesce);
   }
 
+  // Spend the window, parse every frame in the chunk, then promote.
+  // A cancel acknowledgement in this read drops its parked call first.
+  #applyStdout(rec, chunk) {
+    if (rec.dead || this.closed || chunk == null) return;
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    if (buf.length === 0) return;
+    this.#takeStdout(rec, buf.length);
+    this.#onChild(rec, buf);
+  }
+
   #onChild(rec, chunk) {
     if (rec.dead || this.closed) return;
+    rec.childReads += 1;
     const incoming = rec.stash ? Buffer.concat([rec.stash, chunk]) : chunk;
     rec.stash = null;
     rec.inFlightTailBytes = 0;
@@ -1827,9 +1975,11 @@ export class Supervisor {
         rec.inFlightTailBytes = 0;
       }
     } finally {
-      if (!rec.dead) {
+      rec.childReads -= 1;
+      if (rec.childReads === 0 && !rec.dead) {
         rec.inFlightTailBytes = 0;
         this.#refillCredit(rec);
+        this.#drainPark(rec);
       }
     }
   }

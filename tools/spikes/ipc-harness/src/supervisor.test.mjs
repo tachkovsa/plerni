@@ -1787,7 +1787,10 @@ test('the shared input resumes below the global low water', { timeout: 10_000 },
   try {
     pair.sup.spawn({ pluginId: 'a', script: floodPath, env: { FLOOD_MODE: 'partial' }, total: 1024 * 1024 });
     pair.sup.spawn({ pluginId: 'b', script: floodPath, env: { FLOOD_MODE: 'partial' }, total: 1024 * 1024 });
-    const paused = await waitUntil(() => pair.sup.inputPaused && pair.sup.bufferedBytes() > cap, 3_000);
+    const paused = await waitUntil(
+      () => pair.sup.inputPaused && pair.sup.bufferedBytes() + pair.sup.readBytes > cap,
+      3_000,
+    );
     assert.equal(paused, true);
     for (const id of ['a', 'b']) pair.sup.children.get(id).child.kill('SIGKILL');
     const resumed = await waitUntil(
@@ -3951,6 +3954,608 @@ test('parked calls leave a sibling send window usable', async () => {
   } finally {
     stop('a');
     stop('b');
+    await pair.close();
+  }
+});
+
+// Checked after every scripted and seeded admission step:
+// admitKeep === max(admitFloor, live admitted costs), and that value fits B_t and B_g.
+// Each parked id is pending once, and a parked id whose cancel is still pending
+// is not sitting in the stdin payload queue.
+// A call line is not written after its cancel line while that cancel is in force.
+function assertAccountingInvariants(sup, rec) {
+  const ceiling = rec.flowOk ? rec.bT : rec.limits.total;
+  let kernel = 0;
+  for (const child of sup.children.values()) {
+    if (!child.dead && child.flowOk) kernel += child.kIn + child.kOut + sup.readBytes;
+  }
+  const globalCap = sup.capsConfig.totalGlobal - kernel - (sup.kMuxIn + sup.kMuxOut + sup.readBytes);
+  assert.ok(rec.admitKeep <= ceiling, `admitKeep ${rec.admitKeep} above B_t ${ceiling}`);
+  assert.ok(rec.admitKeep <= globalCap, `admitKeep ${rec.admitKeep} above B_g ${globalCap}`);
+  assert.ok(rec.sendWindow >= 0, String(rec.sendWindow));
+  let parkedBytes = 0;
+  let live = rec.admitFloor || 0;
+  const seen = new Set();
+  for (const entry of rec.parked) {
+    parkedBytes += entry.bytes;
+    const id = entry.msg.correlationId;
+    assert.equal(seen.has(id), false, `parked twice ${id}`);
+    seen.add(id);
+    assert.equal(sup.pending.has(rec.credential.pluginId, id, 'call'), true, `parked ${id} is not pending`);
+    const idCost = Buffer.byteLength(JSON.stringify(rec.credential.pluginId))
+      + Buffer.byteLength(JSON.stringify(id));
+    assert.ok(
+      (entry.idReserve || 0) >= idCost,
+      `parked ${id} reserves ${entry.idReserve} identifier bytes, needs ${idCost}`,
+    );
+    if (sup.pending.has(rec.credential.pluginId, id, 'cancel')) {
+      assert.equal(
+        rec.stdinPayload.some((item) => Object.is(item.correlationId, id)),
+        false,
+        `call ${id} is queued while its cancel is pending`,
+      );
+    }
+  }
+  assert.equal(rec.parkedBytes, parkedBytes);
+  for (const pending of sup.pending.values()) {
+    if (pending.cancel || !(pending.admitCost > live)) continue;
+    if (!Object.is(pending.pluginId, rec.credential.pluginId)) continue;
+    if (pending.generation !== rec.credential.generation) continue;
+    live = pending.admitCost;
+  }
+  assert.equal(rec.admitKeep, Math.max(rec.admitFloor || 0, live), JSON.stringify({
+    admitKeep: rec.admitKeep,
+    floor: rec.admitFloor,
+    live,
+  }));
+}
+
+function stdinMessages(written) {
+  const out = [];
+  for (const chunk of written) {
+    for (const line of String(chunk).split('\n')) {
+      if (!line) continue;
+      try { out.push(JSON.parse(line)); } catch { /* a partial write is not a frame */ }
+    }
+  }
+  return out;
+}
+
+function assertNoCallAfterItsCancel(written) {
+  const cancelled = new Set();
+  for (const msg of stdinMessages(written)) {
+    if (msg.kind === 'cancel') cancelled.add(msg.correlationId);
+    assert.equal(
+      msg.kind === 'call' && cancelled.has(msg.correlationId),
+      false,
+      `stdin wrote call ${msg.correlationId} after its cancel`,
+    );
+  }
+}
+
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return () => {
+    a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+test('admission accounting holds across a seeded mix of calls and cancels', async () => {
+  const pair = await connectPair({
+    sweeper: false,
+    caps: { pending: 64, pendingGlobal: 128, total: 256 * 1024, totalGlobal: 4 * 1024 * 1024 },
+  });
+  const stop = () => {
+    const proc = pair.sup.children.get('silent')?.child;
+    if (proc && proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL');
+  };
+  try {
+    const kid = pair.sup.spawn({
+      pluginId: 'silent',
+      script: floodPath,
+      env: { FLOOD_MODE: 'silent' },
+      pending: 4,
+      total: 256 * 1024,
+    });
+    const rec = pair.sup.children.get('silent');
+    const granted = await waitUntil(() => rec.creditSent > 0 && rec.outbound === 0, 2_000);
+    assert.equal(granted, true, String(rec.creditSent));
+    const written = [];
+    const stdin = rec.child.stdin;
+    const orig = stdin.write.bind(stdin);
+    stdin.write = (chunk, enc, cb) => {
+      written.push(Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk));
+      if (typeof enc === 'function') return orig(chunk, enc);
+      return orig(chunk, enc, cb);
+    };
+    assert.equal(await stopChild(rec.child.pid), true);
+    const rejected = new Set();
+    const issue = (id, pad) => {
+      pair.stub.call({
+        pluginId: 'silent',
+        credential: kid.credential,
+        correlationId: id,
+        port: 'db',
+        method: 'get',
+        payload: 'p'.repeat(pad),
+      }, 4_000).then(() => {}, (err) => {
+        if (err?.code) rejected.add(`${id}:${err.code}`);
+      });
+    };
+    const steps = [
+      { op: 'call', id: 1, pad: 32 },
+      { op: 'call', id: 2, pad: 5200 },
+      { op: 'call', id: 3, pad: 1800 },
+      { op: 'call', id: 4, pad: 300000 },
+      { op: 'cancel', id: 2 },
+      { op: 'call', id: 5, pad: 64 },
+    ];
+    const rng = mulberry32(0xC0FFEE);
+    const sizes = [8, 64, 1500, 4000, 300000];
+    for (let n = 0; n < 8; n++) steps.push({ op: 'call', id: 100 + n, pad: sizes[Math.floor(rng() * sizes.length)] });
+    let keptBeforeReject = null;
+    for (const step of steps) {
+      if (step.op === 'cancel') {
+        const parked = rec.parked.some((entry) => Object.is(entry.msg.correlationId, step.id));
+        assert.equal(parked, true, `cancel target ${step.id} was not parked`);
+        pair.stub.cancel({
+          pluginId: 'silent',
+          credential: kid.credential,
+          correlationId: step.id,
+        }, 4_000).catch(() => {});
+        const pendingCancel = await waitUntil(
+          () => pair.sup.pending.has('silent', step.id, 'cancel'),
+          1_000,
+        );
+        assert.equal(pendingCancel, true, `cancel ${step.id} was not admitted`);
+        await delay(80);
+        assert.equal(
+          rec.stdinPayload.some((entry) => Object.is(entry.correlationId, step.id)),
+          false,
+          `call ${step.id} moved to stdin while its cancel was pending`,
+        );
+        assert.equal(
+          rec.parked.some((entry) => Object.is(entry.msg.correlationId, step.id)),
+          true,
+          `call ${step.id} left the park while its cancel was pending`,
+        );
+      } else {
+        if (step.pad === 300000) keptBeforeReject = rec.admitKeep;
+        issue(step.id, step.pad);
+        const saw = await waitUntil(() => {
+          if ([...rejected].some((item) => item.startsWith(`${step.id}:`))) return true;
+          if (rec.parked.some((entry) => Object.is(entry.msg.correlationId, step.id))) {
+            holdPark(rec);
+            return true;
+          }
+          return pair.sup.pending.has('silent', step.id, 'call');
+        }, 1_000);
+        assert.equal(saw, true, JSON.stringify({ id: step.id, pad: step.pad, parked: rec.parked.length }));
+        if (step.pad === 300000) {
+          assert.equal(rejected.has(`${step.id}:total-cap`), true, `oversized ${step.id} was admitted`);
+          assert.equal(pair.sup.pending.has('silent', step.id, 'call'), false);
+          assert.equal(rec.admitKeep, keptBeforeReject);
+          assert.ok(rec.admitKeep <= rec.bT, `${rec.admitKeep} > ${rec.bT}`);
+        }
+      }
+      assertAccountingInvariants(pair.sup, rec);
+      assertNoCallAfterItsCancel(written);
+    }
+  } finally {
+    stop();
+    await pair.close();
+  }
+});
+
+test('a rejected oversized call does not pin send credit', { timeout: 20_000 }, async () => {
+  const pad = 40_000;
+  const pair = await connectPair({ sweeper: false });
+  try {
+    const kid = pair.sup.spawn({
+      pluginId: 'wide',
+      script: responsePath,
+      env: { RESPONSE_PAD: String(pad) },
+    });
+    const rec = pair.sup.children.get('wide');
+    const granted = await waitUntil(() => rec.grantSettled && rec.outbound === 0 && rec.sendWindow > 0, 2_000);
+    assert.equal(granted, true, String(rec.sendWindow));
+    assert.ok(rec.bT < 300_000, String(rec.bT));
+    const before = rec.admitKeep;
+    const rejected = await pair.stub.call({
+      pluginId: 'wide',
+      credential: kid.credential,
+      correlationId: 99,
+      port: 'db',
+      method: 'get',
+      payload: 'x'.repeat(300_000),
+    }, 2_000).catch((err) => err);
+    assert.equal(rejected.code, 'total-cap', JSON.stringify({ code: rejected?.code, keep: rec.admitKeep, bT: rec.bT }));
+    assert.equal(rec.admitKeep, before);
+    assert.ok(rec.admitKeep <= rec.bT, `${rec.admitKeep} > ${rec.bT}`);
+    assertAccountingInvariants(pair.sup, rec);
+    for (let id = 1; id <= 8; id++) {
+      const res = await pair.stub.call({
+        pluginId: 'wide',
+        credential: kid.credential,
+        correlationId: id,
+        port: 'db',
+        method: 'get',
+        payload: { n: id },
+      }, 4_000).catch((err) => err);
+      assert.equal(res.payload?.length, pad, JSON.stringify({
+        id,
+        code: res.code,
+        keep: rec.admitKeep,
+        floor: rec.admitFloor,
+        window: rec.sendWindow,
+        credit: rec.creditSent,
+        bT: rec.bT,
+      }));
+      assertAccountingInvariants(pair.sup, rec);
+    }
+  } finally {
+    await pair.close();
+  }
+});
+
+test('a cancel acknowledgement is applied before a parked call is promoted', async () => {
+  const pair = await connectPair({
+    sweeper: false,
+    caps: { pending: 8, total: 1024 * 1024, totalGlobal: 4 * 1024 * 1024 },
+  });
+  try {
+    const kid = pair.sup.spawn({
+      pluginId: 'echo',
+      script: echoPath,
+      pending: 3,
+      total: 1024 * 1024,
+    });
+    const rec = pair.sup.children.get('echo');
+    const granted = await waitUntil(() => rec.creditSent > 0 && rec.outbound === 0, 2_000);
+    assert.equal(granted, true, String(rec.creditSent));
+    const written = [];
+    const stdin = rec.child.stdin;
+    const orig = stdin.write.bind(stdin);
+    stdin.write = (chunk, enc, cb) => {
+      written.push(Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk));
+      if (typeof enc === 'function') return orig(chunk, enc);
+      return orig(chunk, enc, cb);
+    };
+    assert.equal(await stopChild(rec.child.pid), true);
+    const call = (id, pad) => pair.stub.call({
+      pluginId: 'echo',
+      credential: kid.credential,
+      correlationId: id,
+      port: 'db',
+      method: 'get',
+      payload: pad == null ? { n: id } : 'y'.repeat(pad),
+    }, 4_000).catch((err) => err);
+    const first = call(1);
+    const armed = await waitUntil(() => pair.sup.pending.has('echo', 1, 'call') && rec.outbound === 0, 1_000);
+    assert.equal(armed, true, JSON.stringify({ outbound: rec.outbound, pending: pair.sup.pending.size }));
+    const victim = call(2, 4500);
+    const parked = await waitUntil(() => {
+      const held = rec.parked.some((entry) => entry.msg.correlationId === 2);
+      if (held) holdPark(rec);
+      return held;
+    }, 1_000);
+    assert.equal(parked, true, JSON.stringify({
+      parked: rec.parked.map((entry) => entry.msg.correlationId),
+      window: rec.sendWindow,
+      plugin: rec.framer.pendingBytes(),
+    }));
+    const cancel = pair.stub.cancel({
+      pluginId: 'echo',
+      credential: kid.credential,
+      correlationId: 2,
+    }, 4_000);
+    const cancelQueued = await waitUntil(
+      () => stdinMessages(written).some((msg) => msg.kind === 'cancel' && msg.correlationId === 2),
+      1_000,
+    );
+    assert.equal(cancelQueued, true, stdinMessages(written).map((msg) => msg.kind).join(','));
+    const chunk = Buffer.from(
+      encodeNdjson({ kind: 'result', correlationId: 1, payload: { n: 1 } })
+      + encodeNdjson({ kind: 'cancelled', correlationId: 2 }),
+    );
+    rec.child.stdout.emit('data', chunk);
+    assert.equal(
+      stdinMessages(written).some((msg) => msg.kind === 'call' && msg.correlationId === 2),
+      false,
+      stdinMessages(written).map((msg) => `${msg.kind}:${msg.correlationId}`).join(','),
+    );
+    assert.equal(rec.parked.some((entry) => entry.msg.correlationId === 2), false);
+    const cancelDone = await cancel;
+    const victimDone = await victim;
+    assert.equal(cancelDone.kind, 'cancelled');
+    assert.equal(victimDone.kind, 'cancelled');
+    const firstDone = await first;
+    assert.equal(firstDone.payload?.n, 1);
+    const third = call(3);
+    const thirdArmed = await waitUntil(() => pair.sup.pending.has('echo', 3, 'call'), 1_000);
+    assert.equal(thirdArmed, true);
+    const fourth = call(4, 4500);
+    const fourthParked = await waitUntil(() => {
+      const held = rec.parked.some((entry) => entry.msg.correlationId === 4);
+      if (held) holdPark(rec);
+      return held;
+    }, 1_000);
+    assert.equal(fourthParked, true, String(rec.sendWindow));
+    const cancelFour = pair.stub.cancel({
+      pluginId: 'echo',
+      credential: kid.credential,
+      correlationId: 4,
+    }, 4_000);
+    const cancelFourWritten = await waitUntil(
+      () => stdinMessages(written).some((msg) => msg.kind === 'cancel' && msg.correlationId === 4),
+      1_000,
+    );
+    assert.equal(cancelFourWritten, true);
+    const ack = encodeNdjson({ kind: 'cancelled', correlationId: 4 });
+    rec.sendWindow = Buffer.byteLength(ack);
+    rec.child.stdout.emit('data', Buffer.from(ack));
+    assert.equal(
+      stdinMessages(written).some((msg) => msg.kind === 'call' && msg.correlationId === 4),
+      false,
+      stdinMessages(written).map((msg) => `${msg.kind}:${msg.correlationId}`).join(','),
+    );
+    assert.equal((await cancelFour).kind, 'cancelled');
+    assert.equal((await fourth).kind, 'cancelled');
+    third.catch(() => {});
+    assertAccountingInvariants(pair.sup, rec);
+    assertNoCallAfterItsCancel(written);
+  } finally {
+    const proc = pair.sup.children.get('echo')?.child;
+    if (proc && proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL');
+    await pair.close();
+  }
+});
+
+test('a parked long correlation id can still be cancelled', { timeout: 10_000 }, async () => {
+  const reserved = measureFlowReserve();
+  assert.ok(reserved);
+  const pluginId = 'echo';
+  const longId = 'c'.repeat(1100);
+  const payload = { n: 1 };
+  const idBytes = (correlationId) => Buffer.byteLength(JSON.stringify(pluginId))
+    + Buffer.byteLength(JSON.stringify(correlationId));
+  const callBytes = Buffer.byteLength(encodeNdjson({
+    kind: 'call',
+    correlationId: longId,
+    port: 'db',
+    method: 'get',
+    payload,
+  }));
+  const numericBytes = Buffer.byteLength(encodeNdjson({
+    kind: 'call',
+    correlationId: 1,
+    port: 'db',
+    method: 'get',
+    payload,
+  }));
+  const grant = stdinControlReserve().grant;
+  const cancelFrame = Buffer.byteLength(encodeNdjson({ kind: 'cancel', correlationId: longId }));
+  const wire = grant + Math.max(stdinControlReserve().cancel, cancelFrame);
+  const base = numericBytes + idBytes(1);
+  const withWire = base + callBytes + idBytes(longId) + wire;
+  const withIds = withWire + idBytes(longId);
+  assert.ok(idBytes(longId) > 1000);
+  assert.ok(withIds > withWire + 1000);
+  const tight = withWire + 200;
+  const open = withIds + 200;
+  assert.ok(tight < withIds);
+  const spawnTotal = (userspace) => userspace + reserved.kIn + reserved.kOut + reserved.readBytes;
+  const pair = await connectPair({
+    sweeper: false,
+    caps: { pending: 8, partial: 1024 * 1024, total: spawnTotal(open), totalGlobal: 4 * 1024 * 1024 },
+  });
+  const stop = () => {
+    const proc = pair.sup.children.get(pluginId)?.child;
+    if (proc && proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL');
+  };
+  try {
+    const kid = pair.sup.spawn({
+      pluginId,
+      script: echoPath,
+      pending: 4,
+      total: spawnTotal(tight),
+    });
+    const rec = pair.sup.children.get(pluginId);
+    const granted = await waitUntil(() => rec.grantSettled && rec.outbound === 0, 2_000);
+    assert.equal(granted, true, String(rec.creditSent));
+    assert.equal(rec.bT, tight);
+    assert.equal(await stopChild(rec.child.pid), true);
+    const numeric = pair.stub.call({
+      pluginId,
+      credential: kid.credential,
+      correlationId: 1,
+      port: 'db',
+      method: 'get',
+      payload,
+    }, 4_000).catch((err) => err);
+    const numericArmed = await waitUntil(() => pair.sup.pending.has(pluginId, 1, 'call'), 1_000);
+    assert.equal(numericArmed, true);
+    const charged = pair.sup.queueDepth(pluginId).pluginBytes;
+    assert.ok(charged + callBytes + idBytes(longId) + wire <= rec.bT, `${charged} wire fits ${rec.bT}`);
+    assert.ok(
+      charged + callBytes + idBytes(longId) + wire + idBytes(longId) > rec.bT,
+      `${charged} identifiers do not fit ${rec.bT}`,
+    );
+    const rejected = await pair.stub.call({
+      pluginId,
+      credential: kid.credential,
+      correlationId: longId,
+      port: 'db',
+      method: 'get',
+      payload,
+    }, 1_000).catch((err) => err);
+    assert.equal(rejected.code, 'total-cap');
+    assert.equal(rec.parked.length, 0);
+    assert.equal(pair.sup.pending.has(pluginId, longId, 'call'), false);
+    numeric.catch(() => {});
+    process.kill(rec.child.pid, 'SIGKILL');
+    await pair.close();
+
+    const openPair = await connectPair({
+      sweeper: false,
+      caps: { pending: 8, partial: 1024 * 1024, total: spawnTotal(open), totalGlobal: 4 * 1024 * 1024 },
+    });
+    try {
+      const openKid = openPair.sup.spawn({
+        pluginId,
+        script: echoPath,
+        pending: 4,
+        total: spawnTotal(open),
+      });
+      const openRec = openPair.sup.children.get(pluginId);
+      const openGrant = await waitUntil(() => openRec.grantSettled && openRec.outbound === 0, 2_000);
+      assert.equal(openGrant, true, String(openRec.creditSent));
+      assert.equal(await stopChild(openRec.child.pid), true);
+      const filler = openPair.stub.call({
+        pluginId,
+        credential: openKid.credential,
+        correlationId: 1,
+        port: 'db',
+        method: 'get',
+        payload,
+      }, 4_000).catch((err) => err);
+      const armed = await waitUntil(() => openPair.sup.pending.has(pluginId, 1, 'call'), 1_000);
+      assert.equal(armed, true);
+      const parkedCall = openPair.stub.call({
+        pluginId,
+        credential: openKid.credential,
+        correlationId: longId,
+        port: 'db',
+        method: 'get',
+        payload,
+      }, 4_000).catch((err) => err);
+      const parked = await waitUntil(() => {
+        const held = openRec.parked.some((entry) => entry.msg.correlationId === longId);
+        if (held) holdPark(openRec);
+        return held || openPair.sup.pending.has(pluginId, longId, 'call');
+      }, 1_000);
+      assert.equal(parked, true, JSON.stringify({
+        parked: openRec.parked.map((entry) => entry.msg.correlationId),
+        pending: openPair.sup.pending.has(pluginId, longId, 'call'),
+      }));
+      const kept = openRec.admitKeep;
+      const cancel = openPair.stub.cancel({
+        pluginId,
+        credential: openKid.credential,
+        correlationId: longId,
+      }, 4_000).catch((err) => err);
+      const cancelPending = await waitUntil(
+        () => openPair.sup.pending.has(pluginId, longId, 'cancel'),
+        1_000,
+      );
+      assert.equal(cancelPending, true, 'cancel was not admitted');
+      cancel.catch(() => {});
+      assert.equal(
+        openRec.stdinPayload.some((entry) => entry.correlationId === longId),
+        false,
+      );
+      assert.ok(openRec.admitKeep <= openRec.bT, `${openRec.admitKeep} > ${openRec.bT}`);
+      assert.ok(openRec.admitKeep >= kept);
+      assertAccountingInvariants(openPair.sup, openRec);
+      filler.catch(() => {});
+      parkedCall.catch(() => {});
+    } finally {
+      const proc = openPair.sup.children.get(pluginId)?.child;
+      if (proc && proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL');
+      if (!openPair.sup.closed) await openPair.close();
+    }
+  } finally {
+    stop();
+    if (!pair.sup.closed) await pair.close();
+  }
+});
+
+test('a stdout read stays inside the cap while send credit is open', { timeout: 15_000 }, async () => {
+  const totalGlobal = 100_000;
+  const pad = 16_000;
+  const lineBytes = Buffer.byteLength(encodeNdjson({
+    kind: 'result',
+    correlationId: 1,
+    payload: 'p'.repeat(pad),
+  }));
+  const pair = await connectPair({
+    sweeper: false,
+    caps: { partial: 1024 * 1024, total: 1024 * 1024, totalGlobal },
+  });
+  try {
+    const kid = pair.sup.spawn({
+      pluginId: 'wide',
+      script: responsePath,
+      env: { RESPONSE_PAD: String(pad) },
+      total: 1024 * 1024,
+    });
+    const rec = pair.sup.children.get('wide');
+    const granted = await waitUntil(
+      () => rec.grantSettled && rec.outbound === 0 && rec.sendWindow >= lineBytes,
+      2_000,
+    );
+    assert.equal(granted, true, String(rec.sendWindow));
+    // The grant is in the kernel. Let the child read it before it is stopped,
+    // so the later response is credit-compliant.
+    await delay(100);
+    assert.equal(await stopChild(rec.child.pid), true);
+    let settled = null;
+    const call = pair.stub.call({
+      pluginId: 'wide',
+      credential: kid.credential,
+      correlationId: 1,
+      port: 'db',
+      method: 'get',
+      payload: { n: 1 },
+    }, 8_000).then((res) => {
+      settled = res;
+      return res;
+    }, (err) => {
+      settled = err;
+      return err;
+    });
+    const armed = await waitUntil(() => pair.sup.pending.has('wide', 1, 'call'), 1_000);
+    assert.equal(armed, true, 'call was not admitted beside the open window');
+    const globalCap = totalGlobal
+      - (rec.kIn + rec.kOut + pair.sup.readBytes)
+      - (pair.sup.kMuxIn + pair.sup.kMuxOut + pair.sup.readBytes);
+    const slack = 8_000;
+    const occupy = globalCap - pair.sup.bufferedBytes() - slack;
+    assert.ok(occupy > lineBytes, `${occupy} should exceed the ${lineBytes}-byte response`);
+    pair.sup.queuedBytes += occupy;
+    const occupied = pair.sup.bufferedBytes();
+    assert.ok(occupied + lineBytes > globalCap, `${occupied} + ${lineBytes} vs ${globalCap}`);
+    assert.ok(occupied <= globalCap, `${occupied} already over ${globalCap}`);
+    const promised = Math.min(pair.sup.readBytes, rec.sendWindow);
+    assert.ok(
+      occupied + pair.sup.readBytes - promised <= globalCap,
+      'the old read check would already refuse this slice',
+    );
+    process.kill(rec.child.pid, 'SIGCONT');
+    let peak = occupied;
+    const started = performance.now();
+    while (performance.now() - started < 400) {
+      peak = Math.max(peak, pair.sup.bufferedBytes());
+      await delay(20);
+    }
+    assert.ok(peak <= globalCap, `buffered ${peak} exceeded ${globalCap}`);
+    assert.equal(settled, null, 'the response completed while the mux occupancy was held');
+    pair.sup.queuedBytes = Math.max(0, pair.sup.queuedBytes - occupy);
+    // The occupancy stands in for a retained mux frame. Releasing it is the
+    // drain completion that unpauses a global hold.
+    rec.paused = false;
+    rec.pauseReason = null;
+    rec.readHeld = false;
+    rec.readPosted = false;
+    rec.stdoutSocket?.resume();
+    const done = await call;
+    assert.equal(done.payload?.length, pad);
+  } finally {
+    const proc = pair.sup.children.get('wide')?.child;
+    if (proc && proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL');
     await pair.close();
   }
 });
