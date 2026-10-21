@@ -188,6 +188,27 @@ export function stdinControlReserve() {
 
 const CONTROL_RESERVE = stdinControlReserve();
 
+// The idle grant cannot see the call that will sit beside it. This slot is
+// one 1024-byte call, its identifiers, and the control reserve, so the next
+// admission still fits in B_t and B_g. A larger call raises the per-child
+// slot. The slot is subtracted from the free room; it is not a higher ceiling.
+function admissionKeepFloor() {
+  const correlationId = 480000;
+  const line = encodeNdjson({
+    kind: 'call',
+    correlationId,
+    port: 'db',
+    method: 'get',
+    payload: 'x'.repeat(1024),
+  });
+  const bytes = Buffer.byteLength(line);
+  const idBytes = identifierBytes('echo-0', correlationId);
+  const cancel = Buffer.byteLength(encodeNdjson({ kind: 'cancel', correlationId }));
+  return bytes + idBytes + CONTROL_RESERVE.grant + Math.max(CONTROL_RESERVE.cancel, cancel);
+}
+
+const ADMIT_KEEP = admissionKeepFloor();
+
 // Process environment values are strings and cannot carry a NUL. The spawn
 // map key keeps the original plugin id; this text is only the child hint.
 function envText(value) {
@@ -249,6 +270,9 @@ export class Supervisor {
       : EXIT_DRAIN_MS;
     this.invalidReason = null;
     this.flip = null;
+    this.muxSendTimer = null;
+    this.muxSendLast = null;
+    this.muxSendSpins = 0;
     this.useDirect = opts.useDirect ?? useDirectFromEnv();
     this.capsConfig = { ...DEFAULT_CAPS, ...opts.caps };
     if (opts.caps?.pending != null && opts.caps.pendingGlobal == null) {
@@ -406,7 +430,12 @@ export class Supervisor {
       closeEnds(flow);
       throw err;
     }
-    setImmediate(() => { envHold.settle = true; });
+    setImmediate(() => {
+      envHold.settle = true;
+      // The unread block can pause the mux before the wrapper reads it.
+      // Recounting here opens the input once that block is gone.
+      if (!this.closed) this.#maybeResumeAll();
+    });
     if (flow) {
       closeFd(flow.childStdin);
       closeFd(flow.childStdout);
@@ -427,8 +456,13 @@ export class Supervisor {
       stdinWriting: false,
       creditSent: 0,
       // Bytes the child may still write. Grants raise it. Stdout reads lower
-      // it. Consumed output refills it up to the free part of B_t.
+      // it. Consumed output refills it up to the free room minus one call.
       sendWindow: 0,
+      admitKeep: 0,
+      parked: [],
+      parkedBytes: 0,
+      parkTimer: null,
+      parkDraining: false,
       stash: null,
       inFlightTailBytes: 0,
       hiBytes: 0,
@@ -492,9 +526,8 @@ export class Supervisor {
       // after the gate, on a later turn.
       setImmediate(() => this.#considerRead(rec));
     }
-    // The grant is the free part of the ceiling after calls already written
-    // are charged. Unspent credit stays reserved on a later call and is not
-    // retracted.
+    // The grant is the free room after calls already written, minus one more
+    // call. Unspent credit stays reserved on a later call and is not retracted.
     this.#refillCredit(rec);
     return { credential: detachCredential(credential), token, pid: child.pid };
   }
@@ -628,6 +661,19 @@ export class Supervisor {
 
   // Probe, then post at most one C-byte read. The onread turn returns true
   // itself; resume() here is for a later turn, after the callback has stopped.
+  // A resume() inside the stdout callback is cancelled when that callback
+  // returns false, and readPosted stays set. The socket is paused, the child
+  // is not, and nothing posts the next read. That pair is not a budget hold.
+  #repairStuckReads() {
+    for (const rec of this.children.values()) {
+      if (rec.dead || rec.paused || rec.inStdoutRead || !rec.readPosted) continue;
+      const socket = rec.stdoutSocket;
+      if (!socket || socket.destroyed || !socket.isPaused()) continue;
+      rec.readPosted = false;
+      this.#considerRead(rec);
+    }
+  }
+
   #considerRead(rec) {
     if (rec.inStdoutRead) return;
     if (rec.exitDrain) {
@@ -884,6 +930,53 @@ export class Supervisor {
     if (!this.flip) this.flip = reason;
   }
 
+  // Our own writes stop before they would put the kernel send queue over
+  // K_mux_out. Bytes already handed to libuv are not in SIOCOUTQ yet; they
+  // still belong to that reservation. A frame larger than the reservation
+  // has to be handed to the socket, and libuv holds the tail. A kernel queue
+  // that is already over the reservation is the flip, and K_mux_out is not raised.
+  #muxWriteRoom(nextLen) {
+    const queued = this.#muxCount(this.muxOutq);
+    if (queued == null) {
+      this.#invalidate('siocoutq-unavailable');
+      return 'invalid';
+    }
+    if (queued > this.kMuxOut) {
+      this.#flipMux('mux-send');
+      return 'flip';
+    }
+    const pending = Math.max(0, this.socketOutbound);
+    if (nextLen <= this.kMuxOut && queued + pending + nextLen > this.kMuxOut) return 'wait';
+    return 'ok';
+  }
+
+  #waitMuxSend() {
+    if (this.muxSendTimer || this.closed || this.framingFault) return;
+    const queued = this.#muxCount(this.muxOutq);
+    const dropped = Number.isInteger(queued) && Number.isInteger(this.muxSendLast) && queued < this.muxSendLast;
+    if (Number.isInteger(queued)) this.muxSendLast = queued;
+    const fire = () => {
+      this.muxSendTimer = null;
+      if (!this.closed && !this.framingFault) this.#drain();
+    };
+    // The first sample has no previous queue, so it is not a drop. A wait
+    // that never sees the queue shrink backs off instead of spinning.
+    if (dropped || this.muxSendSpins < 4) {
+      this.muxSendSpins = dropped ? 0 : this.muxSendSpins + 1;
+      this.muxSendTimer = setImmediate(fire);
+      return;
+    }
+    this.muxSendTimer = setTimeout(fire, PROBE_INTERVAL_MS);
+  }
+
+  #clearMuxSendWait() {
+    const timer = this.muxSendTimer;
+    if (!timer) return;
+    this.muxSendTimer = null;
+    if (typeof timer._onTimeout === 'function') clearTimeout(timer);
+    else clearImmediate(timer);
+  }
+
   #muxReadPermitted() {
     if (this.inputPaused || this.closed || this.framingFault || this.flip || this.invalidReason) return false;
     const unread = this.#muxCount(this.muxPending);
@@ -935,15 +1028,24 @@ export class Supervisor {
         this.#clearMuxProbe();
         return;
       }
+      // A pause sticks until something recounts. Stdout used to do that when
+      // a child echoed a grant; a quiet child never will. The probe is the
+      // recount, and it still resumes only under the global low water.
+      if (this.inputPaused) this.#resumeInput();
+      // readPosted plus a paused stdout is a cancelled resume. The child is
+      // not budget-paused, and the bytes already in the kernel are not a new read.
+      this.#repairStuckReads();
       if (this.muxReadPosted) return;
       this.#considerMuxRead();
     }, PROBE_INTERVAL_MS);
   }
 
   #clearMuxProbe() {
-    if (!this.muxProbeTimer) return;
-    clearInterval(this.muxProbeTimer);
-    this.muxProbeTimer = null;
+    if (this.muxProbeTimer) {
+      clearInterval(this.muxProbeTimer);
+      this.muxProbeTimer = null;
+    }
+    this.#clearMuxSendWait();
   }
 
   #onSocket(chunk) {
@@ -1022,14 +1124,118 @@ export class Supervisor {
     // credit-respecting child fills the original window and the reply misses
     // B_t. The credit is not stdin, so it does not enter K_out.
     const cancelReserve = this.#maxCancelBytes(rec, msg.correlationId);
+    const reserve = CONTROL_RESERVE.grant + cancelReserve;
+    const admitCost = bytes + idBytes + reserve;
+    if (admitCost > rec.admitKeep) rec.admitKeep = admitCost;
     const heldCredit = rec.flowOk && rec.callPending > 0 ? Math.max(0, rec.sendWindow) : 0;
-    if (this.#overBudget(rec, bytes + idBytes + heldCredit, bytes, CONTROL_RESERVE.grant + cancelReserve)) {
+    if (this.#overBudget(rec, bytes + idBytes + heldCredit, bytes, reserve)) {
+      // Own bytes fit in B_t and B_g. The miss is the unspent window, a full
+      // K_out, or both. Hold the frame and write it once there is room. A
+      // probe that does not shrink is rejected; waiting would not help it.
+      if (!this.#bytesOver(rec, bytes + idBytes, reserve)) {
+        this.#parkCall(rec, msg, line, bytes, idBytes, ingressTs, reserve);
+        return;
+      }
       this.caps.total = true;
       this.#reject(msg, 'total-cap', true);
       return;
     }
     this.#arm(rec, msg, { cancel: false, bytes, idBytes, ingressTs });
     this.#enqueueStdin(rec, line, bytes, 'call', msg.correlationId);
+  }
+
+  #parkCall(rec, msg, line, bytes, idBytes, ingressTs, reserve) {
+    const cost = bytes + idBytes;
+    const pendingCount = rec.callPending + rec.cancelPending + rec.parked.length;
+    if (rec.parked.length >= rec.limits.pending || pendingCount >= rec.limits.pending) {
+      this.caps.pending = true;
+      this.#reject(msg, 'pending-cap', true);
+      return;
+    }
+    if (this.#pluginBytes(rec) + rec.parkedBytes + cost + reserve > this.#childCeiling(rec)
+        || this.bufferedBytes() + rec.parkedBytes + cost + reserve > this.#globalCap()) {
+      this.caps.total = true;
+      this.#reject(msg, 'total-cap', true);
+      return;
+    }
+    rec.parked.push({ msg, line, bytes, idBytes, ingressTs, reserve });
+    rec.parkedBytes += cost;
+    this.#armPark(rec);
+  }
+
+  #armPark(rec, delayMs = 0) {
+    if (rec.parkTimer || rec.dead || this.closed) return;
+    const fire = () => {
+      rec.parkTimer = null;
+      this.#drainPark(rec);
+    };
+    rec.parkTimer = delayMs > 0 ? setTimeout(fire, delayMs) : setImmediate(fire);
+  }
+
+  // clearImmediate() counts every object as an Immediate and decrements the
+  // process-wide immediate tally. A parked-call timeout passed through it
+  // leaves that tally at zero, and a later child's grant callback never runs.
+  #clearParkTimer(rec) {
+    const timer = rec.parkTimer;
+    if (!timer) return;
+    rec.parkTimer = null;
+    if (typeof timer._onTimeout === 'function') clearTimeout(timer);
+    else clearImmediate(timer);
+  }
+
+  #drainPark(rec) {
+    if (rec.parkDraining || rec.dead || this.closed) return;
+    rec.parkDraining = true;
+    try {
+      while (rec.parked.length > 0) {
+        const next = rec.parked[0];
+        const heldCredit = rec.flowOk && rec.callPending > 0 ? Math.max(0, rec.sendWindow) : 0;
+        if (!this.#overBudget(rec, next.bytes + next.idBytes + heldCredit, next.bytes, next.reserve)) {
+          rec.parked.shift();
+          rec.parkedBytes -= next.bytes + next.idBytes;
+          if (rec.parked.length === 0) rec.parkSince = null;
+          this.#arm(rec, next.msg, {
+            cancel: false,
+            bytes: next.bytes,
+            idBytes: next.idBytes,
+            ingressTs: next.ingressTs,
+          });
+          this.#enqueueStdin(rec, next.line, next.bytes, 'call', next.msg.correlationId);
+          continue;
+        }
+        if (this.#bytesOver(rec, next.bytes + next.idBytes, next.reserve)) {
+          this.caps.total = true;
+          this.#rejectParked(rec, 'total-cap');
+          return;
+        }
+        const idle = rec.outbound === 0 && !rec.stdinWriting
+          && rec.stdinPayload.length === 0 && rec.stdinControl.length === 0;
+        if (!idle) return;
+        const kernel = rec.flowOk ? this.#stdinQueued(rec) : 0;
+        if (rec.parkSince == null) rec.parkSince = performance.now();
+        const dropped = Number.isInteger(kernel) && Number.isInteger(rec.parkKernel) && kernel < rec.parkKernel;
+        if (dropped) rec.parkSince = performance.now();
+        if (Number.isInteger(kernel)) rec.parkKernel = kernel;
+        if (!dropped && performance.now() - rec.parkSince >= 40) {
+          this.caps.total = true;
+          this.#rejectParked(rec, 'total-cap');
+          return;
+        }
+        this.#armPark(rec, 10);
+        return;
+      }
+    } finally {
+      rec.parkDraining = false;
+    }
+  }
+
+  #rejectParked(rec, code) {
+    this.#clearParkTimer(rec);
+    rec.parkSince = null;
+    rec.parkKernel = null;
+    const queued = rec.parked.splice(0);
+    rec.parkedBytes = 0;
+    for (const next of queued) this.#reject(next.msg, code, true);
   }
 
   // The largest cancel still owed for this child. The reserved hole has to
@@ -1067,6 +1273,7 @@ export class Supervisor {
   #takeStdout(rec, n) {
     if (!Number.isInteger(n) || n <= 0 || rec.dead) return;
     rec.sendWindow = Math.max(0, rec.sendWindow - n);
+    this.#drainPark(rec);
   }
 
   // A burst written with spawn lands in several reads. The socket reports
@@ -1100,10 +1307,24 @@ export class Supervisor {
         return;
       }
       rec.refillQuiet = false;
-      const room = this.#childCeiling(rec) - this.#pluginBytes(rec);
-      if (room <= rec.sendWindow) return;
-      const credit = Math.min(2147483647, room - rec.sendWindow);
+      const childRoom = this.#childCeiling(rec) - this.#pluginBytes(rec);
+      const globalRoom = this.#globalCap() - this.bufferedBytes();
+      const room = Math.min(childRoom, globalRoom);
+      // One more call always stays outside the advertised window, and the
+      // window itself stays inside B_g. A ceiling with room for a batch also
+      // keeps that many calls beside the credit. A ceiling sized to a few
+      // result lines does not: those calls are admitted before the grant.
+      const one = Math.max(rec.admitKeep || 0, ADMIT_KEEP);
+      const batch = Math.min(8, rec.limits.pending);
+      const wide = one * batch;
+      const keep = room > one * (batch + 24) ? wide : one;
+      if (room - keep <= rec.sendWindow) {
+        this.#drainPark(rec);
+        return;
+      }
+      const credit = Math.min(2147483647, room - keep - rec.sendWindow);
       this.#queueGrant(rec, credit);
+      this.#drainPark(rec);
     });
   }
 
@@ -1157,11 +1378,20 @@ export class Supervisor {
     rec.outbound = Math.max(0, rec.outbound - bytes);
     this.#noteStdinCeiling(rec);
     this.#maybeResumeAll();
+    this.#drainPark(rec);
   }
 
   #pendingFull(rec) {
     return rec.callPending + rec.cancelPending >= rec.limits.pending
       || this.callPendingTotal + this.cancelPendingTotal >= this.capsConfig.pendingGlobal;
+  }
+
+  // Child and process ceilings only. The kernel queue and the unspent window
+  // are not this check: a call that fails those can wait.
+  #bytesOver(rec, accounted, reserve) {
+    if (this.#pluginBytes(rec) + accounted + reserve > this.#childCeiling(rec)) return true;
+    if (this.bufferedBytes() + accounted + reserve > this.#globalCap()) return true;
+    return false;
   }
 
   // `accounted` is charged to B_t and B_g. `stdinBytes` is what this write
@@ -1250,6 +1480,7 @@ export class Supervisor {
     // The stdin line may still be sitting behind a blocked write. The
     // operation is no longer pending, so that line must not be sent.
     if (same) this.#dropUnsent(rec, correlationId, lane);
+    if (same) this.#drainPark(rec);
     this.#maybeResumeAll();
     return pending;
   }
@@ -1580,6 +1811,7 @@ export class Supervisor {
   }
 
   #releaseFlow(rec) {
+    this.#clearParkTimer(rec);
     this.#clearEnv(rec);
     this.#clearDrainTimer(rec);
     this.#disarmProbe(rec);
@@ -1659,6 +1891,7 @@ export class Supervisor {
   #maybeResumeAll() {
     this.#resumeInput();
     this.#considerMuxRead();
+    this.#repairStuckReads();
     const buffered = this.bufferedBytes();
     const globalLow = buffered <= this.#globalCap() / 2;
     const globalOpen = buffered <= this.#globalCap();
@@ -2102,6 +2335,7 @@ export class Supervisor {
   }
 
   #failPending(rec, code) {
+    this.#rejectParked(rec, code);
     for (const [key, pending] of [...this.pending.entries()]) {
       if (!Object.is(pending.pluginId, rec.credential.pluginId)) continue;
       if (pending.generation !== rec.credential.generation) continue;
@@ -2325,6 +2559,20 @@ export class Supervisor {
           this.draining = false;
           return;
         }
+        const sendRoom = this.#muxWriteRoom(nextLen);
+        if (sendRoom !== 'ok') {
+          this.draining = false;
+          if (sendRoom === 'wait') {
+            // The send reservation is full, so this queue cannot drain down
+            // to the bulk low water. Leave the producer paused there and the
+            // cap is never full again. Top it back up while the wait holds.
+            this.#topUpBulk();
+            this.#waitMuxSend();
+          }
+          return;
+        }
+        this.muxSendSpins = 0;
+        this.muxSendLast = null;
         const next = this.#shiftNext();
         if (!next) {
           this.draining = false;
@@ -2416,6 +2664,25 @@ export class Supervisor {
     let n = 0;
     for (const q of this.lo.values()) n += q.length;
     return n;
+  }
+
+  // A mux wait stops the drain above the bulk low water. The producer was
+  // paused at the cap and will not be resumed by #resumeBulk, so the queue
+  // would sit short of the cap until the peer reads. Fill it back on a later
+  // turn. Unpausing inside the stdout read callback resumes a socket that
+  // the callback's false return then pauses again, and the child stays dark.
+  #topUpBulk() {
+    if (this.bulkTopUp || this.closed) return;
+    this.bulkTopUp = true;
+    setImmediate(() => {
+      this.bulkTopUp = false;
+      if (this.closed) return;
+      for (const rec of this.children.values()) {
+        if (rec.dead || !rec.paused || rec.pauseReason !== 'bulk') continue;
+        const n = this.lo.get(rec.credential.pluginId)?.length ?? 0;
+        if (n < this.capsConfig.lo) this.#unpause(rec);
+      }
+    });
   }
 
   #resumeBulk() {

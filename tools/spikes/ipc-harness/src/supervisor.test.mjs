@@ -3197,6 +3197,77 @@ test('send credit refills after a large response is consumed', { timeout: 10_000
   }
 });
 
+test('a stalled mux reader leaves the low-priority queue at its cap', async () => {
+  const pair = await connectPair({
+    sweeper: false,
+    caps: { lo: 32, partial: 1024 * 1024, total: 1024 * 1024, totalGlobal: 4 * 1024 * 1024 },
+  });
+  try {
+    pair.sup.spawn({ pluginId: 'frames', script: floodPath, total: 1024 * 1024 });
+    pair.stub.socket.pause();
+    const filled = await waitUntil(() => pair.sup.queueDepth('frames').lo >= 32, 2_000);
+    assert.equal(filled, true);
+    await delay(400);
+    assert.ok(pair.sup.queueDepth('frames').lo >= 32, String(pair.sup.queueDepth('frames').lo));
+    assert.equal(pair.sup.flip, null);
+  } finally {
+    pair.stub.socket.resume();
+    await pair.close();
+  }
+});
+
+test('an echo child does not turn a grant into more send credit', async () => {
+  const pair = await connectPair({
+    sweeper: false,
+    caps: { pending: 32, total: 1024 * 1024 },
+  });
+  try {
+    pair.sup.spawn({ pluginId: 'echo', script: echoPath });
+    const rec = pair.sup.children.get('echo');
+    const granted = await waitUntil(() => rec.creditSent > 0 && rec.outbound === 0, 2_000);
+    assert.equal(granted, true);
+    const sent = rec.creditSent;
+    const window = rec.sendWindow;
+    await delay(150);
+    assert.equal(rec.creditSent, sent);
+    assert.equal(rec.sendWindow, window);
+  } finally {
+    await pair.close();
+  }
+});
+
+test('overlapping calls on a wide budget are admitted beside send credit', async () => {
+  const pair = await connectPair({
+    sweeper: false,
+    caps: { pending: 512, total: 8 * 1024 * 1024 },
+  });
+  try {
+    const kid = pair.sup.spawn({ pluginId: 'echo', script: echoPath });
+    const rec = pair.sup.children.get('echo');
+    const granted = await waitUntil(() => rec.creditSent > 0 && rec.outbound === 0, 2_000);
+    assert.equal(granted, true);
+    const payload = 'x'.repeat(1024);
+    const pending = [];
+    for (let id = 1; id <= 8; id++) {
+      pending.push(pair.stub.call({
+        pluginId: 'echo',
+        credential: kid.credential,
+        correlationId: id,
+        port: 'db',
+        method: 'get',
+        payload,
+      }, 2_000).catch((err) => err));
+    }
+    const rows = await Promise.all(pending);
+    const codes = rows.map((row) => (row?.code ? row.code : 'ok'));
+    assert.deepEqual(codes, Array(8).fill('ok'), codes.join(','));
+    assert.ok(rec.sendWindow < rec.bT, `${rec.sendWindow} filled ${rec.bT}`);
+    assert.equal(pair.sup.flip, null);
+  } finally {
+    await pair.close();
+  }
+});
+
 test('concurrent calls fill the original send window', async () => {
   const reserved = measureFlowReserve();
   assert.ok(reserved);

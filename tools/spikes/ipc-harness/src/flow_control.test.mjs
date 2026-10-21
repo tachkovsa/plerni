@@ -856,6 +856,51 @@ test('mux open-loop queues stay inside the read-back buffers', async () => {
   }
 });
 
+test('bytes already handed to the mux socket count against the send reservation', async () => {
+  const pair = await connectPair({
+    sweeper: false,
+    caps: { partial: 1024 * 1024, total: 8 * 1024 * 1024 },
+  });
+  try {
+    const sup = pair.sup;
+    pair.stub.socket.pause();
+    // libuv still holds this much. SIOCOUTQ does not include it yet, and a
+    // further small frame must wait instead of landing past K_mux_out.
+    sup.socketOutbound = sup.kMuxOut - 10;
+    const before = sup.socketOutbound;
+    const frame = Buffer.alloc(100, 0x61);
+    assert.equal(sup.queueMuxBytes(frame), true);
+    assert.equal(sup.flip, null);
+    assert.equal(sup.invalidReason, null);
+    assert.equal(sup.socketOutbound, before);
+    assert.ok(sup.queuedBytes >= frame.length);
+    const outq = siocoutq(sup.muxFd);
+    assert.ok(Number.isInteger(outq) && outq <= sup.kMuxOut, String(outq));
+  } finally {
+    await pair.close();
+  }
+});
+
+test('a burst of mux frames stays inside the send reservation', async () => {
+  const pair = await connectPair({
+    sweeper: false,
+    caps: { partial: 1024 * 1024, total: 8 * 1024 * 1024 },
+  });
+  try {
+    const sup = pair.sup;
+    pair.stub.socket.pause();
+    const frame = Buffer.alloc(1100, 0x61);
+    for (let i = 0; i < 64; i++) sup.queueMuxBytes(frame);
+    await delay(100);
+    const outq = siocoutq(sup.muxFd);
+    assert.equal(sup.flip, null);
+    assert.equal(sup.invalidReason, null);
+    assert.ok(Number.isInteger(outq) && outq <= sup.kMuxOut, `${outq} > ${sup.kMuxOut}`);
+  } finally {
+    await pair.close();
+  }
+});
+
 test('unenforced b3 classifies a missing helper as invalid', async () => {
   const result = await b3({ hold: false, helperAvailable: () => false });
   assert.equal(result.pass, null);

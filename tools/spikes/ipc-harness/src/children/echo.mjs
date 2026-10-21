@@ -30,6 +30,9 @@ function onData(chunk) {
   try {
     framer.feed(chunk);
     for (const msg of framer.frames()) {
+      // A grant is credit, not a request. Echoing it spends the send window
+      // and the supervisor grants that echo back, so the pipe never goes quiet.
+      if (msg.kind === 'grant') continue;
       if (echoPad > 0 && msg.kind === 'call') {
         writeEcho(encodeNdjson({
           kind: 'result',
