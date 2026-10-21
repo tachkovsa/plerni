@@ -248,6 +248,17 @@ export class MuxFramer {
   pendingBytes() {
     return this.#bytes.length;
   }
+
+  // Bytes of the unfinished frame at the head, including its length prefix.
+  // Zero until the prefix is buffered, and zero when that prefix is illegal.
+  // A legal length can still be larger than the process will ever accept.
+  leadingDeclared() {
+    const available = this.#bytes.length - this.#complete;
+    if (available < 4) return 0;
+    const len = this.#bytes.readUInt32BE(this.#complete);
+    if (len > MAX_FRAME_SIZE) return 0;
+    return 4 + len;
+  }
 }
 
 export function encodeMux(obj) {

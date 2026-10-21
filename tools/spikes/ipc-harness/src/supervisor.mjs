@@ -880,6 +880,7 @@ export class Supervisor {
       if (rec.dead) continue;
       total += rec.framer.pendingBytes();
       total += Math.max(0, rec.outbound);
+      total += rec.parkedBytes;
       total += rec.idBytes;
       total += rec.deferredBytes;
       total += rec.stash?.length ?? 0;
@@ -972,6 +973,7 @@ export class Supervisor {
   #pluginBytes(rec) {
     return rec.framer.pendingBytes()
       + Math.max(0, rec.outbound)
+      + rec.parkedBytes
       + rec.hiBytes
       + rec.loBytes
       + rec.idBytes
@@ -1137,6 +1139,16 @@ export class Supervisor {
     try {
       this.bridge.feed(chunk);
       for (const msg of this.bridge.frames()) this.#onMux(msg);
+      // Pausing never resumes: the unfinished frame cannot shrink, and the
+      // low-water check waits for userspace to fall. A declared length past
+      // the whole userspace cap cannot be assembled, so the channel closes.
+      const declared = this.bridge.leadingDeclared();
+      if (declared > this.#globalCap()) {
+        this.framingFault = 'mux-budget';
+        this.#failAll(this.framingFault);
+        this.socket.destroy();
+        return;
+      }
       if (this.bufferedBytes() > this.#globalCap()) this.#pauseOverGlobal();
     } catch (err) {
       this.framingFault = err.constructor?.name || 'framing-error';
@@ -1211,7 +1223,7 @@ export class Supervisor {
     const reserve = CONTROL_RESERVE.grant + cancelReserve;
     const admitCost = bytes + idBytes + reserve;
     if (admitCost > rec.admitKeep) rec.admitKeep = admitCost;
-    const heldCredit = rec.flowOk && rec.callPending > 0 ? Math.max(0, rec.sendWindow) : 0;
+    const heldCredit = this.#overlapCredit(rec);
     if (this.#overBudget(rec, bytes + idBytes + heldCredit, bytes, reserve)) {
       // Own bytes fit in B_t and B_g. The miss is the unspent window, a full
       // K_out, or both. Hold the frame and write it once there is room. A
@@ -1230,20 +1242,18 @@ export class Supervisor {
 
   #parkCall(rec, msg, line, bytes, idBytes, ingressTs, reserve) {
     const cost = bytes + idBytes;
-    const pendingCount = rec.callPending + rec.cancelPending + rec.parked.length;
-    if (rec.parked.length >= rec.limits.pending || pendingCount >= rec.limits.pending) {
-      this.caps.pending = true;
-      this.#reject(msg, 'pending-cap', true);
-      return;
-    }
-    if (this.#pluginBytes(rec) + rec.parkedBytes + cost + reserve > this.#childCeiling(rec)
-        || this.bufferedBytes() + rec.parkedBytes + cost + reserve > this.#globalCap()) {
+    // The line is not in the sums yet. Identifier bytes join with the
+    // reservation below, and the line joins parkedBytes, so a later check
+    // must not add either of them again.
+    if (this.#pluginBytes(rec) + cost + reserve > this.#childCeiling(rec)
+        || this.bufferedBytes() + cost + reserve > this.#globalCap()) {
       this.caps.total = true;
       this.#reject(msg, 'total-cap', true);
       return;
     }
-    rec.parked.push({ msg, line, bytes, idBytes, ingressTs, reserve });
-    rec.parkedBytes += cost;
+    this.#arm(rec, msg, { cancel: false, bytes, idBytes, ingressTs });
+    rec.parked.push({ msg, line, bytes, ingressTs, reserve });
+    rec.parkedBytes += bytes;
     this.#armPark(rec);
   }
 
@@ -1273,21 +1283,27 @@ export class Supervisor {
     try {
       while (rec.parked.length > 0) {
         const next = rec.parked[0];
-        const heldCredit = rec.flowOk && rec.callPending > 0 ? Math.max(0, rec.sendWindow) : 0;
-        if (!this.#overBudget(rec, next.bytes + next.idBytes + heldCredit, next.bytes, next.reserve)) {
+        // The caller's deadline started at ingress. Promoting the call would
+        // hand the child work the caller has already been told expired.
+        if (this.#remainMs(next.msg, next.ingressTs) <= 0) {
+          const correlationId = next.msg.correlationId;
+          this.#expire(next.msg.pluginId, correlationId, 'call');
+          if (rec.parked[0] && Object.is(rec.parked[0].msg.correlationId, correlationId)) {
+            this.#unpark(rec, correlationId);
+          }
+          continue;
+        }
+        // Line bytes and identifier bytes are already in the sums. The
+        // overlap is other in-flight calls, not this parked one.
+        const overlap = this.#overlapCredit(rec);
+        if (!this.#overBudget(rec, overlap, next.bytes, next.reserve)) {
           rec.parked.shift();
-          rec.parkedBytes -= next.bytes + next.idBytes;
+          rec.parkedBytes = Math.max(0, rec.parkedBytes - next.bytes);
           if (rec.parked.length === 0) rec.parkSince = null;
-          this.#arm(rec, next.msg, {
-            cancel: false,
-            bytes: next.bytes,
-            idBytes: next.idBytes,
-            ingressTs: next.ingressTs,
-          });
           this.#enqueueStdin(rec, next.line, next.bytes, 'call', next.msg.correlationId);
           continue;
         }
-        if (this.#bytesOver(rec, next.bytes + next.idBytes, next.reserve)) {
+        if (this.#bytesOver(rec, 0, next.reserve)) {
           this.caps.total = true;
           this.#rejectParked(rec, 'total-cap');
           return;
@@ -1319,7 +1335,42 @@ export class Supervisor {
     rec.parkKernel = null;
     const queued = rec.parked.splice(0);
     rec.parkedBytes = 0;
-    for (const next of queued) this.#reject(next.msg, code, true);
+    for (const next of queued) {
+      this.#take(next.msg.pluginId, next.msg.correlationId, 'call');
+      this.#reject(next.msg, code, true);
+    }
+  }
+
+  // Time left on the deadline captured at ingress. A parked call keeps that
+  // instant; the timer is not restarted when the line is later written.
+  #remainMs(msg, ingressTs) {
+    const budget = Number.isFinite(msg.timeoutMs) && msg.timeoutMs >= 0
+      ? msg.timeoutMs
+      : DEFAULT_DEADLINE_MS;
+    if (!Number.isFinite(ingressTs)) return budget;
+    return budget - (performance.now() - ingressTs);
+  }
+
+  // Send credit overlaps calls already written. Parked calls are reserved
+  // but not in flight, and charging them against the window would pin the
+  // first one behind its own reservation.
+  #overlapCredit(rec) {
+    if (!rec.flowOk || !(rec.sendWindow > 0)) return 0;
+    const inFlight = rec.callPending - rec.parked.length;
+    return inFlight > 0 ? rec.sendWindow : 0;
+  }
+
+  #unpark(rec, correlationId) {
+    if (!rec || rec.parked.length === 0) return;
+    const idx = rec.parked.findIndex((entry) => Object.is(entry.msg.correlationId, correlationId));
+    if (idx < 0) return;
+    const [entry] = rec.parked.splice(idx, 1);
+    rec.parkedBytes = Math.max(0, rec.parkedBytes - entry.bytes);
+    if (rec.parked.length === 0) {
+      rec.parkSince = null;
+      rec.parkKernel = null;
+      this.#clearParkTimer(rec);
+    }
   }
 
   // The largest cancel still owed for this child. The reserved hole has to
@@ -1382,17 +1433,20 @@ export class Supervisor {
   // grant uses the room already accounted. A later refill does not follow
   // again: the mux stays unread for the whole of an open-loop run, and
   // another follow on every response is the spin. The follow is capped.
+  // Settlement is the attempt, not a queued grant. Parked bytes can hold
+  // the first grant out of K_out; treating that miss as "not yet started"
+  // follows again on every response.
   #finishRefill(rec) {
     rec.refillArmed = false;
     if (rec.dead || this.closed || !rec.flowOk) return;
-    if (rec.creditSent > 0) {
+    if (rec.creditSent > 0 || rec.grantSettled) {
       this.#grantFromRoom(rec);
       return;
     }
     const unread = this.#muxCount(this.muxPending);
     const readable = Number.isInteger(unread) && unread > 0 && this.muxReadPosted;
     const waits = rec.refillWaits || 0;
-    const calls = rec.callPending + rec.parked.length;
+    const calls = rec.callPending;
     const growing = Number.isInteger(rec.refillCalls) && calls > rec.refillCalls;
     const shrinking = Number.isInteger(rec.refillUnread) && Number.isInteger(unread) && unread < rec.refillUnread;
     const stuck = readable && Number.isInteger(rec.refillUnread) && unread >= rec.refillUnread;
@@ -1419,6 +1473,7 @@ export class Supervisor {
   }
 
   #grantFromRoom(rec) {
+    rec.grantSettled = true;
     rec.refillWaits = 0;
     rec.refillUnread = null;
     rec.refillGap = 0;
@@ -1532,7 +1587,7 @@ export class Supervisor {
   }
 
   #arm(rec, msg, extra) {
-    const timeoutMs = Number.isFinite(msg.timeoutMs) ? msg.timeoutMs : DEFAULT_DEADLINE_MS;
+    const timeoutMs = Math.max(0, this.#remainMs(msg, extra.ingressTs));
     const lane = extra.cancel ? 'cancel' : 'call';
     const timer = setTimeout(() => this.#expire(msg.pluginId, msg.correlationId, lane), timeoutMs);
     this.pending.set(msg.pluginId, msg.correlationId, {
@@ -1600,8 +1655,9 @@ export class Supervisor {
     } else {
       this.callPendingTotal--;
     }
-    // The stdin line may still be sitting behind a blocked write. The
-    // operation is no longer pending, so that line must not be sent.
+    // The line may still be parked, or sitting behind a blocked write.
+    // The operation is no longer pending, so that line must not be sent.
+    if (same) this.#unpark(rec, correlationId);
     if (same) this.#dropUnsent(rec, correlationId, lane);
     if (same) this.#drainPark(rec);
     this.#maybeResumeAll();
