@@ -52,8 +52,15 @@ test('a forbidden syscall is rejected and a process in the plugin group is kille
     const got = reported.payload?.confinement;
     assert.equal(got?.confined, 1, JSON.stringify(reported));
     assert.equal(got.clone3, constants.errno.ENOSYS);
-    assert.equal(got.fork, constants.errno.EPERM);
-    assert.equal(got.vfork, constants.errno.EPERM);
+    // aarch64 has no standalone fork or vfork. The probe omits those fields
+    // and reports process creation through clone, which the filter denies.
+    if (process.arch === 'x64') {
+      assert.equal(got.fork, constants.errno.EPERM);
+      assert.equal(got.vfork, constants.errno.EPERM);
+    } else {
+      if (got.fork !== undefined) assert.equal(got.fork, constants.errno.EPERM);
+      if (got.vfork !== undefined) assert.equal(got.vfork, constants.errno.EPERM);
+    }
     assert.equal(got.clone, constants.errno.EPERM);
     assert.equal(got.splice, constants.errno.EPERM);
     assert.equal(got.vmsplice, constants.errno.EPERM);

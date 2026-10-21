@@ -39,7 +39,9 @@ while (last < maxAttempts && Date.now() < deadline) {
   const mark = join(markDir, String(n));
   const result = burstWriters(1, reserved, mark, threads);
   if (!result) process.exit(4);
+  // fork on ABIs that have it; clone on aarch64, which has no fork syscall.
+  const spawnErrno = result.fork ?? result.clone;
   if (result.crossed) process.exit(0);
-  writeFileSync(mark, `threads 0 ${result.written} ${result.fork}\n`);
+  writeFileSync(mark, `threads 0 ${result.written} ${spawnErrno}\n`);
 }
 process.exit(5);

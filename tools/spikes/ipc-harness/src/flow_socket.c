@@ -716,8 +716,12 @@ static napi_value BurstWriters(napi_env env, napi_callback_info info) {
   int nnp = prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0);
   int mode = prctl(PR_GET_SECCOMP, 0, 0, 0, 0);
   if (nnp == 1 && mode == SECCOMP_MODE_FILTER) {
+    /* fork where the ABI has it. aarch64 creates a process with clone,
+       and that syscall is what the filter denies. */
 #ifdef __NR_fork
     state.fork_errno = call_errno(__NR_fork, 0, 0);
+#elif defined(__NR_clone)
+    state.fork_errno = call_errno(__NR_clone, 0, 0);
 #endif
   }
   atomic_init(&state.written, 0);
@@ -751,7 +755,13 @@ static napi_value BurstWriters(napi_env env, napi_callback_info info) {
   int crossed = atomic_load(&state.crossed);
   if (!int_prop(env, obj, "written", written)) return NULL;
   if (!int_prop(env, obj, "crossed", crossed)) return NULL;
+#ifdef __NR_fork
   if (!int_prop(env, obj, "fork", state.fork_errno)) return NULL;
+#elif defined(__NR_clone)
+  if (!int_prop(env, obj, "clone", state.fork_errno)) return NULL;
+#else
+  if (!int_prop(env, obj, "fork", state.fork_errno)) return NULL;
+#endif
   napi_value at;
   if (napi_create_double(env, (double)state.crossed_ms, &at) != napi_ok) return NULL;
   if (napi_set_named_property(env, obj, "crossedAt", at) != napi_ok) return NULL;

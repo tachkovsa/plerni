@@ -2046,7 +2046,8 @@ test('pushed-back stdout bytes count against the per-plugin and global caps', as
     const floods = [];
     for (let i = 0; i < 20; i++) floods.push(encodeNdjson({ kind: 'flood' }));
     rec.child.stdout.emit('data', Buffer.from(floods.join('')));
-    assert.equal(rec.pauseReason, 'bulk');
+    assert.ok(rec.paused, rec.pauseReason);
+    assert.ok(rec.pauseReason === 'bulk' || rec.pauseReason === 'global', rec.pauseReason);
     rec.child.stdout.emit('data', Buffer.alloc(20_000, 0x61));
     const unread = rec.child.stdout.readableLength;
     assert.ok(unread > 1024, String(unread));
@@ -2634,7 +2635,7 @@ test('retired tokens do not accumulate across respawns', async () => {
 test('a deferred reply stays inside the byte caps', async () => {
   const reserved = measureFlowReserve();
   assert.ok(reserved);
-  const cap = 30_000;
+  const cap = 42_000;
   const pair = await connectPair({
     sweeper: false,
     caps: {
@@ -2709,10 +2710,10 @@ test('a deferred reply stays inside the byte caps', async () => {
       correlationId: 1,
       port: 'db',
       method: 'get',
-      payload: { blob: 'y'.repeat(12_000) },
+      payload: { blob: 'y'.repeat(25_000) },
     }, 1_000).catch((err) => err);
     const paused = await waitUntil(() => pair.sup.inputPaused === true, 1_000);
-    assert.equal(paused, true);
+    assert.equal(paused, true, pair.sup.framingFault);
     assert.equal(pair.sup.pending.has('b', 1, 'call'), false);
     const held = pair.sup.bufferedBytes();
     assert.ok(held <= cap + recA.deferredBytes, String(held));
@@ -4019,18 +4020,27 @@ test('advertised credit stays reserved until stdout spends it', async () => {
 });
 
 test('parked calls leave a sibling send window usable', async () => {
-  const totalGlobal = 100_000;
+  const reserved = measureFlowReserve();
+  assert.ok(reserved);
   const pad = 40_000;
+  const pending = 64;
   const correlationId = 100;
   const lineBytes = Buffer.byteLength(encodeNdjson({
     kind: 'result',
     correlationId,
     payload: 'p'.repeat(pad),
   }));
+  // A is granted alone, so the pending-sized hole is outside the window and
+  // the line fits in it. B is spawned afterwards. The advertised window is
+  // not pulled back to an equal share, and parked calls on B have to leave
+  // that window usable.
+  const hole = 1209 * pending;
+  const slack = 16_000;
+  const totalGlobal = lineBytes + hole + slack + 2 * reserved.perChild + reserved.muxReserve;
   const pair = await connectPair({
     sweeper: false,
     caps: {
-      pending: 64,
+      pending,
       pendingGlobal: 128,
       partial: 1024 * 1024,
       total: 1024 * 1024,
@@ -4046,18 +4056,10 @@ test('parked calls leave a sibling send window usable', async () => {
       pluginId: 'a',
       script: responsePath,
       env: { RESPONSE_PAD: String(pad) },
-      pending: 64,
-      total: 1024 * 1024,
-    });
-    const kidB = pair.sup.spawn({
-      pluginId: 'b',
-      script: floodPath,
-      env: { FLOOD_MODE: 'silent' },
-      pending: 64,
+      pending,
       total: 1024 * 1024,
     });
     const recA = pair.sup.children.get('a');
-    const recB = pair.sup.children.get('b');
     const granted = await waitUntil(
       () => recA.grantSettled && recA.outbound === 0 && recA.sendWindow >= lineBytes,
       2_000,
@@ -4067,6 +4069,21 @@ test('parked calls leave a sibling send window usable', async () => {
       lineBytes,
       settled: recA.grantSettled,
     }));
+    const advertised = recA.sendWindow;
+    const kidB = pair.sup.spawn({
+      pluginId: 'b',
+      script: floodPath,
+      env: { FLOOD_MODE: 'silent' },
+      pending,
+      total: 1024 * 1024,
+    });
+    const recB = pair.sup.children.get('b');
+    assert.equal(recA.sendWindow, advertised, JSON.stringify({
+      before: advertised,
+      after: recA.sendWindow,
+    }));
+    const envClear = await waitUntil(() => pair.sup.bufferedBytes() < 1024, 2_000);
+    assert.equal(envClear, true, String(pair.sup.bufferedBytes()));
     const globalCap = totalGlobal
       - (recA.kIn + recA.kOut + pair.sup.readBytes)
       - (recB.kIn + recB.kOut + pair.sup.readBytes)
@@ -4129,11 +4146,195 @@ test('parked calls leave a sibling send window usable', async () => {
   }
 });
 
+test('every live child receives a fair send window', async () => {
+  const pad = 4_000;
+  const lineBytes = Buffer.byteLength(encodeNdjson({
+    kind: 'result',
+    correlationId: 1,
+    payload: 'p'.repeat(pad),
+  }));
+  const counts = [2, 7];
+  for (const n of counts) {
+    const pair = await connectPair({ sweeper: false });
+    const ids = [];
+    const stop = () => {
+      for (const id of ids) {
+        const proc = pair.sup.children.get(id)?.child;
+        if (proc && proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL');
+      }
+    };
+    try {
+      const kids = [];
+      for (let i = 0; i < n; i++) {
+        const pluginId = `child-${i}`;
+        ids.push(pluginId);
+        kids.push(pair.sup.spawn({
+          pluginId,
+          script: responsePath,
+          env: { RESPONSE_PAD: String(pad) },
+        }));
+      }
+      const records = ids.map((id) => pair.sup.children.get(id));
+      const granted = await waitUntil(
+        () => records.every((rec) => rec.grantSettled && rec.outbound === 0 && rec.sendWindow >= lineBytes),
+        3_000,
+      );
+      const windows = records.map((rec) => rec.sendWindow);
+      assert.equal(granted, true, JSON.stringify({ n, windows, lineBytes }));
+      const min = Math.min(...windows);
+      const max = Math.max(...windows);
+      assert.ok(min >= lineBytes, JSON.stringify({ n, windows, lineBytes }));
+      assert.ok(min * 2 >= max, JSON.stringify({ n, windows }));
+      for (const rec of records) assertAccountingInvariants(pair.sup, rec);
+      const last = n - 1;
+      const res = await pair.stub.call({
+        pluginId: ids[last],
+        credential: kids[last].credential,
+        correlationId: 1,
+        port: 'db',
+        method: 'get',
+        payload: { n: 1 },
+      }, 3_000).catch((err) => err);
+      assert.equal(res.payload?.length, pad, JSON.stringify({
+        n,
+        code: res.code,
+        pause: records[last].pauseReason,
+        window: records[last].sendWindow,
+      }));
+      assert.notEqual(records[last].pauseReason, 'global');
+    } finally {
+      stop();
+      await pair.close();
+    }
+  }
+});
+
+test('reply metadata is charged beside sibling send windows', async () => {
+  const reserved = measureFlowReserve();
+  assert.ok(reserved);
+  const pad = 4_000;
+  const lineBytes = Buffer.byteLength(encodeNdjson({
+    kind: 'result',
+    correlationId: 7,
+    payload: 'p'.repeat(pad),
+  }));
+  const totalGlobal = 100_000;
+  const pending = 32;
+  const globalCap2 = totalGlobal - 2 * reserved.perChild - reserved.muxReserve;
+  // The ack stays under B_g on its own, and clears B_g once the sibling
+  // window is added. Any window that can carry the result line is enough.
+  const versionLen = globalCap2 - lineBytes - 1_500;
+  assert.ok(versionLen > 20_000, JSON.stringify({ versionLen, globalCap2, lineBytes }));
+  assert.ok(versionLen + 512 < globalCap2, JSON.stringify({ versionLen, globalCap2 }));
+  const version = 'v'.repeat(versionLen);
+  const pair = await connectPair({
+    sweeper: false,
+    caps: { pending, partial: 1024 * 1024, total: 1024 * 1024, totalGlobal },
+  });
+  const stop = (id) => {
+    const proc = pair.sup.children.get(id)?.child;
+    if (proc && proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL');
+  };
+  try {
+    const kidA = pair.sup.spawn({
+      pluginId: 'a',
+      script: responsePath,
+      env: { RESPONSE_PAD: String(pad) },
+      pending,
+      total: 1024 * 1024,
+    });
+    const recA = pair.sup.children.get('a');
+    const granted = await waitUntil(
+      () => recA.grantSettled && recA.outbound === 0 && recA.sendWindow >= lineBytes,
+      2_000,
+    );
+    assert.equal(granted, true, String(recA.sendWindow));
+    const kidB = pair.sup.spawn({
+      pluginId: 'b',
+      script: floodPath,
+      env: { FLOOD_MODE: 'silent' },
+      version,
+      pending,
+      total: 1024 * 1024,
+    });
+    const recB = pair.sup.children.get('b');
+    assert.equal(recB.credential.version.length, versionLen);
+    const globalCap = totalGlobal
+      - (recA.kIn + recA.kOut + pair.sup.readBytes)
+      - (recB.kIn + recB.kOut + pair.sup.readBytes)
+      - (pair.sup.kMuxIn + pair.sup.kMuxOut + pair.sup.readBytes);
+    const ack = encodeMux({
+      kind: 'cancelled',
+      for: 'cancel',
+      pluginId: 'b',
+      correlationId: 1,
+      version,
+      generation: kidB.credential.generation,
+      grants: [...kidB.credential.grants],
+    });
+    assert.ok(ack.length <= globalCap, `${ack.length} would miss even with no window (cap ${globalCap})`);
+    assert.ok(
+      recA.sendWindow + ack.length > globalCap,
+      JSON.stringify({ window: recA.sendWindow, ack: ack.length, globalCap }),
+    );
+    const cancel = pair.stub.cancel({
+      pluginId: 'b',
+      credential: kidB.credential,
+      correlationId: 1,
+    }, 3_000).catch((err) => err);
+    const pendingCancel = await waitUntil(() => pair.sup.pending.has('b', 1, 'cancel'), 1_000);
+    assert.equal(pendingCancel, true);
+    const before = pair.sup.bufferedBytes();
+    recB.stdoutSocket.emit('data', Buffer.from(encodeNdjson({ kind: 'cancelled', correlationId: 1 })));
+    const cancelDone = await cancel;
+    assert.equal(cancelDone.code, 'total-cap', JSON.stringify({
+      kind: cancelDone.kind,
+      code: cancelDone.code,
+      buffered: pair.sup.bufferedBytes(),
+      before,
+      window: recA.sendWindow,
+      ack: ack.length,
+      globalCap,
+    }));
+    assert.ok(pair.sup.bufferedBytes() < before + ack.length, JSON.stringify({
+      before,
+      after: pair.sup.bufferedBytes(),
+      ack: ack.length,
+    }));
+    const res = await pair.stub.call({
+      pluginId: 'a',
+      credential: kidA.credential,
+      correlationId: 7,
+      port: 'db',
+      method: 'get',
+      payload: { n: 7 },
+    }, 3_000).catch((err) => err);
+    assert.equal(res.payload?.length, pad, JSON.stringify({
+      code: res.code,
+      pause: recA.pauseReason,
+      window: recA.sendWindow,
+      buffered: pair.sup.bufferedBytes(),
+      globalCap,
+    }));
+    assert.notEqual(recA.pauseReason, 'global');
+    assert.equal(recA.sendWindow + recA.creditSpent, recA.creditSent);
+  } finally {
+    stop('a');
+    stop('b');
+    await pair.close();
+  }
+});
+
 // Checked after every scripted and seeded admission step:
 // admitKeep === max(admitFloor, live admitted costs), and that value fits B_t and B_g.
 // Each parked id is pending once, and a parked id whose cancel is still pending
 // is not sitting in the stdin payload queue.
 // A call line is not written after its cancel line while that cancel is in force.
+// sendWindow + creditSpent === creditSent. bufferedBytes plus every live window
+// fits B_g. A grant that runs while every peer is already live leaves each
+// child a window that can carry a small result; a window advertised before
+// the peer existed stays as advertised. Reply expansion (version, grants,
+// timestamps) is the same #fitsGlobal check as a grant.
 function assertAccountingInvariants(sup, rec) {
   const ceiling = rec.flowOk ? rec.bT : rec.limits.total;
   let kernel = 0;

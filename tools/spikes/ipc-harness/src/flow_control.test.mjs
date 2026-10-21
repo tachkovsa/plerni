@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readSync, rmSync, writeFileSync, writeSync } from 'node:fs';
 import { spawn } from 'node:child_process';
-import { tmpdir } from 'node:os';
+import { constants, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { connectPair, stdinControlReserve } from './supervisor.mjs';
@@ -689,8 +689,10 @@ test('child threads are classified as a thread writer only when the live queue c
       assert.equal(classifyWriterOverrun(text[0]), 'thread-writer');
       const crossedAt = Number(text[1]);
       const written = Number(text[2]);
+      // Fourth field is the process-creation probe: fork, or clone where
+      // the ABI has no fork. The filter returns EPERM for either.
       const forkErrno = Number(text[3]);
-      assert.equal(forkErrno, 1);
+      assert.equal(forkErrno, constants.errno.EPERM);
       assert.ok(written > 0, String(written));
       fault = pair.sup.faults.find((row) => row.code === 'thread-writer') ?? null;
       const crossed = unread > reserved.kIn || written > reserved.kIn || fault != null;
