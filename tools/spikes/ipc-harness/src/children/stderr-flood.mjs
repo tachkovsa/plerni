@@ -12,6 +12,7 @@ process.stdin.on('data', (chunk) => {
   try {
     framer.feed(chunk);
     for (const msg of framer.frames()) {
+      if (msg.kind !== 'call') continue;
       writeSync(1, encodeNdjson({
         kind: 'result',
         correlationId: msg.correlationId,

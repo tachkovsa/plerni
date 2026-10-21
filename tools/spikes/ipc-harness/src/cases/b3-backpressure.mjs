@@ -327,6 +327,7 @@ export async function tripCaps(opts = {}) {
       buffered,
       inFlightTailBytes,
       pipeUnread,
+      stdinQueued: fault?.stdinQueued ?? null,
       pipeCapacity,
       accounted,
       afterCleanup,

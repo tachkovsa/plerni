@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { constants } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { connectPair } from './supervisor.mjs';
+import { connectPair, pluginEnvBlock, wrapperLaunchEnv } from './supervisor.mjs';
 import { FLOW_READ_BYTES } from './flow_budget.mjs';
 import { encodeMux } from './framing.mjs';
 import {
@@ -104,6 +104,50 @@ test('a forbidden syscall is rejected and a process in the plugin group is kille
     if (sleeper != null && alive(sleeper)) {
       try { process.kill(sleeper, 'SIGKILL'); } catch { /* already gone */ }
     }
+    await pair.close();
+  }
+});
+
+test('loader variables reach the plugin only after the wrapper has confined it', async () => {
+  const block = pluginEnvBlock({
+    LD_AUDIT: '/no/such/audit.so',
+    LD_LIBRARY_PATH: '/no/lib',
+    LD_PRELOAD: '/no/preload.so',
+    PLUGIN_MARKER: 'kept',
+  }, 'probe');
+  const text = block.toString('utf8');
+  assert.equal(text.includes('LD_'), false);
+  assert.equal(text.includes('PLUGIN_MARKER=kept'), true);
+  assert.equal(Object.hasOwn(wrapperLaunchEnv(), 'LD_PRELOAD'), false);
+  assert.equal(Object.hasOwn(wrapperLaunchEnv(), 'LD_AUDIT'), false);
+  const pair = await connectPair({ sweeper: false });
+  try {
+    const kid = pair.sup.spawn({
+      pluginId: 'probe',
+      script: probePath,
+      env: {
+        LD_AUDIT: '/no/such/audit.so',
+        LD_LIBRARY_PATH: '/no/lib',
+        LD_PRELOAD: '/no/preload.so',
+        PLUGIN_MARKER: 'kept',
+      },
+    });
+    const reported = await pair.stub.call({
+      pluginId: 'probe',
+      credential: kid.credential,
+      correlationId: 1,
+      port: 'db',
+      method: 'get',
+      payload: { probe: true },
+    }, 2_000);
+    const got = reported.payload?.confinement;
+    assert.equal(got?.confined, 1, JSON.stringify(got));
+    assert.equal(got.marker, 'kept');
+    assert.equal(got.ldAudit, 0);
+    assert.equal(got.ldLibraryPath, 0);
+    assert.equal(got.ldPreload, '/proc/self/fd/4');
+    assert.equal(got.dumpable, 0);
+  } finally {
     await pair.close();
   }
 });

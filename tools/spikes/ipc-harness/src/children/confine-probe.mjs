@@ -28,13 +28,22 @@ if (typeof target === 'string' && /^[1-9][0-9]*$/.test(target)) {
   }
 }
 
-const report = { ...(probeConfinement() ?? {}), reverse, mem };
+const report = {
+  ...(probeConfinement() ?? {}),
+  reverse,
+  mem,
+  marker: process.env.PLUGIN_MARKER || '',
+  ldAudit: process.env.LD_AUDIT ? 1 : 0,
+  ldLibraryPath: process.env.LD_LIBRARY_PATH ? 1 : 0,
+  ldPreload: process.env.LD_PRELOAD || '',
+};
 const framer = new NdjsonFramer();
 
 process.stdin.on('data', (chunk) => {
   try {
     framer.feed(chunk);
     for (const msg of framer.frames()) {
+      if (msg.kind !== 'call') continue;
       const line = encodeNdjson({
         kind: 'result',
         correlationId: msg.correlationId,

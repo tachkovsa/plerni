@@ -141,12 +141,46 @@ function detachCredential(credential) {
   };
 }
 
-function childEnv(extra) {
-  return {
-    PATH: process.env.PATH || '',
-    ...extra,
-  };
+// The wrapper is dynamically linked. Its own environment is only PATH, so a
+// plugin cannot point the loader at code that runs before NO_NEW_PRIVS.
+// Plugin variables are applied after the filter, and LD_* never comes from
+// the plugin: the wrapper forces LD_PRELOAD to the sealed preload.
+const LOADER_ENV = /^(LD_.*|DYLD_.*)$/;
+
+export function wrapperLaunchEnv() {
+  return { PATH: process.env.PATH || '' };
 }
+
+export function pluginEnvBlock(specEnv, pluginId) {
+  const entries = [];
+  const push = (key, value) => {
+    if (typeof key !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) return;
+    if (LOADER_ENV.test(key)) return;
+    entries.push(`${key}=${envText(value)}\0`);
+  };
+  push('PATH', process.env.PATH || '');
+  if (specEnv && typeof specEnv === 'object') {
+    for (const [key, value] of Object.entries(specEnv)) push(key, value);
+  }
+  push('PLERNI_PLUGIN_ID', envText(pluginId));
+  const buf = Buffer.from(entries.join(''), 'utf8');
+  if (buf.length > 256 * 1024) {
+    const err = new Error('plugin environment does not fit the wrapper');
+    err.code = 'env-rejected';
+    throw err;
+  }
+  return buf;
+}
+
+// One cancel and one window-update, reserved together. Credit is capped so
+// the grant's encoded size cannot grow past this reservation.
+export function stdinControlReserve() {
+  const grant = Buffer.byteLength(encodeNdjson({ kind: 'grant', credit: 2147483647 }));
+  const cancel = Buffer.byteLength(encodeNdjson({ kind: 'cancel', correlationId: 0 }));
+  return { grant, cancel, total: grant + cancel };
+}
+
+const CONTROL_RESERVE = stdinControlReserve();
 
 // Process environment values are strings and cannot carry a NUL. The spawn
 // map key keeps the original plugin id; this text is only the child hint.
@@ -301,6 +335,9 @@ export class Supervisor {
     try {
       // fd 2 is /dev/null. The wrapper sets the process group, NO_NEW_PRIVS,
       // and the seccomp filter, then execs the runtime.
+      const envBlock = pluginEnvBlock(spec.env, spec.pluginId);
+      // fd 5 is the plugin environment. The wrapper reads it only after the
+      // filter is installed. fd 3 and fd 4 stay the sealed binaries.
       child = spawn(this.wrapper, [process.execPath, spec.script], {
         stdio: [
           flow ? flow.childStdin : 'pipe',
@@ -308,13 +345,12 @@ export class Supervisor {
           'ignore',
           this.wrapperFd,
           this.undumpFd,
+          'pipe',
         ],
-        env: childEnv({
-          ...spec.env,
-          PLERNI_PLUGIN_ID: envText(spec.pluginId),
-          LD_PRELOAD: '/proc/self/fd/4',
-        }),
+        env: wrapperLaunchEnv(),
       });
+      child.stdio[5].on('error', () => {});
+      child.stdio[5].end(envBlock);
     } catch (err) {
       closeEnds(flow);
       throw err;
@@ -334,6 +370,11 @@ export class Supervisor {
       limits,
       framer: new NdjsonFramer(),
       outbound: 0,
+      stdinControl: [],
+      stdinPayload: [],
+      stdinWriting: false,
+      creditSent: 0,
+      payloadAdmitted: 0,
       stash: null,
       inFlightTailBytes: 0,
       hiBytes: 0,
@@ -387,6 +428,9 @@ export class Supervisor {
       // after the gate, on a later turn.
       setImmediate(() => this.#considerRead(rec));
     }
+    // After the replaced stdin socket exists. A credit-aware child stops
+    // reading requests until this grant arrives.
+    setImmediate(() => this.#queueGrant(rec, Math.max(1, this.#childCeiling(rec))));
     return { credential: detachCredential(credential), token, pid: child.pid };
   }
 
@@ -847,16 +891,14 @@ export class Supervisor {
       const line = encodeNdjson({ kind: 'cancel', correlationId: msg.correlationId });
       const bytes = Buffer.byteLength(line);
       const idBytes = identifierBytes(msg.pluginId, msg.correlationId);
-      if (this.#overBytes(rec, bytes + idBytes)) {
+      // A cancel is control. It still has to leave room for one grant.
+      if (this.#overBudget(rec, bytes + idBytes, bytes, CONTROL_RESERVE.grant)) {
         this.caps.total = true;
         this.#reject(msg, 'total-cap', true);
         return;
       }
       this.#arm(rec, msg, { cancel: true, bytes, idBytes, ingressTs });
-      rec.outbound += bytes;
-      rec.child.stdin.write(line, () => {
-        this.#releaseOutbound(rec, bytes);
-      });
+      this.#enqueueStdin(rec, line, bytes, 'control');
       return;
     }
     const line = encodeNdjson({
@@ -873,16 +915,73 @@ export class Supervisor {
       this.#reject(msg, 'pending-cap', true);
       return;
     }
-    if (this.#overBytes(rec, bytes + idBytes)) {
+    // Payload has to leave room for one cancel and one grant, in userspace
+    // and in the stdin queue. Those two are written ahead of this line.
+    if (this.#overBudget(rec, bytes + idBytes, bytes, CONTROL_RESERVE.total)) {
+      this.caps.total = true;
+      this.#reject(msg, 'total-cap', true);
+      return;
+    }
+    if (!this.#reserveCredit(rec, bytes)) {
       this.caps.total = true;
       this.#reject(msg, 'total-cap', true);
       return;
     }
     this.#arm(rec, msg, { cancel: false, bytes, idBytes, ingressTs });
+    this.#enqueueStdin(rec, line, bytes, 'payload');
+  }
+
+  // Control frames do not consume the child's request credit. Payload does.
+  // A grant is queued ahead of payload when the credit already sent would
+  // not cover this write.
+  #reserveCredit(rec, payloadBytes) {
+    if (rec.payloadAdmitted + payloadBytes <= rec.creditSent) {
+      rec.payloadAdmitted += payloadBytes;
+      return true;
+    }
+    const room = Math.max(payloadBytes, this.#childCeiling(rec) - rec.creditSent);
+    const credit = Math.max(1, Math.min(2147483647, room));
+    if (!this.#queueGrant(rec, credit)) return false;
+    rec.payloadAdmitted += payloadBytes;
+    return true;
+  }
+
+  #queueGrant(rec, credit) {
+    if (rec.dead || this.closed || !Number.isInteger(credit) || credit <= 0) return false;
+    const line = encodeNdjson({ kind: 'grant', credit });
+    const bytes = Buffer.byteLength(line);
+    if (bytes > CONTROL_RESERVE.grant) return false;
+    if (this.#overBudget(rec, bytes, bytes, CONTROL_RESERVE.cancel)) return false;
+    this.#enqueueStdin(rec, line, bytes, 'control');
+    rec.creditSent += credit;
+    return true;
+  }
+
+  #enqueueStdin(rec, line, bytes, lane) {
+    const entry = { line, bytes };
+    if (lane === 'control') rec.stdinControl.push(entry);
+    else rec.stdinPayload.push(entry);
     rec.outbound += bytes;
-    rec.child.stdin.write(line, () => {
-      this.#releaseOutbound(rec, bytes);
-    });
+    this.#writeStdin(rec);
+  }
+
+  // One write at a time. Control frames already queued jump ahead of payload
+  // that has not been handed to the kernel yet.
+  #writeStdin(rec) {
+    if (rec.stdinWriting || rec.dead) return;
+    const entry = rec.stdinControl.shift() || rec.stdinPayload.shift();
+    if (!entry) return;
+    rec.stdinWriting = true;
+    try {
+      rec.child.stdin.write(entry.line, () => {
+        rec.stdinWriting = false;
+        this.#releaseOutbound(rec, entry.bytes);
+        this.#writeStdin(rec);
+      });
+    } catch {
+      rec.stdinWriting = false;
+      this.#releaseOutbound(rec, entry.bytes);
+    }
   }
 
   #releaseOutbound(rec, bytes) {
@@ -897,10 +996,18 @@ export class Supervisor {
       || this.callPendingTotal + this.cancelPendingTotal >= this.capsConfig.pendingGlobal;
   }
 
-  #overBytes(rec, bytes) {
-    const ceiling = this.enforceFlow && rec.flowOk ? rec.bT : rec.limits.total;
-    return this.#pluginBytes(rec) + bytes > ceiling
-      || this.bufferedBytes() + bytes > this.#globalCap();
+  // `accounted` is charged to B_t and B_g. `stdinBytes` is what this write
+  // adds to K_out. `reserve` is control capacity that must still fit beside it.
+  #overBudget(rec, accounted, stdinBytes, reserve) {
+    const ceiling = this.#childCeiling(rec);
+    if (this.#pluginBytes(rec) + accounted + reserve > ceiling) return true;
+    if (this.bufferedBytes() + accounted + reserve > this.#globalCap()) return true;
+    if (rec.flowOk && rec.kOut != null) {
+      const kernel = this.#stdinQueued(rec);
+      if (!Number.isInteger(kernel)) return true;
+      if (kernel + Math.max(0, rec.outbound) + stdinBytes + reserve > rec.kOut) return true;
+    }
+    return false;
   }
 
   #arm(rec, msg, extra) {
@@ -1643,6 +1750,9 @@ export class Supervisor {
     rec.stash = null;
     rec.deferred = [];
     rec.deferredBytes = 0;
+    rec.stdinControl = [];
+    rec.stdinPayload = [];
+    rec.stdinWriting = false;
     rec.outbound = 0;
     this.#dropStale(rec.credential.pluginId, rec.credential.generation);
     this.#failPending(rec, code);
@@ -1665,6 +1775,10 @@ export class Supervisor {
     rec.stash = null;
     rec.deferred = [];
     rec.deferredBytes = 0;
+    rec.stdinControl = [];
+    rec.stdinPayload = [];
+    rec.stdinWriting = false;
+    rec.outbound = 0;
     this.#dropStale(rec.credential.pluginId, rec.credential.generation);
     this.#failPending(rec, err?.code || 'spawn-error');
     if (rec.child.exitCode == null && rec.child.signalCode == null) this.#signalGroup(rec);
@@ -1880,7 +1994,17 @@ export class Supervisor {
     } catch {
       return;
     }
-    if (!live && this.bufferedBytes() + buf.length > this.#globalCap()) {
+    // A live child's rejection used to skip both ceilings. One frame is kept
+    // only when it fits in B_t and in the process cap; the rest are coalesced.
+    if (live) {
+      const overChild = this.#pluginBytes(rec) + buf.length > this.#childCeiling(rec);
+      const overGlobal = this.bufferedBytes() + buf.length > this.#globalCap();
+      if (overChild || overGlobal) {
+        this.caps.total = true;
+        if (priority >= 10) rec.rejectsCoalesced++;
+        return;
+      }
+    } else if (this.bufferedBytes() + buf.length > this.#globalCap()) {
       this.caps.total = true;
       this.#pauseInput();
       return;
@@ -1949,6 +2073,17 @@ export class Supervisor {
       return { id, buf };
     }
     return null;
+  }
+
+  // The mux flood uses this path. A raw socket.write would leave libuv's
+  // buffer out of socketOutbound, and the process sum would miss it.
+  queueMuxBytes(buf) {
+    if (!Buffer.isBuffer(buf) || buf.length === 0 || this.closed || this.framingFault) return false;
+    if (this.bufferedBytes() + buf.length > this.#globalCap()) return false;
+    this.terminal.push(buf);
+    this.queuedBytes += buf.length;
+    this.#drain();
+    return true;
   }
 
   #drain() {

@@ -14,6 +14,8 @@
 #include <linux/filter.h>
 #include <linux/seccomp.h>
 #include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -132,12 +134,104 @@ static int install_filter(void) {
   return 0;
 }
 
+/* Loader variables in the initial environment run before main. The supervisor
+   allowlists that environment. Plugin variables arrive on fd 5 and are applied
+   only after the filter. LD_PRELOAD is then forced to the sealed preload. */
+static int tainted_loader_env(void) {
+  static const char *keys[] = {
+    "LD_AUDIT",
+    "LD_LIBRARY_PATH",
+    "LD_PRELOAD",
+    "LD_PROFILE",
+    "LD_ORIGIN_PATH",
+    "LD_DEBUG",
+    "LD_DEBUG_OUTPUT",
+    "LD_SHOW_AUXV",
+    "LD_TRACE_LOADED_OBJECTS",
+    "LD_DYNAMIC_WEAK",
+    "LD_BIND_NOW",
+    "LD_BIND_NOT",
+    "LD_ASSUME_KERNEL",
+    NULL,
+  };
+  for (int i = 0; keys[i] != NULL; i++) {
+    const char *value = getenv(keys[i]);
+    if (value != NULL && value[0] != '\0') return 1;
+  }
+  return 0;
+}
+
+static int apply_fd_env(int fd) {
+  size_t cap = 4096;
+  size_t len = 0;
+  char *buf = malloc(cap);
+  if (buf == NULL) return -1;
+  for (;;) {
+    if (len == cap) {
+      if (cap >= 256 * 1024) {
+        free(buf);
+        return -1;
+      }
+      size_t next = cap * 2;
+      if (next > 256 * 1024) next = 256 * 1024;
+      char *grown = realloc(buf, next);
+      if (grown == NULL) {
+        free(buf);
+        return -1;
+      }
+      buf = grown;
+      cap = next;
+    }
+    ssize_t n = read(fd, buf + len, cap - len);
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      free(buf);
+      return -1;
+    }
+    if (n == 0) break;
+    len += (size_t)n;
+  }
+  close(fd);
+  if (clearenv() != 0) {
+    free(buf);
+    return -1;
+  }
+  size_t i = 0;
+  while (i < len) {
+    size_t start = i;
+    while (i < len && buf[i] != '\0') i++;
+    if (i >= len) {
+      free(buf);
+      return -1;
+    }
+    buf[i] = '\0';
+    char *eq = strchr(buf + start, '=');
+    if (eq == NULL || eq == buf + start) {
+      free(buf);
+      return -1;
+    }
+    *eq = '\0';
+    if (strncmp(buf + start, "LD_", 3) != 0) {
+      if (setenv(buf + start, eq + 1, 1) != 0) {
+        free(buf);
+        return -1;
+      }
+    }
+    i++;
+  }
+  free(buf);
+  if (setenv("LD_PRELOAD", "/proc/self/fd/4", 1) != 0) return -1;
+  return 0;
+}
+
 int main(int argc, char **argv) {
   if (argc < 3 || argv[1] == NULL) return 127;
+  if (tainted_loader_env()) return 127;
   /* Own process group before the filter, so the supervisor can kill it. */
   if (setpgid(0, 0) != 0) return 127;
   if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) return 127;
   if (install_filter() != 0) return 127;
+  if (apply_fd_env(5) != 0) return 127;
   execv(argv[1], argv + 1);
   return 127;
 }

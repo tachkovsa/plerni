@@ -5,7 +5,7 @@ import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { connectPair } from './supervisor.mjs';
+import { connectPair, stdinControlReserve } from './supervisor.mjs';
 import { assessFlow, classifyWriterOverrun, FLOW_READ_BYTES, PROBE_INTERVAL_MS, OVERRUN_DEADLINE_MS } from './flow_budget.mjs';
 import { fionread, measureFlowReserve, rcvbuf, siocoutq, sndbuf } from './flow_socket.mjs';
 import { b3, holdAfterSibling, partialSnapshotInvalid, scoreUnenforced, t7Estimate, tripCaps } from './cases/b3-backpressure.mjs';
@@ -255,7 +255,9 @@ test('a reply larger than B_t is rejected before it is queued', async () => {
   const callBytes = Buffer.byteLength(callLine)
     + Buffer.byteLength(JSON.stringify('echo'))
     + Buffer.byteLength(JSON.stringify(1));
-  const userspace = callBytes + 64;
+  // The call has to leave room for one cancel and one grant beside B_t.
+  const reserve = stdinControlReserve();
+  const userspace = callBytes + reserve.total + 64;
   assert.ok(reply.length > userspace);
   const pair = await connectPair({
     sweeper: false,
@@ -831,13 +833,18 @@ test('mux open-loop queues stay inside the read-back buffers', async () => {
     assert.ok(unread > 0, String(unread));
     assert.ok(unread <= sup.kMuxIn, `${unread} > ${sup.kMuxIn}`);
     let outq = 0;
+    let admitted = false;
     for (let i = 0; i < 64; i++) {
-      const ok = sup.socket.write(chunk);
+      admitted = sup.queueMuxBytes(chunk);
       outq = siocoutq(sup.muxFd) ?? 0;
-      if (!ok || outq >= sup.kMuxOut) break;
+      if (!admitted || outq >= sup.kMuxOut) break;
     }
+    assert.equal(admitted, true);
     assert.ok(outq > 0, String(outq));
     assert.ok(outq <= sup.kMuxOut, `${outq} > ${sup.kMuxOut}`);
+    // libuv may still hold the tail. That tail is socketOutbound; a raw write would leave it out.
+    assert.ok(sup.socket.writableLength > 0, String(sup.socket.writableLength));
+    assert.ok(sup.socketOutbound >= sup.socket.writableLength, `${sup.socketOutbound} < ${sup.socket.writableLength}`);
     assert.ok(sndbuf(sup.muxFd) <= sup.muxSndbuf);
     assert.ok(rcvbuf(sup.muxFd) <= sup.muxRcvbuf);
     assert.ok(sup.muxReadHigh <= FLOW_READ_BYTES);
