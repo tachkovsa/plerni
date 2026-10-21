@@ -13,9 +13,11 @@ import { applyScoredSkip, floodBound, floodScore, forgedFlood, hostileBattery, s
 import { assessEnvironment, delay, measureSeries, openLoop, preflight, treeRss, waitUntil } from './measure.mjs';
 import { MuxFramer, encodeMux, encodeNdjson } from './framing.mjs';
 import { FencedError } from './authority.mjs';
-import { DEFAULT_CAPS, PARTIAL_READ_CHUNK, connectPair, dbConfigured, partialCapHolds, stdinControlReserve, totalCapHolds } from './supervisor.mjs';
+import { DEFAULT_CAPS, PARTIAL_READ_CHUNK, Supervisor, connectEnds, connectPair, dbConfigured, partialCapHolds, stdinControlReserve, totalCapHolds } from './supervisor.mjs';
+import { socketPair } from './kernel-stub.mjs';
 import { entryIsPrivate, resolveCacheDir } from './pipe_pending.mjs';
 import { closeFd, dupFd, fionread, measureFlowReserve } from './flow_socket.mjs';
+import { execFile } from 'node:child_process';
 import { lstatSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -2674,8 +2676,10 @@ test('exit keeps one terminal error inside the full byte cap', async () => {
     pair.sup.spawn({ pluginId: 'other', script: echoPath });
     const echo = pair.sup.children.get('echo');
     const sibling = pair.sup.children.get('other');
-    assert.equal(await stopChild(sibling.child.pid), true);
-    assert.equal(await stopChild(kid.pid), true);
+    // Stop and admit in this turn, before the send window is promised.
+    // A later call would have to fit beside that credit.
+    process.kill(sibling.child.pid, 'SIGSTOP');
+    process.kill(kid.pid, 'SIGSTOP');
     for (let i = 0; i < 6; i++) {
       calls.push(pair.stub.call({
         pluginId: 'echo',
@@ -2686,6 +2690,8 @@ test('exit keeps one terminal error inside the full byte cap', async () => {
         payload: { i },
       }, 800).catch((err) => err));
     }
+    assert.equal(await stopChild(sibling.child.pid), true);
+    assert.equal(await stopChild(kid.pid), true);
     const armed = await waitUntil(() => pair.sup.pending.size === 6, 2_000);
     assert.equal(armed, true);
     sibling.stash = Buffer.alloc(reserved.perChild);
@@ -2725,8 +2731,10 @@ test('a terminal error is not queued when the sibling stash already fills the ca
     pair.sup.spawn({ pluginId: 'other', script: echoPath });
     const echo = pair.sup.children.get('echo');
     const sibling = pair.sup.children.get('other');
-    assert.equal(await stopChild(sibling.child.pid), true);
-    assert.equal(await stopChild(kid.pid), true);
+    // Stop and admit in this turn, before the send window is promised.
+    // A later call would have to fit beside that credit.
+    process.kill(sibling.child.pid, 'SIGSTOP');
+    process.kill(kid.pid, 'SIGSTOP');
     for (let i = 0; i < 6; i++) {
       calls.push(pair.stub.call({
         pluginId: 'echo',
@@ -2737,6 +2745,8 @@ test('a terminal error is not queued when the sibling stash already fills the ca
         payload: { i },
       }, 500).catch((err) => err));
     }
+    assert.equal(await stopChild(sibling.child.pid), true);
+    assert.equal(await stopChild(kid.pid), true);
     const armed = await waitUntil(() => pair.sup.pending.size === 6, 2_000);
     assert.equal(armed, true);
     sibling.stash = Buffer.alloc(reserved.perChild);
@@ -2840,9 +2850,8 @@ test('control frames are written ahead of payload when stdin is blocked', async 
       if (typeof cb === 'function') cb();
       return true;
     };
-    const granted = await waitUntil(() => seen.length === 1, 2_000);
-    assert.equal(granted, true);
-    assert.equal(JSON.parse(seen[0]).kind, 'grant');
+    // Admit both calls before the window is promised. The grant is control,
+    // so it is written before the call that is still queued.
     const calls = [1, 2].map((id) => pair.stub.call({
       pluginId: 'credit',
       credential: kid.credential,
@@ -2851,22 +2860,35 @@ test('control frames are written ahead of payload when stdin is blocked', async 
       method: 'get',
       payload: { id },
     }, 2_000).catch((err) => err));
-    const armed = await waitUntil(() => rec.stdinPayload.length === 2 && pair.sup.pending.size === 2, 2_000);
-    assert.equal(armed, true);
+    const armed = await waitUntil(
+      () => seen.length === 1
+        && JSON.parse(seen[0]).kind === 'call'
+        && pair.sup.pending.size === 2
+        && rec.creditSent > 0
+        && rec.stdinPayload.length === 1,
+      2_000,
+    );
+    assert.equal(armed, true, JSON.stringify({
+      seen: seen.map((line) => JSON.parse(line).kind),
+      pending: pair.sup.pending.size,
+      credit: rec.creditSent,
+      payload: rec.stdinPayload.length,
+      control: rec.stdinControl.map((entry) => entry.lane),
+    }));
     const cancel = pair.stub.cancel({
       pluginId: 'credit',
       credential: kid.credential,
       correlationId: 9,
     }, 2_000).catch((err) => err);
-    const queued = await waitUntil(() => rec.stdinControl.length === 1, 2_000);
-    assert.equal(queued, true);
+    const queued = await waitUntil(() => rec.stdinControl.length === 2, 2_000);
+    assert.equal(queued, true, rec.stdinControl.map((entry) => entry.lane).join(','));
     assert.equal(seen.length, 1);
     const release = held;
     held = () => {};
     release();
     const ordered = await waitUntil(() => seen.length === 4, 2_000);
-    assert.equal(ordered, true);
-    assert.deepEqual(seen.map((line) => JSON.parse(line).kind), ['grant', 'cancel', 'call', 'call']);
+    assert.equal(ordered, true, seen.map((line) => JSON.parse(line).kind).join(','));
+    assert.deepEqual(seen.map((line) => JSON.parse(line).kind), ['call', 'grant', 'cancel', 'call']);
     await Promise.allSettled([...calls, cancel]);
   } finally {
     await pair.close();
@@ -2925,8 +2947,16 @@ test('a timed-out call or cancel is dropped before the blocked stdin write resum
       if (typeof cb === 'function') cb();
       return true;
     };
-    const granted = await waitUntil(() => seen.length === 1, 2_000);
-    assert.equal(granted, true);
+    // The live call is handed to the blocked write. The expired call and
+    // cancel stay queued, so the timeout can drop them before the write resumes.
+    const live = pair.stub.call({
+      pluginId: 'credit',
+      credential: kid.credential,
+      correlationId: 2,
+      port: 'db',
+      method: 'get',
+      payload: { id: 2 },
+    }, 2_000).catch((err) => err);
     const expiredCall = pair.stub.call({
       pluginId: 'credit',
       credential: kid.credential,
@@ -2940,33 +2970,36 @@ test('a timed-out call or cancel is dropped before the blocked stdin write resum
       credential: kid.credential,
       correlationId: 1,
     }, 150).catch((err) => err);
-    const live = pair.stub.call({
-      pluginId: 'credit',
-      credential: kid.credential,
-      correlationId: 2,
-      port: 'db',
-      method: 'get',
-      payload: { id: 2 },
-    }, 2_000).catch((err) => err);
     const queued = await waitUntil(
-      () => rec.stdinPayload.length === 2 && rec.stdinControl.length === 1,
+      () => seen.length === 1
+        && JSON.parse(seen[0]).correlationId === 2
+        && rec.stdinPayload.length === 1
+        && rec.stdinControl.some((entry) => entry.lane === 'cancel'),
       1_000,
     );
-    assert.equal(queued, true, `payload ${rec.stdinPayload.length} control ${rec.stdinControl.length}`);
+    assert.equal(queued, true, `seen ${seen.length} payload ${rec.stdinPayload.length} control ${rec.stdinControl.map((entry) => entry.lane).join(',')}`);
     const dropped = await waitUntil(
-      () => rec.stdinPayload.length === 1 && rec.stdinControl.length === 0 && rec.stdinPayload[0].correlationId === 2,
+      () => rec.stdinPayload.length === 0
+        && rec.stdinControl.every((entry) => entry.lane !== 'cancel')
+        && rec.creditSent > 0,
       1_000,
     );
-    assert.equal(dropped, true, `payload ${rec.stdinPayload.map((entry) => entry.correlationId)} control ${rec.stdinControl.length}`);
+    assert.equal(dropped, true, `payload ${rec.stdinPayload.map((entry) => entry.correlationId)} control ${rec.stdinControl.map((entry) => entry.lane).join(',')}`);
     assert.equal(seen.length, 1);
     const release = held;
     held = () => {};
     release();
-    const written = await waitUntil(() => seen.length >= 2, 1_000);
-    assert.equal(written, true, String(seen.length));
+    const written = await waitUntil(
+      () => seen.length >= 2 && rec.stdinPayload.length === 0 && rec.stdinControl.length === 0,
+      1_000,
+    );
+    assert.equal(written, true, `seen ${seen.length} payload ${rec.stdinPayload.length} control ${rec.stdinControl.length}`);
     const kinds = seen.map((line) => JSON.parse(line));
-    assert.deepEqual(kinds.map((msg) => msg.kind), ['grant', 'call']);
-    assert.equal(kinds[1].correlationId, 2);
+    // Dropping the expired call frees room, so a second grant can follow the first.
+    assert.equal(kinds[0].kind, 'call');
+    assert.equal(kinds[0].correlationId, 2);
+    assert.ok(kinds.slice(1).every((msg) => msg.kind === 'grant'), kinds.map((msg) => msg.kind).join(','));
+    assert.ok(!kinds.some((msg) => msg.kind === 'cancel' || msg.correlationId === 1));
     await Promise.allSettled([expiredCall, expiredCancel, live]);
   } finally {
     await pair.close();
@@ -3138,4 +3171,143 @@ test('send credit refills after a large response is consumed', { timeout: 10_000
   } finally {
     await pair.close();
   }
+});
+
+test('concurrent calls fill the original send window', async () => {
+  const reserved = measureFlowReserve();
+  assert.ok(reserved);
+  const pad = 3000;
+  const calls = 3;
+  const lineBytes = Buffer.byteLength(encodeNdjson({
+    kind: 'result',
+    correlationId: 1,
+    payload: 'p'.repeat(pad),
+  }));
+  const idBytes = (id) => Buffer.byteLength(JSON.stringify('wide')) + Buffer.byteLength(JSON.stringify(id));
+  let ident = 0;
+  for (let id = 1; id <= calls; id++) ident += idBytes(id);
+  // The grant is the ceiling minus those identifiers. Three result lines
+  // fill it, and a fourth line does not. The slack covers the mux wrapper.
+  const slack = 2048;
+  assert.ok(slack < lineBytes);
+  const bT = calls * lineBytes + ident + slack;
+  const total = bT + reserved.kIn + reserved.kOut + reserved.readBytes;
+  const pair = await connectPair({
+    sweeper: false,
+    caps: {
+      pending: 8,
+      partial: 1024 * 1024,
+      total,
+      totalGlobal: total + reserved.perChild + reserved.muxReserve,
+    },
+  });
+  try {
+    const kid = pair.sup.spawn({
+      pluginId: 'wide',
+      script: responsePath,
+      env: { RESPONSE_PAD: String(pad) },
+      pending: 8,
+      total,
+    });
+    const rec = pair.sup.children.get('wide');
+    // Stop and admit before the first await. A stop that takes a timer turn
+    // would let the full ceiling be granted, and the later calls would then
+    // be rejected for sitting beside that credit.
+    process.kill(kid.pid, 'SIGSTOP');
+    const pending = [];
+    for (let id = 1; id <= calls; id++) {
+      pending.push(pair.stub.call({
+        pluginId: 'wide',
+        credential: kid.credential,
+        correlationId: id,
+        port: 'db',
+        method: 'get',
+        payload: { n: id },
+      }, 3_000));
+    }
+    assert.equal(await stopChild(kid.pid), true);
+    const granted = await waitUntil(
+      () => rec.creditSent > 0 && rec.outbound === 0 && rec.callPending === calls && rec.sendWindow > 0,
+      2_000,
+    );
+    assert.equal(granted, true, JSON.stringify({
+      creditSent: rec.creditSent,
+      outbound: rec.outbound,
+      callPending: rec.callPending,
+      sendWindow: rec.sendWindow,
+    }));
+    const window = rec.sendWindow;
+    assert.ok(window >= calls * lineBytes, `${window} < ${calls * lineBytes}`);
+    assert.ok(window < (calls + 1) * lineBytes, `${window} fits another line`);
+    process.kill(kid.pid, 'SIGCONT');
+    const results = await Promise.all(pending);
+    assert.deepEqual(results.map((row) => row.payload?.length), Array(calls).fill(pad));
+  } finally {
+    const proc = pair.sup.children.get('wide')?.child;
+    if (proc && proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL');
+    await pair.close();
+  }
+});
+
+test('fd 0 is a valid mux handle and a rejected mux closes both ends', async () => {
+  const script = `
+    import { fstatSync } from 'node:fs';
+    import { Supervisor, connectEnds } from './src/supervisor.mjs';
+    import { socketPair } from './src/kernel-stub.mjs';
+    import { closeFd, dupFd } from './src/flow_socket.mjs';
+
+    const stdin = dupFd(0);
+    if (stdin == null || stdin <= 0) throw new Error('stdin dup ' + stdin);
+    closeFd(0);
+    try {
+      const ends = await socketPair();
+      let fd = ends.supervisorFd;
+      if (fd !== 0) {
+        try { closeFd(0); } catch { /* already closed */ }
+        fd = dupFd(ends.supervisorFd);
+      }
+      if (fd !== 0) throw new Error('expected fd 0, got ' + fd);
+      const sup = new Supervisor({
+        fd: 0,
+        kMuxIn: ends.kMuxIn,
+        kMuxOut: ends.kMuxOut,
+        muxSndbuf: ends.muxSndbuf,
+        muxRcvbuf: ends.muxRcvbuf,
+      });
+      if (sup.muxFd !== 0) throw new Error('muxFd ' + sup.muxFd);
+      await sup.close();
+      closeFd(ends.supervisorFd);
+      ends.kernel.destroy();
+
+      const failed = await socketPair();
+      failed.kMuxIn = 0;
+      let code = null;
+      try {
+        connectEnds(failed);
+      } catch (err) {
+        code = err?.code ?? null;
+      }
+      if (code !== 'flow-unavailable') throw new Error('code ' + code);
+      if (!failed.kernel.destroyed) throw new Error('kernel still open');
+      let supervisorClosed = false;
+      try { fstatSync(failed.supervisorFd); }
+      catch { supervisorClosed = true; }
+      if (!supervisorClosed) throw new Error('supervisor fd still open');
+    } finally {
+      try { closeFd(0); } catch { /* already closed */ }
+      const back = dupFd(stdin);
+      if (back !== 0) throw new Error('stdin restored onto ' + back);
+      closeFd(stdin);
+    }
+    console.log('ok');
+  `;
+  const { stdout } = await new Promise((resolve, reject) => {
+    execFile(process.execPath, ['--input-type=module', '-e', script], {
+      cwd: fileURLToPath(new URL('..', import.meta.url)),
+    }, (err, stdout, stderr) => {
+      if (err) reject(new Error(stderr || err.message));
+      else resolve({ stdout });
+    });
+  });
+  assert.match(stdout, /ok/);
 });

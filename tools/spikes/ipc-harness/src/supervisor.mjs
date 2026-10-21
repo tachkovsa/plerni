@@ -192,9 +192,15 @@ function positiveInt(value) {
   return Number.isInteger(value) && value > 0 ? value : null;
 }
 
+// A mux socket can be dup'd onto fd 0 when standard input is closed. Zero is
+// a real descriptor. Buffer sizes stay strictly positive.
+function nonNegativeInt(value) {
+  return Number.isInteger(value) && value >= 0 ? value : null;
+}
+
 export class Supervisor {
   constructor(mux, opts = {}) {
-    const muxFd = positiveInt(mux?.fd) != null && mux.fd >= 0 ? mux.fd : null;
+    const muxFd = nonNegativeInt(mux?.fd);
     this.kMuxIn = positiveInt(mux?.kMuxIn);
     this.kMuxOut = positiveInt(mux?.kMuxOut);
     this.muxSndbuf = positiveInt(mux?.muxSndbuf);
@@ -410,6 +416,11 @@ export class Supervisor {
       stdoutWriter: flow?.stdoutWriter ?? null,
       probeTimer: null,
       readPosted: false,
+      // Two quiet mux observations are required before a grant. One empty
+      // gap between socket-buffer drains is not enough: the rest of a burst
+      // can still be in flight.
+      refillQuiet: false,
+      refillArmed: false,
       exitDrain: false,
       exitFinished: false,
       exitDrainTimer: null,
@@ -433,9 +444,10 @@ export class Supervisor {
       // after the gate, on a later turn.
       setImmediate(() => this.#considerRead(rec));
     }
-    // After the replaced stdin socket exists. A credit-aware child stops
-    // reading requests until this grant arrives.
-    setImmediate(() => this.#queueGrant(rec, Math.max(1, this.#childCeiling(rec))));
+    // The grant is the free part of the ceiling after calls already written
+    // are charged. Unspent credit stays reserved on a later call and is not
+    // retracted.
+    this.#refillCredit(rec);
     return { credential: detachCredential(credential), token, pid: child.pid };
   }
 
@@ -931,8 +943,14 @@ export class Supervisor {
     }
     // Payload has to leave room for one cancel of this correlation id and
     // one grant. A numeric-id cancel is smaller than a string id.
+    // Unspent send credit is stdout the child may still write. The first
+    // in-flight call overlaps that promise: its reply releases its own
+    // identifiers. A further call has to fit beside the promise, or a
+    // credit-respecting child fills the original window and the reply misses
+    // B_t. The credit is not stdin, so it does not enter K_out.
     const cancelReserve = this.#maxCancelBytes(rec, msg.correlationId);
-    if (this.#overBudget(rec, bytes + idBytes, bytes, CONTROL_RESERVE.grant + cancelReserve)) {
+    const heldCredit = rec.flowOk && rec.callPending > 0 ? Math.max(0, rec.sendWindow) : 0;
+    if (this.#overBudget(rec, bytes + idBytes + heldCredit, bytes, CONTROL_RESERVE.grant + cancelReserve)) {
       this.caps.total = true;
       this.#reject(msg, 'total-cap', true);
       return;
@@ -978,12 +996,42 @@ export class Supervisor {
     rec.sendWindow = Math.max(0, rec.sendWindow - n);
   }
 
+  // A burst written with spawn lands in several reads. The socket reports
+  // empty for one turn between those reads, and several refill calls can
+  // run in that same turn. Credit is promised only from a later turn that
+  // still sees an empty mux, so the rest of the burst is charged first.
   #refillCredit(rec) {
     if (rec.dead || this.closed || !rec.flowOk) return;
-    const room = this.#childCeiling(rec) - this.#pluginBytes(rec);
-    if (room <= rec.sendWindow) return;
-    const credit = Math.min(2147483647, room - rec.sendWindow);
-    this.#queueGrant(rec, credit);
+    const unread = this.#muxCount(this.muxPending);
+    if (Number.isInteger(unread) && unread > 0 && this.muxReadPosted) rec.refillQuiet = false;
+    this.#armRefill(rec);
+  }
+
+  #armRefill(rec) {
+    if (rec.refillArmed || rec.dead || this.closed) return;
+    rec.refillArmed = true;
+    const quietAtSchedule = rec.refillQuiet === true;
+    setImmediate(() => {
+      rec.refillArmed = false;
+      if (rec.dead || this.closed || !rec.flowOk) return;
+      const unread = this.#muxCount(this.muxPending);
+      const bytesWaiting = Number.isInteger(unread) && unread > 0 && this.muxReadPosted;
+      if (bytesWaiting) {
+        rec.refillQuiet = false;
+        this.#armRefill(rec);
+        return;
+      }
+      if (!quietAtSchedule) {
+        rec.refillQuiet = true;
+        this.#armRefill(rec);
+        return;
+      }
+      rec.refillQuiet = false;
+      const room = this.#childCeiling(rec) - this.#pluginBytes(rec);
+      if (room <= rec.sendWindow) return;
+      const credit = Math.min(2147483647, room - rec.sendWindow);
+      this.#queueGrant(rec, credit);
+    });
   }
 
   #enqueueStdin(rec, line, bytes, lane, correlationId) {
@@ -2305,15 +2353,23 @@ function normalizeEcho(msg) {
   return msg;
 }
 
-export async function connectPair(opts = {}) {
-  const ends = await socketPair();
-  const sup = new Supervisor({
-    fd: ends.supervisorFd,
-    kMuxIn: ends.kMuxIn,
-    kMuxOut: ends.kMuxOut,
-    muxSndbuf: ends.muxSndbuf,
-    muxRcvbuf: ends.muxRcvbuf,
-  }, opts);
+// The descriptor is still the caller's until Supervisor returns. A throw
+// before that returns it, so both ends are closed here.
+export function connectEnds(ends, opts = {}) {
+  let sup;
+  try {
+    sup = new Supervisor({
+      fd: ends.supervisorFd,
+      kMuxIn: ends.kMuxIn,
+      kMuxOut: ends.kMuxOut,
+      muxSndbuf: ends.muxSndbuf,
+      muxRcvbuf: ends.muxRcvbuf,
+    }, opts);
+  } catch (err) {
+    closeFd(ends.supervisorFd);
+    ends.kernel.destroy();
+    throw err;
+  }
   const stub = new KernelStub(ends.kernel, opts.kernel);
   return {
     sup,
@@ -2323,4 +2379,8 @@ export async function connectPair(opts = {}) {
       stub.close();
     },
   };
+}
+
+export async function connectPair(opts = {}) {
+  return connectEnds(await socketPair(), opts);
 }
