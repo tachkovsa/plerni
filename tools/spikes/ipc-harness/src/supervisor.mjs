@@ -658,8 +658,7 @@ export class Supervisor {
     // that block, those promises, every live reservation, the new
     // reservation, and the mux reservation fit in totalGlobal.
     const owed = Number.isInteger(envBytes) && envBytes > 0 ? envBytes : 0;
-    const promised = this.#siblingCredit(null);
-    if (this.bufferedBytes() + owed + already + reserve + muxReserve + promised > this.capsConfig.totalGlobal) {
+    if (this.#globalHeld(null) + owed + already + reserve + muxReserve > this.capsConfig.totalGlobal) {
       closeEnds(ends);
       const err = new Error('flow reservation does not fit the live process');
       err.code = 'spawn-rejected';
@@ -806,7 +805,11 @@ export class Supervisor {
       this.#accountReserved(rec);
       return false;
     }
-    if (this.bufferedBytes() + this.readBytes > this.#globalCap()) {
+    // Bytes the grant already promised are not a second charge. The read
+    // retires that much of the window as it lands. Only the part of C past
+    // the remaining window needs free room in B_g.
+    const promised = Math.min(this.readBytes, Math.max(0, rec.sendWindow));
+    if (this.bufferedBytes() + this.readBytes - promised > this.#globalCap()) {
       // A child with nothing in userspace is still held. Pausing it would
       // wait for bytes it does not have; the probe has to run anyway.
       if (this.#pluginBytes(rec) > 0) this.#pause(rec, 'global');
@@ -1276,9 +1279,10 @@ export class Supervisor {
     if (admitCost > rec.admitKeep) rec.admitKeep = admitCost;
     const heldCredit = this.#overlapCredit(rec);
     if (this.#overBudget(rec, bytes + idBytes + heldCredit, bytes, reserve)) {
-      // Own bytes fit in B_t and B_g. The miss is the unspent window, a full
-      // K_out, or both. Hold the frame and write it once there is room. A
-      // probe that does not shrink is rejected; waiting would not help it.
+      // Own bytes fit B_t and the process ceiling, including credit promised
+      // to a sibling. The miss is this child's unspent window, a full K_out,
+      // or both. Hold the frame and write it once there is room. A probe that
+      // does not shrink is rejected; waiting would not help it.
       if (!this.#bytesOver(rec, bytes + idBytes, reserve)) {
         this.#parkCall(rec, msg, line, bytes, idBytes, ingressTs, reserve);
         return;
@@ -1297,7 +1301,7 @@ export class Supervisor {
     // reservation below, and the line joins parkedBytes, so a later check
     // must not add either of them again.
     if (this.#pluginBytes(rec) + cost + reserve > this.#childCeiling(rec)
-        || this.bufferedBytes() + cost + reserve > this.#globalCap()) {
+        || this.#globalHeld(rec) + cost + reserve > this.#globalCap()) {
       this.caps.total = true;
       this.#reject(msg, 'total-cap', true);
       return;
@@ -1555,9 +1559,19 @@ export class Supervisor {
     return sum;
   }
 
+  // Userspace bytes already retained, plus send credit promised to every other
+  // live child. Grants, spawn, and call admission — a call that is written and
+  // a call that would park — all charge this sum. `except` is the child being
+  // charged; its own window is not in the sum. Spawn passes null and counts
+  // every live window. The promised bytes are not in bufferedBytes() until
+  // that child writes them.
+  #globalHeld(except) {
+    return this.bufferedBytes() + this.#siblingCredit(except);
+  }
+
   #creditRoom(rec) {
     const childRoom = this.#childCeiling(rec) - this.#pluginBytes(rec);
-    const globalRoom = this.#globalCap() - this.bufferedBytes() - this.#siblingCredit(rec);
+    const globalRoom = this.#globalCap() - this.#globalHeld(rec);
     return Math.min(childRoom, globalRoom);
   }
 
@@ -1629,20 +1643,23 @@ export class Supervisor {
       || this.callPendingTotal + this.cancelPendingTotal >= this.capsConfig.pendingGlobal;
   }
 
-  // Child and process ceilings only. The kernel queue and the unspent window
-  // are not this check: a call that fails those can wait.
+  // Child and process ceilings only. The kernel queue and this child's own
+  // unspent window are not this check: a call that fails those can wait.
+  // Credit promised to a sibling is part of the process ceiling. Parking
+  // into that promise fills the bytes the sibling was told it may write.
   #bytesOver(rec, accounted, reserve) {
     if (this.#pluginBytes(rec) + accounted + reserve > this.#childCeiling(rec)) return true;
-    if (this.bufferedBytes() + accounted + reserve > this.#globalCap()) return true;
+    if (this.#globalHeld(rec) + accounted + reserve > this.#globalCap()) return true;
     return false;
   }
 
   // `accounted` is charged to B_t and B_g. `stdinBytes` is what this write
   // adds to K_out. `reserve` is control capacity that must still fit beside it.
+  // Sibling send credit is inside `#globalHeld` and is not part of `stdinBytes`.
   #overBudget(rec, accounted, stdinBytes, reserve) {
     const ceiling = this.#childCeiling(rec);
     if (this.#pluginBytes(rec) + accounted + reserve > ceiling) return true;
-    if (this.bufferedBytes() + accounted + reserve > this.#globalCap()) return true;
+    if (this.#globalHeld(rec) + accounted + reserve > this.#globalCap()) return true;
     if (rec.flowOk && rec.kOut != null) {
       const kernel = this.#stdinQueued(rec);
       if (!Number.isInteger(kernel)) return true;

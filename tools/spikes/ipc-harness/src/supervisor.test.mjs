@@ -3848,6 +3848,113 @@ test('a compliant response is not stalled by a sibling grant', async () => {
   }
 });
 
+test('parked calls leave a sibling send window usable', async () => {
+  const totalGlobal = 100_000;
+  const pad = 40_000;
+  const correlationId = 100;
+  const lineBytes = Buffer.byteLength(encodeNdjson({
+    kind: 'result',
+    correlationId,
+    payload: 'p'.repeat(pad),
+  }));
+  const pair = await connectPair({
+    sweeper: false,
+    caps: {
+      pending: 64,
+      pendingGlobal: 128,
+      partial: 1024 * 1024,
+      total: 1024 * 1024,
+      totalGlobal,
+    },
+  });
+  const stop = (id) => {
+    const proc = pair.sup.children.get(id)?.child;
+    if (proc && proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL');
+  };
+  try {
+    const kidA = pair.sup.spawn({
+      pluginId: 'a',
+      script: responsePath,
+      env: { RESPONSE_PAD: String(pad) },
+      pending: 64,
+      total: 1024 * 1024,
+    });
+    const kidB = pair.sup.spawn({
+      pluginId: 'b',
+      script: floodPath,
+      env: { FLOOD_MODE: 'silent' },
+      pending: 64,
+      total: 1024 * 1024,
+    });
+    const recA = pair.sup.children.get('a');
+    const recB = pair.sup.children.get('b');
+    const granted = await waitUntil(
+      () => recA.grantSettled && recA.outbound === 0 && recA.sendWindow >= lineBytes,
+      2_000,
+    );
+    assert.equal(granted, true, JSON.stringify({
+      window: recA.sendWindow,
+      lineBytes,
+      settled: recA.grantSettled,
+    }));
+    const globalCap = totalGlobal
+      - (recA.kIn + recA.kOut + pair.sup.readBytes)
+      - (recB.kIn + recB.kOut + pair.sup.readBytes)
+      - (pair.sup.kMuxIn + pair.sup.kMuxOut + pair.sup.readBytes);
+    const rejections = [];
+    for (let i = 0; i < 30; i++) {
+      pair.stub.call({
+        pluginId: 'b',
+        credential: kidB.credential,
+        correlationId: i + 1,
+        port: 'db',
+        method: 'get',
+        payload: 'p'.repeat(3000),
+      }, 5_000).catch((err) => {
+        rejections.push(err?.code ?? 'error');
+      });
+    }
+    const flooded = await waitUntil(() => {
+      if (recB.parked.length > 0) holdPark(recB);
+      return rejections.length > 0;
+    }, 2_000);
+    assert.equal(flooded, true, JSON.stringify({
+      parked: recB.parkedBytes,
+      rejections: rejections.length,
+      window: recA.sendWindow,
+      buffered: pair.sup.bufferedBytes(),
+      globalCap,
+    }));
+    assert.ok(rejections.every((code) => code === 'total-cap'), JSON.stringify(rejections));
+    assert.ok(
+      pair.sup.bufferedBytes() + recA.sendWindow <= globalCap,
+      `buffered ${pair.sup.bufferedBytes()} + window ${recA.sendWindow} exceeds ${globalCap}`,
+    );
+    const res = await pair.stub.call({
+      pluginId: 'a',
+      credential: kidA.credential,
+      correlationId,
+      port: 'db',
+      method: 'get',
+      payload: { n: 1 },
+    }, 3_000).catch((err) => err);
+    assert.equal(res.payload?.length, pad, JSON.stringify({
+      code: res.code,
+      pause: recA.pauseReason,
+      framer: recA.framer.pendingBytes(),
+      buffered: pair.sup.bufferedBytes(),
+      window: recA.sendWindow,
+      parked: recB.parkedBytes,
+      globalCap,
+    }));
+    assert.notEqual(recA.pauseReason, 'global');
+  } finally {
+    stop('a');
+    stop('b');
+    await pair.close();
+  }
+});
+
 test('send credit is granted from accounted room while the mux is unread', async () => {
   const pair = await connectPair({
     sweeper: false,
