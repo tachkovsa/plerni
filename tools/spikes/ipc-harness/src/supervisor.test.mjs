@@ -18,7 +18,7 @@ import { socketPair } from './kernel-stub.mjs';
 import { entryIsPrivate, resolveCacheDir } from './pipe_pending.mjs';
 import { closeFd, dupFd, fionread, measureFlowReserve, openEnvPipe, processGroup, spawnSleeper } from './flow_socket.mjs';
 import { execFile } from 'node:child_process';
-import { lstatSync, readFileSync } from 'node:fs';
+import { closeSync, fstatSync, lstatSync, openSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -3515,6 +3515,130 @@ test('a stalled mux reader leaves the low-priority queue at its cap', async () =
   }
 });
 
+test('sibling send windows share one global grant', async () => {
+  const totalGlobal = 100_000;
+  const pair = await connectPair({
+    sweeper: false,
+    caps: { pending: 8, partial: 1024 * 1024, total: 1024 * 1024, totalGlobal },
+  });
+  const stop = (id) => {
+    const proc = pair.sup.children.get(id)?.child;
+    if (proc && proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL');
+  };
+  try {
+    const kidA = pair.sup.spawn({
+      pluginId: 'a',
+      script: responsePath,
+      env: { RESPONSE_PAD: '1024' },
+      total: 1024 * 1024,
+    });
+    const kidB = pair.sup.spawn({
+      pluginId: 'b',
+      script: responsePath,
+      env: { RESPONSE_PAD: '1024' },
+      total: 1024 * 1024,
+    });
+    const recA = pair.sup.children.get('a');
+    const recB = pair.sup.children.get('b');
+    const granted = await waitUntil(
+      () => recA.grantSettled && recB.grantSettled && recA.outbound === 0 && recB.outbound === 0,
+      2_000,
+    );
+    assert.equal(granted, true, JSON.stringify({
+      a: recA.sendWindow,
+      b: recB.sendWindow,
+      settled: [recA.grantSettled, recB.grantSettled],
+    }));
+    const globalCap = totalGlobal
+      - (recA.kIn + recA.kOut + pair.sup.readBytes)
+      - (recB.kIn + recB.kOut + pair.sup.readBytes)
+      - (pair.sup.kMuxIn + pair.sup.kMuxOut + pair.sup.readBytes);
+    assert.ok(
+      recA.sendWindow + recB.sendWindow <= globalCap,
+      `windows ${recA.sendWindow}+${recB.sendWindow} exceed ${globalCap}`,
+    );
+    const [pluginId, kid, rec] = recA.sendWindow >= recB.sendWindow
+      ? ['a', kidA, recA]
+      : ['b', kidB, recB];
+    const lineBytes = Buffer.byteLength(encodeNdjson({
+      kind: 'result',
+      correlationId: 1,
+      payload: 'p'.repeat(1024),
+    }));
+    assert.ok(rec.sendWindow >= lineBytes, String(rec.sendWindow));
+    const res = await pair.stub.call({
+      pluginId,
+      credential: kid.credential,
+      correlationId: 1,
+      port: 'db',
+      method: 'get',
+      payload: { n: 1 },
+    }, 3_000);
+    assert.equal(res.payload?.length, 1024);
+    assert.notEqual(rec.pauseReason, 'global');
+  } finally {
+    stop('a');
+    stop('b');
+    await pair.close();
+  }
+});
+
+test('a compliant response is not stalled by a sibling grant', async () => {
+  const reserved = measureFlowReserve();
+  assert.ok(reserved);
+  const totalGlobal = 100_000;
+  const shared = totalGlobal - 2 * reserved.perChild - reserved.muxReserve;
+  const pad = 57_000;
+  const lineBytes = Buffer.byteLength(encodeNdjson({
+    kind: 'result',
+    correlationId: 1,
+    payload: 'p'.repeat(pad),
+  }));
+  assert.ok(lineBytes > shared, `${lineBytes} does not exceed the two-child room ${shared}`);
+  const pair = await connectPair({
+    sweeper: false,
+    caps: { pending: 8, partial: 1024 * 1024, total: 1024 * 1024, totalGlobal },
+  });
+  const stop = (id) => {
+    const proc = pair.sup.children.get(id)?.child;
+    if (proc && proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL');
+  };
+  try {
+    const kid = pair.sup.spawn({
+      pluginId: 'a',
+      script: responsePath,
+      env: { RESPONSE_PAD: String(pad) },
+      total: 1024 * 1024,
+    });
+    const rec = pair.sup.children.get('a');
+    const granted = await waitUntil(() => rec.outbound === 0 && rec.sendWindow >= lineBytes, 2_000);
+    assert.equal(granted, true, String(rec.sendWindow));
+    assert.throws(
+      () => pair.sup.spawn({
+        pluginId: 'b',
+        script: responsePath,
+        env: { RESPONSE_PAD: String(pad) },
+        total: 1024 * 1024,
+      }),
+      (err) => err.code === 'spawn-rejected',
+    );
+    const res = await pair.stub.call({
+      pluginId: 'a',
+      credential: kid.credential,
+      correlationId: 1,
+      port: 'db',
+      method: 'get',
+      payload: { n: 1 },
+    }, 3_000);
+    assert.equal(res.payload?.length, pad);
+    assert.notEqual(rec.pauseReason, 'global');
+  } finally {
+    stop('a');
+    stop('b');
+    await pair.close();
+  }
+});
+
 test('send credit is granted from accounted room while the mux is unread', async () => {
   const pair = await connectPair({
     sweeper: false,
@@ -3537,6 +3661,37 @@ test('send credit is granted from accounted room while the mux is unread', async
   }
 });
 
+test('a cancelled environment write does not close a reused descriptor', async () => {
+  const ends = openEnvPipe();
+  assert.ok(ends);
+  const buf = Buffer.alloc(8_192, 0x71);
+  const owner = { writeFd: ends.writeFd, aborted: false, writing: false };
+  const pending = writePluginEnv(ends.writeFd, buf, owner);
+  const opened = [];
+  let reused = -1;
+  try {
+    assert.equal(owner.writing, true);
+    const fd = owner.writeFd;
+    owner.aborted = true;
+    owner.writeFd = -1;
+    closeSync(fd);
+    for (let i = 0; i < 128 && reused < 0; i++) {
+      const n = openSync('/dev/null', 'r');
+      if (n === fd) reused = n;
+      else opened.push(n);
+    }
+    assert.equal(reused, fd);
+    await pending;
+    assert.doesNotThrow(() => fstatSync(reused), 'environment writer closed a reused descriptor');
+  } finally {
+    closeFd(reused);
+    for (const n of opened) closeFd(n);
+    closeFd(ends.readFd);
+    closeFd(ends.probe);
+    closeFd(ends.writeFd);
+  }
+});
+
 test('an environment write yields while the pipe is still full', async () => {
   const ends = openEnvPipe();
   assert.ok(ends);
@@ -3552,6 +3707,37 @@ test('an environment write yields while the pipe is still full', async () => {
   closeFd(ends.readFd);
   closeFd(ends.probe);
   await writing;
+});
+
+test('close leaves an in-flight environment write owning its descriptor', async () => {
+  const env = { PAD: 'p'.repeat(100_000) };
+  assert.ok(pluginEnvBlock(env, 'echo').length > 4096);
+  const pair = await connectPair({
+    sweeper: false,
+    caps: { partial: 1024 * 1024, total: 1024 * 1024, totalGlobal: 1024 * 1024 },
+  });
+  try {
+    pair.sup.spawn({
+      pluginId: 'echo',
+      script: echoPath,
+      env,
+      total: 1024 * 1024,
+    });
+    const rec = pair.sup.children.get('echo');
+    const fd = rec.envHold.writeFd;
+    assert.equal(rec.envHold.writing, true);
+    const closing = pair.close();
+    assert.doesNotThrow(
+      () => fstatSync(fd),
+      'clearEnv closed the environment fd while the write was in flight',
+    );
+    await closing;
+    assert.throws(() => fstatSync(fd), (err) => err.code === 'EBADF');
+  } finally {
+    const proc = pair.sup.children.get('echo')?.child;
+    if (proc && proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL');
+    if (!pair.sup.closed) await pair.close();
+  }
 });
 
 test('a spawn error settles while a large environment is still queued', async () => {

@@ -47,6 +47,11 @@ export async function b4(opts = {}) {
   try {
     const good = pair.sup.spawn({ pluginId: 'good', script: echoPath });
     pair.sup.spawn({ pluginId: 'bad', script: child('malformed') });
+    // The first grant promises the shared userspace budget. A child started
+    // after that grant does not fit beside it. Admit this one now, and keep
+    // it stopped so its unterminated bytes stay out of the malformed check.
+    const nt = pair.sup.spawn({ pluginId: 'nt', script: child('never-terminating') });
+    process.kill(nt.pid, 'SIGSTOP');
     const malformedDeadline = Date.now() + 2_000;
     while (!pair.sup.faults.some((f) => f.pluginId === 'bad') && Date.now() < malformedDeadline) {
       await delay(10);
@@ -58,7 +63,7 @@ export async function b4(opts = {}) {
       siblingRoundTrip: await roundTrip(pair.stub, good.credential),
     };
 
-    pair.sup.spawn({ pluginId: 'nt', script: child('never-terminating') });
+    process.kill(nt.pid, 'SIGCONT');
     const ntDeadline = Date.now() + 15_000;
     while (!pair.sup.faults.some((f) => f.pluginId === 'nt') && Date.now() < ntDeadline) {
       await delay(20);

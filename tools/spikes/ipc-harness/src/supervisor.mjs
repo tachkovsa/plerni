@@ -192,25 +192,40 @@ export function pluginEnvBlock(specEnv, pluginId) {
 
 // A short block is written and closed before this returns, so the wrapper
 // sees EOF even if the caller then blocks the event loop. A block larger
-// than the pipe is finished on the threadpool: the event loop stays able
-// to observe a spawn error and close the fd, which ends the blocked write.
-export function writePluginEnv(fd, buf) {
+// than the pipe is finished on the threadpool. `owner` keeps that descriptor
+// until the threadpool callback settles: cancellation sets owner.aborted and
+// must not close or reuse the number while owner.writing is set, or the
+// callback would close or write whatever was opened on the same number.
+export function writePluginEnv(fd, buf, owner = null) {
   return new Promise((resolve, reject) => {
     let settled = false;
+    const owns = () => !owner || owner.writeFd === fd;
     const finish = (err) => {
       if (settled) return;
       settled = true;
-      try { closeSync(fd); }
-      catch (closeErr) {
-        if (closeErr.code !== 'EBADF' && !(err && (err.code === 'EPIPE' || err.code === 'EBADF'))) {
-          reject(closeErr);
-          return;
+      if (owner) owner.writing = false;
+      if (owns()) {
+        if (owner) owner.writeFd = -1;
+        try { closeSync(fd); }
+        catch (closeErr) {
+          if (closeErr.code !== 'EBADF' && !(err && (err.code === 'EPIPE' || err.code === 'EBADF'))) {
+            reject(closeErr);
+            return;
+          }
         }
       }
       if (err && err.code !== 'EPIPE' && err.code !== 'EBADF') reject(err);
       else resolve();
     };
     const onChunk = (err, n) => {
+      // A cancellation that already released the descriptor must not write
+      // the rest or close the number the kernel gave to someone else.
+      if (owner && (owner.aborted || owner.writeFd !== fd)) {
+        const error = new Error('plugin environment write cancelled');
+        error.code = 'EPIPE';
+        finish(err && (err.code === 'EPIPE' || err.code === 'EBADF') ? err : error);
+        return;
+      }
       if (err) {
         finish(err);
         return;
@@ -242,7 +257,10 @@ export function writePluginEnv(fd, buf) {
       return;
     }
     if (off >= buf.length) finish(null);
-    else write(fd, buf, off, buf.length - off, onChunk);
+    else {
+      if (owner) owner.writing = true;
+      write(fd, buf, off, buf.length - off, onChunk);
+    }
   });
 }
 
@@ -455,6 +473,9 @@ export class Supervisor {
       written: false,
       turnDone: false,
       aborted: false,
+      // Set while the threadpool write owns writeFd. #clearEnv must not
+      // close that number until the callback settles.
+      writing: false,
       probe: envEnds.probe,
       writeFd: envEnds.writeFd,
     };
@@ -581,9 +602,9 @@ export class Supervisor {
     child.on('exit', (code, signal) => this.#onExit(rec, code, signal));
     this.children.set(spec.pluginId, rec);
     // A full pipe must not block this turn. The wrapper reads fd 5 after
-    // the filter; if spawn then fails, closing the write end and the probe
-    // unblocks the threadpool write.
-    writePluginEnv(envHold.writeFd, envBlock).then(() => {
+    // the filter; if spawn then fails, the writer is cancelled and closes
+    // the write end itself once the threadpool operation settles.
+    writePluginEnv(envHold.writeFd, envBlock, envHold).then(() => {
       envHold.writeFd = -1;
       if (envHold.aborted || this.closed) return;
       envHold.written = true;
@@ -631,11 +652,14 @@ export class Supervisor {
       throw err;
     }
     // Empty kernel queues still owe K_in + K_out + C. The fd 5 block is
-    // owed as well until the wrapper reads it. Admit only when userspace
-    // bytes, that block, every live reservation, the new reservation, and
-    // the mux reservation fit in totalGlobal.
+    // owed as well until the wrapper reads it. Credit already granted to a
+    // live child is stdout that child may still write, and it is not in
+    // bufferedBytes() until it arrives. Admit only when userspace bytes,
+    // that block, those promises, every live reservation, the new
+    // reservation, and the mux reservation fit in totalGlobal.
     const owed = Number.isInteger(envBytes) && envBytes > 0 ? envBytes : 0;
-    if (this.bufferedBytes() + owed + already + reserve + muxReserve > this.capsConfig.totalGlobal) {
+    const promised = this.#siblingCredit(null);
+    if (this.bufferedBytes() + owed + already + reserve + muxReserve + promised > this.capsConfig.totalGlobal) {
       closeEnds(ends);
       const err = new Error('flow reservation does not fit the live process');
       err.code = 'spawn-rejected';
@@ -920,6 +944,11 @@ export class Supervisor {
     const probe = hold?.probe;
     if (hold) hold.probe = null;
     closeFd(probe);
+    // The threadpool callback still has the descriptor. Closing it here
+    // frees the number, and that callback would then close or write the
+    // resource opened in its place. The callback closes it once, and only
+    // while owner.writeFd still names this write.
+    if (hold?.writing) return 0;
     const writeFd = hold?.writeFd;
     if (hold) hold.writeFd = -1;
     closeFd(writeFd);
@@ -1490,9 +1519,20 @@ export class Supervisor {
     this.#drainPark(rec);
   }
 
+  // Send windows of other live children. This child's own window is subtracted
+  // when the grant is sized, so counting it here would advertise nothing.
+  #siblingCredit(except) {
+    let sum = 0;
+    for (const rec of this.children.values()) {
+      if (rec === except || rec.dead || !rec.flowOk) continue;
+      if (rec.sendWindow > 0) sum += rec.sendWindow;
+    }
+    return sum;
+  }
+
   #creditRoom(rec) {
     const childRoom = this.#childCeiling(rec) - this.#pluginBytes(rec);
-    const globalRoom = this.#globalCap() - this.bufferedBytes();
+    const globalRoom = this.#globalCap() - this.bufferedBytes() - this.#siblingCredit(rec);
     return Math.min(childRoom, globalRoom);
   }
 
