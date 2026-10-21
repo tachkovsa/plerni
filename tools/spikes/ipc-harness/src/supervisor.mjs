@@ -233,6 +233,10 @@ export class Supervisor {
     this.loTurn = 0;
     this.terminal = [];
     this.terminalCoalesced = 0;
+    // One delivered terminal error per child during a single failure burst.
+    // Cleared on the next turn so a later timeout can still be reported.
+    this.terminalChild = new Set();
+    this.terminalChildClear = false;
     this.queuedBytes = 0;
     // Bytes accepted by socket.write until the flush callback. They have left
     // the mux queues and are not visible in queuedBytes.
@@ -408,7 +412,10 @@ export class Supervisor {
       err.code = 'unsatisfiable';
       throw err;
     }
-    if (this.#occupiedBytes() + reserve + muxReserve > this.capsConfig.totalGlobal) {
+    // Empty kernel queues still owe K_in + K_out + C. Admit only when
+    // userspace bytes plus every live reservation, the new reservation, and
+    // the mux reservation fit in totalGlobal.
+    if (this.bufferedBytes() + already + reserve + muxReserve > this.capsConfig.totalGlobal) {
       closeEnds(ends);
       const err = new Error('flow reservation does not fit the live process');
       err.code = 'spawn-rejected';
@@ -437,22 +444,6 @@ export class Supervisor {
   // reservation K_mux_in + K_mux_out + C.
   #globalCap() {
     return this.capsConfig.totalGlobal - this.#kernelReserved() - this.#muxReserve();
-  }
-
-  #occupiedBytes() {
-    let total = this.bufferedBytes();
-    for (const rec of this.children.values()) {
-      if (!rec.flowOk || rec.dead) continue;
-      const unread = this.#stdoutUnread(rec);
-      const queued = this.#stdinQueued(rec);
-      if (Number.isInteger(unread)) total += unread;
-      if (Number.isInteger(queued)) total += queued;
-    }
-    const muxUnread = this.#muxCount(this.muxPending);
-    const muxSendQueued = this.#muxCount(this.muxOutq);
-    if (Number.isInteger(muxUnread)) total += muxUnread;
-    if (Number.isInteger(muxSendQueued)) total += muxSendQueued;
-    return total;
   }
 
   #attachFlowSockets(rec, flow) {
@@ -969,7 +960,9 @@ export class Supervisor {
     this.pending.delete(pluginId, correlationId, lane);
     const rec = this.children.get(pending.pluginId);
     const same = rec && rec.credential.generation === pending.generation;
-    if (same && pending.idBytes) rec.idBytes = Math.max(0, rec.idBytes - pending.idBytes);
+    if (same && pending.idBytes && !pending.idsReleased) {
+      rec.idBytes = Math.max(0, rec.idBytes - pending.idBytes);
+    }
     if (pending.cancel) {
       this.cancelPendingTotal--;
       if (same) rec.cancelPending--;
@@ -1079,9 +1072,22 @@ export class Supervisor {
   // `front` keeps a replayed hold ahead of anything parked in the same pass.
   // A missing buffer still charges `need`. The parsed object is retained for
   // the retry, and an uncharged copy would sit outside B_t and totalGlobal.
+  // The parked buffer replaces the pending identifiers. Releasing them here
+  // keeps pluginBytes and bufferedBytes equal to the sum checked before the defer.
+  #releaseHeldIds(rec, msg) {
+    if (!msg) return;
+    const lane = msg.kind === 'cancelled' ? 'cancel' : 'call';
+    const pending = this.pending.get(rec.credential.pluginId, msg.correlationId, lane);
+    if (!pending || pending.idsReleased) return;
+    if (pending.generation !== rec.credential.generation) return;
+    pending.idsReleased = true;
+    if (pending.idBytes) rec.idBytes = Math.max(0, rec.idBytes - pending.idBytes);
+  }
+
   #park(rec, msg, buf, front, need = null) {
     const size = buf ? buf.length : (need ?? 0);
     const held = { msg, buf: buf ?? null, bytes: size, need: size };
+    this.#releaseHeldIds(rec, msg);
     if (front) rec.deferred.unshift(held);
     else rec.deferred.push(held);
     rec.deferredBytes += held.bytes;
@@ -1101,7 +1107,7 @@ export class Supervisor {
     if (loFull && held.msg?.kind !== 'cancelled') return false;
     const lane = held.msg?.kind === 'cancelled' ? 'cancel' : 'call';
     const pending = this.pending.get(rec.credential.pluginId, held.msg?.correlationId, lane);
-    const ids = pending?.idBytes ?? 0;
+    const ids = pending && !pending.idsReleased ? (pending.idBytes ?? 0) : 0;
     const need = held.buf ? held.buf.length : (held.need ?? 0);
     const resulting = this.#pluginBytes(rec) - held.bytes - ids + need;
     if (resulting > this.#childCeiling(rec)) return false;
@@ -1501,14 +1507,14 @@ export class Supervisor {
       }
     }
     // Grants and timestamps are attached here, so the mux frame can be larger
-    // than the child's line. Admit it only when the resulting #pluginBytes
-    // (this frame in place of the pending identifiers) stays ≤ B_t. A frame
-    // that does not fit is rejected and dropped. Parking the parsed object
-    // or its encoding would keep bytes the cap is not allowed to miss.
+    // than the child's line. Parking releases the pending identifiers, so the
+    // retained sum is this frame in their place. A reply that still does not
+    // fit in B_t or B_g is rejected. Deferring it would keep both.
     const ceiling = this.#childCeiling(rec);
-    const pendingIds = pending.idBytes ?? 0;
+    const pendingIds = pending.idsReleased ? 0 : (pending.idBytes ?? 0);
     const resulting = this.#pluginBytes(rec) - pendingIds + buf.length;
-    if (resulting > ceiling) {
+    const globalResult = this.bufferedBytes() - pendingIds + buf.length;
+    if (resulting > ceiling || globalResult > this.#globalCap()) {
       this.caps.total = true;
       const still = this.#take(pluginId, msg.correlationId, lane);
       if (still) {
@@ -1524,16 +1530,11 @@ export class Supervisor {
       return false;
     }
     // One stdout chunk can carry many results. Pause does not stop this loop.
-    // A reply that does not fit stays with its waiter and is charged; taking
-    // it here would leave the kernel with a timeout and the bytes uncounted.
+    // The low-priority queue is full. The reply stays with its waiter. The
+    // identifiers are released when it is parked, so the cap still holds.
     if (priority < 10 && (this.lo.get(pluginId)?.length ?? 0) >= this.capsConfig.lo) {
       this.caps.lo = true;
       this.#pause(rec, 'bulk');
-      return { defer: true, buf };
-    }
-    if (this.bufferedBytes() - pendingIds + buf.length > this.#globalCap()) {
-      this.caps.total = true;
-      this.#pause(rec, 'global');
       return { defer: true, buf };
     }
     if (priority >= 10 && !this.#roomHi(pluginId)) {
@@ -1648,16 +1649,26 @@ export class Supervisor {
     if (rec.child.exitCode == null && rec.child.signalCode == null) this.#signalGroup(rec);
   }
 
+  // `error` can be the only child event. Leaving exitDone pending makes
+  // respawn wait forever for an exit that never arrives.
   #onSpawnError(rec, err) {
-    if (rec.dead) return;
+    if (rec.dead) {
+      rec.exited = true;
+      rec.exitFinished = true;
+      this.#settleExit(rec);
+      return;
+    }
     this.#releaseFlow(rec);
     rec.dead = true;
+    rec.exited = true;
+    rec.exitFinished = true;
     rec.stash = null;
     rec.deferred = [];
     rec.deferredBytes = 0;
     this.#dropStale(rec.credential.pluginId, rec.credential.generation);
     this.#failPending(rec, err?.code || 'spawn-error');
     if (rec.child.exitCode == null && rec.child.signalCode == null) this.#signalGroup(rec);
+    this.#settleExit(rec);
   }
 
   // The plugin's pid is its process group. SIGKILL reaches a grandchild that
@@ -1800,10 +1811,30 @@ export class Supervisor {
     } catch {
       return;
     }
-    if (this.queuedBytes + this.socketOutbound + buf.length > this.#globalCap()) {
+    const child = frame.pluginId;
+    // One error for this child is already queued in this burst. Further
+    // frames would spend the cap without telling another waiter.
+    if (child != null && this.terminalChild.has(child)) {
       this.terminalCoalesced++;
       this.caps.total = true;
       return;
+    }
+    // queuedBytes and socketOutbound omit the bridge and each live child's
+    // framer, outbound, identifiers, deferred replies, and stash.
+    if (this.bufferedBytes() + buf.length > this.#globalCap()) {
+      this.terminalCoalesced++;
+      this.caps.total = true;
+      return;
+    }
+    if (child != null) {
+      this.terminalChild.add(child);
+      if (!this.terminalChildClear) {
+        this.terminalChildClear = true;
+        queueMicrotask(() => {
+          this.terminalChild.clear();
+          this.terminalChildClear = false;
+        });
+      }
     }
     this.terminal.push(buf);
     this.queuedBytes += buf.length;

@@ -9,6 +9,7 @@
 #include <sys/stat.h>
 #include <node_api.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -595,10 +596,12 @@ static napi_value ProbeConfinement(napi_env env, napi_callback_info info) {
 struct burst_state {
   int fd;
   int ceiling;
-  int fork_errno;
   char path[4096];
+  int fork_errno;
   atomic_int written;
   atomic_int crossed;
+  atomic_int ready;
+  atomic_int go;
   int64_t crossed_ms;
 };
 
@@ -622,11 +625,15 @@ static void write_mark(struct burst_state *state, int written, int64_t ms) {
 
 static void *burst_worker(void *arg) {
   struct burst_state *state = arg;
-  char buf[8192];
+  /* One skb is capped near (sndbuf >> 1) - 64. A single 4096-byte send is
+     long enough for that alloc to overlap another thread's wmem check. */
+  char buf[4096];
   memset(buf, 'T', sizeof(buf));
-  for (;;) {
-    ssize_t n = send(state->fd, buf, sizeof(buf), MSG_DONTWAIT);
-    if (n <= 0) break;
+  atomic_fetch_add(&state->ready, 1);
+  while (atomic_load(&state->go) == 0) {
+  }
+  ssize_t n = send(state->fd, buf, sizeof(buf), MSG_DONTWAIT);
+  if (n > 0) {
     int total = atomic_fetch_add(&state->written, (int)n) + (int)n;
     if (total > state->ceiling) {
       int expected = 0;
@@ -640,19 +647,25 @@ static void *burst_worker(void *arg) {
   return NULL;
 }
 
-/* Two pthreads write one stdout fd. The mark is written on the crossing,
-   before either thread returns, so a later SIGKILL still leaves the clock. */
+/* Threads write one stdout fd together. Two skbs fill sndbuf and stay under
+   K. Four overlapping sends are what queue a fourth skb. The mark is written
+   on the crossing, before the threads return, so a later SIGKILL still leaves
+   the clock. */
 static napi_value BurstWriters(napi_env env, napi_callback_info info) {
-  size_t argc = 3;
-  napi_value argv[3];
+  size_t argc = 4;
+  napi_value argv[4];
   napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
   int32_t fd = -1;
   int32_t ceiling = 0;
+  int32_t threads = 4;
   if (argc < 3
       || napi_get_value_int32(env, argv[0], &fd) != napi_ok
       || napi_get_value_int32(env, argv[1], &ceiling) != napi_ok
       || fd < 0
-      || ceiling <= 0) {
+      || ceiling <= 0
+      || (argc >= 4 && napi_get_value_int32(env, argv[3], &threads) != napi_ok)
+      || threads < 2
+      || threads > 32) {
     napi_throw_type_error(env, NULL, "burst");
     return NULL;
   }
@@ -676,19 +689,29 @@ static napi_value BurstWriters(napi_env env, napi_callback_info info) {
   }
   atomic_init(&state.written, 0);
   atomic_init(&state.crossed, 0);
-  pthread_t first;
-  pthread_t second;
-  if (pthread_create(&first, NULL, burst_worker, &state) != 0) {
-    napi_throw_error(env, NULL, "thread");
-    return NULL;
+  atomic_init(&state.ready, 0);
+  atomic_init(&state.go, 0);
+  pthread_t ids[32];
+  int started = 0;
+  long cpus = sysconf(_SC_NPROCESSORS_ONLN);
+  if (cpus < 1) cpus = 1;
+  for (int i = 0; i < threads; i++) {
+    if (pthread_create(&ids[i], NULL, burst_worker, &state) != 0) {
+      atomic_store(&state.go, 1);
+      for (int j = 0; j < started; j++) pthread_join(ids[j], NULL);
+      napi_throw_error(env, NULL, "thread");
+      return NULL;
+    }
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET((int)(i % cpus), &set);
+    pthread_setaffinity_np(ids[i], sizeof(set), &set);
+    started++;
   }
-  if (pthread_create(&second, NULL, burst_worker, &state) != 0) {
-    pthread_join(first, NULL);
-    napi_throw_error(env, NULL, "thread");
-    return NULL;
+  while (atomic_load(&state.ready) < threads) {
   }
-  pthread_join(first, NULL);
-  pthread_join(second, NULL);
+  atomic_store(&state.go, 1);
+  for (int i = 0; i < started; i++) pthread_join(ids[i], NULL);
   napi_value obj;
   if (napi_create_object(env, &obj) != napi_ok) return NULL;
   int written = atomic_load(&state.written);

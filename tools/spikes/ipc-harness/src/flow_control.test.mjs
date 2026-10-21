@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, writeSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readSync, rmSync, writeFileSync, writeSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { connectPair } from './supervisor.mjs';
 import { assessFlow, classifyWriterOverrun, FLOW_READ_BYTES, PROBE_INTERVAL_MS, OVERRUN_DEADLINE_MS } from './flow_budget.mjs';
 import { fionread, measureFlowReserve, rcvbuf, siocoutq, sndbuf } from './flow_socket.mjs';
-import { b3, partialSnapshotInvalid, scoreUnenforced, t7Estimate, tripCaps } from './cases/b3-backpressure.mjs';
+import { b3, holdAfterSibling, partialSnapshotInvalid, scoreUnenforced, t7Estimate, tripCaps } from './cases/b3-backpressure.mjs';
 import { b4 } from './cases/b4-bounds.mjs';
 import { encodeMux, encodeNdjson } from './framing.mjs';
 import { delay, waitUntil } from './measure.mjs';
@@ -603,64 +603,120 @@ test('a reply that does not fit beside charged bytes is rejected and not retaine
   }
 });
 
-test('two child threads are classified as a thread writer and scored when the live queue crosses K_in', { timeout: 15_000 }, async () => {
+test('an invalid hold discovered during the sibling wait cannot score as a pass', () => {
+  const base = {
+    growth: 10,
+    measurable: true,
+    answered: true,
+    near: { pending: true, partial: true, bytes: true, lo: true },
+  };
+  const invalid = holdAfterSibling(
+    { invalidReason: 'fionread-unavailable', flip: 'stdin-overrun' },
+    true,
+    base,
+  );
+  assert.equal(invalid.invalidReason, 'fionread-unavailable');
+  assert.equal(invalid.flip, undefined);
+  assert.equal(invalid.measurable, false);
+  assert.equal(invalid.answered, false);
+  assert.equal(invalid.growth, null);
+  const flipped = holdAfterSibling({ invalidReason: null, flip: 'stdin-overrun' }, true, base);
+  assert.equal(flipped.flip, 'stdin-overrun');
+  assert.equal(flipped.invalidReason, undefined);
+  assert.equal(flipped.answered, false);
+});
+
+function drainStdout(fd) {
+  const buf = Buffer.alloc(8192);
+  for (let i = 0; i < 64; i++) {
+    const n = fionread(fd) ?? 0;
+    if (n <= 0) return;
+    try {
+      readSync(fd, buf, 0, Math.min(buf.length, n), null);
+    } catch {
+      return;
+    }
+  }
+}
+
+test('child threads are classified as a thread writer only when the live queue crosses K_in', { timeout: 30_000 }, async () => {
   const reserved = measureFlowReserve();
   assert.ok(reserved);
   const dir = mkdtempSync(join(tmpdir(), 'plerni-threads-'));
   const go = join(dir, 'go');
-  const mark = join(dir, 'mark');
+  const marks = join(dir, 'marks');
+  mkdirSync(marks);
   const pair = await connectPair({
     sweeper: false,
     caps: { lo: 1, partial: 1024 * 1024, total: 1024 * 1024, totalGlobal: 8 * 1024 * 1024 },
   });
+  const attempts = 40;
   try {
     pair.sup.spawn({
       pluginId: 'threads',
       script: threadPath,
-      env: { THREAD_GO: go, THREAD_MARK: mark, RESERVED_K: String(reserved.kIn) },
+      env: {
+        THREAD_GO: go,
+        THREAD_MARK: marks,
+        THREAD_COUNT: '4',
+        THREAD_ATTEMPTS: String(attempts),
+        RESERVED_K: String(reserved.kIn),
+      },
     });
     const rec = pair.sup.children.get('threads');
+    // The probe still runs while the socket is paused. It is what scores
+    // stdoutUnread > K_in. A read would hide the crossing.
     rec.paused = true;
     rec.pauseReason = 'bulk';
-    rec.child.stdout.pause();
-    writeFileSync(go, '1');
-    const lag = block(50);
+    rec.stdoutSocket?.pause();
+    rec.child.stdout?.pause();
     let peak = 0;
-    const sampleUntil = Date.now() + 1_000;
-    while (Date.now() < sampleUntil) {
+    let lag = 0;
+    let fault = null;
+    for (let attempt = 1; attempt <= attempts && !fault; attempt++) {
+      writeFileSync(go, String(attempt));
+      // Hold the event loop across the burst. The child runs while this waits.
+      lag = block(50);
+      const mark = join(marks, String(attempt));
+      const marked = await waitUntil(() => existsSync(mark), 2_000);
+      assert.equal(marked, true, `attempt ${attempt} produced no mark`);
+      await delay(5);
       const unread = fionread(rec.stdoutFd) ?? 0;
       if (unread > peak) peak = unread;
-      if (pair.sup.faults.some((fault) => fault.code === 'thread-writer')) break;
-      let markedDone = false;
-      if (peak > 0) {
-        try {
-          markedDone = readFileSync(mark, 'utf8').includes('threads');
-        } catch { /* the mark is written when the burst finishes */ }
+      const text = readFileSync(mark, 'utf8').trim().split(/\s+/);
+      assert.equal(classifyWriterOverrun(text[0]), 'thread-writer');
+      const crossedAt = Number(text[1]);
+      const written = Number(text[2]);
+      const forkErrno = Number(text[3]);
+      assert.equal(forkErrno, 1);
+      assert.ok(written > 0, String(written));
+      fault = pair.sup.faults.find((row) => row.code === 'thread-writer') ?? null;
+      const crossed = unread > reserved.kIn || written > reserved.kIn || fault != null;
+      if (!crossed) {
+        assert.equal(pair.sup.faults.some((row) => row.code === 'buffer-enlarged'), false);
+        if (!rec.dead) drainStdout(rec.stdoutFd);
+        continue;
       }
-      if (markedDone && (peak > reserved.kIn || pair.sup.faults.some((fault) => fault.code === 'thread-writer'))) break;
-      await delay(5);
-    }
-    const text = readFileSync(mark, 'utf8').trim().split(/\s+/);
-    assert.equal(classifyWriterOverrun(text[0]), 'thread-writer');
-    const marked = Number(text[1]);
-    const written = Number(text[2]);
-    const forkErrno = Number(text[3]);
-    assert.equal(forkErrno, 1);
-    assert.ok(written > 0, String(written));
-    assert.equal(pair.sup.faults.some((row) => row.code === 'buffer-enlarged'), false);
-    const fault = pair.sup.faults.find((row) => row.code === 'thread-writer');
-    if (written > reserved.kIn || peak > reserved.kIn) {
-      assert.ok(fault, JSON.stringify({ peak, written, kIn: reserved.kIn, faults: pair.sup.faults }));
-      const elapsed = Date.now() - marked;
+      while (!fault && Date.now() - crossedAt < OVERRUN_DEADLINE_MS) {
+        await delay(5);
+        const unreadAgain = fionread(rec.stdoutFd) ?? 0;
+        if (unreadAgain > peak) peak = unreadAgain;
+        fault = pair.sup.faults.find((row) => row.code === 'thread-writer') ?? null;
+      }
+      assert.ok(fault, JSON.stringify({
+        peak, unread, written, kIn: reserved.kIn, faults: pair.sup.faults, invalid: pair.sup.invalidReason,
+      }));
+      const elapsed = Date.now() - crossedAt;
       assert.ok(elapsed >= 0 && elapsed < OVERRUN_DEADLINE_MS, String(elapsed));
       assert.ok(PROBE_INTERVAL_MS + lag < OVERRUN_DEADLINE_MS, String(lag));
       assert.ok(fault.stdoutUnread > fault.kIn, JSON.stringify(fault));
       assert.equal(fault.kIn, reserved.kIn);
-    } else {
-      assert.equal(fault, undefined, JSON.stringify({ peak, written, kIn: reserved.kIn }));
-      assert.ok(peak <= reserved.kIn, `${peak} > ${reserved.kIn}`);
-      assert.ok(peak > 0, String(peak));
+      assert.equal(pair.sup.invalidReason, null);
+      assert.equal(pair.sup.faults.some((row) => row.code === 'buffer-enlarged'), false);
+      assert.ok(peak > reserved.kIn || fault.stdoutUnread > reserved.kIn);
+      break;
     }
+    assert.ok(fault, JSON.stringify({ peak, kIn: reserved.kIn, faults: pair.sup.faults }));
   } finally {
     rmSync(dir, { recursive: true, force: true });
     await pair.close();

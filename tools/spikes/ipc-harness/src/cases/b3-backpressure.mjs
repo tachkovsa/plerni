@@ -430,6 +430,32 @@ function holdByteCap(reserved) {
   return Math.min(floor + reserved.readBytes, exclusive - 1);
 }
 
+const HOLD_NEAR_MISS = Object.freeze({ pending: false, partial: false, bytes: false, lo: false });
+
+// The sibling wait is the last place a probe can go invalid. A flip-only
+// recheck would still return a row holdOk() can score as a pass.
+export function holdAfterSibling(sup, answered, base) {
+  if (sup?.invalidReason) {
+    return {
+      ...base,
+      invalidReason: sup.invalidReason,
+      growth: null,
+      measurable: false,
+      answered: false,
+      near: HOLD_NEAR_MISS,
+    };
+  }
+  if (sup?.flip) {
+    return {
+      ...base,
+      flip: sup.flip,
+      answered: false,
+      near: HOLD_NEAR_MISS,
+    };
+  }
+  return { ...base, answered };
+}
+
 async function holdRep({ warmupMs, windowMs, readRss }) {
   const byteCap = holdByteCap(measureFlowReserve());
   const pair = await connectPair({
@@ -653,26 +679,7 @@ async function holdRep({ warmupMs, windowMs, readRss }) {
       siblingCall,
       delay(2_000).then(() => null),
     ]);
-    if (pair.sup.flip) {
-      return {
-        flip: pair.sup.flip,
-        growth: maxRss - rss0,
-        rss0,
-        maxRss,
-        arrivals,
-        filled,
-        warmedMs,
-        offered: loop.offered,
-        issued: loop.issued,
-        skipped: loop.skipped,
-        answered: false,
-        caps: { ...pair.sup.caps },
-        near: { pending: false, partial: false, bytes: false, lo: false },
-        samples: samples.length,
-      };
-    }
-    const near = (pred) => samples.length > 0 && samples.filter(pred).length / samples.length >= 0.8;
-    return {
+    const decided = holdAfterSibling(pair.sup, answered?.payload?.who === 'sib', {
       growth: maxRss - rss0,
       rss0,
       maxRss,
@@ -682,15 +689,19 @@ async function holdRep({ warmupMs, windowMs, readRss }) {
       offered: loop.offered,
       issued: loop.issued,
       skipped: loop.skipped,
-      answered: answered?.payload?.who === 'sib',
       caps: { ...pair.sup.caps },
+      samples: samples.length,
+    });
+    if (decided.invalidReason || decided.flip) return decided;
+    const near = (pred) => samples.length > 0 && samples.filter(pred).length / samples.length >= 0.8;
+    return {
+      ...decided,
       near: {
         pending: near((row) => row.pending >= PENDING_CAP),
         partial: near((row) => row.partialFault && row.partial === 0),
         bytes: near((row) => row.bytesFault || (row.bytes >= byteCap && row.bytes <= byteCap + 192 * 1024)),
         lo: near((row) => row.lo >= LO_CAP),
       },
-      samples: samples.length,
     };
   } finally {
     pair.stub.socket.resume();

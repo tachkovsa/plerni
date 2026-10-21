@@ -455,13 +455,14 @@ export function flowHelperAvailable() {
   return Boolean(fn && typeof fn.create === 'function' && typeof fn.pinListen === 'function');
 }
 
-export function burstWriters(fd, ceiling, mark) {
+export function burstWriters(fd, ceiling, mark, threads = 4) {
   if (!Number.isInteger(fd) || fd < 0 || !Number.isInteger(ceiling) || ceiling <= 0) return null;
   if (typeof mark !== 'string' || mark.length === 0) return null;
+  if (!Number.isInteger(threads) || threads < 2 || threads > 32) return null;
   const fn = loadHelper();
   if (!fn || typeof fn.burstWriters !== 'function') return null;
   try {
-    const row = fn.burstWriters(fd, ceiling, mark);
+    const row = fn.burstWriters(fd, ceiling, mark, threads);
     if (!row || !Number.isInteger(row.written) || row.written < 0) return null;
     return row;
   } catch {

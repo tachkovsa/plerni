@@ -1686,9 +1686,12 @@ test('socket writes stay in the global byte count until flushed', async () => {
     assert.ok(held <= cap, String(held));
     assert.ok(pair.sup.socketOutbound <= cap, String(pair.sup.socketOutbound));
     assert.ok(pair.sup.bufferedBytes() >= held, `${pair.sup.bufferedBytes()} vs ${held}`);
+    assert.ok(pair.sup.bufferedBytes() <= cap, String(pair.sup.bufferedBytes()));
     const mux = pair.sup.queuedBytes + pair.sup.socketOutbound;
     assert.ok(mux <= cap, `queued+outbound ${mux}`);
-    assert.ok(pair.sup.queueDepth('echo').lo > 0 || rec.deferredBytes > 0);
+    // A reply that does not fit is rejected. Parking it would keep the ids and the frame.
+    assert.equal(rec.deferred.length, 0);
+    assert.ok(pair.sup.caps.total === true);
     await Promise.all(calls);
   } finally {
     const proc = pair.sup.children.get('echo')?.child;
@@ -1980,12 +1983,10 @@ test('a socket write does not start when it would pass the global cap', async ()
     assert.ok(pair.sup.socketOutbound <= cap, String(pair.sup.socketOutbound));
     const accepted = pair.sup.queuedBytes + pair.sup.socketOutbound;
     assert.ok(accepted <= cap, `queued+outbound ${accepted}`);
-    assert.ok(pair.sup.bufferedBytes() > pair.sup.socketOutbound);
-    if (rec.deferredBytes > 0) {
-      assert.ok(pair.sup.bufferedBytes() >= rec.deferredBytes, String(pair.sup.bufferedBytes()));
-    }
-    assert.ok(pair.sup.pending.size >= 1);
+    assert.ok(pair.sup.bufferedBytes() <= cap, String(pair.sup.bufferedBytes()));
+    assert.equal(rec.deferred.length, 0);
     assert.equal(rec.dead, false);
+    assert.ok(pair.sup.caps.total === true);
     await Promise.all(calls);
   } finally {
     const proc = pair.sup.children.get('echo')?.child;
@@ -2485,23 +2486,148 @@ test('a call during the stdout drain is rejected', async () => {
   }
 });
 
-test('exit cleanup does not queue terminal errors past the global cap', async () => {
+test('spawn admission counts userspace bytes and every live reservation', async () => {
+  const reserved = measureFlowReserve();
+  assert.ok(reserved);
+  const slack = 500;
   const pair = await connectPair({
     sweeper: false,
-    caps: { pending: 16, partial: 1024 * 1024, total: 1024 * 1024, totalGlobal: 8 * 1024 * 1024 },
+    caps: {
+      partial: 1024 * 1024,
+      total: 1024 * 1024,
+      totalGlobal: reserved.muxReserve + 2 * reserved.perChild + slack,
+    },
+  });
+  try {
+    pair.sup.spawn({ pluginId: 'echo', script: echoPath });
+    const rec = pair.sup.children.get('echo');
+    rec.stash = Buffer.alloc(slack + 1);
+    assert.throws(
+      () => pair.sup.spawn({ pluginId: 'other', script: echoPath }),
+      (err) => err?.code === 'spawn-rejected',
+    );
+    assert.equal(pair.sup.children.has('other'), false);
+  } finally {
+    await pair.close();
+  }
+});
+
+test('a parked reply releases its identifiers and stays inside the caps', async () => {
+  const reserved = measureFlowReserve();
+  assert.ok(reserved);
+  const userspace = 20_000;
+  const correlation = 'c'.repeat(32);
+  const pair = await connectPair({
+    sweeper: false,
+    caps: {
+      lo: 1,
+      pending: 8,
+      partial: 1024 * 1024,
+      total: reserved.perChild + userspace,
+      totalGlobal: reserved.muxReserve + reserved.perChild + userspace,
+    },
+  });
+  try {
+    const kid = pair.sup.spawn({
+      pluginId: 'echo',
+      script: echoPath,
+      pending: 8,
+      total: reserved.perChild + userspace,
+    });
+    const rec = pair.sup.children.get('echo');
+    assert.equal(rec.bT, userspace);
+    rec.child.kill('SIGSTOP');
+    const firstId = `${correlation}a`;
+    const secondId = `${correlation}b`;
+    for (const id of [firstId, secondId]) {
+      pair.stub.call({
+        pluginId: 'echo',
+        credential: kid.credential,
+        correlationId: id,
+        port: 'db',
+        method: 'get',
+        payload: { n: 1 },
+      }, 5_000).catch(() => {});
+    }
+    const armed = await waitUntil(() => pair.sup.pending.size === 2, 2_000);
+    assert.equal(armed, true);
+    pair.sup.draining = true;
+    rec.child.stdout.emit('data', Buffer.from(encodeNdjson({
+      kind: 'result',
+      correlationId: firstId,
+      payload: { n: 1 },
+    })));
+    const filled = await waitUntil(() => pair.sup.queueDepth('echo').lo >= 1 && rec.paused, 2_000);
+    assert.equal(filled, true);
+    const measured = pair.sup.lo.get('echo')[0].length;
+    const idBytes = rec.idBytes;
+    assert.ok(idBytes >= 16, String(idBytes));
+    const slack = Math.floor(idBytes / 2);
+    rec.loBytes = rec.bT - measured + slack - idBytes;
+    rec.paused = false;
+    rec.pauseReason = null;
+    rec.child.stdout.emit('data', Buffer.from(encodeNdjson({
+      kind: 'result',
+      correlationId: secondId,
+      payload: { n: 1 },
+    })));
+    assert.equal(rec.deferred.length, 1, JSON.stringify({
+      deferred: rec.deferred.length,
+      pluginBytes: pair.sup.queueDepth('echo').pluginBytes,
+      bT: rec.bT,
+      idBytes: rec.idBytes,
+      measured,
+    }));
+    assert.equal(rec.idBytes, 0, String(rec.idBytes));
+    assert.equal(pair.sup.pending.has('echo', secondId, 'call'), true);
+    assert.ok(pair.sup.queueDepth('echo').pluginBytes <= rec.bT, String(pair.sup.queueDepth('echo').pluginBytes));
+    assert.ok(pair.sup.bufferedBytes() <= userspace, String(pair.sup.bufferedBytes()));
+  } finally {
+    const proc = pair.sup.children.get('echo')?.child;
+    if (proc && proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL');
+    await pair.close();
+  }
+});
+
+async function stopChild(pid) {
+  return waitUntil(() => {
+    try {
+      process.kill(pid, 'SIGSTOP');
+      return readFileSync(`/proc/${pid}/status`, 'utf8').includes('\tT');
+    } catch {
+      return false;
+    }
+  }, 2_000);
+}
+
+test('exit keeps one terminal error inside the full byte cap', async () => {
+  const reserved = measureFlowReserve();
+  assert.ok(reserved);
+  const frameLen = encodeMux({
+    kind: 'error',
+    code: 'child-exited',
+    for: 'call',
+    pluginId: 'echo',
+    correlationId: 1,
+    generation: 1,
+  }).length;
+  const pair = await connectPair({
+    sweeper: false,
+    caps: {
+      pending: 16,
+      partial: 1024 * 1024,
+      total: 1024 * 1024,
+      totalGlobal: 8 * 1024 * 1024,
+    },
   });
   const calls = [];
   try {
-    const kid = pair.sup.spawn({ pluginId: 'echo', script: echoPath });
-    const stopped = await waitUntil(() => {
-      try {
-        process.kill(kid.pid, 'SIGSTOP');
-        return readFileSync(`/proc/${kid.pid}/status`, 'utf8').includes('\tT');
-      } catch {
-        return false;
-      }
-    }, 2_000);
-    assert.equal(stopped, true);
+    const kid = pair.sup.spawn({ pluginId: 'echo', script: echoPath, pending: 16 });
+    pair.sup.spawn({ pluginId: 'other', script: echoPath });
+    const echo = pair.sup.children.get('echo');
+    const sibling = pair.sup.children.get('other');
+    assert.equal(await stopChild(sibling.child.pid), true);
+    assert.equal(await stopChild(kid.pid), true);
     for (let i = 0; i < 6; i++) {
       calls.push(pair.stub.call({
         pluginId: 'echo',
@@ -2510,18 +2636,94 @@ test('exit cleanup does not queue terminal errors past the global cap', async ()
         port: 'db',
         method: 'get',
         payload: { i },
-      }, 400).catch((err) => err));
+      }, 800).catch((err) => err));
     }
     const armed = await waitUntil(() => pair.sup.pending.size === 6, 2_000);
     assert.equal(armed, true);
-    pair.sup.capsConfig.totalGlobal = 1;
+    sibling.stash = Buffer.alloc(reserved.perChild);
+    pair.sup.capsConfig.totalGlobal = reserved.muxReserve + 2 * reserved.perChild + frameLen;
     process.kill(kid.pid, 'SIGKILL');
-    const finished = await waitUntil(() => pair.sup.children.get('echo')?.exitFinished === true, 3_000);
+    const finished = await waitUntil(() => echo.exitFinished === true, 3_000);
     assert.equal(finished, true);
-    assert.ok(pair.sup.terminalCoalesced >= 6, String(pair.sup.terminalCoalesced));
-    assert.ok(pair.sup.bufferedBytes() <= 1, String(pair.sup.bufferedBytes()));
+    const settled = await Promise.all(calls);
+    const delivered = settled.filter((row) => row?.code === 'child-exited');
+    assert.equal(delivered.length, 1, JSON.stringify(settled.map((row) => row?.code)));
+    assert.ok(pair.sup.terminalCoalesced >= 5, String(pair.sup.terminalCoalesced));
+    assert.ok(
+      pair.sup.bufferedBytes() <= reserved.perChild + frameLen,
+      String(pair.sup.bufferedBytes()),
+    );
   } finally {
     await Promise.allSettled(calls);
+    await pair.close();
+  }
+});
+
+test('a terminal error is not queued when the sibling stash already fills the cap', async () => {
+  const reserved = measureFlowReserve();
+  assert.ok(reserved);
+  const pair = await connectPair({
+    sweeper: false,
+    caps: {
+      pending: 16,
+      partial: 1024 * 1024,
+      total: 1024 * 1024,
+      totalGlobal: 8 * 1024 * 1024,
+    },
+  });
+  const calls = [];
+  try {
+    const kid = pair.sup.spawn({ pluginId: 'echo', script: echoPath, pending: 16 });
+    pair.sup.spawn({ pluginId: 'other', script: echoPath });
+    const echo = pair.sup.children.get('echo');
+    const sibling = pair.sup.children.get('other');
+    assert.equal(await stopChild(sibling.child.pid), true);
+    assert.equal(await stopChild(kid.pid), true);
+    for (let i = 0; i < 6; i++) {
+      calls.push(pair.stub.call({
+        pluginId: 'echo',
+        credential: kid.credential,
+        correlationId: i + 1,
+        port: 'db',
+        method: 'get',
+        payload: { i },
+      }, 500).catch((err) => err));
+    }
+    const armed = await waitUntil(() => pair.sup.pending.size === 6, 2_000);
+    assert.equal(armed, true);
+    sibling.stash = Buffer.alloc(reserved.perChild);
+    pair.sup.capsConfig.totalGlobal = reserved.muxReserve + 2 * reserved.perChild;
+    process.kill(kid.pid, 'SIGKILL');
+    const finished = await waitUntil(() => echo.exitFinished === true, 3_000);
+    assert.equal(finished, true);
+    const settled = await Promise.all(calls);
+    assert.ok(settled.every((row) => row?.code === 'timeout'), JSON.stringify(settled.map((row) => row?.code)));
+    assert.ok(pair.sup.terminalCoalesced >= 6, String(pair.sup.terminalCoalesced));
+    assert.equal(pair.sup.terminal.length, 0);
+    assert.ok(pair.sup.bufferedBytes() <= reserved.perChild, String(pair.sup.bufferedBytes()));
+  } finally {
+    await Promise.allSettled(calls);
+    await pair.close();
+  }
+});
+
+test('a spawn error with no exit lets respawn finish', { timeout: 10_000 }, async () => {
+  const pair = await connectPair({ sweeper: false });
+  try {
+    const kid = pair.sup.spawn({ pluginId: 'echo', script: echoPath });
+    const rec = pair.sup.children.get('echo');
+    rec.child.removeAllListeners('exit');
+    rec.child.emit('error', Object.assign(new Error('emfile'), { code: 'EMFILE' }));
+    assert.equal(rec.exitFinished, true);
+    const next = await Promise.race([
+      pair.sup.respawn('echo'),
+      delay(3_000).then(() => null),
+    ]);
+    assert.ok(next?.pid, 'respawn hung after a spawn error with no exit');
+    assert.notEqual(next.pid, kid.pid);
+  } finally {
+    const proc = pair.sup.children.get('echo')?.child;
+    if (proc && proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL');
     await pair.close();
   }
 });
