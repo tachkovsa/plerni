@@ -160,6 +160,39 @@ static napi_value Create(napi_env env, napi_callback_info info) {
   return obj;
 }
 
+/* The environment block is a real pipe. Node's stdio "pipe" is a socket, and
+   FIONREAD on that write end stays 0 while the bytes sit in the peer. The
+   probe is a dup of the read end, so the unread count remains visible after
+   the write end closes. */
+static napi_value OpenPipe(napi_env env, napi_callback_info info) {
+  (void)info;
+  int fds[2] = {-1, -1};
+  int probe = -1;
+  if (pipe2(fds, O_CLOEXEC) != 0) {
+    napi_throw_error(env, NULL, "pipe");
+    return NULL;
+  }
+  probe = fcntl(fds[0], F_DUPFD_CLOEXEC, 0);
+  if (probe < 0) {
+    close(fds[0]);
+    close(fds[1]);
+    napi_throw_error(env, NULL, "dup");
+    return NULL;
+  }
+  napi_value obj;
+  if (napi_create_object(env, &obj) != napi_ok
+      || !int_prop(env, obj, "readFd", fds[0])
+      || !int_prop(env, obj, "writeFd", fds[1])
+      || !int_prop(env, obj, "probe", probe)) {
+    close(fds[0]);
+    close(fds[1]);
+    if (probe >= 0) close(probe);
+    napi_throw_error(env, NULL, "object");
+    return NULL;
+  }
+  return obj;
+}
+
 static napi_value ioctl_count(napi_env env, napi_callback_info info, unsigned long req) {
   size_t argc = 1;
   napi_value argv[1];
@@ -844,6 +877,7 @@ static void export_fn(napi_env env, napi_value exports, const char *name, napi_c
 
 NAPI_MODULE_INIT() {
   export_fn(env, exports, "create", Create);
+  export_fn(env, exports, "openPipe", OpenPipe);
   export_fn(env, exports, "pending", Pending);
   export_fn(env, exports, "outq", Outq);
   export_fn(env, exports, "setSndbuf", SetSndbuf);

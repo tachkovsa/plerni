@@ -230,6 +230,30 @@ function asFd(value) {
   return Number.isInteger(value) && value >= 0 ? value : null;
 }
 
+// readFd is what the child inherits. probe is a dup of that read end and
+// stays in the parent so FIONREAD still sees unread bytes after the write
+// end closes. A null result is a failed helper, not an empty pipe.
+export function openEnvPipe() {
+  const fn = loadHelper();
+  if (!fn || typeof fn.openPipe !== 'function') return null;
+  let row = null;
+  try {
+    row = fn.openPipe();
+  } catch {
+    return null;
+  }
+  const readFd = asFd(row?.readFd);
+  const writeFd = asFd(row?.writeFd);
+  const probe = asFd(row?.probe);
+  if (readFd == null || writeFd == null || probe == null) {
+    closeFd(readFd);
+    closeFd(writeFd);
+    closeFd(probe);
+    return null;
+  }
+  return { readFd, writeFd, probe };
+}
+
 export function closeFd(fd) {
   if (!Number.isInteger(fd) || fd < 0) return;
   try { closeSync(fd); } catch { /* already closed */ }

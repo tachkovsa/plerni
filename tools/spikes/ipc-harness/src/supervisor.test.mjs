@@ -13,7 +13,7 @@ import { applyScoredSkip, floodBound, floodScore, forgedFlood, hostileBattery, s
 import { assessEnvironment, delay, measureSeries, openLoop, preflight, treeRss, waitUntil } from './measure.mjs';
 import { MuxFramer, encodeMux, encodeNdjson } from './framing.mjs';
 import { FencedError } from './authority.mjs';
-import { DEFAULT_CAPS, PARTIAL_READ_CHUNK, Supervisor, connectEnds, connectPair, dbConfigured, partialCapHolds, stdinControlReserve, totalCapHolds } from './supervisor.mjs';
+import { DEFAULT_CAPS, PARTIAL_READ_CHUNK, PLUGIN_ENV_MAX, Supervisor, connectEnds, connectPair, dbConfigured, partialCapHolds, pluginEnvBlock, stdinControlReserve, totalCapHolds } from './supervisor.mjs';
 import { socketPair } from './kernel-stub.mjs';
 import { entryIsPrivate, resolveCacheDir } from './pipe_pending.mjs';
 import { closeFd, dupFd, fionread, measureFlowReserve } from './flow_socket.mjs';
@@ -1241,17 +1241,19 @@ test('an unfinished mux frame pauses the shared input at the global ceiling', as
   assert.ok(reserved);
   const pair = await connectPair({
     sweeper: false,
-    caps: { totalGlobal: 64 + reserved.perChild + reserved.muxReserve },
+    caps: { totalGlobal: 64 + pluginEnvBlock({}, 'echo').length + reserved.perChild + reserved.muxReserve },
   });
   try {
     pair.sup.spawn({ pluginId: 'echo', script: echoPath });
     const prefix = Buffer.alloc(4);
     prefix.writeUInt32BE(200, 0);
     pair.stub.socket.write(Buffer.concat([prefix, Buffer.alloc(80, 0x61)]));
-    await delay(30);
-    // B_g is below C, so the read never starts. The unfinished frame stays in
-    // the kernel reservation and a later write does not enter userspace.
-    assert.equal(pair.sup.bufferedBytes(), 0);
+    // The environment pipe is inside the sum until the wrapper reads it.
+    // B_g stays below C after that, so the read never starts. The unfinished
+    // frame stays in the kernel reservation and a later write does not enter
+    // userspace.
+    const drained = await waitUntil(() => pair.sup.bufferedBytes() === 0, 2_000);
+    assert.equal(drained, true, String(pair.sup.bufferedBytes()));
     assert.equal(pair.sup.caps.total, true);
     assert.equal(pair.sup.inputPaused, true);
     const queued = fionread(pair.sup.muxFd);
@@ -2472,7 +2474,7 @@ test('respawn keeps the old reservation until the stdout drain finishes', async 
     caps: {
       partial: 1024 * 1024,
       total: 1024 * 1024,
-      totalGlobal: reserved.perChild + reserved.muxReserve,
+      totalGlobal: reserved.perChild + reserved.muxReserve + pluginEnvBlock({}, 'echo').length,
     },
   });
   let held = null;
@@ -2650,6 +2652,23 @@ async function stopChild(pid) {
   }, 2_000);
 }
 
+// The wrapper must exec before SIGSTOP. Waiting here does not return to the
+// event loop, so the send-window grant stays unsent and the calls that follow
+// are still admitted in this turn.
+function waitForRuntime(pid) {
+  const nap = new Int32Array(new SharedArrayBuffer(4));
+  const deadline = Date.now() + 1_000;
+  while (Date.now() < deadline) {
+    try {
+      if (readFileSync(`/proc/${pid}/comm`, 'utf8').startsWith('node')) return true;
+    } catch {
+      return false;
+    }
+    Atomics.wait(nap, 0, 0, 5);
+  }
+  return false;
+}
+
 test('exit keeps one terminal error inside the full byte cap', async () => {
   const reserved = measureFlowReserve();
   assert.ok(reserved);
@@ -2676,8 +2695,10 @@ test('exit keeps one terminal error inside the full byte cap', async () => {
     pair.sup.spawn({ pluginId: 'other', script: echoPath });
     const echo = pair.sup.children.get('echo');
     const sibling = pair.sup.children.get('other');
-    // Stop and admit in this turn, before the send window is promised.
-    // A later call would have to fit beside that credit.
+    // The environment pipe is still in the sum until the wrapper reads it.
+    // Reach the runtime first, then stop and admit before the grant is sent.
+    assert.equal(waitForRuntime(sibling.child.pid), true);
+    assert.equal(waitForRuntime(kid.pid), true);
     process.kill(sibling.child.pid, 'SIGSTOP');
     process.kill(kid.pid, 'SIGSTOP');
     for (let i = 0; i < 6; i++) {
@@ -2731,8 +2752,10 @@ test('a terminal error is not queued when the sibling stash already fills the ca
     pair.sup.spawn({ pluginId: 'other', script: echoPath });
     const echo = pair.sup.children.get('echo');
     const sibling = pair.sup.children.get('other');
-    // Stop and admit in this turn, before the send window is promised.
-    // A later call would have to fit beside that credit.
+    // The environment pipe is still in the sum until the wrapper reads it.
+    // Reach the runtime first, then stop and admit before the grant is sent.
+    assert.equal(waitForRuntime(sibling.child.pid), true);
+    assert.equal(waitForRuntime(kid.pid), true);
     process.kill(sibling.child.pid, 'SIGSTOP');
     process.kill(kid.pid, 'SIGSTOP');
     for (let i = 0; i < 6; i++) {
@@ -3010,12 +3033,13 @@ test('a global hold probes a child that has no plugin bytes', async () => {
   const reserved = measureFlowReserve();
   assert.ok(reserved);
   const userspace = 64;
+  const envBytes = pluginEnvBlock({ FLOOD_MODE: 'silent' }, 'silent').length;
   const pair = await connectPair({
     sweeper: false,
     caps: {
       partial: 1024 * 1024,
       total: 1024 * 1024,
-      totalGlobal: reserved.perChild + reserved.muxReserve + userspace,
+      totalGlobal: reserved.perChild + reserved.muxReserve + userspace + envBytes,
     },
   });
   try {
@@ -3304,6 +3328,174 @@ test('fd 0 is a valid mux handle and a rejected mux closes both ends', async () 
   const { stdout } = await new Promise((resolve, reject) => {
     execFile(process.execPath, ['--input-type=module', '-e', script], {
       cwd: fileURLToPath(new URL('..', import.meta.url)),
+    }, (err, stdout, stderr) => {
+      if (err) reject(new Error(stderr || err.message));
+      else resolve({ stdout });
+    });
+  });
+  assert.match(stdout, /ok/);
+});
+
+test('plugin environment rejects a block the wrapper cannot finish reading', () => {
+  const base = pluginEnvBlock({}, 'echo');
+  const overhead = Buffer.byteLength('PAD=\0');
+  const under = PLUGIN_ENV_MAX - 1 - base.length - overhead;
+  assert.ok(under > 0);
+  const accepted = pluginEnvBlock({ PAD: 'x'.repeat(under) }, 'echo');
+  assert.equal(accepted.length, PLUGIN_ENV_MAX - 1);
+  assert.throws(
+    () => pluginEnvBlock({ PAD: 'x'.repeat(under + 1) }, 'echo'),
+    (err) => err.code === 'env-rejected' && accepted.length + 1 === PLUGIN_ENV_MAX,
+  );
+  assert.throws(
+    () => pluginEnvBlock({ PAD: 'x'.repeat(under + 2) }, 'echo'),
+    (err) => err.code === 'env-rejected',
+  );
+});
+
+test('the largest accepted environment block starts the plugin', async () => {
+  // One kernel string cannot reach the wrapper cap (MAX_ARG_STRLEN). Several
+  // short variables fill the block to exactly one byte under that cap.
+  const env = {};
+  for (let guard = 0; guard < 16; guard++) {
+    const len = pluginEnvBlock(env, 'echo').length;
+    const room = PLUGIN_ENV_MAX - 1 - len;
+    if (room === 0) break;
+    const key = `P${Object.keys(env).length}`;
+    const overhead = Buffer.byteLength(`${key}=\0`);
+    if (room < overhead) {
+      const last = Object.keys(env).at(-1);
+      env[last] = env[last].slice(0, -(overhead - room));
+      continue;
+    }
+    env[key] = 'x'.repeat(Math.min(100_000, room - overhead));
+  }
+  assert.equal(pluginEnvBlock(env, 'echo').length, PLUGIN_ENV_MAX - 1);
+  const pair = await connectPair({
+    sweeper: false,
+    caps: { partial: 1024 * 1024, total: 1024 * 1024, totalGlobal: 1024 * 1024 },
+  });
+  try {
+    const kid = pair.sup.spawn({
+      pluginId: 'echo',
+      script: echoPath,
+      env,
+      total: 1024 * 1024,
+    });
+    const res = await pair.stub.call({
+      pluginId: 'echo',
+      credential: kid.credential,
+      correlationId: 1,
+      port: 'db',
+      method: 'get',
+      payload: { ok: true },
+    }, 2_000);
+    assert.equal(res.payload?.ok, true);
+  } finally {
+    const proc = pair.sup.children.get('echo')?.child;
+    if (proc && proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL');
+    await pair.close();
+  }
+});
+
+test('a spawn burst reserves each unread environment pipe inside totalGlobal', async () => {
+  const reserved = measureFlowReserve();
+  assert.ok(reserved);
+  const pad = 'y'.repeat(32_000);
+  const block = pluginEnvBlock({ PAD: pad }, 'wide');
+  const slack = 8_192;
+  const total = reserved.perChild + slack;
+  const totalGlobal = reserved.muxReserve + 2 * reserved.perChild + block.length + slack;
+  const pair = await connectPair({
+    sweeper: false,
+    caps: { partial: 1024 * 1024, total, totalGlobal },
+  });
+  const stop = (id) => {
+    const proc = pair.sup.children.get(id)?.child;
+    if (proc && proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL');
+  };
+  try {
+    pair.sup.spawn({
+      pluginId: 'wide',
+      script: echoPath,
+      env: { PAD: pad },
+      total,
+    });
+    const held = pair.sup.bufferedBytes();
+    assert.ok(held >= block.length, String(held));
+    assert.throws(
+      () => pair.sup.spawn({
+        pluginId: 'other',
+        script: echoPath,
+        env: { PAD: pad },
+        total,
+      }),
+      (err) => err.code === 'spawn-rejected',
+    );
+    assert.equal(pair.sup.children.has('other'), false);
+    const released = await waitUntil(() => pair.sup.bufferedBytes() < block.length, 2_000);
+    assert.equal(released, true, String(pair.sup.bufferedBytes()));
+    pair.sup.spawn({
+      pluginId: 'other',
+      script: echoPath,
+      env: { PAD: pad },
+      total,
+    });
+    assert.equal(pair.sup.children.has('other'), true);
+  } finally {
+    stop('wide');
+    stop('other');
+    await pair.close();
+  }
+});
+
+test('respawn and close right after spawn do not wait for the group-kill fallback', async () => {
+  const script = `
+    import { performance } from 'node:perf_hooks';
+    import { fileURLToPath } from 'node:url';
+    import { connectPair } from './src/supervisor.mjs';
+    const echoPath = fileURLToPath(new URL('./src/children/echo.mjs', import.meta.url));
+    const real = process.kill.bind(process);
+    let armed = false;
+    let esrch = 0;
+    process.kill = (pid, signal) => {
+      if (armed && typeof pid === 'number' && pid < 0 && esrch < 1) {
+        esrch += 1;
+        const err = new Error('esrch');
+        err.code = 'ESRCH';
+        throw err;
+      }
+      return real(pid, signal);
+    };
+    const pair = await connectPair({ sweeper: false });
+    try {
+      const kid = pair.sup.spawn({ pluginId: 'echo', script: echoPath });
+      armed = true;
+      const t0 = performance.now();
+      const next = await pair.sup.respawn('echo');
+      const respawnMs = performance.now() - t0;
+      if (!(respawnMs < 1500)) throw new Error('respawn ' + respawnMs);
+      if (esrch !== 1) throw new Error('respawn esrch ' + esrch);
+      if (next.pid === kid.pid) throw new Error('same pid');
+      let dead = false;
+      try { real(kid.pid, 0); } catch { dead = true; }
+      if (!dead) throw new Error('leader still alive');
+      pair.sup.spawn({ pluginId: 'other', script: echoPath });
+      esrch = 0;
+      const t1 = performance.now();
+      await pair.close();
+      const closeMs = performance.now() - t1;
+      if (!(closeMs < 1500)) throw new Error('close ' + closeMs);
+      if (esrch !== 1) throw new Error('close esrch ' + esrch);
+      console.log('ok ' + Math.round(respawnMs) + ' ' + Math.round(closeMs));
+    } finally {
+      process.kill = real;
+    }
+  `;
+  const { stdout } = await new Promise((resolve, reject) => {
+    execFile(process.execPath, ['--input-type=module', '-e', script], {
+      cwd: fileURLToPath(new URL('..', import.meta.url)),
+      timeout: 15_000,
     }, (err, stdout, stderr) => {
       if (err) reject(new Error(stderr || err.message));
       else resolve({ stdout });

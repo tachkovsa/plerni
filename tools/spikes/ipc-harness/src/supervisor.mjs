@@ -13,6 +13,7 @@
 import { spawn } from 'node:child_process';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
+import { closeSync, writeSync } from 'node:fs';
 import { Socket } from 'node:net';
 import { MuxFramer, NdjsonFramer, MAX_RESIDUAL, encodeNdjson, encodeMux } from './framing.mjs';
 import { PendingTable, socketPair, KernelStub } from './kernel-stub.mjs';
@@ -25,6 +26,7 @@ import {
   createChildEnds,
   ensureSubreaper,
   fionread,
+  openEnvPipe,
   rcvbuf,
   reapGroup,
   siocoutq,
@@ -151,6 +153,10 @@ export function wrapperLaunchEnv() {
   return { PATH: process.env.PATH || '' };
 }
 
+// apply_fd_env grows to 256 KiB and then fails when len == cap, before the
+// read that would observe EOF. A block of that size is not readable.
+export const PLUGIN_ENV_MAX = 256 * 1024;
+
 export function pluginEnvBlock(specEnv, pluginId) {
   const entries = [];
   const push = (key, value) => {
@@ -164,7 +170,7 @@ export function pluginEnvBlock(specEnv, pluginId) {
   }
   push('PLERNI_PLUGIN_ID', envText(pluginId));
   const buf = Buffer.from(entries.join(''), 'utf8');
-  if (buf.length > 256 * 1024) {
+  if (buf.length >= PLUGIN_ENV_MAX) {
     const err = new Error('plugin environment does not fit the wrapper');
     err.code = 'env-rejected';
     throw err;
@@ -331,19 +337,36 @@ export class Supervisor {
       err.code = 'flow-unavailable';
       throw err;
     }
-    const flow = this.enforceFlow ? this.#openFlowEnds(limits) : null;
+    // Reject an unreadable block before any descriptor is opened.
+    const envBlock = pluginEnvBlock(spec.env, spec.pluginId);
+    const flow = this.enforceFlow ? this.#openFlowEnds(limits, envBlock.length) : null;
     if (this.enforceFlow && !flow) {
       const err = new Error('flow-control helper unavailable');
       err.code = 'flow-unavailable';
       throw err;
     }
+    const envEnds = openEnvPipe();
+    if (!envEnds) {
+      closeEnds(flow);
+      const err = new Error('environment pipe unavailable');
+      err.code = 'flow-unavailable';
+      throw err;
+    }
+    // fd 5 stays readable on `probe` after the write end closes, so the
+    // unread block remains inside bufferedBytes() until the wrapper reads it.
+    const envHold = {
+      bytes: envBlock.length,
+      // A synchronous burst still owes the block. The next turn counts only
+      // what the probe still shows, after the wrapper has had a chance to read.
+      settle: false,
+      probe: envEnds.probe,
+    };
     let child;
     try {
       // fd 2 is /dev/null. The wrapper sets the process group, NO_NEW_PRIVS,
-      // and the seccomp filter, then execs the runtime.
-      const envBlock = pluginEnvBlock(spec.env, spec.pluginId);
-      // fd 5 is the plugin environment. The wrapper reads it only after the
-      // filter is installed. fd 3 and fd 4 stay the sealed binaries.
+      // and the seccomp filter, then execs the runtime. fd 3 and fd 4 stay
+      // the sealed binaries. fd 5 is the plugin environment, read only after
+      // the filter is installed.
       child = spawn(this.wrapper, [process.execPath, spec.script], {
         stdio: [
           flow ? flow.childStdin : 'pipe',
@@ -351,16 +374,39 @@ export class Supervisor {
           'ignore',
           this.wrapperFd,
           this.undumpFd,
-          'pipe',
+          envEnds.readFd,
         ],
         env: wrapperLaunchEnv(),
       });
-      child.stdio[5].on('error', () => {});
-      child.stdio[5].end(envBlock);
+      closeFd(envEnds.readFd);
+      envEnds.readFd = -1;
+      // The bytes and EOF are in the kernel before spawn returns, so the
+      // wrapper is not waiting on the parent to finish the read.
+      let off = 0;
+      while (off < envBlock.length) {
+        const n = writeSync(envEnds.writeFd, envBlock, off, envBlock.length - off);
+        if (n <= 0) break;
+        off += n;
+      }
+      if (off !== envBlock.length) {
+        const err = new Error('plugin environment was not written');
+        err.code = 'env-rejected';
+        throw err;
+      }
+      closeSync(envEnds.writeFd);
+      envEnds.writeFd = -1;
     } catch (err) {
+      closeFd(envEnds.readFd);
+      closeFd(envEnds.writeFd);
+      closeFd(envEnds.probe);
+      envHold.probe = null;
+      if (child && child.exitCode == null && child.signalCode == null) {
+        try { child.kill('SIGKILL'); } catch { /* already gone */ }
+      }
       closeEnds(flow);
       throw err;
     }
+    setImmediate(() => { envHold.settle = true; });
     if (flow) {
       closeFd(flow.childStdin);
       closeFd(flow.childStdout);
@@ -421,6 +467,8 @@ export class Supervisor {
       // can still be in flight.
       refillQuiet: false,
       refillArmed: false,
+      envHold,
+      groupSignaled: false,
       exitDrain: false,
       exitFinished: false,
       exitDrainTimer: null,
@@ -455,7 +503,7 @@ export class Supervisor {
   // That rejection is unsatisfiable when the kernel terms alone do not fit.
   // A live process that is already too full is spawn-rejected, which is not
   // a B3 cap failure. K_mux_in + K_mux_out + C is reserved once for the process.
-  #openFlowEnds(limits) {
+  #openFlowEnds(limits, envBytes) {
     const ends = createChildEnds();
     if (!ends) return null;
     const muxReserve = this.#muxReserve();
@@ -473,10 +521,12 @@ export class Supervisor {
       err.code = 'unsatisfiable';
       throw err;
     }
-    // Empty kernel queues still owe K_in + K_out + C. Admit only when
-    // userspace bytes plus every live reservation, the new reservation, and
+    // Empty kernel queues still owe K_in + K_out + C. The fd 5 block is
+    // owed as well until the wrapper reads it. Admit only when userspace
+    // bytes, that block, every live reservation, the new reservation, and
     // the mux reservation fit in totalGlobal.
-    if (this.bufferedBytes() + already + reserve + muxReserve > this.capsConfig.totalGlobal) {
+    const owed = Number.isInteger(envBytes) && envBytes > 0 ? envBytes : 0;
+    if (this.bufferedBytes() + owed + already + reserve + muxReserve > this.capsConfig.totalGlobal) {
       closeEnds(ends);
       const err = new Error('flow reservation does not fit the live process');
       err.code = 'spawn-rejected';
@@ -720,8 +770,31 @@ export class Supervisor {
     for (const rec of this.children.values()) {
       if (rec.dead) continue;
       total += this.#stdoutBuffered(rec);
+      total += this.#envBuffered(rec);
     }
     return total;
+  }
+
+  // Unread bytes on the read-end probe. Through the end of the spawn turn
+  // the whole block stays reserved, so a synchronous burst cannot pass
+  // totalGlobal. After that, only bytes the wrapper has not read remain.
+  #envBuffered(rec) {
+    const hold = rec?.envHold;
+    if (!hold || !(hold.bytes > 0)) return 0;
+    const kernel = Number.isInteger(hold.probe) ? fionread(hold.probe) : null;
+    if (kernel == null) return hold.bytes;
+    if (!hold.settle) return Math.max(kernel, hold.bytes);
+    if (kernel === 0) return this.#clearEnv(rec);
+    return kernel;
+  }
+
+  #clearEnv(rec) {
+    const hold = rec?.envHold;
+    if (hold) hold.bytes = 0;
+    const probe = hold?.probe;
+    if (hold) hold.probe = null;
+    closeFd(probe);
+    return 0;
   }
 
   queueDepth(pluginId) {
@@ -1507,6 +1580,7 @@ export class Supervisor {
   }
 
   #releaseFlow(rec) {
+    this.#clearEnv(rec);
     this.#clearDrainTimer(rec);
     this.#disarmProbe(rec);
     if (Number.isInteger(rec.stdinProbe) && rec.stdinProbe >= 0) closeFd(rec.stdinProbe);
@@ -1890,13 +1964,34 @@ export class Supervisor {
     this.#settleExit(rec);
   }
 
-  // The plugin's pid is its process group. SIGKILL reaches a grandchild that
-  // joined the group. Reap runs after libuv has collected the leader.
+  // The plugin's pid is its process group once the wrapper has called
+  // setpgid. SIGKILL reaches a grandchild that joined the group. A kill
+  // before that call returns ESRCH; the flag stays clear so a later exit
+  // path can try the group again, and the leader is signaled directly so
+  // respawn and close do not wait out the exit fallback. Reap runs after
+  // libuv has collected the leader.
   #signalGroup(rec) {
     const pid = rec?.child?.pid;
     if (!Number.isInteger(pid) || pid <= 1 || rec.groupSignaled) return;
-    rec.groupSignaled = true;
-    try { process.kill(-pid, 'SIGKILL'); } catch { /* the group is already empty */ }
+    const first = this.#killGroup(pid);
+    if (first === 'ok') {
+      rec.groupSignaled = true;
+      return;
+    }
+    if (first !== 'esrch') return;
+    try { process.kill(pid, 'SIGKILL'); } catch { /* the leader is already gone */ }
+    if (this.#killGroup(pid) === 'ok') rec.groupSignaled = true;
+  }
+
+  // 'ok' is a delivered group signal. 'esrch' means setpgid has not run.
+  // Any other failure leaves the flag clear so the next path retries.
+  #killGroup(pid) {
+    try {
+      process.kill(-pid, 'SIGKILL');
+      return 'ok';
+    } catch (err) {
+      return err?.code === 'ESRCH' ? 'esrch' : 'error';
+    }
   }
 
   #reapGroup(rec) {
