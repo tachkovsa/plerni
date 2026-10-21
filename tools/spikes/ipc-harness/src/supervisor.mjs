@@ -1243,7 +1243,14 @@ export class Supervisor {
   //
   // bufferedBytes() plus send credit already granted to other live
   // children is one sum (#globalHeld). The child's own window is overlap
-  // on a further call, not a second copy of K_out. A stdout read is posted
+  // on a further call, not a second copy of K_out. A grant leaves one
+  // call free. After the child has spent some of that grant, bytes that
+  // land in the hole are pulled back out of this child's window
+  // (#releaseStaleWindow) before the next admission and before a parked
+  // call is promoted. A sibling window is not reduced. Generated
+  // rejection and terminal frames use #globalHeld(null), every live
+  // window, and are coalesced when they would spend that credit. A
+  // stdout read is posted
   // only when bufferedBytes() plus the bytes it will pull fit B_g. A
   // waiting read can pull C. A kernel queue shorter than C is only that
   // tail. The open window is not subtracted: the credit is not in
@@ -1311,6 +1318,7 @@ export class Supervisor {
       this.#reject(msg, 'pending-cap', true);
       return;
     }
+    this.#releaseStaleWindow(rec);
     // Payload has to leave room for one cancel of this correlation id and
     // one grant. A numeric-id cancel is smaller than a string id.
     // Unspent send credit is stdout the child may still write. The first
@@ -1696,6 +1704,28 @@ export class Supervisor {
     return Math.min(childRoom, globalRoom);
   }
 
+  // The largest window that still leaves one call free beside bytes
+  // already buffered and beside every other child's window. A noted
+  // admit cost can be a large response's request. Reserving that again
+  // would take the sibling's credit. The floor is the one call the grant
+  // always leaves.
+  #creditTarget(rec) {
+    const room = Math.max(0, this.#creditRoom(rec));
+    return Math.max(0, room - ADMIT_KEEP);
+  }
+
+  // A grant is not rewritten. Once the child has spent some of it, later
+  // bytes can land in the hole that grant left. Pull this child's window
+  // back to that hole. A sibling's window is untouched: that credit may
+  // still be written. A window that has not been spent is the grant the
+  // child is about to use, and it is not reduced.
+  #releaseStaleWindow(rec) {
+    if (!rec || rec.dead || !rec.flowOk) return;
+    if (!(rec.creditSent > rec.sendWindow)) return;
+    const target = this.#creditTarget(rec);
+    if (rec.sendWindow > target) rec.sendWindow = target;
+  }
+
   // One more call always stays outside the advertised window, and the
   // window itself stays inside B_g. A ceiling with room for a batch also
   // keeps that many calls beside the credit. A ceiling sized to a few
@@ -1978,6 +2008,7 @@ export class Supervisor {
       rec.childReads -= 1;
       if (rec.childReads === 0 && !rec.dead) {
         rec.inFlightTailBytes = 0;
+        this.#releaseStaleWindow(rec);
         this.#refillCredit(rec);
         this.#drainPark(rec);
       }
@@ -2802,9 +2833,9 @@ export class Supervisor {
       this.caps.total = true;
       return;
     }
-    // queuedBytes and socketOutbound omit the bridge and each live child's
-    // framer, outbound, identifiers, deferred replies, and stash.
-    if (this.bufferedBytes() + buf.length > this.#globalCap()) {
+    // Every live send window is credit a sibling may still write. A
+    // terminal frame that ignores it fills the cap the response needs.
+    if (this.#globalHeld(null) + buf.length > this.#globalCap()) {
       this.terminalCoalesced++;
       this.caps.total = true;
       return;
@@ -2864,16 +2895,17 @@ export class Supervisor {
       return;
     }
     // A live child's rejection used to skip both ceilings. One frame is kept
-    // only when it fits in B_t and in the process cap; the rest are coalesced.
+    // only when it fits in B_t and beside every live send window; the rest
+    // are coalesced so a sibling's credited response can still land.
     if (live) {
       const overChild = this.#pluginBytes(rec) + buf.length > this.#childCeiling(rec);
-      const overGlobal = this.bufferedBytes() + buf.length > this.#globalCap();
+      const overGlobal = this.#globalHeld(null) + buf.length > this.#globalCap();
       if (overChild || overGlobal) {
         this.caps.total = true;
         if (priority >= 10) rec.rejectsCoalesced++;
         return;
       }
-    } else if (this.bufferedBytes() + buf.length > this.#globalCap()) {
+    } else if (this.#globalHeld(null) + buf.length > this.#globalCap()) {
       this.caps.total = true;
       this.#pauseInput();
       return;

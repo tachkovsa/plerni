@@ -3227,6 +3227,11 @@ test('exit keeps one terminal error inside the full byte cap', async () => {
     const armed = await waitUntil(() => pair.sup.pending.size === 6, 2_000);
     assert.equal(armed, true);
     sibling.stash = Buffer.alloc(reserved.perChild);
+    // The grant belongs to the wide cap above. The tightened cap is the
+    // byte budget under test; a leftover window would be credit against
+    // a ceiling this case has already replaced.
+    echo.sendWindow = 0;
+    sibling.sendWindow = 0;
     pair.sup.capsConfig.totalGlobal = reserved.muxReserve + 2 * reserved.perChild + frameLen;
     process.kill(kid.pid, 'SIGKILL');
     const finished = await waitUntil(() => echo.exitFinished === true, 3_000);
@@ -3293,6 +3298,73 @@ test('a terminal error is not queued when the sibling stash already fills the ca
     assert.ok(pair.sup.terminalCoalesced >= 6, String(pair.sup.terminalCoalesced));
     assert.equal(pair.sup.terminal.length, 0);
     assert.ok(pair.sup.bufferedBytes() <= reserved.perChild, String(pair.sup.bufferedBytes()));
+  } finally {
+    await Promise.allSettled(calls);
+    await pair.close();
+  }
+});
+
+test('a terminal frame does not spend a sibling send window', async () => {
+  const reserved = measureFlowReserve();
+  assert.ok(reserved);
+  const frameLen = encodeMux({
+    kind: 'error',
+    code: 'child-exited',
+    for: 'call',
+    pluginId: 'echo',
+    correlationId: 1,
+    generation: 1,
+  }).length;
+  const pair = await connectPair({
+    sweeper: false,
+    caps: {
+      pending: 16,
+      partial: 1024 * 1024,
+      total: 1024 * 1024,
+      totalGlobal: 8 * 1024 * 1024,
+    },
+  });
+  const calls = [];
+  try {
+    const kid = pair.sup.spawn({ pluginId: 'echo', script: echoPath, pending: 16 });
+    pair.sup.spawn({ pluginId: 'other', script: echoPath });
+    const echo = pair.sup.children.get('echo');
+    const sibling = pair.sup.children.get('other');
+    assert.equal(waitForRuntime(sibling.child.pid), true);
+    assert.equal(waitForRuntime(kid.pid), true);
+    process.kill(sibling.child.pid, 'SIGSTOP');
+    process.kill(kid.pid, 'SIGSTOP');
+    for (let i = 0; i < 6; i++) {
+      calls.push(pair.stub.call({
+        pluginId: 'echo',
+        credential: kid.credential,
+        correlationId: i + 1,
+        port: 'db',
+        method: 'get',
+        payload: { i },
+      }, 800).catch((err) => err));
+    }
+    assert.equal(await stopChild(sibling.child.pid), true);
+    assert.equal(await stopChild(kid.pid), true);
+    const armed = await waitUntil(() => pair.sup.pending.size === 6, 2_000);
+    assert.equal(armed, true);
+    sibling.stash = Buffer.alloc(reserved.perChild);
+    // The wide-cap grant is not part of this budget. One frame of slack
+    // remains, and the sibling's send window is that slack.
+    echo.sendWindow = 0;
+    sibling.sendWindow = frameLen;
+    pair.sup.capsConfig.totalGlobal = reserved.muxReserve + 2 * reserved.perChild + frameLen;
+    process.kill(kid.pid, 'SIGKILL');
+    const finished = await waitUntil(() => echo.exitFinished === true, 3_000);
+    assert.equal(finished, true);
+    const settled = await Promise.all(calls);
+    assert.ok(settled.every((row) => row?.code === 'timeout'), JSON.stringify(settled.map((row) => row?.code)));
+    assert.ok(pair.sup.terminalCoalesced >= 6, String(pair.sup.terminalCoalesced));
+    assert.equal(pair.sup.terminal.length, 0);
+    assert.ok(
+      pair.sup.bufferedBytes() + sibling.sendWindow <= reserved.perChild + frameLen,
+      JSON.stringify({ buffered: pair.sup.bufferedBytes(), window: sibling.sendWindow }),
+    );
   } finally {
     await Promise.allSettled(calls);
     await pair.close();
@@ -3919,15 +3991,19 @@ test('parked calls leave a sibling send window usable', async () => {
     }
     const flooded = await waitUntil(() => {
       if (recB.parked.length > 0) holdPark(recB);
-      return rejections.length > 0;
+      return rejections.length + recB.rejectsCoalesced > 0;
     }, 2_000);
     assert.equal(flooded, true, JSON.stringify({
       parked: recB.parkedBytes,
       rejections: rejections.length,
       window: recA.sendWindow,
+      bWindow: recB.sendWindow,
       buffered: pair.sup.bufferedBytes(),
       globalCap,
+      coalesced: recB.rejectsCoalesced,
+      pending: pair.sup.pending.size,
     }));
+    assert.ok(recB.rejectsCoalesced > 0, String(recB.rejectsCoalesced));
     assert.ok(rejections.every((code) => code === 'total-cap'), JSON.stringify(rejections));
     assert.ok(
       pair.sup.bufferedBytes() + recA.sendWindow <= globalCap,
@@ -4007,6 +4083,16 @@ function assertAccountingInvariants(sup, rec) {
     admitKeep: rec.admitKeep,
     floor: rec.admitFloor,
     live,
+  }));
+  let windows = 0;
+  for (const child of sup.children.values()) {
+    if (child.dead || !child.flowOk || !(child.sendWindow > 0)) continue;
+    windows += child.sendWindow;
+  }
+  assert.ok(sup.bufferedBytes() + windows <= globalCap, JSON.stringify({
+    buffered: sup.bufferedBytes(),
+    windows,
+    globalCap,
   }));
 }
 
@@ -4556,6 +4642,167 @@ test('a stdout read stays inside the cap while send credit is open', { timeout: 
   } finally {
     const proc = pair.sup.children.get('wide')?.child;
     if (proc && proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL');
+    await pair.close();
+  }
+});
+
+test('calls beside a full send window are admitted for both children', async () => {
+  const pair = await connectPair({
+    sweeper: false,
+    caps: { pending: 64, total: 8 * 1024 * 1024 },
+  });
+  try {
+    const kids = [0, 1].map((n) => pair.sup.spawn({ pluginId: `echo-${n}`, script: echoPath }));
+    // One completed call spends the grant. Later calls then see the hole
+    // the grant left, which is the steady state of a throughput run.
+    for (const kid of kids) {
+      const primed = await pair.stub.call({
+        pluginId: kid.credential.pluginId,
+        credential: kid.credential,
+        correlationId: 1,
+        port: 'db',
+        method: 'get',
+        payload: 'x'.repeat(1024),
+      }, 3_000).catch((err) => err);
+      assert.equal(primed.payload, 'x'.repeat(1024), primed.code);
+    }
+    const calls = [];
+    for (let n = 0; n < 40; n++) {
+      const kid = kids[n % 2];
+      calls.push(pair.stub.call({
+        pluginId: kid.credential.pluginId,
+        credential: kid.credential,
+        correlationId: n + 10,
+        port: 'db',
+        method: 'get',
+        payload: 'x'.repeat(1024),
+      }, 3_000).catch((err) => err));
+    }
+    const results = await Promise.all(calls);
+    const codes = {};
+    for (const row of results) {
+      const code = row?.code || (row?.payload === 'x'.repeat(1024) ? 'ok' : 'other');
+      codes[code] = (codes[code] || 0) + 1;
+    }
+    assert.equal(codes.ok, 40, JSON.stringify(codes));
+    for (const id of ['echo-0', 'echo-1']) {
+      assertAccountingInvariants(pair.sup, pair.sup.children.get(id));
+    }
+  } finally {
+    for (const rec of pair.sup.children.values()) {
+      if (rec.child.exitCode == null && rec.child.signalCode == null) rec.child.kill('SIGKILL');
+    }
+    await pair.close();
+  }
+});
+
+test('a rejection frame does not spend a sibling send window', async () => {
+  const totalGlobal = 100_000;
+  const pad = 16_000;
+  const pair = await connectPair({
+    sweeper: false,
+    caps: { partial: 1024 * 1024, total: 1024 * 1024, totalGlobal },
+  });
+  try {
+    const kid = pair.sup.spawn({
+      pluginId: 'wide',
+      script: responsePath,
+      env: { RESPONSE_PAD: String(pad) },
+      total: 1024 * 1024,
+    });
+    const other = pair.sup.spawn({ pluginId: 'echo', script: echoPath, total: 1024 * 1024 });
+    const recA = pair.sup.children.get('wide');
+    const recB = pair.sup.children.get('echo');
+    const granted = await waitUntil(
+      () => recA.grantSettled && recA.outbound === 0 && recA.sendWindow > 0,
+      2_000,
+    );
+    assert.equal(granted, true, String(recA.sendWindow));
+    const globalCap = totalGlobal
+      - (recA.kIn + recA.kOut + pair.sup.readBytes)
+      - (recB.kIn + recB.kOut + pair.sup.readBytes)
+      - (pair.sup.kMuxIn + pair.sup.kMuxOut + pair.sup.readBytes);
+    const lineBytes = Buffer.byteLength(encodeNdjson({
+      kind: 'result',
+      correlationId: 1,
+      payload: 'p'.repeat(pad),
+    }));
+    assert.ok(recA.sendWindow >= lineBytes, `${recA.sendWindow} < ${lineBytes}`);
+    // The echo child would answer before the duplicate calls are issued.
+    // Stopped, the anchor stays pending and those duplicates are rejections.
+    assert.equal(waitForRuntime(recB.child.pid), true);
+    assert.equal(await stopChild(recB.child.pid), true);
+    const anchor = pair.stub.call({
+      pluginId: 'echo',
+      credential: other.credential,
+      correlationId: 1,
+      port: 'db',
+      method: 'get',
+      payload: { n: 1 },
+    }, 3_000).catch((err) => err);
+    const armed = await waitUntil(
+      () => pair.sup.pending.has('echo', 1, 'call') && recB.outbound === 0 && !recA.refillArmed && !recB.refillArmed,
+      1_000,
+    );
+    assert.equal(armed, true);
+    // The grant follow clamps the window back to the free room. Let that
+    // follow finish, then reserve the whole userspace cap as send credit.
+    await delay(30);
+    recB.sendWindow = 0;
+    recA.sendWindow = Math.max(0, globalCap - pair.sup.bufferedBytes());
+    assert.ok(recA.sendWindow > lineBytes, `${recA.sendWindow} < ${lineBytes}`);
+    const write = pair.sup.socket.write.bind(pair.sup.socket);
+    pair.sup.socket.write = () => false;
+    const before = pair.sup.queuedBytes + pair.sup.socketOutbound;
+    const heldWindow = recA.sendWindow;
+    // The kernel stub rejects a repeated id locally. These frames are the
+    // supervisor's own duplicate path, which is what emits the rejection.
+    const dup = encodeMux({
+      kind: 'call',
+      pluginId: 'echo',
+      correlationId: 1,
+      credential: other.credential,
+      port: 'db',
+      method: 'get',
+      payload: { n: 1 },
+      timeoutMs: 1_000,
+      sendTs: performance.now(),
+    });
+    for (let n = 0; n < 30; n++) pair.stub.socket.write(dup);
+    const coalesced = await waitUntil(() => recB.rejectsCoalesced > 0, 1_000);
+    const rejectionBytes = pair.sup.queuedBytes + pair.sup.socketOutbound - before;
+    assert.equal(coalesced, true, JSON.stringify({
+      coalesced: recB.rejectsCoalesced,
+      buffered: pair.sup.bufferedBytes(),
+      window: recA.sendWindow,
+      heldWindow,
+      globalCap,
+      rejectionBytes,
+      total: pair.sup.caps.total,
+    }));
+    assert.equal(recA.sendWindow, heldWindow);
+    assert.ok(pair.sup.bufferedBytes() + recA.sendWindow <= globalCap);
+    pair.sup.socket.write = write;
+    pair.sup.socket.emit('drain');
+    const response = await pair.stub.call({
+      pluginId: 'wide',
+      credential: kid.credential,
+      correlationId: 7,
+      port: 'db',
+      method: 'get',
+      payload: { n: 7 },
+    }, 3_000).catch((err) => err);
+    assert.equal(response.payload?.length, pad, JSON.stringify({
+      code: response.code,
+      pause: recA.pauseReason,
+      buffered: pair.sup.bufferedBytes(),
+      window: recA.sendWindow,
+    }));
+    anchor.catch(() => {});
+  } finally {
+    for (const rec of pair.sup.children.values()) {
+      if (rec.child.exitCode == null && rec.child.signalCode == null) rec.child.kill('SIGKILL');
+    }
     await pair.close();
   }
 });
