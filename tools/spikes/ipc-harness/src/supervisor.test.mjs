@@ -22,6 +22,7 @@ import { join } from 'node:path';
 
 const echoPath = fileURLToPath(new URL('./children/echo.mjs', import.meta.url));
 const creditPath = fileURLToPath(new URL('./children/credit-wait.mjs', import.meta.url));
+const responsePath = fileURLToPath(new URL('./children/credit-response.mjs', import.meta.url));
 const floodPath = fileURLToPath(new URL('./children/flood.mjs', import.meta.url));
 const ignorePath = fileURLToPath(new URL('./children/ignore-cancel.mjs', import.meta.url));
 const validEnv = () => ({ valid: true, throttled: false, overloaded: false, cpus: 1, load: 0, cpuUnlimited: true });
@@ -2602,7 +2603,15 @@ test('a parked reply releases its identifiers and stays inside the caps', async 
     const idBytes = rec.idBytes;
     assert.ok(idBytes >= 16, String(idBytes));
     const slack = Math.floor(idBytes / 2);
-    rec.loBytes = rec.bT - measured + slack - idBytes;
+    // A send-credit refill may already be queued. Those bytes are charged
+    // beside the low-priority frame, so the synthetic load has to leave room
+    // for them. The slack is still only half the identifiers: the reply fits
+    // once parking releases them, and it would not fit if they stayed.
+    const charged = pair.sup.queueDepth('echo').pluginBytes;
+    const other = charged - rec.loBytes - idBytes;
+    assert.ok(other >= 0, String(other));
+    rec.loBytes = rec.bT - measured + slack - idBytes - other;
+    assert.ok(rec.loBytes >= 0, String(rec.loBytes));
     rec.paused = false;
     rec.pauseReason = null;
     rec.child.stdout.emit('data', Buffer.from(encodeNdjson({
@@ -2895,6 +2904,237 @@ test('payload stops before the stdin reserve for a cancel and a grant', async ()
       correlationId: 4,
     }, 2_000);
     assert.equal(cancel.kind, 'cancelled');
+  } finally {
+    await pair.close();
+  }
+});
+
+test('a timed-out call or cancel is dropped before the blocked stdin write resumes', async () => {
+  const pair = await connectPair({ sweeper: false });
+  try {
+    const kid = pair.sup.spawn({ pluginId: 'credit', script: creditPath });
+    const rec = pair.sup.children.get('credit');
+    const seen = [];
+    let held = null;
+    rec.child.stdin.write = (chunk, cb) => {
+      seen.push(String(chunk));
+      if (held == null) {
+        held = cb;
+        return false;
+      }
+      if (typeof cb === 'function') cb();
+      return true;
+    };
+    const granted = await waitUntil(() => seen.length === 1, 2_000);
+    assert.equal(granted, true);
+    const expiredCall = pair.stub.call({
+      pluginId: 'credit',
+      credential: kid.credential,
+      correlationId: 1,
+      port: 'db',
+      method: 'get',
+      payload: { id: 1 },
+    }, 150).catch((err) => err);
+    const expiredCancel = pair.stub.cancel({
+      pluginId: 'credit',
+      credential: kid.credential,
+      correlationId: 1,
+    }, 150).catch((err) => err);
+    const live = pair.stub.call({
+      pluginId: 'credit',
+      credential: kid.credential,
+      correlationId: 2,
+      port: 'db',
+      method: 'get',
+      payload: { id: 2 },
+    }, 2_000).catch((err) => err);
+    const queued = await waitUntil(
+      () => rec.stdinPayload.length === 2 && rec.stdinControl.length === 1,
+      1_000,
+    );
+    assert.equal(queued, true, `payload ${rec.stdinPayload.length} control ${rec.stdinControl.length}`);
+    const dropped = await waitUntil(
+      () => rec.stdinPayload.length === 1 && rec.stdinControl.length === 0 && rec.stdinPayload[0].correlationId === 2,
+      1_000,
+    );
+    assert.equal(dropped, true, `payload ${rec.stdinPayload.map((entry) => entry.correlationId)} control ${rec.stdinControl.length}`);
+    assert.equal(seen.length, 1);
+    const release = held;
+    held = () => {};
+    release();
+    const written = await waitUntil(() => seen.length >= 2, 1_000);
+    assert.equal(written, true, String(seen.length));
+    const kinds = seen.map((line) => JSON.parse(line));
+    assert.deepEqual(kinds.map((msg) => msg.kind), ['grant', 'call']);
+    assert.equal(kinds[1].correlationId, 2);
+    await Promise.allSettled([expiredCall, expiredCancel, live]);
+  } finally {
+    await pair.close();
+  }
+});
+
+test('a global hold probes a child that has no plugin bytes', async () => {
+  const reserved = measureFlowReserve();
+  assert.ok(reserved);
+  const userspace = 64;
+  const pair = await connectPair({
+    sweeper: false,
+    caps: {
+      partial: 1024 * 1024,
+      total: 1024 * 1024,
+      totalGlobal: reserved.perChild + reserved.muxReserve + userspace,
+    },
+  });
+  try {
+    pair.sup.spawn({
+      pluginId: 'silent',
+      script: floodPath,
+      env: { FLOOD_MODE: 'silent' },
+      total: 1024 * 1024,
+    });
+    const rec = pair.sup.children.get('silent');
+    const held = await waitUntil(
+      () => rec.readHeld === true && rec.paused === false && rec.outbound === 0,
+      2_000,
+    );
+    assert.equal(held, true, JSON.stringify({
+      readHeld: rec.readHeld,
+      paused: rec.paused,
+      outbound: rec.outbound,
+    }));
+    const real = pair.sup.flowPending;
+    const marked = Date.now();
+    pair.sup.flowPending = (fd) => (fd === rec.stdoutFd ? rec.kIn + 1 : real(fd));
+    const faulted = await waitUntil(
+      () => pair.sup.faults.some((fault) => fault.pluginId === 'silent' && fault.stdoutUnread > fault.kIn),
+      500,
+    );
+    const elapsed = Date.now() - marked;
+    assert.equal(faulted, true, JSON.stringify(pair.sup.faults));
+    assert.ok(elapsed < 100, String(elapsed));
+    const fault = pair.sup.faults.find((row) => row.pluginId === 'silent');
+    assert.equal(fault.code, 'thread-writer');
+    assert.equal(rec.dead, true);
+  } finally {
+    await pair.close();
+  }
+});
+
+test('a call leaves room for a cancel of its own correlation id', async () => {
+  const reserved = measureFlowReserve();
+  assert.ok(reserved);
+  const minimum = stdinControlReserve();
+  const correlationId = 'c'.repeat(180);
+  const longCancel = Buffer.byteLength(encodeNdjson({ kind: 'cancel', correlationId }));
+  const numericCancel = minimum.cancel;
+  assert.ok(longCancel > numericCancel);
+  const smallCall = Buffer.byteLength(encodeNdjson({
+    kind: 'call',
+    correlationId: 1,
+    port: 'db',
+    method: 'get',
+    payload: { ok: true },
+  }));
+  const longCall = Buffer.byteLength(encodeNdjson({
+    kind: 'call',
+    correlationId,
+    port: 'db',
+    method: 'get',
+    payload: { ok: true },
+  }));
+  const numericLimit = reserved.kOut - smallCall - minimum.total;
+  const longLimit = reserved.kOut - longCall - minimum.grant - longCancel;
+  assert.ok(numericLimit > longLimit, `${numericLimit} vs ${longLimit}`);
+  const pair = await connectPair({
+    sweeper: false,
+    caps: { partial: 1024 * 1024, total: 1024 * 1024, totalGlobal: 8 * 1024 * 1024 },
+  });
+  try {
+    const kid = pair.sup.spawn({
+      pluginId: 'silent',
+      script: floodPath,
+      env: { FLOOD_MODE: 'silent' },
+      total: 1024 * 1024,
+    });
+    const rec = pair.sup.children.get('silent');
+    const flushed = await waitUntil(() => rec.creditSent > 0 && rec.outbound === 0, 2_000);
+    assert.equal(flushed, true);
+    const real = pair.sup.flowPending;
+    // Room for a numeric-id call plus the numeric cancel and a grant.
+    // The longer correlation id's cancel does not fit in that hole.
+    pair.sup.flowPending = (fd) => (fd === rec.stdinProbe ? numericLimit : real(fd));
+    const rejected = await pair.stub.call({
+      pluginId: 'silent',
+      credential: kid.credential,
+      correlationId,
+      port: 'db',
+      method: 'get',
+      payload: { ok: true },
+    }, 1_000).catch((err) => err);
+    assert.equal(rejected.code, 'total-cap');
+    assert.equal(pair.sup.pending.has('silent', correlationId, 'call'), false);
+    const admitted = pair.stub.call({
+      pluginId: 'silent',
+      credential: kid.credential,
+      correlationId: 1,
+      port: 'db',
+      method: 'get',
+      payload: { ok: true },
+    }, 1_000).catch((err) => err);
+    const armed = await waitUntil(() => pair.sup.pending.has('silent', 1, 'call'), 1_000);
+    assert.equal(armed, true);
+    admitted.catch(() => {});
+  } finally {
+    await pair.close();
+  }
+});
+
+test('send credit refills after a large response is consumed', { timeout: 10_000 }, async () => {
+  const reserved = measureFlowReserve();
+  assert.ok(reserved);
+  const pad = 3000;
+  const lineBytes = Buffer.byteLength(encodeNdjson({
+    kind: 'result',
+    correlationId: 1,
+    payload: 'p'.repeat(pad),
+  }));
+  const bT = lineBytes + 2048;
+  assert.ok(lineBytes <= bT);
+  assert.ok(lineBytes * 2 > bT);
+  const total = bT + reserved.kIn + reserved.kOut + reserved.readBytes;
+  const pair = await connectPair({
+    sweeper: false,
+    caps: {
+      partial: 1024 * 1024,
+      total,
+      totalGlobal: total + reserved.perChild + reserved.muxReserve,
+    },
+  });
+  try {
+    const kid = pair.sup.spawn({
+      pluginId: 'wide',
+      script: responsePath,
+      env: { RESPONSE_PAD: String(pad) },
+      total,
+    });
+    const first = await pair.stub.call({
+      pluginId: 'wide',
+      credential: kid.credential,
+      correlationId: 1,
+      port: 'db',
+      method: 'get',
+      payload: { n: 1 },
+    }, 3_000);
+    assert.equal(first.payload.length, pad);
+    const second = await pair.stub.call({
+      pluginId: 'wide',
+      credential: kid.credential,
+      correlationId: 2,
+      port: 'db',
+      method: 'get',
+      payload: { n: 2 },
+    }, 3_000);
+    assert.equal(second.payload.length, pad);
   } finally {
     await pair.close();
   }

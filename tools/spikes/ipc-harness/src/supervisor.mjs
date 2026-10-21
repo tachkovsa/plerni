@@ -374,7 +374,9 @@ export class Supervisor {
       stdinPayload: [],
       stdinWriting: false,
       creditSent: 0,
-      payloadAdmitted: 0,
+      // Bytes the child may still write. Grants raise it. Stdout reads lower
+      // it. Consumed output refills it up to the free part of B_t.
+      sendWindow: 0,
       stash: null,
       inFlightTailBytes: 0,
       hiBytes: 0,
@@ -388,6 +390,9 @@ export class Supervisor {
       exited: false,
       paused: false,
       pauseReason: null,
+      // The global gate withheld a read without pausing. The probe still has
+      // to see stdoutUnread > K_in.
+      readHeld: false,
       exitCode: null,
       rejectQueued: false,
       rejectsCoalesced: 0,
@@ -511,7 +516,10 @@ export class Supervisor {
     // 'data' event is how tests inject bytes. Pause before the next turn so
     // the first read is the gated one.
     stdout.pause();
-    stdout.on('data', (chunk) => this.#onChild(rec, chunk));
+    stdout.on('data', (chunk) => {
+      this.#takeStdout(rec, chunk.length);
+      this.#onChild(rec, chunk);
+    });
     rec.child.stdout = stdout;
     rec.child.stdin = stdin;
     rec.stdoutSocket = stdout;
@@ -531,6 +539,7 @@ export class Supervisor {
       }
       if (typeof nread === 'number' && nread > 0) {
         const chunk = Buffer.from(buf.subarray(0, nread));
+        this.#takeStdout(rec, nread);
         this.#onChild(rec, chunk);
       }
       // Exit drain keeps reading until EOF. A budget pause here would leave
@@ -590,9 +599,14 @@ export class Supervisor {
       return false;
     }
     if (this.bufferedBytes() + this.readBytes > this.#globalCap()) {
+      // A child with nothing in userspace is still held. Pausing it would
+      // wait for bytes it does not have; the probe has to run anyway.
       if (this.#pluginBytes(rec) > 0) this.#pause(rec, 'global');
+      else this.#armProbe(rec);
+      rec.readHeld = true;
       return false;
     }
+    rec.readHeld = false;
     return true;
   }
 
@@ -898,7 +912,7 @@ export class Supervisor {
         return;
       }
       this.#arm(rec, msg, { cancel: true, bytes, idBytes, ingressTs });
-      this.#enqueueStdin(rec, line, bytes, 'control');
+      this.#enqueueStdin(rec, line, bytes, 'cancel', msg.correlationId);
       return;
     }
     const line = encodeNdjson({
@@ -915,35 +929,34 @@ export class Supervisor {
       this.#reject(msg, 'pending-cap', true);
       return;
     }
-    // Payload has to leave room for one cancel and one grant, in userspace
-    // and in the stdin queue. Those two are written ahead of this line.
-    if (this.#overBudget(rec, bytes + idBytes, bytes, CONTROL_RESERVE.total)) {
-      this.caps.total = true;
-      this.#reject(msg, 'total-cap', true);
-      return;
-    }
-    if (!this.#reserveCredit(rec, bytes)) {
+    // Payload has to leave room for one cancel of this correlation id and
+    // one grant. A numeric-id cancel is smaller than a string id.
+    const cancelReserve = this.#maxCancelBytes(rec, msg.correlationId);
+    if (this.#overBudget(rec, bytes + idBytes, bytes, CONTROL_RESERVE.grant + cancelReserve)) {
       this.caps.total = true;
       this.#reject(msg, 'total-cap', true);
       return;
     }
     this.#arm(rec, msg, { cancel: false, bytes, idBytes, ingressTs });
-    this.#enqueueStdin(rec, line, bytes, 'payload');
+    this.#enqueueStdin(rec, line, bytes, 'call', msg.correlationId);
   }
 
-  // Control frames do not consume the child's request credit. Payload does.
-  // A grant is queued ahead of payload when the credit already sent would
-  // not cover this write.
-  #reserveCredit(rec, payloadBytes) {
-    if (rec.payloadAdmitted + payloadBytes <= rec.creditSent) {
-      rec.payloadAdmitted += payloadBytes;
-      return true;
+  // The largest cancel still owed for this child. The reserved hole has to
+  // fit that frame, not the numeric-id sample.
+  #maxCancelBytes(rec, alsoId) {
+    let max = CONTROL_RESERVE.cancel;
+    const consider = (correlationId) => {
+      const n = Buffer.byteLength(encodeNdjson({ kind: 'cancel', correlationId }));
+      if (n > max) max = n;
+    };
+    if (alsoId !== undefined) consider(alsoId);
+    for (const pending of this.pending.values()) {
+      if (pending.cancel) continue;
+      if (!Object.is(pending.pluginId, rec.credential.pluginId)) continue;
+      if (pending.generation !== rec.credential.generation) continue;
+      consider(pending.correlationId);
     }
-    const room = Math.max(payloadBytes, this.#childCeiling(rec) - rec.creditSent);
-    const credit = Math.max(1, Math.min(2147483647, room));
-    if (!this.#queueGrant(rec, credit)) return false;
-    rec.payloadAdmitted += payloadBytes;
-    return true;
+    return max;
   }
 
   #queueGrant(rec, credit) {
@@ -951,18 +964,52 @@ export class Supervisor {
     const line = encodeNdjson({ kind: 'grant', credit });
     const bytes = Buffer.byteLength(line);
     if (bytes > CONTROL_RESERVE.grant) return false;
-    if (this.#overBudget(rec, bytes, bytes, CONTROL_RESERVE.cancel)) return false;
-    this.#enqueueStdin(rec, line, bytes, 'control');
+    if (this.#overBudget(rec, bytes, bytes, this.#maxCancelBytes(rec))) return false;
+    this.#enqueueStdin(rec, line, bytes, 'grant');
     rec.creditSent += credit;
+    rec.sendWindow += credit;
     return true;
   }
 
-  #enqueueStdin(rec, line, bytes, lane) {
-    const entry = { line, bytes };
-    if (lane === 'control') rec.stdinControl.push(entry);
-    else rec.stdinPayload.push(entry);
+  // Stdout bytes spend the send window. The refill below gives them back
+  // only once those bytes are no longer held in the child's budget.
+  #takeStdout(rec, n) {
+    if (!Number.isInteger(n) || n <= 0 || rec.dead) return;
+    rec.sendWindow = Math.max(0, rec.sendWindow - n);
+  }
+
+  #refillCredit(rec) {
+    if (rec.dead || this.closed || !rec.flowOk) return;
+    const room = this.#childCeiling(rec) - this.#pluginBytes(rec);
+    if (room <= rec.sendWindow) return;
+    const credit = Math.min(2147483647, room - rec.sendWindow);
+    this.#queueGrant(rec, credit);
+  }
+
+  #enqueueStdin(rec, line, bytes, lane, correlationId) {
+    const entry = { line, bytes, lane, correlationId: correlationId ?? null };
+    if (lane === 'call') rec.stdinPayload.push(entry);
+    else rec.stdinControl.push(entry);
     rec.outbound += bytes;
     this.#writeStdin(rec);
+  }
+
+  // A timed-out operation is still in the queue when the write that blocked
+  // it has not been handed to the kernel. Sending it after the unblock would
+  // run a call the caller was already told had failed.
+  #dropUnsent(rec, correlationId, lane) {
+    let released = 0;
+    const keep = (queue) => {
+      const next = [];
+      for (const entry of queue) {
+        if (entry.lane === lane && Object.is(entry.correlationId, correlationId)) released += entry.bytes;
+        else next.push(entry);
+      }
+      return next;
+    };
+    rec.stdinControl = keep(rec.stdinControl);
+    rec.stdinPayload = keep(rec.stdinPayload);
+    if (released > 0) this.#releaseOutbound(rec, released);
   }
 
   // One write at a time. Control frames already queued jump ahead of payload
@@ -1079,6 +1126,9 @@ export class Supervisor {
     } else {
       this.callPendingTotal--;
     }
+    // The stdin line may still be sitting behind a blocked write. The
+    // operation is no longer pending, so that line must not be sent.
+    if (same) this.#dropUnsent(rec, correlationId, lane);
     this.#maybeResumeAll();
     return pending;
   }
@@ -1149,7 +1199,10 @@ export class Supervisor {
         rec.inFlightTailBytes = 0;
       }
     } finally {
-      if (!rec.dead) rec.inFlightTailBytes = 0;
+      if (!rec.dead) {
+        rec.inFlightTailBytes = 0;
+        this.#refillCredit(rec);
+      }
     }
   }
 
@@ -1392,8 +1445,9 @@ export class Supervisor {
         return;
       }
       this.#noteStdinCeiling(rec);
-      // A paused socket emits no read. The timer is the probe that still runs.
-      if (!rec.paused) return;
+      // A paused socket emits no read. A global hold with nothing in
+      // userspace never pauses, so the same timer has to see that child too.
+      if (!rec.paused && !rec.readHeld) return;
       this.#noteOverrun(rec);
     }, PROBE_INTERVAL_MS);
   }
@@ -1505,6 +1559,9 @@ export class Supervisor {
     }
     for (const rec of this.children.values()) {
       if (!rec.dead && rec.flowOk && !rec.paused) this.#considerRead(rec);
+    }
+    for (const rec of this.children.values()) {
+      if (!rec.dead && rec.flowOk) this.#refillCredit(rec);
     }
   }
 
