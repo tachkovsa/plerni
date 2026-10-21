@@ -1428,6 +1428,146 @@ test('a parked call is not sent after its caller times out', { timeout: 10_000 }
   }
 });
 
+test('a parked call stays queued when its cancel times out', { timeout: 10_000 }, async () => {
+  const pair = await connectPair({
+    sweeper: false,
+    caps: { pending: 64, total: 8 * 1024 * 1024 },
+  });
+  try {
+    const kid = pair.sup.spawn({
+      pluginId: 'echo',
+      script: echoPath,
+      pending: 64,
+      total: 8 * 1024 * 1024,
+    });
+    const rec = pair.sup.children.get('echo');
+    const granted = await waitUntil(() => rec.creditSent > 0 && rec.outbound === 0, 2_000);
+    assert.equal(granted, true, String(rec.creditSent));
+    let releaseWrite = null;
+    const stdin = rec.child.stdin;
+    const orig = stdin.write.bind(stdin);
+    // The filler reaches the kernel, and the supervisor callback stays held
+    // so a later cancel cannot skip ahead of that write.
+    stdin.write = (chunk, enc, cb) => {
+      const done = typeof enc === 'function' ? enc : cb;
+      if (releaseWrite == null) {
+        orig(chunk, () => {});
+        releaseWrite = () => {
+          if (typeof done === 'function') done();
+        };
+        return false;
+      }
+      return orig(chunk, enc, cb);
+    };
+    assert.equal(await stopChild(rec.child.pid), true);
+    // The filler occupies the single stdin write. The victim fits in K_out on
+    // its own, and misses once the filler is still charged, so it parks. A
+    // cancel is smaller than that slack and is accepted.
+    const fillerId = 'filler-blocked';
+    const victimId = 'parked-cancel';
+    const fillerPayload = { n: 1 };
+    const fillerBytes = Buffer.byteLength(encodeNdjson({
+      kind: 'call',
+      correlationId: fillerId,
+      port: 'db',
+      method: 'get',
+      payload: fillerPayload,
+    }));
+    const reserve = stdinControlReserve();
+    const cancelBytes = (id) => Buffer.byteLength(encodeNdjson({ kind: 'cancel', correlationId: id }));
+    // The parked call reserves the largest cancel still owed, including the
+    // filler's id, not only its own.
+    const callReserve = reserve.grant + Math.max(reserve.cancel, cancelBytes(victimId), cancelBytes(fillerId));
+    const victimLine = (pad) => encodeNdjson({
+      kind: 'call',
+      correlationId: victimId,
+      port: 'db',
+      method: 'get',
+      payload: { n: 7, pad },
+    });
+    let lo = 0;
+    let hi = rec.kOut;
+    let pad = '';
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      const candidate = 'y'.repeat(mid);
+      if (Buffer.byteLength(victimLine(candidate)) + callReserve <= rec.kOut) {
+        pad = candidate;
+        lo = mid + 1;
+      } else {
+        hi = mid - 1;
+      }
+    }
+    const victimBytes = Buffer.byteLength(victimLine(pad));
+    assert.ok(victimBytes + callReserve <= rec.kOut, `${victimBytes} reserve ${callReserve} kOut ${rec.kOut}`);
+    assert.ok(
+      victimBytes + callReserve + fillerBytes > rec.kOut,
+      `${victimBytes} + ${fillerBytes} vs ${rec.kOut}`,
+    );
+    const filler = pair.stub.call({
+      pluginId: 'echo',
+      credential: kid.credential,
+      correlationId: fillerId,
+      port: 'db',
+      method: 'get',
+      payload: fillerPayload,
+    }, 8_000).catch((err) => err);
+    const victim = pair.stub.call({
+      pluginId: 'echo',
+      credential: kid.credential,
+      correlationId: victimId,
+      port: 'db',
+      method: 'get',
+      payload: { n: 7, pad },
+    }, 8_000);
+    const saw = await waitUntil(() => {
+      const parked = rec.parked.some((entry) => entry.msg.correlationId === victimId);
+      if (parked) holdPark(rec);
+      return parked && rec.stdinWriting && pair.sup.pending.has('echo', victimId, 'call');
+    }, 1_000);
+    assert.equal(saw, true, JSON.stringify({
+      parked: rec.parked.map((entry) => entry.msg.correlationId),
+      writing: rec.stdinWriting,
+      outbound: rec.outbound,
+      kOut: rec.kOut,
+      pending: pair.sup.pending.has('echo', victimId, 'call'),
+      queued: rec.stdinPayload.length,
+    }));
+    const cancel = await pair.stub.cancel({
+      pluginId: 'echo',
+      credential: kid.credential,
+      correlationId: victimId,
+    }, 200).catch((err) => err);
+    assert.equal(cancel.code, 'timeout', JSON.stringify({ code: cancel?.code, kind: cancel?.kind }));
+    const expired = await waitUntil(
+      () => pair.sup.pending.has('echo', victimId, 'cancel') === false,
+      1_000,
+    );
+    assert.equal(expired, true, 'cancel lane still pending');
+    assert.equal(rec.parked.some((entry) => entry.msg.correlationId === victimId), true);
+    assert.equal(pair.sup.pending.has('echo', victimId, 'call'), true);
+    if (rec.parkTimer?.held) {
+      clearTimeout(rec.parkTimer);
+      rec.parkTimer = null;
+    }
+    rec.parkSince = null;
+    rec.parkKernel = null;
+    process.kill(rec.child.pid, 'SIGCONT');
+    await delay(50);
+    assert.equal(typeof releaseWrite, 'function');
+    releaseWrite();
+    const done = await victim;
+    assert.equal(done.payload?.n, 7);
+    assert.equal(rec.parked.some((entry) => entry.msg.correlationId === victimId), false);
+    assert.equal(pair.sup.pending.has('echo', victimId, 'call'), false);
+    await filler;
+  } finally {
+    const proc = pair.sup.children.get('echo')?.child;
+    if (proc && proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL');
+    await pair.close();
+  }
+});
+
 test('a parked call reserves its correlation id', { timeout: 10_000 }, async () => {
   const pair = await connectPair({
     sweeper: false,
@@ -1552,6 +1692,75 @@ test('a mux frame larger than the userspace budget closes the channel', async ()
     assert.ok(elapsed < 1_500, String(elapsed));
     assert.equal(pair.sup.inputPaused, false);
     assert.ok(pair.sup.bridge.pendingBytes() <= pair.sup.readBytes, String(pair.sup.bridge.pendingBytes()));
+    const again = await pair.stub.call({
+      pluginId: 'echo',
+      credential: kid.credential,
+      correlationId: 2,
+      port: 'db',
+      method: 'get',
+      payload: { n: 1 },
+    }, 500).catch((e) => e);
+    assert.equal(again.code, 'closed');
+  } finally {
+    await pair.close();
+  }
+});
+
+test('a mux frame under the cap that cannot take another full read closes the channel', async () => {
+  const pair = await connectPair({ sweeper: false });
+  try {
+    const kid = pair.sup.spawn({ pluginId: 'echo', script: echoPath });
+    const rec = pair.sup.children.get('echo');
+    const globalCap = pair.sup.capsConfig.totalGlobal
+      - (rec.kIn + rec.kOut + pair.sup.readBytes)
+      - (pair.sup.kMuxIn + pair.sup.kMuxOut + pair.sup.readBytes);
+    const drained = await waitUntil(() => pair.sup.bufferedBytes() === 0, 2_000);
+    assert.equal(drained, true, String(pair.sup.bufferedBytes()));
+    const sample = (payload) => encodeMux({
+      kind: 'call',
+      pluginId: 'echo',
+      correlationId: 1,
+      credential: kid.credential,
+      port: 'db',
+      method: 'get',
+      payload,
+      timeoutMs: 2_000,
+      sendTs: 123456.789012345,
+    });
+    const overhead = sample('').length;
+    // One hundred bytes under the cap, past the last full C-sized read.
+    // Default caps on this host are a 1,017,884-byte frame against 1,017,984.
+    const target = globalCap - 100;
+    assert.ok(target > globalCap - pair.sup.readBytes, `${target} vs ${globalCap}`);
+    assert.ok(target < globalCap);
+    const payload = 'x'.repeat(Math.max(1, target - overhead));
+    const frame = sample(payload);
+    assert.ok(frame.length < globalCap, `${frame.length} vs ${globalCap}`);
+    assert.ok(frame.length + 64 < pair.stub.byteCap, `${frame.length} vs ${pair.stub.byteCap}`);
+    assert.ok(frame.length > globalCap - pair.sup.readBytes, `${frame.length} vs ${globalCap}`);
+    const started = performance.now();
+    const err = await pair.stub.call({
+      pluginId: 'echo',
+      credential: kid.credential,
+      correlationId: 1,
+      port: 'db',
+      method: 'get',
+      payload,
+    }, 2_000).catch((e) => e);
+    const elapsed = performance.now() - started;
+    assert.equal(pair.sup.framingFault, 'mux-budget', JSON.stringify({
+      code: err?.code,
+      elapsed,
+      frame: frame.length,
+      globalCap,
+      bridge: pair.sup.bridge.pendingBytes(),
+      buffered: pair.sup.bufferedBytes(),
+      paused: pair.sup.inputPaused,
+    }));
+    assert.notEqual(err.code, 'timeout');
+    assert.ok(err.code === 'closed' || err.code === 'mux-budget', String(err.code));
+    assert.ok(elapsed < 1_500, String(elapsed));
+    assert.equal(pair.sup.inputPaused, false);
     const again = await pair.stub.call({
       pluginId: 'echo',
       credential: kid.credential,

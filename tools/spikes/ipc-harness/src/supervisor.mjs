@@ -1163,16 +1163,38 @@ export class Supervisor {
     this.#clearMuxSendWait();
   }
 
+  // The next read is a full C, and other retained bytes shrink the room
+  // beside the unfinished frame. Fault when that room cannot take the read
+  // and draining those bytes cannot reopen it: the frame alone is already
+  // past half the cap, or it already leaves less than C. A short read is
+  // not used. The onread buffer is C, so it can pull a full buffer and
+  // cross the cap. A length that is not buffered yet stays in the kernel.
+  #muxFrameUnfinishable() {
+    const declared = this.bridge.leadingDeclared();
+    if (!(declared > 0)) return false;
+    const cap = this.#globalCap();
+    if (declared > cap) return true;
+    const held = this.bridge.pendingBytes();
+    if (held >= declared) return false;
+    // A partial that can still take a full read, and that can fall under the
+    // resume line by itself, is left for the normal pause. Counting retained
+    // bytes here would walk every child on the throughput path.
+    if (held + this.readBytes <= cap && held <= cap / 2) return false;
+    const other = Math.max(0, this.bufferedBytes() - held);
+    const free = cap - other - held;
+    if (free >= this.readBytes) return false;
+    return true;
+  }
+
   #onSocket(chunk) {
     if (this.closed || this.framingFault) return;
     try {
       this.bridge.feed(chunk);
       for (const msg of this.bridge.frames()) this.#onMux(msg);
       // Pausing never resumes: the unfinished frame cannot shrink, and the
-      // low-water check waits for userspace to fall. A declared length past
-      // the whole userspace cap cannot be assembled, so the channel closes.
-      const declared = this.bridge.leadingDeclared();
-      if (declared > this.#globalCap()) {
+      // low-water check waits for userspace to fall. A frame that cannot be
+      // assembled closes the channel instead of sitting there forever.
+      if (this.#muxFrameUnfinishable()) {
         this.framingFault = 'mux-budget';
         this.#failAll(this.framingFault);
         this.socket.destroy();
@@ -1312,6 +1334,9 @@ export class Supervisor {
     try {
       while (rec.parked.length > 0) {
         const next = rec.parked[0];
+        // #take of a cancel sets this while the call lane is still pending.
+        // Promoting that line would write a payload #dropCall is about to retire.
+        if (rec.parkHold && Object.is(next.msg.correlationId, rec.parkHoldId)) return;
         // The caller's deadline started at ingress. Promoting the call would
         // hand the child work the caller has already been told expired.
         if (this.#remainMs(next.msg, next.ingressTs) <= 0) {
@@ -1695,11 +1720,26 @@ export class Supervisor {
     } else {
       this.callPendingTotal--;
     }
-    // The line may still be parked, or sitting behind a blocked write.
-    // The operation is no longer pending, so that line must not be sent.
-    if (same) this.#unpark(rec, correlationId);
-    if (same) this.#dropUnsent(rec, correlationId, lane);
-    if (same) this.#drainPark(rec);
+    // The parked payload belongs to the call lane. A cancel that expires
+    // leaves that lane pending, so the line stays until the call settles.
+    // #dropCall removes it when the cancellation succeeds. Draining while
+    // this take still holds the cancel would write that line first.
+    if (same && lane === 'call') this.#unpark(rec, correlationId);
+    const callRemains = same && lane === 'cancel'
+      && this.pending.has(pending.pluginId, correlationId, 'call');
+    if (callRemains) {
+      rec.parkHold = true;
+      rec.parkHoldId = correlationId;
+    }
+    try {
+      if (same) this.#dropUnsent(rec, correlationId, lane);
+    } finally {
+      if (callRemains) {
+        rec.parkHold = false;
+        rec.parkHoldId = null;
+      }
+    }
+    if (same && !callRemains) this.#drainPark(rec);
     this.#maybeResumeAll();
     return pending;
   }
