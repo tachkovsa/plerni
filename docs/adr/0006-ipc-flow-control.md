@@ -11,7 +11,7 @@
 
 This record claims bounded hostile IPC only: memory and flow-control ceilings for non-colluding plugins on the tested Linux ABI, with a basic seccomp filter. The runtime, the pre-start helper cache, and same-UID access are trusted.
 
-Malicious-plugin isolation is out of scope and is deferred to a follow-up isolation ADR and PR. That is plugin-to-plugin tampering, plugin-to-cache tampering, dumpable after `exec` or re-exec, and same-user file writes. The filter described below stays. It is the ceiling backstop, not that isolation boundary.
+Malicious-plugin isolation is out of scope. [ADR-0004](0004-plugin-isolation-topology.md) is that topology record: plugin-to-plugin tampering, plugin-to-cache tampering, dumpable after `exec` or re-exec, and same-user file writes. The filter described below stays. It is the ceiling backstop, not that isolation boundary.
 
 ## Context
 
@@ -218,7 +218,7 @@ The spike B report gains §3.0 diagnosis records for any FAIL along the way. P0 
 
 ## Out of scope / verified in re-spike
 
-Malicious-plugin isolation is not part of this record and was not verified here. Plugin-to-plugin tampering, plugin-to-cache tampering, dumpable after `exec` or re-exec, and same-user file writes are deferred to a follow-up isolation ADR and PR. The runtime, the pre-start helper cache, and same-UID access are trusted.
+Malicious-plugin isolation is not part of this record and was not verified here. Plugin-to-plugin tampering, plugin-to-cache tampering, dumpable after `exec` or re-exec, and same-user file writes are recorded in [ADR-0004](0004-plugin-isolation-topology.md). The runtime, the pre-start helper cache, and same-UID access are trusted.
 
 The checks below (B4's explicit budget, the descendant, the multi-writer, the mux open-loop, and the stderr flood) are the acceptance tests for the flow-control ceiling. Further edge cases of that ceiling belong to the harness PR, not to another section of this record:
 
