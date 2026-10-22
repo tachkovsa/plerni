@@ -43,7 +43,8 @@ test('oversize mux call rejects before a waiter is armed', async () => {
       payload: 'x'.repeat(1024 * 1024),
     }, 300).catch((e) => e);
     assert.equal(err.constructor.name, 'MuxOversizeError');
-    await new Promise((resolve) => setTimeout(resolve, 400));
+    const armed = await waitUntil(() => pair.stub.calls.size > 0, 400);
+    assert.equal(armed, false);
     assert.equal(pair.stub.calls.size, 0);
   } finally {
     await pair.close();
@@ -298,7 +299,8 @@ test('a stale generation does not settle the respawned waiter', async () => {
       method: 'get',
       payload: { who: 'fresh' },
     }, 2_000);
-    await delay(50);
+    const armed = await waitUntil(() => pair.sup.pending.has('echo', 7, 'call'), 1_000);
+    assert.equal(armed, true, String(pair.sup.pending.size));
     pair.sup.socket.write(encodeMux({
       kind: 'result',
       for: 'call',
@@ -307,7 +309,11 @@ test('a stale generation does not settle the respawned waiter', async () => {
       generation: first.generation,
       payload: { who: 'stale' },
     }));
-    await delay(30);
+    const consumed = await waitUntil(() => {
+      const queued = fionread(pair.sup.muxFd);
+      return pair.sup.bridge.pendingBytes() === 0 && (queued === 0 || queued == null);
+    }, 1_000);
+    assert.equal(consumed, true, String(fionread(pair.sup.muxFd)));
     assert.equal(pair.stub.calls.size, 1);
     proc.kill('SIGCONT');
     const res = await pending;
@@ -351,8 +357,8 @@ test('ignored cancels obey the pending cap and are reclaimed', { timeout: 10_000
       correlationId: i + 1,
     }, 250).catch((err) => err)));
     assert.ok(settled.some((row) => row.code === 'pending-cap'));
-    await delay(50);
-    assert.equal(pair.sup.pending.size, 0);
+    const reclaimed = await waitUntil(() => pair.sup.pending.size === 0, 1_000);
+    assert.equal(reclaimed, true, String(pair.sup.pending.size));
     const call = await pair.stub.call({
       pluginId: 'ig',
       credential: kid.credential,
@@ -680,9 +686,14 @@ test('a second in-flight correlation id does not replace the first waiter', asyn
     assert.equal(second.code, 'duplicate-correlation');
     const res = await first;
     assert.equal(res.payload?.who, 'first');
-    await delay(20);
-    assert.equal(pair.sup.pending.size, 0);
-    assert.equal(pair.stub.calls.size, 0);
+    const cleared = await waitUntil(
+      () => pair.sup.pending.size === 0 && pair.stub.calls.size === 0,
+      1_000,
+    );
+    assert.equal(cleared, true, JSON.stringify({
+      pending: pair.sup.pending.size,
+      calls: pair.stub.calls.size,
+    }));
   } finally {
     await pair.close();
   }
@@ -697,7 +708,8 @@ test('calls count cancellation slots against the pending cap', async () => {
       credential: kid.credential,
       correlationId: id,
     }, 800).catch((err) => err));
-    await delay(40);
+    const held = await waitUntil(() => pair.sup.pending.size >= 2, 1_000);
+    assert.equal(held, true, String(pair.sup.pending.size));
     const calls = await Promise.all([3, 4].map((id) => pair.stub.call({
       pluginId: 'ig',
       credential: kid.credential,
@@ -766,7 +778,11 @@ test('a cancelled frame with for call retires the call waiter', async () => {
       credential: kid.credential,
       correlationId: 5,
     }, 1_000);
-    await delay(40);
+    const armed = await waitUntil(
+      () => pair.sup.pending.has('echo', 5, 'call') && pair.sup.pending.has('echo', 5, 'cancel'),
+      1_000,
+    );
+    assert.equal(armed, true, String(pair.sup.pending.size));
     const generation = kid.credential.generation;
     pair.sup.socket.write(encodeMux({
       kind: 'cancelled', for: 'cancel', pluginId: 'echo', correlationId: 5, generation,
@@ -807,7 +823,8 @@ test('an unterminated partial that cannot advance is faulted at the global ceili
     assert.equal(pair.sup.children.get('a').dead, true);
     assert.equal(pair.sup.children.get('b').dead, true);
     const buffered = pair.sup.bufferedBytes();
-    await delay(300);
+    const grew = await waitUntil(() => pair.sup.bufferedBytes() > cap, 300);
+    assert.equal(grew, false, String(pair.sup.bufferedBytes()));
     assert.ok(buffered <= cap, String(buffered));
     assert.ok(pair.sup.bufferedBytes() <= cap);
   } finally {
@@ -1084,7 +1101,8 @@ test('an unterminated partial that fills the global budget is faulted and stops 
     }));
     assert.equal(rec.dead, true);
     const buffered = pair.sup.bufferedBytes();
-    await delay(200);
+    const grew = await waitUntil(() => pair.sup.bufferedBytes() !== buffered, 200);
+    assert.equal(grew, false, String(pair.sup.bufferedBytes()));
     assert.equal(pair.sup.bufferedBytes(), buffered);
     assert.ok(buffered <= cap, String(buffered));
   } finally {
@@ -1124,7 +1142,10 @@ test('a paused stdout stream does not deliver a truncated result', { timeout: 20
       }, 8_000).catch((err) => err));
     }
     await waitUntil(() => pair.sup.children.get('echo').paused, 3_000);
-    await delay(300);
+    const rec = pair.sup.children.get('echo');
+    if (rec.paused) {
+      await waitUntil(() => rec.framer.pendingBytes() > 0, 300);
+    }
     pair.stub.socket.resume();
     const settled = await Promise.all(pending);
     const lengths = settled.map((row) => (typeof row.payload === 'string' ? row.payload.length : -1));
@@ -1183,7 +1204,8 @@ test('faulting a child does not drive the outbound count negative', { timeout: 1
     const held = await waitUntil(() => rec.outbound > 0, 2_000);
     assert.equal(held, true, String(rec.outbound));
     rec.child.stdout.emit('data', Buffer.from('{bad\n'));
-    await delay(100);
+    const faulted = await waitUntil(() => rec.dead === true, 1_000);
+    assert.equal(faulted, true, JSON.stringify(pair.sup.faults));
     assert.equal(rec.dead, true);
     assert.ok(rec.outbound >= 0, String(rec.outbound));
     assert.ok(pair.sup.bufferedBytes() >= 0, String(pair.sup.bufferedBytes()));
@@ -1212,7 +1234,17 @@ test('kernel-side rejections do not hi-cap fault the target child', { timeout: 1
         payload: { i },
       }, 500).catch((err) => err));
     }
-    await delay(100);
+    const tripped = await waitUntil(
+      () => pair.sup.children.get('q').dead
+        || pair.sup.faults.some((fault) => fault.code === 'hi-cap')
+        || pair.sup.queueDepth('q').hi >= 4,
+      100,
+    );
+    assert.equal(tripped, false, JSON.stringify({
+      dead: pair.sup.children.get('q').dead,
+      hi: pair.sup.queueDepth('q').hi,
+      faults: pair.sup.faults.map((fault) => fault.code),
+    }));
     assert.equal(pair.sup.children.get('q').dead, false);
     assert.equal(pair.sup.faults.some((fault) => fault.code === 'hi-cap'), false);
     assert.ok(pair.sup.queueDepth('q').hi < 4);
@@ -1263,7 +1295,8 @@ test('child-exited is delivered while the high-priority queue is full', { timeou
       method: 'get',
       payload: { ok: true },
     }, 3_000).catch((err) => err);
-    await delay(40);
+    const admitted = await waitUntil(() => pair.sup.pending.has('echo', 3, 'call'), 1_000);
+    assert.equal(admitted, true, String(pair.sup.pending.size));
     rec.child.kill('SIGKILL');
     block = false;
     pair.sup.socket.emit('drain');
@@ -1342,10 +1375,10 @@ test('an unsolicited cancelled frame does not retire the call', async () => {
       method: 'get',
       payload: { who: 'kept' },
     }, 2_000);
-    await delay(40);
+    const admitted = await waitUntil(() => pair.sup.pending.has('echo', 7, 'call'), 1_000);
+    assert.equal(admitted, true, String(pair.sup.pending.size));
     rec.credential.generation += 1;
     rec.child.stdout.emit('data', Buffer.from(encodeNdjson({ kind: 'cancelled', correlationId: 7 })));
-    await delay(30);
     assert.equal(pair.sup.pending.has('echo', 7, 'call'), true);
     assert.equal(pair.stub.calls.size, 1);
     rec.credential.generation -= 1;
@@ -1410,7 +1443,8 @@ test('an unfinished mux frame pauses the shared input at the global ceiling', as
     assert.ok(queued >= 84, String(queued));
     assert.ok(queued <= pair.sup.kMuxIn, String(queued));
     pair.stub.socket.write(Buffer.alloc(1_000, 0x62));
-    await delay(40);
+    const stayed = await waitUntil(() => pair.sup.bufferedBytes() !== 0, 40);
+    assert.equal(stayed, false, String(pair.sup.bufferedBytes()));
     assert.equal(pair.sup.bufferedBytes(), 0);
     const again = fionread(pair.sup.muxFd);
     assert.ok(again >= queued, String(again));
@@ -1612,8 +1646,6 @@ test('a parked call is not sent after its caller times out', { timeout: 10_000 }
     );
     assert.equal(left, true, 'timed-out call stayed reserved');
     process.kill(rec.child.pid, 'SIGCONT');
-    await delay(200);
-    assert.equal(written.some((line) => line.includes(victimId)), false);
     const fresh = await pair.stub.call({
       pluginId: 'echo',
       credential: kid.credential,
@@ -1623,6 +1655,7 @@ test('a parked call is not sent after its caller times out', { timeout: 10_000 }
       payload: { n: 2 },
     }, 3_000);
     assert.equal(fresh.payload?.n, 2);
+    assert.equal(written.some((line) => line.includes(victimId)), false);
     assert.equal(pair.sup.pending.has('echo', victimId, 'call'), false);
     assert.equal(rec.parked.some((entry) => entry.msg.correlationId === victimId), false);
   } finally {
@@ -1757,7 +1790,16 @@ test('a parked call stays queued when its cancel times out', { timeout: 10_000 }
     rec.parkSince = null;
     rec.parkKernel = null;
     process.kill(rec.child.pid, 'SIGCONT');
-    await delay(50);
+    const resumed = await waitUntil(() => {
+      try {
+        const text = readFileSync(`/proc/${rec.child.pid}/stat`, 'utf8');
+        const end = text.lastIndexOf(')');
+        return end > 0 && text[end + 2] !== 'T';
+      } catch {
+        return false;
+      }
+    }, 1_000);
+    assert.equal(resumed, true);
     assert.equal(typeof releaseWrite, 'function');
     releaseWrite();
     const done = await victim;
@@ -1787,21 +1829,36 @@ test('a parked call reserves its correlation id', { timeout: 10_000 }, async () 
     const rec = pair.sup.children.get('echo');
     assert.equal(await stopChild(rec.child.pid), true);
     const calls = [];
+    const duplicateCodes = [];
     for (let i = 0; i < 12; i++) {
-      calls.push(pair.stub.call({
+      const id = i + 1;
+      const pending = pair.stub.call({
         pluginId: 'echo',
         credential: kid.credential,
-        correlationId: i + 1,
+        correlationId: id,
         port: 'db',
         method: 'get',
         payload: 'z'.repeat(2000),
-      }, 5_000).catch((err) => err));
+      }, 5_000);
+      pending.catch((err) => {
+        if (err?.code === 'duplicate-correlation') duplicateCodes.push(id);
+      });
+      calls.push(pending.catch((err) => err));
     }
-    const parked = await waitUntil(() => {
+    const admitted = await waitUntil(() => {
       if (rec.parked.length > 0) holdPark(rec);
-      return rec.parked.length > 0;
-    }, 1_000);
-    assert.equal(parked, true, String(rec.parked.length));
+      let accounted = 0;
+      for (let id = 1; id <= 12; id++) {
+        if (pair.sup.pending.has('echo', id, 'call')) accounted++;
+      }
+      return accounted === 12 && rec.callPending === 12;
+    }, 2_000);
+    assert.equal(admitted, true, JSON.stringify({
+      pending: pair.sup.pending.size,
+      callPending: rec.callPending,
+      parked: rec.parked.length,
+    }));
+    assert.ok(rec.parked.length > 0, String(rec.parked.length));
     const victim = rec.parked[0];
     const victimId = victim.msg.correlationId;
     assert.equal(pair.sup.pending.has('echo', victimId, 'call'), true);
@@ -1809,6 +1866,7 @@ test('a parked call reserves its correlation id', { timeout: 10_000 }, async () 
     const pendingSize = pair.sup.pending.size;
     const callPending = rec.callPending;
     const parkedCount = rec.parked.length;
+    const coalesced = rec.rejectsCoalesced;
     pair.stub.socket.write(encodeMux({
       kind: 'call',
       pluginId: 'echo',
@@ -1819,7 +1877,15 @@ test('a parked call reserves its correlation id', { timeout: 10_000 }, async () 
       payload: { n: 9 },
       timeoutMs: 300,
     }));
-    await delay(30);
+    const rejected = await waitUntil(
+      () => duplicateCodes.includes(victimId) || rec.rejectsCoalesced > coalesced,
+      1_000,
+    );
+    assert.equal(rejected, true, JSON.stringify({
+      duplicateCodes,
+      coalesced: rec.rejectsCoalesced,
+      rejectQueued: rec.rejectQueued,
+    }));
     assert.equal(rec.parked.length, parkedCount);
     assert.equal(pair.sup.pending.size, pendingSize);
     assert.equal(rec.callPending, callPending);
@@ -2046,7 +2112,8 @@ test('a timed-out unsent call is not written after drain', { timeout: 10_000 }, 
     );
     pair.stub.socket.write = original;
     pair.stub.socket.emit('drain');
-    await delay(50);
+    const admittedLate = await waitUntil(() => pair.sup.pending.has('echo', 9_001, 'call'), 50);
+    assert.equal(admittedLate, false);
     assert.equal(pair.sup.pending.has('echo', 9_001, 'call'), false);
     const again = await pair.stub.call({
       pluginId: 'echo',
@@ -2079,7 +2146,8 @@ test('unknown plugin rejections share one bounded queue', async () => {
         payload: { i },
       }, 200).catch(() => {});
     }
-    await delay(40);
+    const coalesced = await waitUntil(() => pair.sup.unknownRejectsCoalesced > 0, 1_000);
+    assert.equal(coalesced, true, String(pair.sup.unknownRejectsCoalesced));
     assert.equal(pair.sup.children.get('echo').dead, false);
     assert.equal(pair.sup.faults.some((fault) => fault.code === 'hi-cap'), false);
     assert.ok(pair.sup.hi.size <= 1, String(pair.sup.hi.size));
@@ -2123,7 +2191,8 @@ test('respawn still delivers the retired generation child-exited error', { timeo
       method: 'get',
       payload: { ok: true },
     }, 8_000).catch((err) => err);
-    await delay(40);
+    const admitted = await waitUntil(() => pair.sup.pending.has('echo', 3, 'call'), 1_000);
+    assert.equal(admitted, true, String(pair.sup.pending.size));
     const next = await pair.sup.respawn('echo');
     assert.notEqual(next.credential.generation, kid.credential.generation);
     block = false;
@@ -2204,8 +2273,8 @@ test('a mux framing fault closes the kernel and rejects later sends', async () =
     assert.equal(pair.stub.socket.destroyed, true);
     pair.stub.socket.write = original;
     pair.stub.socket.emit('drain');
-    await delay(30);
-    assert.equal(pair.sup.pending.size, 0);
+    const cleared = await waitUntil(() => pair.sup.pending.size === 0, 1_000);
+    assert.equal(cleared, true, String(pair.sup.pending.size));
     const again = await pair.stub.call({
       pluginId: 'echo',
       credential: kid.credential,
@@ -2309,7 +2378,15 @@ test('numeric and NUL identities do not retire each other\'s waiters', async () 
       method: 'get',
       payload: { who: 'lane' },
     }, 1_000).catch((err) => err);
-    await delay(40);
+    const admitted = await waitUntil(
+      () => pair.sup.pending.has(1, 4, 'call')
+        && pair.sup.pending.has('1', 4, 'call')
+        && pair.sup.pending.has('a', 'b\0c', 'call')
+        && pair.sup.pending.has('a\0b', 'c', 'call')
+        && pair.sup.pending.has('a', 'cancel\u00005', 'call'),
+      1_000,
+    );
+    assert.equal(admitted, true, String(pair.sup.pending.size));
     assert.equal(pair.sup.pending.has(1, 4, 'call'), true);
     assert.equal(pair.sup.pending.has('1', 4, 'call'), true);
     assert.equal(pair.stub.calls.has(1, 4), true);
@@ -2323,7 +2400,6 @@ test('numeric and NUL identities do not retire each other\'s waiters', async () 
     pair.sup.children.get('a').child.stdout.emit('data', Buffer.from(encodeNdjson({
       kind: 'cancelled', correlationId: '5',
     })));
-    await delay(30);
     assert.equal(pair.sup.pending.has(1, 4, 'call'), true);
     assert.equal(pair.sup.pending.has('a', 'b\0c', 'call'), true);
     assert.equal(pair.sup.pending.has('a', 'cancel\u00005', 'call'), true);
@@ -2920,7 +2996,8 @@ test('a deferred reply stays inside the byte caps', async () => {
     const held = pair.sup.bufferedBytes();
     assert.ok(held <= cap + recA.deferredBytes, String(held));
     pair.stub.socket.write(Buffer.alloc(4_000, 0x62));
-    await delay(40);
+    const grew = await waitUntil(() => pair.sup.bufferedBytes() !== held, 40);
+    assert.equal(grew, false, String(pair.sup.bufferedBytes()));
     assert.equal(pair.sup.bufferedBytes(), held);
     const settled = await denied;
     assert.equal(settled.code, 'timeout');
@@ -2952,7 +3029,8 @@ test('a timed-out correlation is not reused in the same generation', async () =>
       2_000,
     );
     assert.equal(quarantined, true);
-    await delay(30);
+    const lingering = await waitUntil(() => pair.stub.calls.size > 0, 30);
+    assert.equal(lingering, false);
     assert.equal(pair.stub.calls.size, 0);
     const reused = await pair.stub.call({
       pluginId: 'echo',
@@ -2969,7 +3047,8 @@ test('a timed-out correlation is not reused in the same generation', async () =>
       correlationId: 7,
       payload: { who: 'first' },
     })));
-    await delay(30);
+    const revived = await waitUntil(() => pair.sup.pending.size > 0, 30);
+    assert.equal(revived, false);
     assert.equal(pair.sup.pending.size, 0);
     const freshP = pair.stub.call({
       pluginId: 'echo',
@@ -4158,7 +4237,8 @@ test('supervisor credit matches the credit senders', async () => {
       }
     }
     assert.ok(control > 0, String(control));
-    await delay(150);
+    const recycled = await waitUntil(() => rec.creditSent > origin + spent, 150);
+    assert.equal(recycled, false, String(rec.creditSent));
     assert.ok(rec.creditSent <= origin + spent, JSON.stringify({
       origin,
       sent: rec.creditSent,
@@ -4230,7 +4310,16 @@ test('cancel acks do not recycle data credit', { timeout: 10_000 }, async () => 
     }
     const acks = await Promise.all(cancels);
     assert.ok(acks.every((row) => row?.kind === 'cancelled'), JSON.stringify(acks.map((row) => row?.kind || row?.code)));
-    await delay(150);
+    const recycled = await waitUntil(
+      () => rec.creditSpent !== 0 || rec.creditSent - origin >= ackBytes,
+      150,
+    );
+    assert.equal(recycled, false, JSON.stringify({
+      sent: rec.creditSent,
+      spent: rec.creditSpent,
+      origin,
+      ackBytes,
+    }));
     assert.equal(rec.creditSpent, 0, String(rec.creditSpent));
     assert.equal(rec.sendWindow, rec.creditSent);
     assert.ok(rec.creditSent - origin < ackBytes, JSON.stringify({
@@ -4396,7 +4485,8 @@ test('a partial mux frame overlapping an in-credit reply faults', { timeout: 10_
       2_000,
     );
     assert.equal(granted, true, String(rec.sendWindow));
-    await delay(100);
+    const readGrant = await waitUntil(() => pair.sup.flowPending(rec.stdinProbe) === 0, 1_000);
+    assert.equal(readGrant, true, String(pair.sup.flowPending(rec.stdinProbe)));
     assert.equal(await stopChild(rec.child.pid), true);
     const call = pair.stub.call({
       pluginId: 'wide',
@@ -4484,7 +4574,8 @@ test('overlapping partial mux and stdout frames fault', { timeout: 10_000 }, asy
       2_000,
     );
     assert.equal(granted, true, String(rec.sendWindow));
-    await delay(80);
+    const readGrant = await waitUntil(() => pair.sup.flowPending(rec.stdinProbe) === 0, 1_000);
+    assert.equal(readGrant, true, String(pair.sup.flowPending(rec.stdinProbe)));
     assert.equal(await stopChild(rec.child.pid), true);
     const call = pair.stub.call({
       pluginId: 'wide',
@@ -4600,7 +4691,21 @@ test('a stalled mux reader leaves the low-priority queue at its cap', async () =
     pair.stub.socket.pause();
     const filled = await waitUntil(() => pair.sup.queueDepth('frames').lo >= 32, 2_000);
     assert.equal(filled, true);
-    await delay(400);
+    let heldSince = null;
+    const held = await waitUntil(() => {
+      const full = pair.sup.queueDepth('frames').lo >= 32 && pair.sup.flip == null;
+      const now = performance.now();
+      if (!full) {
+        heldSince = null;
+        return false;
+      }
+      if (heldSince == null) heldSince = now;
+      return now - heldSince >= 400;
+    }, 2_000);
+    assert.equal(held, true, JSON.stringify({
+      lo: pair.sup.queueDepth('frames').lo,
+      flip: pair.sup.flip,
+    }));
     assert.ok(pair.sup.queueDepth('frames').lo >= 32, String(pair.sup.queueDepth('frames').lo));
     assert.equal(pair.sup.flip, null);
   } finally {
@@ -4771,8 +4876,16 @@ test('advertised credit stays reserved until stdout spends it', async () => {
     pair.sup.queuedBytes += muxPartial;
     const noise = Buffer.from('{"kind":"noop"}\n');
     rec.stdoutSocket.emit('data', noise);
-    await delay(50);
     const unspent = advertised - noise.length;
+    const moved = await waitUntil(
+      () => rec.creditSpent !== noise.length || rec.sendWindow !== unspent,
+      50,
+    );
+    assert.equal(moved, false, JSON.stringify({
+      window: rec.sendWindow,
+      spent: rec.creditSpent,
+      unspent,
+    }));
     assert.equal(rec.creditSpent, noise.length);
     assert.equal(rec.sendWindow, unspent, JSON.stringify({
       window: rec.sendWindow,
@@ -5872,7 +5985,12 @@ test('admission accounting holds across a seeded mix of calls and cancels', asyn
           1_000,
         );
         assert.equal(pendingCancel, true, `cancel ${step.id} was not admitted`);
-        await delay(80);
+        const moved = await waitUntil(
+          () => rec.stdinPayload.some((entry) => Object.is(entry.correlationId, step.id))
+            || !rec.parked.some((entry) => Object.is(entry.msg.correlationId, step.id)),
+          80,
+        );
+        assert.equal(moved, false, `call ${step.id} left the park while its cancel was pending`);
         assert.equal(
           rec.stdinPayload.some((entry) => Object.is(entry.correlationId, step.id)),
           false,
@@ -6272,9 +6390,10 @@ test('a stdout read stays inside the cap while send credit is open', { timeout: 
       2_000,
     );
     assert.equal(granted, true, String(rec.sendWindow));
-    // The grant is in the kernel. Let the child read it before it is stopped,
+    // The grant is in the kernel. The child reads it before it is stopped,
     // so the later response is credit-compliant.
-    await delay(100);
+    const readGrant = await waitUntil(() => pair.sup.flowPending(rec.stdinProbe) === 0, 1_000);
+    assert.equal(readGrant, true, String(pair.sup.flowPending(rec.stdinProbe)));
     assert.equal(await stopChild(rec.child.pid), true);
     let settled = null;
     const call = pair.stub.call({
@@ -6310,11 +6429,11 @@ test('a stdout read stays inside the cap while send credit is open', { timeout: 
     );
     process.kill(rec.child.pid, 'SIGCONT');
     let peak = occupied;
-    const started = performance.now();
-    while (performance.now() - started < 400) {
+    const spilled = await waitUntil(() => {
       peak = Math.max(peak, pair.sup.bufferedBytes());
-      await delay(20);
-    }
+      return peak > globalCap || settled != null;
+    }, 400);
+    assert.equal(spilled, false, JSON.stringify({ peak, settled: settled != null }));
     assert.ok(peak <= globalCap, `buffered ${peak} exceeded ${globalCap}`);
     assert.equal(settled, null, 'the response completed while the mux occupancy was held');
     pair.sup.queuedBytes = Math.max(0, pair.sup.queuedBytes - occupy);
@@ -6433,9 +6552,13 @@ test('a rejection frame does not spend a sibling send window', async () => {
       1_000,
     );
     assert.equal(armed, true);
-    // The grant follow clamps the window back to the free room. Let that
-    // follow finish, then reserve the whole userspace cap as send credit.
-    await delay(30);
+    // The grant follow clamps the window back to the free room. Wait until
+    // that follow is idle, then reserve the whole userspace cap as send credit.
+    const following = await waitUntil(() => recA.refillArmed || recB.refillArmed, 40);
+    if (following) {
+      const idle = await waitUntil(() => !recA.refillArmed && !recB.refillArmed, 1_000);
+      assert.equal(idle, true);
+    }
     const stamp = encodeMux({
       kind: 'result',
       for: 'call',
@@ -6537,7 +6660,8 @@ test('send credit is granted from accounted room while the mux is unread', async
     assert.equal(granted, true, String(rec.creditSent));
     assert.ok(rec.sendWindow < rec.bT, `${rec.sendWindow} filled ${rec.bT}`);
     const sent = rec.creditSent;
-    await delay(80);
+    const grew = await waitUntil(() => rec.creditSent !== sent, 80);
+    assert.equal(grew, false, String(rec.creditSent));
     assert.equal(rec.creditSent, sent);
   } finally {
     await pair.close();
@@ -6694,10 +6818,12 @@ test('an echo child does not turn a grant into more send credit', async () => {
       2_000,
     );
     assert.equal(granted, true);
-    await delay(60);
+    const early = await waitUntil(() => rec.creditFlush != null, 60);
+    assert.equal(early, false);
     const sent = rec.creditSent;
     const window = rec.sendWindow;
-    await delay(150);
+    const grew = await waitUntil(() => rec.creditSent !== sent || rec.sendWindow !== window, 150);
+    assert.equal(grew, false, JSON.stringify({ sent: rec.creditSent, window: rec.sendWindow }));
     assert.equal(rec.creditSent, sent);
     assert.equal(rec.sendWindow, window);
   } finally {

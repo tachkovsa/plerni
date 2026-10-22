@@ -787,7 +787,10 @@ test('a mux read waits for FIONREAD inside K_mux_in and room for C', async () =>
   });
   try {
     tight.stub.socket.write(Buffer.alloc(64, 0x61));
-    await new Promise((resolve) => setTimeout(resolve, 80));
+    const landed = await waitUntil(() => (fionread(tight.sup.muxFd) ?? 0) > 0, 1_000);
+    assert.equal(landed, true, String(fionread(tight.sup.muxFd)));
+    const read = await waitUntil(() => tight.sup.muxReadHigh > 0, 80);
+    assert.equal(read, false);
     assert.equal(tight.sup.muxReadHigh, 0);
     const queued = fionread(tight.sup.muxFd);
     assert.ok(queued > 0, String(queued));
@@ -893,7 +896,8 @@ test('a burst of mux frames stays inside the send reservation', async () => {
     pair.stub.socket.pause();
     const frame = Buffer.alloc(1100, 0x61);
     for (let i = 0; i < 64; i++) sup.queueMuxBytes(frame);
-    await delay(100);
+    const drained = await waitUntil(() => sup.queuedBytes === 0 || sup.flip != null, 1_000);
+    assert.equal(drained, true, String(sup.queuedBytes));
     const outq = siocoutq(sup.muxFd);
     assert.equal(sup.flip, null);
     assert.equal(sup.invalidReason, null);
