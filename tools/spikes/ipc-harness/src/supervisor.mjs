@@ -340,6 +340,19 @@ function admissionKeepFloor() {
 
 const ADMIT_KEEP = admissionKeepFloor();
 
+// One initial result a correct plugin writes only when the window covers the
+// line. Spawn admits a child when the first grant can reach this many bytes,
+// or the whole idle grant when the caps are smaller than the line. Peer
+// share keeps that floor for every live child. An equal-share gap is not
+// reserved when it would spend the floor. A window already advertised is
+// not reduced. A child that cannot be given the floor is not started.
+const USABLE_RESPONSE_PAD = 4_000;
+export const USABLE_RESPONSE = Buffer.byteLength(encodeNdjson({
+  kind: 'result',
+  correlationId: 1,
+  payload: 'p'.repeat(USABLE_RESPONSE_PAD),
+}));
+
 // A correct sender waits until the advertised window covers its next reply.
 // The half-room threshold coalesces open-loop grants. If the child stops
 // while the spent part is still under half the room, that reply never
@@ -502,7 +515,7 @@ export class Supervisor {
     }
     // Reject an unreadable block before any descriptor is opened.
     const envBlock = pluginEnvBlock(spec.env, spec.pluginId);
-    const flow = this.enforceFlow ? this.#openFlowEnds(limits, envBlock.length) : null;
+    const flow = this.enforceFlow ? this.#openFlowEnds(limits, envBlock.length, credential) : null;
     if (this.enforceFlow && !flow) {
       const err = new Error('flow-control helper unavailable');
       err.code = 'flow-unavailable';
@@ -696,7 +709,8 @@ export class Supervisor {
     }
     // The grant is this child's share of the free room after calls already
     // written. Unspent credit stays reserved and is not retracted. A child
-    // that is already live keeps the share it was advertised.
+    // that is already live keeps the share it was advertised. Spawn already
+    // required that this first grant can reach the usable floor.
     this.#refillCredit(rec);
     return { credential: detachCredential(credential), token, pid: child.pid };
   }
@@ -704,8 +718,9 @@ export class Supervisor {
   // A negative B_p, B_t, or B_g closes the ends and does not start the child.
   // That rejection is unsatisfiable when the kernel terms alone do not fit.
   // A live process that is already too full is spawn-rejected, which is not
-  // a B3 cap failure. K_mux_in + K_mux_out + C is reserved once for the process.
-  #openFlowEnds(limits, envBytes) {
+  // a B3 cap failure. So is a child that would be admitted with no usable
+  // send credit. K_mux_in + K_mux_out + C is reserved once for the process.
+  #openFlowEnds(limits, envBytes, credential) {
     const ends = createChildEnds();
     if (!ends) return null;
     const muxReserve = this.#muxReserve();
@@ -736,7 +751,47 @@ export class Supervisor {
       err.code = 'spawn-rejected';
       throw err;
     }
+    // The env block is gone once the wrapper reads it. The kernel reserve
+    // and every window already advertised are not. Admit only when the
+    // steady-state grant, after that reserve, still covers the usable floor.
+    if (!this.#initialCreditFits({ bT, pending: limits.pending, reserve, credential })) {
+      closeEnds(ends);
+      const err = new Error('send credit does not fit the live process');
+      err.code = 'spawn-rejected';
+      throw err;
+    }
     return { ...ends, bP, bT };
+  }
+
+  // Credit the new child will be granted once its env block has been read
+  // and no peer window is reduced. The floor is one initial result line, or
+  // the whole idle grant when the caps are smaller than that line. A budget
+  // that cannot grant anything still admits: the caps, not a stalled peer,
+  // are what left the window at zero.
+  #initialCreditFits({ bT, pending, reserve, credential }) {
+    const globalCap = this.capsConfig.totalGlobal - this.#kernelReserved() - reserve - this.#muxReserve();
+    const hole = this.#callHole({ pending, ceiling: bT, globalCap });
+    const stamp = this.#replyStampOverhead({ credential });
+    const idleRoom = Math.min(bT, globalCap) - hole - stamp;
+    const idleKeep = this.#keepBytes(idleRoom, hole, pending, 0);
+    const lone = Math.max(0, this.#replenishCredit(idleRoom, idleKeep, 0));
+    const usable = lone > 0 ? Math.min(USABLE_RESPONSE, lone) : 0;
+    if (!(usable > 0)) return true;
+    const peerWindows = [];
+    for (const child of this.children.values()) {
+      if (child.dead || !child.flowOk) continue;
+      peerWindows.push(child.sendWindow > 0 ? child.sendWindow : 0);
+    }
+    const sibling = peerWindows.reduce((sum, window) => sum + window, 0);
+    const buffered = this.bufferedBytes();
+    const pool = Math.max(0, globalCap - hole - buffered);
+    const globalWithout = globalCap - buffered - sibling - hole - stamp;
+    const childRoom = bT - hole - stamp;
+    const keep = this.#keepBytes(Math.min(childRoom, globalWithout), hole, pending, 0);
+    const reserved = this.#shareReserve(peerWindows, 0, usable, globalWithout, childRoom, keep, pool);
+    const room = Math.min(childRoom, globalWithout - reserved);
+    const credit = Math.max(0, this.#replenishCredit(room, keep, 0));
+    return credit >= usable;
   }
 
   #muxReserve() {
@@ -1399,8 +1454,10 @@ export class Supervisor {
   // The call does not also add the window into the cost: #globalHeld(null)
   // already counts it, and adding it again would pin the line behind its own
   // reservation. The same room is split across the live children
-  // (#peerShareReserve). A window already at or above an equal share is not
-  // reserved again and is not reduced.
+  // (#peerShareReserve). Each peer keeps a usable initial window. An
+  // equal-share gap above that floor is reserved only while this child can
+  // still be granted the floor. A window already at or above its share is
+  // not reserved again and is not reduced.
   // Park. The parked line has to fit beside every window. The miss that parks
   // is K_out. Parking into the unspent window would keep the line in the room
   // the child was told it may still fill. Promotion rechecks the reserve with
@@ -1477,7 +1534,9 @@ export class Supervisor {
   // that stayed inside its credit would be killed. hi and lo are frame
   // counts. Their bytes are already in #pluginBytes and have passed
   // #fitsChild. Spawn's new child has no window yet. Other children's
-  // windows are in the global spawn check. #creditRoom sizes new credit
+  // windows are in the global spawn check, and so is the usable grant this
+  // child must still be able to receive. A child that cannot is
+  // spawn-rejected and is not started. #creditRoom sizes new credit
   // beside #pluginBytes and the current window; it does not spend the
   // window. #enqueueBuf only commits bytes the caller already admitted.
   // #failAll writes after the bridge is unusable. queueMuxBytes and
@@ -2017,11 +2076,15 @@ export class Supervisor {
   // ceiling is still granted. Above eight calls, a large cap keeps one
   // slot per pending call. The hole is outside sendWindow. Stdout is the
   // only spend.
-  #callHole() {
+  // `extra` is a child that is not in the map yet. Spawn admission passes
+  // its pending limit, its ceiling, and the global cap after its kernel
+  // reserve. The live hole is unchanged when `extra` is omitted.
+  #callHole(extra = null) {
     const one = ADMIT_KEEP;
     let pending = this.capsConfig.pending;
     let seen = false;
-    let space = Math.max(0, this.#globalCap());
+    const cap = Number.isFinite(extra?.globalCap) ? extra.globalCap : this.#globalCap();
+    let space = Math.max(0, cap);
     for (const rec of this.children.values()) {
       if (rec.dead) continue;
       const limit = rec.limits?.pending;
@@ -2033,6 +2096,14 @@ export class Supervisor {
       const ceiling = this.#childCeiling(rec);
       if (ceiling < space) space = ceiling;
     }
+    if (extra) {
+      const limit = extra.pending;
+      if (Number.isInteger(limit) && limit > 0) {
+        pending = seen ? Math.min(pending, limit) : limit;
+        seen = true;
+      }
+      if (Number.isFinite(extra.ceiling) && extra.ceiling < space) space = extra.ceiling;
+    }
     pending = Math.max(1, Math.min(pending, this.capsConfig.pendingGlobal));
     const classic = Math.min(8, pending);
     let batch = 1;
@@ -2041,29 +2112,90 @@ export class Supervisor {
     return one * batch;
   }
 
-  // Share of the free pool still owed to other live children. The pool is
-  // B_g minus the call hole and bytes already buffered, divided equally.
-  // A peer at or above that share contributes nothing here: #globalHeld
-  // already counts the window it was advertised, and that window is not
-  // pulled back. This does not call #creditRoom.
+  // Room held back from this child's grant for the other live children.
+  // Each peer is owed a usable initial window. The equal share of the free
+  // pool is owed on top of that floor only while this child can still be
+  // granted the floor. A peer already at or above the share contributes
+  // nothing: #globalHeld counts the window it was advertised, and that
+  // window is not pulled back. A configuration that cannot grant the
+  // result line keeps the equal-share reserve and no higher floor. This
+  // does not call #creditRoom.
   #peerShareReserve(rec) {
-    const live = [];
+    const peerWindows = [];
+    let n = 0;
     for (const child of this.children.values()) {
       if (child.dead || !child.flowOk) continue;
-      live.push(child);
-    }
-    const n = live.length;
-    if (n <= 1) return 0;
-    const pool = Math.max(0, this.#globalCap() - this.#callHole() - this.bufferedBytes());
-    const share = Math.floor(pool / n);
-    if (share <= 0) return 0;
-    let reserve = 0;
-    for (const child of live) {
+      n += 1;
       if (child === rec) continue;
-      const held = child.sendWindow > 0 ? child.sendWindow : 0;
-      if (held < share) reserve += share - held;
+      peerWindows.push(child.sendWindow > 0 ? child.sendWindow : 0);
     }
-    return reserve;
+    if (n <= 1) return 0;
+    const hole = this.#callHole();
+    const stamp = this.#replyStampOverhead(rec);
+    const usable = this.#usableFloor(rec, hole, stamp);
+    const pool = Math.max(0, this.#globalCap() - hole - this.bufferedBytes());
+    const globalWithout = this.#globalCap() - this.#globalHeld(rec) - hole - stamp;
+    const childRoom = this.#childCeiling(rec) - this.#pluginBytes(rec) - hole - stamp;
+    const keep = this.#creditKeep(rec, Math.min(childRoom, globalWithout));
+    return this.#shareReserve(
+      peerWindows,
+      rec.sendWindow,
+      usable,
+      globalWithout,
+      childRoom,
+      keep,
+      pool,
+    );
+  }
+
+  // Idle grant at this child's ceiling, capped at one initial result line.
+  // Plugin bytes are not subtracted: the floor is the promise made at
+  // admission, not the room left after a later call. Zero when this
+  // configuration cannot advertise any credit.
+  #usableFloor(rec, hole, stamp) {
+    const ceiling = this.#childCeiling(rec);
+    const globalCap = this.#globalCap();
+    const room = Math.min(ceiling, globalCap) - hole - stamp;
+    const keep = this.#keepBytes(room, hole, rec.limits.pending, 0);
+    const lone = Math.max(0, this.#replenishCredit(room, keep, 0));
+    if (!(lone > 0)) return 0;
+    return Math.min(USABLE_RESPONSE, lone);
+  }
+
+  // `peerWindows` omits the child being granted. `globalWithout` and
+  // `childRoom` are the two rooms before this reserve. `usable` is the
+  // floor spawn admission promised. A recipient that already holds it
+  // keeps the full equal-share reserve, so a later refill does not take
+  // the window back. A recipient still below it keeps every equal-share
+  // gap that leaves the floor in place, and drops the gap that would spend it.
+  #shareReserve(peerWindows, recipientHeld, usable, globalWithout, childRoom, keep, pool) {
+    const n = peerWindows.length + 1;
+    if (n <= 1) return 0;
+    const share = Math.floor(Math.max(0, pool) / n);
+    if (!(usable > 0)) {
+      let reserve = 0;
+      for (const held of peerWindows) {
+        const window = held > 0 ? held : 0;
+        if (window < share) reserve += share - window;
+      }
+      return reserve;
+    }
+    let floor = 0;
+    let fullExtra = 0;
+    for (const held of peerWindows) {
+      const window = held > 0 ? held : 0;
+      floor += Math.max(0, usable - window);
+      const base = Math.max(window, usable);
+      if (base < share) fullExtra += share - base;
+    }
+    const heldWindow = recipientHeld > 0 ? recipientHeld : 0;
+    if (heldWindow >= usable) return floor + fullExtra;
+    const withFloor = Math.min(childRoom, globalWithout - floor) - keep;
+    if (withFloor < usable) return floor;
+    const uncapped = Math.min(childRoom, globalWithout - floor - fullExtra) - keep;
+    if (uncapped >= usable) return floor + fullExtra;
+    const extra = Math.max(0, globalWithout - floor - keep - usable);
+    return floor + Math.min(fullExtra, extra);
   }
 
   #replyStampOverhead(rec) {
@@ -2120,11 +2252,18 @@ export class Supervisor {
     let noted = rec.admitKeep || 0;
     const ceiling = Math.min(this.#childCeiling(rec), this.#globalCap());
     if (noted > ceiling) noted = rec.admitFloor || 0;
-    const one = Math.max(noted, ADMIT_KEEP);
-    const batch = Math.min(8, rec.limits.pending);
-    const spacious = Math.max(0, room) + this.#callHole();
+    return this.#keepBytes(room, this.#callHole(), rec.limits.pending, noted);
+  }
+
+  // Bytes of `room` the next admission still needs. The shared hole is
+  // already out of `room`. A noted call larger than that hole still keeps
+  // the excess. A small ceiling keeps one call, not a batch.
+  #keepBytes(room, hole, pending, noted) {
+    const one = Math.max(noted || 0, ADMIT_KEEP);
+    const batch = Math.min(8, pending);
+    const spacious = Math.max(0, room) + hole;
     const local = spacious > one * (batch + 24) ? one * batch : one;
-    const extra = Math.max(0, local - this.#callHole());
+    const extra = Math.max(0, local - hole);
     return Math.min(Math.max(0, room), extra);
   }
 

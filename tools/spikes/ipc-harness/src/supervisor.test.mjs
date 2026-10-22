@@ -13,7 +13,7 @@ import { applyScoredSkip, floodBound, floodScore, forgedFlood, hostileBattery, s
 import { assessEnvironment, delay, measureSeries, openLoop, preflight, treeRss, waitUntil } from './measure.mjs';
 import { MuxFramer, STDOUT_KIND_PREFIX, classifyStdoutLine, encodeMux, encodeNdjson } from './framing.mjs';
 import { FencedError } from './authority.mjs';
-import { DEFAULT_CAPS, PARTIAL_READ_CHUNK, PLUGIN_ENV_ENTRY_MAX, PLUGIN_ENV_MAX, Supervisor, connectEnds, connectPair, dbConfigured, partialCapHolds, pluginEnvBlock, stdinControlReserve, totalCapHolds, writePluginEnv } from './supervisor.mjs';
+import { DEFAULT_CAPS, PARTIAL_READ_CHUNK, PLUGIN_ENV_ENTRY_MAX, PLUGIN_ENV_MAX, Supervisor, USABLE_RESPONSE, connectEnds, connectPair, dbConfigured, partialCapHolds, pluginEnvBlock, stdinControlReserve, totalCapHolds, writePluginEnv } from './supervisor.mjs';
 import { socketPair } from './kernel-stub.mjs';
 import { entryIsPrivate, resolveCacheDir } from './pipe_pending.mjs';
 import { closeFd, dupFd, fionread, measureFlowReserve, openEnvPipe, processGroup, spawnSleeper } from './flow_socket.mjs';
@@ -4677,13 +4677,18 @@ test('parked calls leave a sibling send window usable', async () => {
     correlationId,
     payload: 'p'.repeat(pad),
   }));
-  // A is granted alone, so the pending-sized hole is outside the window and
-  // the line fits in it. B is spawned afterwards. The advertised window is
-  // not pulled back to an equal share, and parked calls on B have to leave
-  // that window usable.
+  // A is granted alone. Its ceiling holds the window at the result line,
+  // so the pending-sized hole stays outside that window. The global cap
+  // leaves B a usable grant after A's window and the second kernel reserve.
+  // B is spawned afterwards. The advertised window is not pulled back, and
+  // parked calls on B have to leave it usable.
   const hole = 1209 * pending;
-  const slack = 16_000;
-  const totalGlobal = lineBytes + hole + slack + 2 * reserved.perChild + reserved.muxReserve;
+  const stampRoom = 1024;
+  const margin = 2_048;
+  const callSlack = 16_000;
+  const childTotal = lineBytes + hole + stampRoom + margin + reserved.perChild;
+  const totalGlobal = lineBytes + hole + stampRoom + USABLE_RESPONSE + callSlack + margin
+    + 2 * reserved.perChild + reserved.muxReserve;
   const pair = await connectPair({
     sweeper: false,
     caps: {
@@ -4704,7 +4709,7 @@ test('parked calls leave a sibling send window usable', async () => {
       script: responsePath,
       env: { RESPONSE_PAD: String(pad) },
       pending,
-      total: 1024 * 1024,
+      total: childTotal,
     });
     const recA = pair.sup.children.get('a');
     const granted = await waitUntil(
@@ -4736,7 +4741,7 @@ test('parked calls leave a sibling send window usable', async () => {
       - (recB.kIn + recB.kOut + pair.sup.readBytes)
       - (pair.sup.kMuxIn + pair.sup.kMuxOut + pair.sup.readBytes);
     const rejections = [];
-    for (let i = 0; i < 30; i++) {
+    for (let i = 0; i < 40; i++) {
       pair.stub.call({
         pluginId: 'b',
         credential: kidB.credential,
@@ -4750,7 +4755,7 @@ test('parked calls leave a sibling send window usable', async () => {
     }
     const flooded = await waitUntil(() => {
       if (recB.parked.length > 0) holdPark(recB);
-      return rejections.length + recB.rejectsCoalesced > 0;
+      return recB.rejectsCoalesced > 0;
     }, 2_000);
     assert.equal(flooded, true, JSON.stringify({
       parked: recB.parkedBytes,
@@ -4794,6 +4799,235 @@ test('parked calls leave a sibling send window usable', async () => {
     stop('a');
     stop('b');
     await pair.close();
+  }
+});
+
+test('a child admitted after earlier grants have settled can obtain usable credit', async () => {
+  const pad = 4_000;
+  assert.equal(USABLE_RESPONSE, Buffer.byteLength(encodeNdjson({
+    kind: 'result',
+    correlationId: 1,
+    payload: 'p'.repeat(pad),
+  })));
+  const pair = await connectPair({ sweeper: false });
+  const kids = [];
+  const ids = [];
+  const stop = () => {
+    for (const id of ids) {
+      const proc = pair.sup.children.get(id)?.child;
+      if (proc && proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL');
+    }
+  };
+  let held = null;
+  try {
+    let rejected = null;
+    for (let i = 0; i < 8; i++) {
+      const pluginId = `late-${i}`;
+      let kid;
+      try {
+        kid = pair.sup.spawn({
+          pluginId,
+          script: responsePath,
+          env: { RESPONSE_PAD: String(pad) },
+        });
+      } catch (err) {
+        assert.equal(err.code, 'spawn-rejected', err.message);
+        assert.equal(pair.sup.children.has(pluginId), false);
+        rejected = pluginId;
+        break;
+      }
+      ids.push(pluginId);
+      kids.push(kid);
+      const rec = pair.sup.children.get(pluginId);
+      const granted = await waitUntil(
+        () => rec.grantSettled && rec.outbound === 0 && rec.sendWindow >= USABLE_RESPONSE,
+        3_000,
+      );
+      assert.equal(granted, true, JSON.stringify({
+        pluginId,
+        window: rec.sendWindow,
+        settled: rec.grantSettled,
+        outbound: rec.outbound,
+      }));
+    }
+    assert.equal(rejected, 'late-5');
+    assert.equal(ids.length, 5);
+    for (const id of ids) {
+      const rec = pair.sup.children.get(id);
+      assert.equal(rec.dead, false);
+      assert.ok(rec.sendWindow >= USABLE_RESPONSE, `${id} ${rec.sendWindow}`);
+      assertAccountingInvariants(pair.sup, rec);
+    }
+    const last = ids.length - 1;
+    const answered = await pair.stub.call({
+      pluginId: ids[last],
+      credential: kids[last].credential,
+      correlationId: 1,
+      port: 'db',
+      method: 'get',
+      payload: { n: 1 },
+    }, 3_000).catch((err) => err);
+    assert.equal(answered.payload?.length, pad, JSON.stringify({
+      code: answered.code,
+      pause: pair.sup.children.get(ids[last]).pauseReason,
+      window: pair.sup.children.get(ids[last]).sendWindow,
+    }));
+    const crashed = ids[last];
+    const before = pair.sup.children.get(crashed);
+    before.child.kill('SIGKILL');
+    const next = await pair.sup.respawn(crashed);
+    ids.push(crashed);
+    const respawned = pair.sup.children.get(crashed);
+    const respawnGrant = await waitUntil(
+      () => respawned.grantSettled
+        && respawned.outbound === 0
+        && respawned.sendWindow >= USABLE_RESPONSE
+        && respawned.credential.generation === next.credential.generation,
+      3_000,
+    );
+    assert.equal(respawnGrant, true, JSON.stringify({
+      window: respawned.sendWindow,
+      generation: respawned.credential.generation,
+      dead: respawned.dead,
+    }));
+    const afterCrash = await pair.stub.call({
+      pluginId: crashed,
+      credential: next.credential,
+      correlationId: 2,
+      port: 'db',
+      method: 'get',
+      payload: { n: 2 },
+    }, 3_000).catch((err) => err);
+    assert.equal(afterCrash.payload?.length, pad, JSON.stringify({
+      code: afterCrash.code,
+      pause: respawned.pauseReason,
+      window: respawned.sendWindow,
+    }));
+    const victimId = ids[0];
+    const victim = pair.sup.children.get(victimId);
+    held = dupFd(victim.stdoutWriter);
+    victim.child.kill('SIGKILL');
+    const draining = await waitUntil(() => victim.exited === true && victim.exitFinished === false, 2_000);
+    assert.equal(draining, true);
+    assert.throws(
+      () => pair.sup.spawn({
+        pluginId: 'during-drain',
+        script: responsePath,
+        env: { RESPONSE_PAD: String(pad) },
+      }),
+      (err) => err.code === 'spawn-rejected',
+    );
+    assert.equal(pair.sup.children.has('during-drain'), false);
+    closeFd(held);
+    held = null;
+    const released = await waitUntil(() => victim.dead === true && victim.exitFinished === true, 3_000);
+    assert.equal(released, true);
+    const born = pair.sup.spawn({
+      pluginId: 'after-exit',
+      script: responsePath,
+      env: { RESPONSE_PAD: String(pad) },
+    });
+    ids.push('after-exit');
+    const bornRec = pair.sup.children.get('after-exit');
+    const bornGrant = await waitUntil(
+      () => bornRec.grantSettled && bornRec.outbound === 0 && bornRec.sendWindow >= USABLE_RESPONSE,
+      3_000,
+    );
+    assert.equal(bornGrant, true, String(bornRec.sendWindow));
+    const afterExit = await pair.stub.call({
+      pluginId: 'after-exit',
+      credential: born.credential,
+      correlationId: 3,
+      port: 'db',
+      method: 'get',
+      payload: { n: 3 },
+    }, 3_000).catch((err) => err);
+    assert.equal(afterExit.payload?.length, pad, JSON.stringify({
+      code: afterExit.code,
+      pause: bornRec.pauseReason,
+      window: bornRec.sendWindow,
+    }));
+    for (const id of new Set(ids)) {
+      const rec = pair.sup.children.get(id);
+      if (!rec || rec.dead || rec.exited) continue;
+      assert.ok(rec.sendWindow >= USABLE_RESPONSE, `${id} ${rec.sendWindow}`);
+    }
+  } finally {
+    closeFd(held);
+    stop();
+    await pair.close();
+  }
+});
+
+test('children admitted together can each obtain usable credit', async () => {
+  const pad = 4_000;
+  const counts = [1, 4, 8];
+  for (const n of counts) {
+    const pair = await connectPair({ sweeper: false });
+    const ids = [];
+    const stop = () => {
+      for (const id of ids) {
+        const proc = pair.sup.children.get(id)?.child;
+        if (proc && proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL');
+      }
+    };
+    try {
+      for (let i = 0; i < n; i++) {
+        const pluginId = `idle-${i}`;
+        ids.push(pluginId);
+        pair.sup.spawn({
+          pluginId,
+          script: responsePath,
+          env: { RESPONSE_PAD: String(pad) },
+        });
+      }
+      const records = ids.map((id) => pair.sup.children.get(id));
+      const granted = await waitUntil(
+        () => records.every((rec) => rec.grantSettled && rec.outbound === 0 && rec.sendWindow >= USABLE_RESPONSE),
+        3_000,
+      );
+      const windows = records.map((rec) => rec.sendWindow);
+      assert.equal(granted, true, JSON.stringify({ n, windows }));
+      const min = Math.min(...windows);
+      const max = Math.max(...windows);
+      assert.ok(min >= USABLE_RESPONSE, JSON.stringify({ n, windows }));
+      assert.ok(min * 2 >= max, JSON.stringify({ n, windows }));
+      for (const rec of records) assertAccountingInvariants(pair.sup, rec);
+      const follower = `idle-${n}`;
+      let followerKid = null;
+      try {
+        followerKid = pair.sup.spawn({
+          pluginId: follower,
+          script: responsePath,
+          env: { RESPONSE_PAD: String(pad) },
+        });
+      } catch (err) {
+        assert.equal(err.code, 'spawn-rejected', err.message);
+        assert.equal(pair.sup.children.has(follower), false);
+        assert.equal(n, 8);
+        continue;
+      }
+      ids.push(follower);
+      const rec = pair.sup.children.get(follower);
+      const followed = await waitUntil(
+        () => rec.grantSettled && rec.outbound === 0 && rec.sendWindow >= USABLE_RESPONSE,
+        3_000,
+      );
+      assert.equal(followed, true, JSON.stringify({ n, window: rec.sendWindow }));
+      assert.notEqual(n, 8);
+      const res = await pair.stub.call({
+        pluginId: follower,
+        credential: followerKid.credential,
+        correlationId: 1,
+        port: 'db',
+        method: 'get',
+        payload: { n: 1 },
+      }, 3_000).catch((err) => err);
+      assert.equal(res.payload?.length, pad, JSON.stringify({ n, code: res.code, window: rec.sendWindow }));
+    } finally {
+      stop();
+      await pair.close();
+    }
   }
 });
 
