@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url';
 import { b1 } from './cases/b1-throughput.mjs';
 import { applyScoredSkip, floodBound, floodScore, forgedFlood, hostileBattery, starvation } from './cases/b6-mux-identity.mjs';
 import { assessEnvironment, delay, measureSeries, openLoop, preflight, treeRss, waitUntil } from './measure.mjs';
-import { MuxFramer, encodeMux, encodeNdjson } from './framing.mjs';
+import { MuxFramer, STDOUT_KIND_PREFIX, classifyStdoutLine, encodeMux, encodeNdjson } from './framing.mjs';
 import { FencedError } from './authority.mjs';
 import { DEFAULT_CAPS, PARTIAL_READ_CHUNK, PLUGIN_ENV_ENTRY_MAX, PLUGIN_ENV_MAX, Supervisor, connectEnds, connectPair, dbConfigured, partialCapHolds, pluginEnvBlock, stdinControlReserve, totalCapHolds, writePluginEnv } from './supervisor.mjs';
 import { socketPair } from './kernel-stub.mjs';
@@ -3818,28 +3818,43 @@ test('mixed-size replies flush credit the half threshold withheld', async () => 
 // lines and writes cancelled without subtracting. Neither writes a grant
 // line; a grant line is control if one appears. echo keeps no window.
 // ignore-cancel and flood are not credit senders (their bytes are data).
+// The spend decision is the shared top-level classifier, not a second copy.
 function dataSpent(text) {
   const buf = Buffer.from(text);
   let spent = 0;
   let offset = 0;
   while (offset < buf.length) {
-    const nl = buf.indexOf(0x0a, offset);
-    const complete = nl >= 0;
-    const end = complete ? nl + 1 : buf.length;
-    const line = buf.subarray(offset, end);
-    const body = complete ? line.subarray(0, Math.max(0, line.length - 1)) : line;
-    const match = /"kind"\s*:\s*"([^"\\]*)"/.exec(body.toString('latin1'));
-    const kind = match ? match[1] : null;
-    const control = kind === 'cancelled' || kind === 'grant';
-    if (complete) {
-      if (!control) spent += line.length;
-      offset = end;
+    const info = classifyStdoutLine(buf.subarray(offset));
+    if (info.complete) {
+      if (!info.control) spent += info.length;
+      offset += info.length;
       continue;
     }
-    if (!control && (kind != null || line.length > 96)) spent += line.length;
+    if (!info.control && (info.kind != null || info.length > STDOUT_KIND_PREFIX)) spent += info.length;
     break;
   }
   return spent;
+}
+
+// Complete lines use JSON.parse's top-level kind. That is not the classifier.
+function oracleSpent(text) {
+  let spent = 0;
+  let i = 0;
+  while (i < text.length) {
+    const nl = text.indexOf('\n', i);
+    if (nl < 0) break;
+    const body = text.slice(i, nl);
+    const bytes = Buffer.byteLength(text.slice(i, nl + 1));
+    try {
+      const msg = JSON.parse(body);
+      const kind = msg && typeof msg === 'object' && typeof msg.kind === 'string' ? msg.kind : '';
+      if (kind !== 'cancelled' && kind !== 'grant') spent += bytes;
+    } catch {
+      spent += bytes;
+    }
+    i = nl + 1;
+  }
+  return { spent, tail: text.slice(i) };
 }
 
 test('supervisor credit matches the credit senders', async () => {
@@ -3868,6 +3883,21 @@ test('supervisor credit matches the credit senders', async () => {
     lines.push('ed","correlationId":3}\n');
     lines.push('{"kin');
     lines.push('d":"result","correlationId":4,"payload":{"n":1}}\n');
+    lines.push(encodeNdjson({
+      payload: { kind: 'cancelled', text: 'p'.repeat(40), note: 'kind":"grant"' },
+      correlationId: 9,
+      kind: 'result',
+    }));
+    lines.push(encodeNdjson({
+      payload: { kind: 'result', note: 'kind":"cancelled"' },
+      correlationId: 10,
+      kind: 'cancelled',
+    }));
+    lines.push(encodeNdjson({
+      kind: 'grant',
+      payload: { kind: 'result', text: '"kind":"cancelled"' },
+      correlationId: 11,
+    }));
     lines.push('a'.repeat(200));
     let text = '';
     for (const piece of lines) {
@@ -3886,6 +3916,13 @@ test('supervisor credit matches the credit senders', async () => {
     }
     const spent = dataSpent(text);
     assert.ok(spent > 0, String(spent));
+    const oracle = oracleSpent(text);
+    assert.equal(oracle.tail, 'a'.repeat(200));
+    assert.equal(spent, oracle.spent + Buffer.byteLength(oracle.tail), JSON.stringify({
+      spent,
+      oracle: oracle.spent,
+      tail: oracle.tail.length,
+    }));
     let control = 0;
     for (const line of text.split('\n')) {
       if (!line) continue;
@@ -4019,6 +4056,84 @@ test('cancel acks do not recycle data credit', { timeout: 10_000 }, async () => 
       sent: rec.creditSent,
       oversizedLine,
     }));
+    assertAccountingInvariants(pair.sup, rec);
+  } finally {
+    stop();
+    await pair.close();
+  }
+});
+
+test('a reordered result spends credit and refills', { timeout: 15_000 }, async () => {
+  const totalGlobal = 100_000;
+  const pending = 8;
+  const pair = await connectPair({
+    sweeper: false,
+    caps: { pending, pendingGlobal: 64, partial: 1024 * 1024, total: 1024 * 1024, totalGlobal },
+  });
+  const stop = () => {
+    const proc = pair.sup.children.get('reordered')?.child;
+    if (proc && proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL');
+  };
+  const reorderedLine = (id, n) => encodeNdjson({
+    payload: {
+      kind: 'cancelled',
+      text: 'p'.repeat(n),
+      note: 'kind":"grant"',
+    },
+    correlationId: id,
+    kind: 'result',
+  });
+  try {
+    const kid = pair.sup.spawn({
+      pluginId: 'reordered',
+      script: responsePath,
+      pending,
+      total: 1024 * 1024,
+    });
+    const rec = pair.sup.children.get('reordered');
+    const granted = await waitUntil(
+      () => rec.grantSettled && rec.outbound === 0 && rec.sendWindow > 0,
+      2_000,
+    );
+    assert.equal(granted, true, String(rec.sendWindow));
+    const origin = rec.creditSent;
+    // Three lines fit in the first grant. The fourth needs the refill that
+    // a nested payload.kind would suppress. A 10_000-byte line does that
+    // when the grant is about 30_000; a larger window uses a larger line.
+    const target = Math.floor(origin / 3) - 32;
+    let pad = Math.max(1, target - 160);
+    while (pad > 1 && Buffer.byteLength(reorderedLine(1, pad)) > target) pad--;
+    const lineLen = Buffer.byteLength(reorderedLine(1, pad));
+    assert.ok(lineLen * 3 <= origin, JSON.stringify({ lineLen, origin, pad }));
+    assert.ok(lineLen * 4 > origin, JSON.stringify({ lineLen, origin, pad }));
+    assert.equal(JSON.parse(reorderedLine(1, pad)).kind, 'result');
+    const calls = [];
+    for (let id = 1; id <= 4; id++) {
+      calls.push(pair.stub.call({
+        pluginId: 'reordered',
+        credential: kid.credential,
+        correlationId: id,
+        port: 'db',
+        method: 'get',
+        payload: { pad, shape: 'reordered' },
+      }, 3_000).catch((err) => err));
+    }
+    const results = await Promise.all(calls);
+    assert.ok(results.every((row) => row?.kind === 'result' && row.payload?.text?.length === pad && row.payload?.kind === 'cancelled'), JSON.stringify({
+      kinds: results.map((row) => row?.kind || row?.code),
+      pause: rec.pauseReason,
+      window: rec.sendWindow,
+      spent: rec.creditSpent,
+      sent: rec.creditSent,
+      origin,
+      lineLen,
+      fault: pair.sup.framingFault,
+    }));
+    assert.ok(rec.creditSpent > 0, String(rec.creditSpent));
+    assert.ok(rec.creditSent > origin, JSON.stringify({ origin, sent: rec.creditSent, spent: rec.creditSpent }));
+    assert.notEqual(rec.pauseReason, 'global');
+    assert.equal(pair.sup.framingFault, null);
+    assert.equal(rec.sendWindow + rec.creditSpent, rec.creditSent);
     assertAccountingInvariants(pair.sup, rec);
   } finally {
     stop();

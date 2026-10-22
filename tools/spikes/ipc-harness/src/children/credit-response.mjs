@@ -2,7 +2,7 @@
 // A result is written only when the send window covers that line. Further
 // results wait for a window-update after the supervisor consumes stdout.
 
-import { NdjsonFramer, encodeNdjson } from '../framing.mjs';
+import { NdjsonFramer, encodeNdjson, stdoutLineSpends } from '../framing.mjs';
 
 const framer = new NdjsonFramer();
 const padRequest = Number(process.env.RESPONSE_PAD);
@@ -19,10 +19,23 @@ function resultPad(msg) {
 }
 
 function resultLine(msg) {
+  const n = resultPad(msg);
+  // payload before kind: a nested payload.kind must not decide credit.
+  if (msg?.payload?.shape === 'reordered') {
+    return encodeNdjson({
+      payload: {
+        kind: 'cancelled',
+        text: 'p'.repeat(n),
+        note: 'kind":"grant"',
+      },
+      correlationId: msg.correlationId,
+      kind: 'result',
+    });
+  }
   return encodeNdjson({
     kind: 'result',
     correlationId: msg.correlationId,
-    payload: 'p'.repeat(resultPad(msg)),
+    payload: 'p'.repeat(n),
   });
 }
 
@@ -31,9 +44,10 @@ function flush() {
     const msg = waiting[0];
     const line = resultLine(msg);
     const n = Buffer.byteLength(line);
-    if (n > credit) return;
+    const spends = stdoutLineSpends(line);
+    if (spends && n > credit) return;
     waiting.shift();
-    credit -= n;
+    if (spends) credit -= n;
     process.stdout.write(line);
   }
 }

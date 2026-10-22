@@ -15,7 +15,7 @@ import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { closeSync, write, writeSync } from 'node:fs';
 import { Socket } from 'node:net';
-import { MuxFramer, NdjsonFramer, MAX_RESIDUAL, encodeNdjson, encodeMux } from './framing.mjs';
+import { MuxFramer, NdjsonFramer, MAX_RESIDUAL, STDOUT_KIND_PREFIX, classifyStdoutLine, encodeNdjson, encodeMux } from './framing.mjs';
 import { PendingTable, socketPair, KernelStub } from './kernel-stub.mjs';
 import { FencedError, commitExecution, startSweeper } from './authority.mjs';
 import { pipePending } from './pipe_pending.mjs';
@@ -274,27 +274,10 @@ export function stdinControlReserve() {
 
 const CONTROL_RESERVE = stdinControlReserve();
 
-// A prefix shorter than this, with no "kind" yet, can still be a cancel ack
-// or a grant. Those lines do not spend send credit. A longer prefix, or one
-// whose kind is already a data kind, spends as it arrives so the line is not
-// buffered on top of the window it came out of. credit-wait and
-// credit-response put kind first, well inside this bound.
-const CONTROL_KIND_PREFIX = 96;
-
-function lineKind(bytes) {
-  const nl = bytes.indexOf(0x0a);
-  const line = nl >= 0 ? bytes.subarray(0, nl) : bytes;
-  const match = /"kind"\s*:\s*"([^"\\]*)"/.exec(line.toString('latin1'));
-  return match ? match[1] : null;
-}
-
-function isControlKind(kind) {
-  return kind === 'cancelled' || kind === 'grant';
-}
-
 // `pending` is the unterminated tail already in the framer. `charged` is how
 // many bytes of that tail have already left the send window. Cancel acks and
-// grant lines do not leave it: the sender does not subtract them either.
+// grant lines do not leave it. The kind is the top-level field, the same
+// classifier credit-wait and credit-response use before they decrement.
 function accountStdoutCredit(pending, chunk, charged) {
   const pendingLen = pending?.length ?? 0;
   const combined = pendingLen > 0 ? Buffer.concat([pending, chunk]) : chunk;
@@ -303,28 +286,23 @@ function accountStdoutCredit(pending, chunk, charged) {
   let openCharged = charged > 0 ? charged : 0;
   let offset = 0;
   while (offset < combined.length) {
-    const nl = combined.indexOf(0x0a, offset);
-    const complete = nl >= 0;
-    const end = complete ? nl + 1 : combined.length;
-    const line = combined.subarray(offset, end);
-    const lineLen = end - offset;
-    const kind = lineKind(line);
-    const control = isControlKind(kind);
-    if (complete) {
-      if (control) {
+    const info = classifyStdoutLine(combined.subarray(offset));
+    const lineLen = info.length;
+    if (info.complete) {
+      if (info.control) {
         if (openCharged > 0) refund += openCharged;
       } else {
         const need = lineLen - openCharged;
         if (need > 0) spend += need;
       }
       openCharged = 0;
-      offset = end;
+      offset += lineLen;
       continue;
     }
-    if (control) {
+    if (info.control) {
       if (openCharged > 0) refund += openCharged;
       openCharged = 0;
-    } else if (kind != null || lineLen > CONTROL_KIND_PREFIX) {
+    } else if (info.kind != null || lineLen > STDOUT_KIND_PREFIX) {
       const need = lineLen - openCharged;
       if (need > 0) {
         spend += need;
@@ -1386,9 +1364,10 @@ export class Supervisor {
   // does not decide who receives a usable window. sendWindow is advertised
   // credit the child has not spent: grants raise it, data stdout lowers it,
   // and sendWindow + creditSpent stays equal to creditSent. Cancel acks and
-  // grant lines do not lower it. credit-wait writes those acks without
-  // decrementing, and spending them made the quiet flush advertise the same
-  // bytes again. A data partial spends as soon as its kind is known, so the
+  // grant lines do not lower it. The kind is the top-level JSON field;
+  // credit-wait and credit-response use that same classifier and do not
+  // decrement those lines. Spending them made the quiet flush advertise the
+  // same bytes again. A data partial spends as soon as its kind is known, so the
   // line is not held on top of the window. A spent read is not its own
   // grant. The unspent remainder stays advertised until half the room is
   // gone, and that half comes back as one grant. A sender that stops before

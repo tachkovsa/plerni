@@ -2,14 +2,20 @@
 // Cancel is control: it does not consume the request credit and is acknowledged
 // even when the credit is zero. A call stays queued until a grant covers it.
 
-import { NdjsonFramer, encodeNdjson } from '../framing.mjs';
+import { NdjsonFramer, encodeNdjson, stdoutLineSpends } from '../framing.mjs';
 
 const framer = new NdjsonFramer();
 let credit = 0;
 const waiting = [];
 
 function writeLine(obj) {
-  process.stdout.write(encodeNdjson(obj));
+  const line = encodeNdjson(obj);
+  if (stdoutLineSpends(line)) {
+    const n = Buffer.byteLength(line);
+    if (n > credit) return;
+    credit -= n;
+  }
+  process.stdout.write(line);
 }
 
 function resultPayload(msg) {
@@ -29,9 +35,10 @@ function flush() {
       payload: resultPayload(msg),
     });
     const n = Buffer.byteLength(line);
-    if (n > credit) return;
+    const spends = stdoutLineSpends(line);
+    if (spends && n > credit) return;
     waiting.shift();
-    credit -= n;
+    if (spends) credit -= n;
     process.stdout.write(line);
   }
 }
