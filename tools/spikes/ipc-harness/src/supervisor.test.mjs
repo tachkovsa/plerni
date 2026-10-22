@@ -3734,6 +3734,86 @@ test('a call leaves room for a cancel of its own correlation id', async () => {
   }
 });
 
+test('mixed-size replies flush credit the half threshold withheld', async () => {
+  const totalGlobal = 100_000;
+  const small = 10_000;
+  const large = 25_000;
+  const smallLine = Buffer.byteLength(encodeNdjson({
+    kind: 'result',
+    correlationId: 1,
+    payload: 'p'.repeat(small),
+  }));
+  const largeLine = Buffer.byteLength(encodeNdjson({
+    kind: 'result',
+    correlationId: 2,
+    payload: 'p'.repeat(large),
+  }));
+  const pair = await connectPair({
+    sweeper: false,
+    caps: { pending: 32, partial: 1024 * 1024, total: 1024 * 1024, totalGlobal },
+  });
+  const stop = () => {
+    const proc = pair.sup.children.get('mixed')?.child;
+    if (proc && proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL');
+  };
+  try {
+    const kid = pair.sup.spawn({
+      pluginId: 'mixed',
+      script: responsePath,
+      pending: 32,
+      total: 1024 * 1024,
+    });
+    const rec = pair.sup.children.get('mixed');
+    const granted = await waitUntil(
+      () => rec.grantSettled && rec.outbound === 0 && rec.sendWindow >= smallLine,
+      2_000,
+    );
+    assert.equal(granted, true, String(rec.sendWindow));
+    // The first grant covers the small line. Spending it leaves less than
+    // the large line, and less than half the room, so the half threshold
+    // does not replenish. The sender waits until a later flush.
+    assert.ok(rec.sendWindow - smallLine < largeLine, String(rec.sendWindow));
+    assert.ok(smallLine * 2 < rec.sendWindow, String(rec.sendWindow));
+    const advertised = rec.creditSent;
+    const first = await pair.stub.call({
+      pluginId: 'mixed',
+      credential: kid.credential,
+      correlationId: 1,
+      port: 'db',
+      method: 'get',
+      payload: { pad: small },
+    }, 3_000);
+    assert.equal(first.payload?.length, small);
+    if (rec.creditSent === advertised) {
+      assert.ok(rec.sendWindow > 0 && rec.sendWindow < largeLine, String(rec.sendWindow));
+    }
+    const second = await pair.stub.call({
+      pluginId: 'mixed',
+      credential: kid.credential,
+      correlationId: 2,
+      port: 'db',
+      method: 'get',
+      payload: { pad: large },
+    }, 3_000).catch((err) => err);
+    assert.equal(second.payload?.length, large, JSON.stringify({
+      code: second.code,
+      pause: rec.pauseReason,
+      window: rec.sendWindow,
+      spent: rec.creditSpent,
+      granted: rec.creditSent,
+      fault: pair.sup.framingFault,
+    }));
+    assert.ok(rec.creditSent > advertised, String(rec.creditSent));
+    assert.notEqual(rec.pauseReason, 'global');
+    assert.equal(pair.sup.framingFault, null);
+    assert.equal(rec.sendWindow + rec.creditSpent, rec.creditSent);
+    assertAccountingInvariants(pair.sup, rec);
+  } finally {
+    stop();
+    await pair.close();
+  }
+});
+
 test('send credit refills after a large response is consumed', { timeout: 10_000 }, async () => {
   const reserved = measureFlowReserve();
   assert.ok(reserved);
@@ -4334,7 +4414,8 @@ test('reply metadata is charged beside sibling send windows', async () => {
 // fits B_g. A grant that runs while every peer is already live leaves each
 // child a window that can carry a small result; a window advertised before
 // the peer existed stays as advertised. Reply expansion (version, grants,
-// timestamps) is the same #fitsGlobal check as a grant.
+// timestamps) is the same #fitsGlobal check as a grant. A quiet flush adds
+// withheld credit and does not shrink sendWindow.
 function assertAccountingInvariants(sup, rec) {
   const ceiling = rec.flowOk ? rec.bT : rec.limits.total;
   let kernel = 0;

@@ -297,6 +297,14 @@ function admissionKeepFloor() {
 
 const ADMIT_KEEP = admissionKeepFloor();
 
+// A correct sender waits until the advertised window covers its next reply.
+// The half-room threshold coalesces open-loop grants. If the child stops
+// while the spent part is still under half the room, that reply never
+// starts. Quiet stdout flushes the withheld deficit. Further stdout
+// postpones the flush, and not past the max.
+const CREDIT_FLUSH_QUIET_MS = 40;
+const CREDIT_FLUSH_MAX_MS = 1000;
+
 // Process environment values are strings and cannot carry a NUL. The spawn
 // map key keeps the original plugin id; this text is only the child hint.
 function envText(value) {
@@ -594,6 +602,11 @@ export class Supervisor {
       // accounted room before it runs. A short follow of a shrinking burst
       // does not continue while the mux stays unread.
       refillArmed: false,
+      // Withheld credit (spent, not yet re-advertised) while the child still
+      // holds at least half the room. Quiet stdout flushes it. The due time
+      // is the latest that flush may wait.
+      creditFlush: null,
+      creditFlushDue: null,
       envHold,
       groupSignaled: false,
       exitDrain: false,
@@ -1258,7 +1271,11 @@ export class Supervisor {
   // credit the child has not spent: grants raise it, stdout lowers it, and
   // sendWindow + creditSpent stays equal to creditSent. A spent read is not
   // its own grant. The unspent remainder stays advertised until half the
-  // room is gone, and that half comes back as one grant.
+  // room is gone, and that half comes back as one grant. A sender that
+  // stops before that half, still waiting for a window that covers its
+  // next reply, is flushed after a quiet delay. Further stdout postpones
+  // that flush, and not past the max delay. The flush adds credit; it does
+  // not reduce a window already advertised.
   //
   // Every admission that adds mux bytes or reserves userspace beside those
   // windows uses #fitsGlobal. That is call and cancel admission, parking,
@@ -1588,9 +1605,11 @@ export class Supervisor {
     const room = this.#creditRoom(rec);
     const keep = this.#creditKeep(rec, room);
     if (this.#replenishCredit(room, keep, rec.sendWindow) <= 0) {
+      this.#noteWithheldCredit(rec, room, keep);
       this.#drainPark(rec);
       return;
     }
+    this.#disarmCreditFlush(rec);
     rec.refillArmed = true;
     setImmediate(() => this.#finishRefill(rec));
   }
@@ -1652,9 +1671,11 @@ export class Supervisor {
     const keep = this.#creditKeep(rec, room);
     const credit = this.#replenishCredit(room, keep, rec.sendWindow);
     if (credit <= 0) {
+      this.#noteWithheldCredit(rec, room, keep);
       this.#drainPark(rec);
       return;
     }
+    this.#disarmCreditFlush(rec);
     this.#queueGrant(rec, credit);
     this.#drainPark(rec);
   }
@@ -1663,13 +1684,79 @@ export class Supervisor {
   // child still holds at least half of the room, a spent chunk is not a
   // grant. Crossing that half returns the spent half in one grant, so an
   // open-loop response does not write a window update of its own. A window
-  // of zero is the first advertisement and takes the whole room.
+  // of zero is the first advertisement and takes the whole room. Credit
+  // still withheld when the child goes quiet is flushed by #noteWithheldCredit.
   #replenishCredit(room, keep, sendWindow) {
     const budget = room - keep;
     if (!Number.isFinite(budget) || budget <= sendWindow) return 0;
     const deficit = budget - sendWindow;
     if (sendWindow > 0 && deficit * 2 < budget) return 0;
     return Math.min(2147483647, deficit);
+  }
+
+  // Spent credit that is not yet advertised again. Zero when the window
+  // already covers the room. The half threshold does not change this gap.
+  #advertisedDeficit(room, keep, sendWindow) {
+    const budget = room - keep;
+    if (!Number.isFinite(budget) || budget <= sendWindow) return 0;
+    const deficit = budget - sendWindow;
+    if (!Number.isFinite(deficit) || deficit <= 0) return 0;
+    return Math.min(2147483647, Math.floor(deficit));
+  }
+
+  // The half threshold is holding a positive deficit back. Arm the quiet
+  // flush. A full window, or a window the half threshold will grant now,
+  // cancels it.
+  #noteWithheldCredit(rec, room, keep) {
+    const deficit = this.#advertisedDeficit(room, keep, rec.sendWindow);
+    const withheld = rec.sendWindow > 0
+      && deficit > 0
+      && this.#replenishCredit(room, keep, rec.sendWindow) <= 0;
+    if (withheld) this.#armCreditFlush(rec);
+    else this.#disarmCreditFlush(rec);
+  }
+
+  #armCreditFlush(rec, retry = false) {
+    if (rec.dead || this.closed || !rec.flowOk) return;
+    const now = performance.now();
+    if (rec.creditFlushDue == null) rec.creditFlushDue = now + CREDIT_FLUSH_MAX_MS;
+    let delay = CREDIT_FLUSH_QUIET_MS;
+    if (!retry) delay = Math.max(0, Math.min(CREDIT_FLUSH_QUIET_MS, rec.creditFlushDue - now));
+    if (rec.creditFlush) clearTimeout(rec.creditFlush);
+    const timer = setTimeout(() => this.#flushWithheldCredit(rec), delay);
+    if (typeof timer.unref === 'function') timer.unref();
+    rec.creditFlush = timer;
+  }
+
+  #disarmCreditFlush(rec) {
+    if (rec.creditFlush) clearTimeout(rec.creditFlush);
+    rec.creditFlush = null;
+    rec.creditFlushDue = null;
+  }
+
+  // One grant of the deficit the half threshold has been holding. The
+  // amount is the room at flush time, so a sibling share taken since the
+  // spend is not advertised. A grant that does not fit yet is retried
+  // inside the same bound.
+  #flushWithheldCredit(rec) {
+    rec.creditFlush = null;
+    if (rec.dead || this.closed || !rec.flowOk) {
+      rec.creditFlushDue = null;
+      return;
+    }
+    const room = this.#creditRoom(rec);
+    const keep = this.#creditKeep(rec, room);
+    const deficit = this.#advertisedDeficit(room, keep, rec.sendWindow);
+    if (!(rec.sendWindow > 0) || !(deficit > 0)) {
+      rec.creditFlushDue = null;
+      return;
+    }
+    if (!this.#queueGrant(rec, deficit)) {
+      this.#armCreditFlush(rec, true);
+      return;
+    }
+    rec.creditFlushDue = null;
+    this.#drainPark(rec);
   }
 
   // Send windows of other live children. This child's own window is subtracted
@@ -2349,6 +2436,7 @@ export class Supervisor {
   }
 
   #releaseFlow(rec) {
+    this.#disarmCreditFlush(rec);
     this.#clearParkTimer(rec);
     this.#clearEnv(rec);
     this.#clearDrainTimer(rec);

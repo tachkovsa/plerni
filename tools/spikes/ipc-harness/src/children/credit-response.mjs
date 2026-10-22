@@ -12,18 +12,24 @@ const pad = Number.isInteger(padRequest) && padRequest > 0 && padRequest <= 64 *
 let credit = 0;
 const waiting = [];
 
-function resultLine(correlationId) {
+function resultPad(msg) {
+  const requested = Number(msg?.payload?.pad);
+  if (Number.isInteger(requested) && requested > 0 && requested <= 64 * 1024) return requested;
+  return pad;
+}
+
+function resultLine(msg) {
   return encodeNdjson({
     kind: 'result',
-    correlationId,
-    payload: 'p'.repeat(pad),
+    correlationId: msg.correlationId,
+    payload: 'p'.repeat(resultPad(msg)),
   });
 }
 
 function flush() {
   while (waiting.length > 0) {
     const msg = waiting[0];
-    const line = resultLine(msg.correlationId);
+    const line = resultLine(msg);
     const n = Buffer.byteLength(line);
     if (n > credit) return;
     waiting.shift();
