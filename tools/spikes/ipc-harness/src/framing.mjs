@@ -163,6 +163,13 @@ export class NdjsonFramer {
   hasPendingNewline() {
     return this.#firstNewline >= 0;
   }
+
+  // Bytes after the last complete line. Empty when the buffer ends on a newline.
+  pendingTail() {
+    const start = this.#lastNewline < 0 ? 0 : this.#lastNewline + 1;
+    if (start >= this.#bytes.length) return Buffer.alloc(0);
+    return this.#bytes.subarray(start, this.#bytes.length);
+  }
 }
 
 export function encodeNdjson(obj) {

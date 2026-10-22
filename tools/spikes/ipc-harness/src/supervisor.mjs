@@ -274,6 +274,71 @@ export function stdinControlReserve() {
 
 const CONTROL_RESERVE = stdinControlReserve();
 
+// A prefix shorter than this, with no "kind" yet, can still be a cancel ack
+// or a grant. Those lines do not spend send credit. A longer prefix, or one
+// whose kind is already a data kind, spends as it arrives so the line is not
+// buffered on top of the window it came out of. credit-wait and
+// credit-response put kind first, well inside this bound.
+const CONTROL_KIND_PREFIX = 96;
+
+function lineKind(bytes) {
+  const nl = bytes.indexOf(0x0a);
+  const line = nl >= 0 ? bytes.subarray(0, nl) : bytes;
+  const match = /"kind"\s*:\s*"([^"\\]*)"/.exec(line.toString('latin1'));
+  return match ? match[1] : null;
+}
+
+function isControlKind(kind) {
+  return kind === 'cancelled' || kind === 'grant';
+}
+
+// `pending` is the unterminated tail already in the framer. `charged` is how
+// many bytes of that tail have already left the send window. Cancel acks and
+// grant lines do not leave it: the sender does not subtract them either.
+function accountStdoutCredit(pending, chunk, charged) {
+  const pendingLen = pending?.length ?? 0;
+  const combined = pendingLen > 0 ? Buffer.concat([pending, chunk]) : chunk;
+  let spend = 0;
+  let refund = 0;
+  let openCharged = charged > 0 ? charged : 0;
+  let offset = 0;
+  while (offset < combined.length) {
+    const nl = combined.indexOf(0x0a, offset);
+    const complete = nl >= 0;
+    const end = complete ? nl + 1 : combined.length;
+    const line = combined.subarray(offset, end);
+    const lineLen = end - offset;
+    const kind = lineKind(line);
+    const control = isControlKind(kind);
+    if (complete) {
+      if (control) {
+        if (openCharged > 0) refund += openCharged;
+      } else {
+        const need = lineLen - openCharged;
+        if (need > 0) spend += need;
+      }
+      openCharged = 0;
+      offset = end;
+      continue;
+    }
+    if (control) {
+      if (openCharged > 0) refund += openCharged;
+      openCharged = 0;
+    } else if (kind != null || lineLen > CONTROL_KIND_PREFIX) {
+      const need = lineLen - openCharged;
+      if (need > 0) {
+        spend += need;
+        openCharged = lineLen;
+      }
+    } else if (openCharged > 0) {
+      refund += openCharged;
+      openCharged = 0;
+    }
+    break;
+  }
+  return { spend, refund, charged: openCharged };
+}
+
 // The idle grant cannot see the call that will sit beside it. This slot is
 // one 1024-byte call, its identifiers, and the control reserve, so the next
 // admission still fits in B_t and B_g. A larger call raises the per-child
@@ -550,9 +615,12 @@ export class Supervisor {
       // Bytes of advertised credit stdout has already consumed. sendWindow
       // plus this is creditSent: the grant is not rewritten downward.
       creditSpent: 0,
-      // Bytes the child may still write. Grants raise it. Stdout reads lower
+      // Bytes of the open stdout line already taken from sendWindow. Control
+      // lines refund this. A later chunk of a data line does not spend it twice.
+      stdoutCreditCharged: 0,
+      // Bytes the child may still write. Grants raise it. Data stdout lowers
       // it by the same amount. A refill adds new credit; it does not shrink
-      // credit the child has not spent.
+      // credit the child has not spent. Cancel acks and grant lines do not.
       sendWindow: 0,
       // Largest call cost currently reserved. A rejected call does not keep
       // its cost. admitFloor is the largest cost that finished without rejection.
@@ -835,6 +903,9 @@ export class Supervisor {
     // that tail, so the last bytes of a response are not stuck behind C.
     const incoming = unread > 0 ? Math.min(this.readBytes, unread) : this.readBytes;
     if (this.bufferedBytes() + incoming > this.#globalCap()) {
+      // A partial mux frame can be what filled this room. Fault that pair
+      // here: the mux socket will not deliver another chunk while it is paused.
+      this.#noteMuxBudget();
       // A child with nothing in userspace is still held. Pausing it would
       // wait for bytes it does not have; the probe has to run anyway.
       if (this.#pluginBytes(rec) > 0) this.#pause(rec, 'global');
@@ -1150,6 +1221,11 @@ export class Supervisor {
       this.#flipMux('mux-buffer');
       return false;
     }
+    // The window is not subtracted here. A frame that does not fit beside
+    // credit still has to be read so admission can reject it. Pausing that
+    // read leaves the frame unfinished and the rejection unsent. The stall
+    // is the other shape: this partial and an unfinished stdout line that
+    // cannot take its next read either. #noteMuxBudget closes that pair.
     if (this.bufferedBytes() + this.readBytes > this.#globalCap()) {
       this.#pauseInput();
       return false;
@@ -1174,6 +1250,9 @@ export class Supervisor {
       // A pause sticks until something recounts. Stdout used to do that when
       // a child echoed a grant; a quiet child never will. The probe is the
       // recount, and it still resumes only under the global low water.
+      // A mux frame and a stdout line that block each other never recount
+      // into room, so the probe is also the fault for that pair.
+      if (this.#noteMuxBudget()) return;
       if (this.inputPaused) this.#resumeInput();
       // readPosted plus a paused stdout is a cancelled resume. The child is
       // not budget-paused, and the bytes already in the kernel are not a new read.
@@ -1194,7 +1273,10 @@ export class Supervisor {
   // The next read is a full C, and other retained bytes shrink the room
   // beside the unfinished frame. Fault when that room cannot take the read
   // and draining those bytes cannot reopen it: the frame alone is already
-  // past half the cap, or it already leaves less than C. A short read is
+  // past half the cap, or it already leaves less than C. A partial under
+  // that line still faults when an unfinished stdout line is what fills the
+  // rest and that line's next read does not fit either. Those two partials
+  // never shrink, and the low-water checks wait forever. A short read is
   // not used. The onread buffer is C, so it can pull a full buffer and
   // cross the cap. A length that is not buffered yet stays in the kernel.
   #muxFrameUnfinishable() {
@@ -1204,13 +1286,52 @@ export class Supervisor {
     if (declared > cap) return true;
     const held = this.bridge.pendingBytes();
     if (held >= declared) return false;
-    // A partial that can still take a full read, and that can fall under the
-    // resume line by itself, is left for the normal pause. Counting retained
-    // bytes here would walk every child on the throughput path.
-    if (held + this.readBytes <= cap && held <= cap / 2) return false;
     const other = Math.max(0, this.bufferedBytes() - held);
     const free = cap - other - held;
     if (free >= this.readBytes) return false;
+    if (held + this.readBytes > cap || held > cap / 2) return true;
+    // Drainable queues can still open a full read. An unfinished stdout
+    // line cannot. Walk children only once the buffer is already tight.
+    return this.#stdoutPartialBlocked();
+  }
+
+  // An incomplete child line whose next kernel read does not fit beside the
+  // bytes already retained. Unread of zero is the child not having written
+  // yet, which is not a block. A tail shorter than C fits when `free` does.
+  #stdoutPartialBlocked() {
+    const buffered = this.bufferedBytes();
+    const cap = this.#globalCap();
+    for (const rec of this.children.values()) {
+      if (rec.dead || !rec.flowOk) continue;
+      const framerStuck = rec.framer.pendingBytes() > 0 && !rec.framer.hasPendingNewline();
+      const stashed = (rec.stash?.length ?? 0) > 0;
+      if (!framerStuck && !stashed) continue;
+      const unread = this.#stdoutPending(rec);
+      if (!Number.isInteger(unread) || unread <= 0) continue;
+      const incoming = Math.min(this.readBytes, unread);
+      if (buffered + incoming > cap) return true;
+    }
+    return false;
+  }
+
+  // FIONREAD without the invalidation the read gate uses. A fault probe must
+  // not retire the run because one sample failed.
+  #stdoutPending(rec) {
+    if (!Number.isInteger(rec.stdoutFd)) return null;
+    try {
+      const unread = this.flowPending(rec.stdoutFd);
+      return Number.isInteger(unread) && unread >= 0 ? unread : null;
+    } catch {
+      return null;
+    }
+  }
+
+  #noteMuxBudget() {
+    if (this.framingFault || this.closed || this.flip) return false;
+    if (!this.#muxFrameUnfinishable()) return false;
+    this.framingFault = 'mux-budget';
+    this.#failAll(this.framingFault);
+    this.socket.destroy();
     return true;
   }
 
@@ -1222,12 +1343,7 @@ export class Supervisor {
       // Pausing never resumes: the unfinished frame cannot shrink, and the
       // low-water check waits for userspace to fall. A frame that cannot be
       // assembled closes the channel instead of sitting there forever.
-      if (this.#muxFrameUnfinishable()) {
-        this.framingFault = 'mux-budget';
-        this.#failAll(this.framingFault);
-        this.socket.destroy();
-        return;
-      }
+      if (this.#noteMuxBudget()) return;
       if (this.bufferedBytes() > this.#globalCap()) this.#pauseOverGlobal();
     } catch (err) {
       this.framingFault = err.constructor?.name || 'framing-error';
@@ -1268,32 +1384,41 @@ export class Supervisor {
   // share keeps that share out of every other grant. A window already at
   // or above the share is not reserved again and is not reduced. Map order
   // does not decide who receives a usable window. sendWindow is advertised
-  // credit the child has not spent: grants raise it, stdout lowers it, and
-  // sendWindow + creditSpent stays equal to creditSent. A spent read is not
-  // its own grant. The unspent remainder stays advertised until half the
-  // room is gone, and that half comes back as one grant. A sender that
-  // stops before that half, still waiting for a window that covers its
-  // next reply, is flushed after a quiet delay. Further stdout postpones
-  // that flush, and not past the max delay. The flush adds credit; it does
-  // not reduce a window already advertised.
+  // credit the child has not spent: grants raise it, data stdout lowers it,
+  // and sendWindow + creditSpent stays equal to creditSent. Cancel acks and
+  // grant lines do not lower it. credit-wait writes those acks without
+  // decrementing, and spending them made the quiet flush advertise the same
+  // bytes again. A data partial spends as soon as its kind is known, so the
+  // line is not held on top of the window. A spent read is not its own
+  // grant. The unspent remainder stays advertised until half the room is
+  // gone, and that half comes back as one grant. A sender that stops before
+  // that half, still waiting for a window that covers its next reply, is
+  // flushed after a quiet delay. Further stdout postpones that flush, and
+  // not past the max delay. The flush adds credit; it does not reduce a
+  // window already advertised.
   //
   // Every admission that adds mux bytes or reserves userspace beside those
   // windows uses #fitsGlobal. That is call and cancel admission, parking,
   // grants (#overBudget / #bytesOver), reply expansion in #complete
   // (version, grants, timestamps, and a supervisor-stamped cancel ack),
   // rejections, terminal frames, flood frames, and queueMuxBytes. The
-  // child's own window is omitted for a reply that just spent stdout
-  // (#fitsGlobal(extra, rec)); every other path passes null and counts
-  // every live window. #enqueueBuf only commits bytes the caller already
-  // admitted. A stdout read and a mux read do not subtract the open window:
-  // the credit is not in bufferedBytes(), and subtracting it admits the
-  // response on top of a mux frame that already fills the room. #retainTail
-  // uses that same read budget. #failAll writes only after the bridge is
-  // already unusable. Spawn still charges #globalHeld(null) plus the kernel
-  // reserves against totalGlobal, which is the cap those reserves sit in.
-  // A stdout read is posted only when bufferedBytes() plus the bytes it
-  // will pull fit B_g. A waiting read can pull C. A kernel queue shorter
-  // than C is only that tail. A mux read of C uses the same userspace check.
+  // child's own window is omitted for a data reply that just spent stdout
+  // (#fitsGlobal(extra, rec)). A cancel ack did not spend that window, so
+  // its mux frame counts it. Every other path passes null and counts every
+  // live window. #enqueueBuf only commits bytes the caller already admitted.
+  // A stdout read does not subtract the open window: the credit is not in
+  // bufferedBytes(), and subtracting it admits the response on top of a mux
+  // frame that already fills the room. A mux read does not subtract it
+  // either. A frame larger than the hole beside that credit is how admission
+  // rejects the call; refusing the read stalls the rejection. An unfinished
+  // mux frame that also leaves an unfinished stdout line unable to take its
+  // next read cannot shrink, and #noteMuxBudget faults that pair instead of
+  // pausing both. #retainTail uses the stdout read budget. #failAll
+  // writes only after the bridge is already unusable. Spawn still charges
+  // #globalHeld(null) plus the kernel reserves against totalGlobal, which
+  // is the cap those reserves sit in. A stdout read is posted only when
+  // bufferedBytes() plus the bytes it will pull fit B_g. A waiting read can
+  // pull C. A kernel queue shorter than C is only that tail.
   // Cancel and grant are queued ahead of payload and do not consume the
   // send window. One cancel's encoded frame and one grant are the K_out
   // hole. That cancel's identifier bytes are a separate userspace hole:
@@ -1585,15 +1710,25 @@ export class Supervisor {
     return true;
   }
 
-  // Stdout bytes spend the send window. The refill below gives them back
-  // only once those bytes are no longer held in the child's budget.
-  // Promotion is not done here: the chunk that spent the window is parsed
-  // first, so a cancel acknowledgement in it can drop a parked call.
+  // Data stdout spends the send window. The refill below gives those bytes
+  // back only once they are no longer held in the child's budget. Cancel
+  // acks and grant lines are not data: #applyStdout does not pass them here.
+  // Promotion is not done here: the chunk is parsed first, so a cancel
+  // acknowledgement in it can drop a parked call.
   #takeStdout(rec, n) {
     if (!Number.isInteger(n) || n <= 0 || rec.dead) return;
     const spent = Math.min(rec.sendWindow, n);
     rec.sendWindow -= spent;
     rec.creditSpent += spent;
+  }
+
+  // Give back window charged before a line was known to be control. The
+  // grant total does not change: the child was not offered these bytes.
+  #refundStdout(rec, n) {
+    if (!Number.isInteger(n) || n <= 0 || rec.dead) return;
+    const back = Math.min(rec.creditSpent, n);
+    rec.creditSpent -= back;
+    rec.sendWindow += back;
   }
 
   // Credit follows bytes already in the child's budget and the process
@@ -2122,14 +2257,24 @@ export class Supervisor {
     }, 10, coalesce);
   }
 
-  // Spend the window, parse every frame in the chunk, then promote.
-  // A cancel acknowledgement in this read drops its parked call first.
+  // Spend data bytes, parse every frame in the chunk, then promote.
+  // A cancel acknowledgement does not spend the window, and in this read
+  // it drops its parked call before that call can be promoted.
+  // credit-response spends only result lines. credit-wait spends result
+  // lines and writes cancelled without spending. echo keeps no window and
+  // skips grant echoes. ignore-cancel and flood are not credit senders;
+  // their stdout is data. A grant line from a child is control, same as
+  // a cancel ack, so it cannot be flushed back as data credit.
   #applyStdout(rec, chunk) {
     if (rec.dead || this.closed || chunk == null) return;
     const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     if (buf.length === 0) return;
-    this.#takeStdout(rec, buf.length);
+    const credit = accountStdoutCredit(rec.framer.pendingTail(), buf, rec.stdoutCreditCharged || 0);
+    if (credit.refund > 0) this.#refundStdout(rec, credit.refund);
+    if (credit.spend > 0) this.#takeStdout(rec, credit.spend);
+    rec.stdoutCreditCharged = credit.charged;
     this.#onChild(rec, buf);
+    this.#noteMuxBudget();
   }
 
   #onChild(rec, chunk) {
@@ -2660,10 +2805,12 @@ export class Supervisor {
     const resulting = this.#pluginBytes(rec) - pendingIds + buf.length;
     // The pending identifiers are already in the sums. The mux frame can be
     // larger: version, grants, and timestamps are stamped here. That growth
-    // has to fit beside every other child's send window. This child's own
-    // window was spent by the stdout read and is not charged again.
+    // has to fit beside every other child's send window. A data line spent
+    // this child's window, so the remainder is not charged again. A cancel
+    // ack did not spend it, and the frame sits beside that credit.
     const expansion = buf.length - pendingIds;
-    if (resulting > ceiling || (expansion > 0 && !this.#fitsGlobal(expansion, rec))) {
+    const except = msg.kind === 'cancelled' ? null : rec;
+    if (resulting > ceiling || (expansion > 0 && !this.#fitsGlobal(expansion, except))) {
       this.caps.total = true;
       const still = this.#take(pluginId, msg.correlationId, lane);
       if (still) {

@@ -3814,6 +3814,392 @@ test('mixed-size replies flush credit the half threshold withheld', async () => 
   }
 });
 
+// credit-response subtracts only result lines. credit-wait subtracts result
+// lines and writes cancelled without subtracting. Neither writes a grant
+// line; a grant line is control if one appears. echo keeps no window.
+// ignore-cancel and flood are not credit senders (their bytes are data).
+function dataSpent(text) {
+  const buf = Buffer.from(text);
+  let spent = 0;
+  let offset = 0;
+  while (offset < buf.length) {
+    const nl = buf.indexOf(0x0a, offset);
+    const complete = nl >= 0;
+    const end = complete ? nl + 1 : buf.length;
+    const line = buf.subarray(offset, end);
+    const body = complete ? line.subarray(0, Math.max(0, line.length - 1)) : line;
+    const match = /"kind"\s*:\s*"([^"\\]*)"/.exec(body.toString('latin1'));
+    const kind = match ? match[1] : null;
+    const control = kind === 'cancelled' || kind === 'grant';
+    if (complete) {
+      if (!control) spent += line.length;
+      offset = end;
+      continue;
+    }
+    if (!control && (kind != null || line.length > 96)) spent += line.length;
+    break;
+  }
+  return spent;
+}
+
+test('supervisor credit matches the credit senders', async () => {
+  const pair = await connectPair({ sweeper: false });
+  try {
+    pair.sup.spawn({ pluginId: 'echo', script: echoPath });
+    const rec = pair.sup.children.get('echo');
+    const granted = await waitUntil(
+      () => rec.grantSettled && rec.outbound === 0 && rec.sendWindow > 8000,
+      2_000,
+    );
+    assert.equal(granted, true, String(rec.sendWindow));
+    const origin = rec.creditSent;
+    const window0 = rec.sendWindow;
+    assert.equal(window0, origin);
+    const lines = [];
+    let state = 0x12345678;
+    const kinds = ['result', 'error', 'cancelled', 'grant', 'noop'];
+    for (let i = 0; i < 36; i++) {
+      state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+      const kind = kinds[state % kinds.length];
+      const payload = state % 5 === 0 ? 'p'.repeat(state % 24) : { n: state % 20 };
+      lines.push(encodeNdjson({ kind, correlationId: state % 17, payload }));
+    }
+    lines.push('{"kind":"cancell');
+    lines.push('ed","correlationId":3}\n');
+    lines.push('{"kin');
+    lines.push('d":"result","correlationId":4,"payload":{"n":1}}\n');
+    lines.push('a'.repeat(200));
+    let text = '';
+    for (const piece of lines) {
+      text += piece;
+      rec.stdoutSocket.emit('data', Buffer.from(piece));
+      const spent = dataSpent(text);
+      assert.equal(rec.sendWindow, window0 - spent, JSON.stringify({
+        spent,
+        window: rec.sendWindow,
+        window0,
+        creditSent: rec.creditSent,
+        piece: piece.slice(0, 48),
+      }));
+      assert.equal(rec.creditSent, origin);
+      assert.equal(rec.sendWindow + rec.creditSpent, rec.creditSent);
+    }
+    const spent = dataSpent(text);
+    assert.ok(spent > 0, String(spent));
+    let control = 0;
+    for (const line of text.split('\n')) {
+      if (!line) continue;
+      try {
+        const msg = JSON.parse(line);
+        if (msg.kind === 'cancelled' || msg.kind === 'grant') control += Buffer.byteLength(line) + 1;
+      } catch {
+        // A raw partial is data, not a control ack.
+      }
+    }
+    assert.ok(control > 0, String(control));
+    await delay(150);
+    assert.ok(rec.creditSent <= origin + spent, JSON.stringify({
+      origin,
+      sent: rec.creditSent,
+      spent,
+      control,
+    }));
+    assert.equal(rec.sendWindow + rec.creditSpent, rec.creditSent);
+    assertAccountingInvariants(pair.sup, rec);
+  } finally {
+    const proc = pair.sup.children.get('echo')?.child;
+    if (proc && proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL');
+    await pair.close();
+  }
+});
+
+test('cancel acks do not recycle data credit', { timeout: 10_000 }, async () => {
+  const totalGlobal = 100_000;
+  const pending = 8;
+  const fitting = 1000;
+  const oversized = 80_000;
+  const fittingLine = Buffer.byteLength(encodeNdjson({
+    kind: 'result',
+    correlationId: 100,
+    payload: 'p'.repeat(fitting),
+  }));
+  const oversizedLine = Buffer.byteLength(encodeNdjson({
+    kind: 'result',
+    correlationId: 101,
+    payload: 'p'.repeat(oversized),
+  }));
+  const pair = await connectPair({
+    sweeper: false,
+    caps: { pending, pendingGlobal: 64, partial: 1024 * 1024, total: 1024 * 1024, totalGlobal },
+  });
+  const stop = () => {
+    const proc = pair.sup.children.get('credit')?.child;
+    if (proc && proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL');
+  };
+  try {
+    const kid = pair.sup.spawn({
+      pluginId: 'credit',
+      script: creditPath,
+      pending: 64,
+      total: 1024 * 1024,
+    });
+    const rec = pair.sup.children.get('credit');
+    const granted = await waitUntil(
+      () => rec.grantSettled && rec.outbound === 0 && rec.sendWindow >= fittingLine,
+      2_000,
+    );
+    assert.equal(granted, true, String(rec.sendWindow));
+    const origin = rec.creditSent;
+    assert.ok(origin < oversizedLine, `${origin} already covers ${oversizedLine}`);
+    assert.ok(origin >= fittingLine, `${origin} < ${fittingLine}`);
+    // The quiet flush can still publish a deficit the half threshold was
+    // already holding. Ack stdout postpones that flush; it must not add the
+    // ack bytes themselves. Sixteen cancelled lines are the ceiling.
+    let ackBytes = 0;
+    for (let i = 1; i <= 16; i++) {
+      ackBytes += Buffer.byteLength(encodeNdjson({ kind: 'cancelled', correlationId: i }));
+    }
+    const cancels = [];
+    for (let i = 0; i < 16; i++) {
+      cancels.push(pair.stub.cancel({
+        pluginId: 'credit',
+        credential: kid.credential,
+        correlationId: i + 1,
+      }, 2_000).catch((err) => err));
+    }
+    const acks = await Promise.all(cancels);
+    assert.ok(acks.every((row) => row?.kind === 'cancelled'), JSON.stringify(acks.map((row) => row?.kind || row?.code)));
+    await delay(150);
+    assert.equal(rec.creditSpent, 0, String(rec.creditSpent));
+    assert.equal(rec.sendWindow, rec.creditSent);
+    assert.ok(rec.creditSent - origin < ackBytes, JSON.stringify({
+      origin,
+      sent: rec.creditSent,
+      window: rec.sendWindow,
+      spent: rec.creditSpent,
+      ackBytes,
+    }));
+    const fit = await pair.stub.call({
+      pluginId: 'credit',
+      credential: kid.credential,
+      correlationId: 100,
+      port: 'db',
+      method: 'get',
+      payload: { pad: fitting },
+    }, 2_000).catch((err) => err);
+    assert.equal(fit.payload?.length, fitting, JSON.stringify({
+      code: fit.code,
+      pause: rec.pauseReason,
+      window: rec.sendWindow,
+      sent: rec.creditSent,
+    }));
+    const beforeOver = rec.creditSent;
+    const stall = await pair.stub.call({
+      pluginId: 'credit',
+      credential: kid.credential,
+      correlationId: 101,
+      port: 'db',
+      method: 'get',
+      payload: { pad: oversized },
+    }, 400).catch((err) => err);
+    assert.equal(stall.code, 'timeout', JSON.stringify({
+      code: stall.code,
+      pause: rec.pauseReason,
+      framer: rec.framer.pendingBytes(),
+      window: rec.sendWindow,
+      sent: rec.creditSent,
+      fault: pair.sup.framingFault,
+    }));
+    assert.notEqual(rec.pauseReason, 'global');
+    assert.equal(pair.sup.framingFault, null);
+    assert.ok(rec.framer.pendingBytes() < fittingLine, String(rec.framer.pendingBytes()));
+    assert.ok(rec.creditSent < oversizedLine, JSON.stringify({
+      origin,
+      beforeOver,
+      sent: rec.creditSent,
+      oversizedLine,
+    }));
+    assertAccountingInvariants(pair.sup, rec);
+  } finally {
+    stop();
+    await pair.close();
+  }
+});
+
+test('a partial mux frame overlapping an in-credit reply faults', { timeout: 10_000 }, async () => {
+  const totalGlobal = 100_000;
+  const pending = 8;
+  const pad = 57_000;
+  const lineBytes = Buffer.byteLength(encodeNdjson({
+    kind: 'result',
+    correlationId: 1,
+    payload: 'p'.repeat(pad),
+  }));
+  const pair = await connectPair({
+    sweeper: false,
+    caps: { pending, partial: 1024 * 1024, total: 1024 * 1024, totalGlobal },
+  });
+  const stop = () => {
+    const proc = pair.sup.children.get('wide')?.child;
+    if (proc && proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL');
+  };
+  try {
+    const kid = pair.sup.spawn({
+      pluginId: 'wide',
+      script: responsePath,
+      env: { RESPONSE_PAD: String(pad) },
+      pending,
+      total: 1024 * 1024,
+    });
+    const rec = pair.sup.children.get('wide');
+    const granted = await waitUntil(
+      () => rec.grantSettled && rec.outbound === 0 && rec.sendWindow >= lineBytes,
+      2_000,
+    );
+    assert.equal(granted, true, String(rec.sendWindow));
+    await delay(100);
+    assert.equal(await stopChild(rec.child.pid), true);
+    const call = pair.stub.call({
+      pluginId: 'wide',
+      credential: kid.credential,
+      correlationId: 1,
+      port: 'db',
+      method: 'get',
+      payload: { n: 1 },
+    }, 3_000).catch((err) => err);
+    const armed = await waitUntil(() => pair.sup.pending.has('wide', 1, 'call'), 1_000);
+    assert.equal(armed, true);
+    const globalCap = totalGlobal
+      - (rec.kIn + rec.kOut + pair.sup.readBytes)
+      - (pair.sup.kMuxIn + pair.sup.kMuxOut + pair.sup.readBytes);
+    const frame = encodeMux({
+      kind: 'call',
+      pluginId: 'wide',
+      correlationId: 2,
+      credential: kid.credential,
+      port: 'db',
+      method: 'get',
+      payload: 'm'.repeat(20_000),
+      timeoutMs: 2_000,
+    });
+    assert.ok(frame.length > 16_000, String(frame.length));
+    pair.stub.socket.write(frame.subarray(0, 16_000));
+    const prefixed = await waitUntil(
+      () => pair.sup.bridge.pendingBytes() > 0 && pair.sup.bridge.leadingDeclared() > pair.sup.bridge.pendingBytes(),
+      1_000,
+    );
+    assert.equal(prefixed, true, JSON.stringify({
+      mux: pair.sup.bridge.pendingBytes(),
+      declared: pair.sup.bridge.leadingDeclared(),
+    }));
+    const started = performance.now();
+    process.kill(rec.child.pid, 'SIGCONT');
+    const res = await call;
+    const elapsed = performance.now() - started;
+    assert.equal(pair.sup.framingFault, 'mux-budget', JSON.stringify({
+      code: res.code,
+      elapsed,
+      pause: rec.pauseReason,
+      mux: pair.sup.bridge.pendingBytes(),
+      framer: rec.framer.pendingBytes(),
+      window: rec.sendWindow,
+      buffered: pair.sup.bufferedBytes(),
+      globalCap,
+    }));
+    assert.notEqual(res.code, 'timeout');
+    assert.ok(elapsed < 1_500, String(elapsed));
+  } finally {
+    stop();
+    await pair.close();
+  }
+});
+
+test('overlapping partial mux and stdout frames fault', { timeout: 10_000 }, async () => {
+  const totalGlobal = 100_000;
+  const pending = 8;
+  const pad = 57_000;
+  const lineBytes = Buffer.byteLength(encodeNdjson({
+    kind: 'result',
+    correlationId: 1,
+    payload: 'p'.repeat(pad),
+  }));
+  const pair = await connectPair({
+    sweeper: false,
+    caps: { pending, partial: 1024 * 1024, total: 1024 * 1024, totalGlobal },
+  });
+  const stop = () => {
+    const proc = pair.sup.children.get('wide')?.child;
+    if (proc && proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL');
+  };
+  try {
+    const kid = pair.sup.spawn({
+      pluginId: 'wide',
+      script: responsePath,
+      env: { RESPONSE_PAD: String(pad) },
+      pending,
+      total: 1024 * 1024,
+    });
+    const rec = pair.sup.children.get('wide');
+    const granted = await waitUntil(
+      () => rec.grantSettled && rec.outbound === 0 && rec.sendWindow >= lineBytes,
+      2_000,
+    );
+    assert.equal(granted, true, String(rec.sendWindow));
+    await delay(80);
+    assert.equal(await stopChild(rec.child.pid), true);
+    const call = pair.stub.call({
+      pluginId: 'wide',
+      credential: kid.credential,
+      correlationId: 1,
+      port: 'db',
+      method: 'get',
+      payload: { n: 1 },
+    }, 3_000).catch((err) => err);
+    const armed = await waitUntil(() => pair.sup.pending.has('wide', 1, 'call'), 1_000);
+    assert.equal(armed, true);
+    const frame = encodeMux({
+      kind: 'call',
+      pluginId: 'wide',
+      correlationId: 9,
+      credential: kid.credential,
+      port: 'db',
+      method: 'get',
+      payload: 'm'.repeat(24_000),
+      timeoutMs: 2_000,
+    });
+    const prefix = frame.subarray(0, 17_024);
+    assert.ok(prefix.length < frame.length);
+    pair.sup.bridge.feed(prefix);
+    assert.ok(pair.sup.bridge.leadingDeclared() > prefix.length);
+    const globalCap = totalGlobal
+      - (rec.kIn + rec.kOut + pair.sup.readBytes)
+      - (pair.sup.kMuxIn + pair.sup.kMuxOut + pair.sup.readBytes);
+    assert.ok(prefix.length + rec.sendWindow > globalCap, JSON.stringify({
+      prefix: prefix.length,
+      window: rec.sendWindow,
+      globalCap,
+    }));
+    const started = performance.now();
+    process.kill(rec.child.pid, 'SIGCONT');
+    const err = await call;
+    const elapsed = performance.now() - started;
+    assert.equal(pair.sup.framingFault, 'mux-budget', JSON.stringify({
+      code: err?.code,
+      elapsed,
+      pause: rec.pauseReason,
+      mux: pair.sup.bridge.pendingBytes(),
+      framer: rec.framer.pendingBytes(),
+      buffered: pair.sup.bufferedBytes(),
+      window: rec.sendWindow,
+    }));
+    assert.notEqual(err.code, 'timeout');
+    assert.ok(elapsed < 1_500, String(elapsed));
+  } finally {
+    stop();
+    await pair.close();
+  }
+});
+
 test('send credit refills after a large response is consumed', { timeout: 10_000 }, async () => {
   const reserved = measureFlowReserve();
   assert.ok(reserved);
@@ -4194,6 +4580,10 @@ test('parked calls leave a sibling send window usable', async () => {
       globalCap,
       coalesced: recB.rejectsCoalesced,
       pending: pair.sup.pending.size,
+      paused: pair.sup.inputPaused,
+      fault: pair.sup.framingFault,
+      mux: pair.sup.bridge.pendingBytes(),
+      declared: pair.sup.bridge.leadingDeclared(),
     }));
     assert.ok(recB.rejectsCoalesced > 0, String(recB.rejectsCoalesced));
     assert.ok(rejections.every((code) => code === 'total-cap'), JSON.stringify(rejections));
@@ -4363,7 +4753,15 @@ test('reply metadata is charged beside sibling send windows', async () => {
       correlationId: 1,
     }, 3_000).catch((err) => err);
     const pendingCancel = await waitUntil(() => pair.sup.pending.has('b', 1, 'cancel'), 1_000);
-    assert.equal(pendingCancel, true);
+    assert.equal(pendingCancel, true, JSON.stringify({
+      fault: pair.sup.framingFault,
+      paused: pair.sup.inputPaused,
+      mux: pair.sup.bridge.pendingBytes(),
+      declared: pair.sup.bridge.leadingDeclared(),
+      buffered: pair.sup.bufferedBytes(),
+      window: recA.sendWindow,
+      globalCap,
+    }));
     const before = pair.sup.bufferedBytes();
     recB.stdoutSocket.emit('data', Buffer.from(encodeNdjson({ kind: 'cancelled', correlationId: 1 })));
     const cancelDone = await cancel;
@@ -4415,7 +4813,8 @@ test('reply metadata is charged beside sibling send windows', async () => {
 // child a window that can carry a small result; a window advertised before
 // the peer existed stays as advertised. Reply expansion (version, grants,
 // timestamps) is the same #fitsGlobal check as a grant. A quiet flush adds
-// withheld credit and does not shrink sendWindow.
+// withheld data credit and does not shrink sendWindow. Cancel acks and grant
+// lines are not that data, so the flush does not advertise them again.
 function assertAccountingInvariants(sup, rec) {
   const ceiling = rec.flowOk ? rec.bT : rec.limits.total;
   let kernel = 0;
@@ -5166,7 +5565,16 @@ test('a rejection frame does not spend a sibling send window', async () => {
       total: pair.sup.caps.total,
     }));
     assert.equal(recA.sendWindow, heldWindow);
-    assert.ok(pair.sup.bufferedBytes() + recA.sendWindow <= globalCap);
+    assert.ok(pair.sup.bufferedBytes() + recA.sendWindow <= globalCap, JSON.stringify({
+      buffered: pair.sup.bufferedBytes(),
+      window: recA.sendWindow,
+      globalCap,
+      fault: pair.sup.framingFault,
+      paused: pair.sup.inputPaused,
+      mux: pair.sup.bridge.pendingBytes(),
+      outbound: pair.sup.socketOutbound,
+      queued: pair.sup.queuedBytes,
+    }));
     pair.sup.socket.write = write;
     pair.sup.socket.emit('drain');
     const response = await pair.stub.call({

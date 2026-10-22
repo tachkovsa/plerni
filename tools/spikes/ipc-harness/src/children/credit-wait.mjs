@@ -12,23 +12,27 @@ function writeLine(obj) {
   process.stdout.write(encodeNdjson(obj));
 }
 
+function resultPayload(msg) {
+  const requested = Number(msg?.payload?.pad);
+  if (Number.isInteger(requested) && requested > 0 && requested <= 80 * 1024) {
+    return 'p'.repeat(requested);
+  }
+  return { granted: true };
+}
+
 function flush() {
   while (waiting.length > 0) {
     const msg = waiting[0];
     const line = encodeNdjson({
       kind: 'result',
       correlationId: msg.correlationId,
-      payload: { granted: true },
+      payload: resultPayload(msg),
     });
     const n = Buffer.byteLength(line);
     if (n > credit) return;
     waiting.shift();
     credit -= n;
-    writeLine({
-      kind: 'result',
-      correlationId: msg.correlationId,
-      payload: { granted: true },
-    });
+    process.stdout.write(line);
   }
 }
 
