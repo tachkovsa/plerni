@@ -11,4 +11,5 @@ The pre-implementation decision record (32 decisions with evidence and flip cond
 
 - [0001 — Kernel + equal-citizen plugins](0001-kernel-and-equal-citizen-plugins.md)
 - [0003 — Unified outbox + pg-boss](0003-outbox-pgboss.md)
+- [0004 — Plugin isolation topology](0004-plugin-isolation-topology.md)
 - [0006 — IPC flow control (Proposed)](0006-ipc-flow-control.md)
