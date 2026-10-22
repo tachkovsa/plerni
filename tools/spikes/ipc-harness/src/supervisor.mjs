@@ -1342,62 +1342,80 @@ export class Supervisor {
   // without being rejected. Credit headroom uses that value, so a
   // rejected oversized call cannot stop replenishment.
   //
-  // A call parks only when its own bytes fit B_t and B_g and the miss is
-  // this child's unspent window or K_out. Parked bytes are in pluginBytes
+  // A call parks only when its own bytes fit B_t and B_g beside every live
+  // send window and the miss is K_out. Parked bytes are in pluginBytes
   // and bufferedBytes, and the correlation id is pending exactly once.
-  // Promotion writes the line only when that window or queue has moved
-  // and no cancel for the id is still settling. Settling means the cancel
-  // lane is pending, or this take still holds that cancel. Stdout spends
-  // the window and then parses every frame in the chunk before any
-  // promotion, including a cancel acknowledgement in the same read. A
-  // cancel timeout leaves the call parked and then allows promotion. An
-  // acknowledgement drops the call and does not write it.
+  // Promotion writes the line only when that queue has moved and no cancel
+  // for the id is still settling. Settling means the cancel lane is pending,
+  // or this take still holds that cancel. Stdout spends the window and then
+  // parses every frame in the chunk before any promotion, including a cancel
+  // acknowledgement in the same read. A cancel timeout leaves the call parked
+  // and then allows promotion. An acknowledgement drops the call and does not
+  // write it.
   //
-  // bufferedBytes() plus send credit already granted to other live
-  // children is one sum (#globalHeld). The child's own window is overlap
-  // on a further call, not a second copy of K_out. A grant leaves the
-  // shared call hole (#callHole) outside every window, so a later grant
-  // cannot spend it. The same room is split across the live children
-  // (#peerShareReserve): each child that still holds less than an equal
-  // share keeps that share out of every other grant. A window already at
-  // or above the share is not reserved again and is not reduced. Map order
-  // does not decide who receives a usable window. sendWindow is advertised
-  // credit the child has not spent: grants raise it, data stdout lowers it,
-  // and sendWindow + creditSpent stays equal to creditSent. Cancel acks and
-  // grant lines do not lower it. The kind is the top-level JSON field;
-  // credit-wait and credit-response use that same classifier and do not
-  // decrement those lines. Spending them made the quiet flush advertise the
-  // same bytes again. A data partial spends as soon as its kind is known, so the
-  // line is not held on top of the window. A spent read is not its own
-  // grant. The unspent remainder stays advertised until half the room is
-  // gone, and that half comes back as one grant. A sender that stops before
-  // that half, still waiting for a window that covers its next reply, is
-  // flushed after a quiet delay. Further stdout postpones that flush, and
-  // not past the max delay. The flush adds credit; it does not reduce a
-  // window already advertised.
+  // Retained userspace plus every live send window stays within B_g.
+  // bufferedBytes() does not include a window. sendWindow is credit the child
+  // has not spent: grants raise it, data stdout lowers it, and
+  // sendWindow + creditSpent stays equal to creditSent. Cancel acks and grant
+  // lines do not lower it. The kind is the top-level JSON field; credit-wait
+  // and credit-response use that same classifier and do not decrement those
+  // lines. Spending them made the quiet flush advertise the same bytes again.
+  // A data partial spends as soon as its kind is known, so the line is not
+  // held on top of the window. The unspent remainder stays advertised until
+  // half the room is gone, and that half comes back as one grant. A sender
+  // that stops before that half, still waiting for a window that covers its
+  // next reply, is flushed after a quiet delay. Further stdout postpones that
+  // flush, and not past the max delay. The flush adds credit. It does not
+  // reduce a window already advertised.
   //
-  // Every admission that adds mux bytes or reserves userspace beside those
-  // windows uses #fitsGlobal. That is call and cancel admission, parking,
-  // grants (#overBudget / #bytesOver), reply expansion in #complete
-  // (version, grants, timestamps, and a supervisor-stamped cancel ack),
-  // rejections, terminal frames, flood frames, and queueMuxBytes. The
-  // child's own window is omitted for a data reply that just spent stdout
-  // (#fitsGlobal(extra, rec)). A cancel ack did not spend that window, so
-  // its mux frame counts it. Every other path passes null and counts every
-  // live window. #enqueueBuf only commits bytes the caller already admitted.
-  // A stdout read does not subtract the open window: the credit is not in
-  // bufferedBytes(), and subtracting it admits the response on top of a mux
-  // frame that already fills the room. A mux read does not subtract it
-  // either. A frame larger than the hole beside that credit is how admission
-  // rejects the call; refusing the read stalls the rejection. An unfinished
-  // mux frame that also leaves an unfinished stdout line unable to take its
-  // next read cannot shrink, and #noteMuxBudget faults that pair instead of
-  // pausing both. #retainTail uses the stdout read budget. #failAll
-  // writes only after the bridge is already unusable. Spawn still charges
-  // #globalHeld(null) plus the kernel reserves against totalGlobal, which
-  // is the cap those reserves sit in. A stdout read is posted only when
-  // bufferedBytes() plus the bytes it will pull fit B_g. A waiting read can
-  // pull C. A kernel queue shorter than C is only that tail.
+  // Every path that keeps new userspace bytes charges them beside every live
+  // window, including the child being served (#fitsGlobal(extra, null)).
+  // None of them may spend bytes already advertised:
+  //
+  // Admission. A call or a cancel is retained only when its line, its
+  // identifier bytes, and the control reserve fit beside every window. The
+  // grant left the call hole (#callHole) outside the window for that line.
+  // The call does not also add the window into the cost: #globalHeld(null)
+  // already counts it, and adding it again would pin the line behind its own
+  // reservation. The same room is split across the live children
+  // (#peerShareReserve). A window already at or above an equal share is not
+  // reserved again and is not reduced.
+  // Park. The parked line has to fit beside every window. The miss that parks
+  // is K_out. Parking into the unspent window would keep the line in the room
+  // the child was told it may still fill. Promotion rechecks the reserve with
+  // the line already in the sums and does not add the window a second time.
+  // Expansion. #complete stamps version, grants, and timestamps onto a reply.
+  // The stdout line has already left the framer. A data line has already left
+  // the window; the unspent remainder is still advertised, and the growth is
+  // charged beside it. A cancel ack never spent the window. Both pass null.
+  // Omitting the replying child's remainder lets that stamp occupy credit the
+  // child has not spent, and the next in-credit reply then pauses on B_g.
+  // #holdFits charges the same growth when a deferred reply is released. A
+  // pure move adds no bytes.
+  // Refill and flush. #creditRoom omits this child's window only while it
+  // sizes the new grant, then subtracts the current window from that budget.
+  // It also keeps #replyStampOverhead outside the window: version, grants,
+  // and timestamps that #complete will attach. The grant line itself is
+  // admitted with null, inside the hole the budget left outside the window.
+  // A later grant cannot spend the hole.
+  // Reject, terminal, flood, and queueMuxBytes pass null. #enqueueBuf only
+  // commits bytes the caller already admitted. A second check would count
+  // the frame again.
+  // Reads are not admissions. A stdout read does not subtract the open
+  // window: data bytes spend that window in the same turn, one for one,
+  // before the line is parsed. Subtracting it would refuse a reply the child
+  // was credited to write. #retainTail stashes the unread tail of a chunk
+  // that this spend already classified, so the tail is not a second copy of
+  // the window. A mux read does not subtract the window either. The partial
+  // is assembly, not a retained copy: a finished frame is admitted beside
+  // every window or rejected without keeping the bytes. Refusing the read
+  // would stall that rejection. An unfinished mux frame that also leaves an
+  // unfinished stdout line unable to take its next read cannot shrink, and
+  // #noteMuxBudget faults that pair instead of pausing both. #failAll writes
+  // only after the bridge is already unusable. Spawn charges #globalHeld(null)
+  // plus the kernel reserves against totalGlobal. A stdout read is posted
+  // only when bufferedBytes() plus the bytes it will pull fit B_g. A waiting
+  // read can pull C. A kernel queue shorter than C is only that tail.
   // Cancel and grant are queued ahead of payload and do not consume the
   // send window. One cancel's encoded frame and one grant are the K_out
   // hole. That cancel's identifier bytes are a separate userspace hole:
@@ -1461,22 +1479,19 @@ export class Supervisor {
     }
     // Payload has to leave room for one cancel of this correlation id and
     // one grant. A numeric-id cancel is smaller than a string id.
-    // Unspent send credit is stdout the child may still write. The first
-    // in-flight call overlaps that promise: its reply releases its own
-    // identifiers. A further call has to fit beside the promise, or a
-    // credit-respecting child fills the original window and the reply misses
-    // B_t. The credit is not stdin, so it does not enter K_out.
+    // Unspent send credit is stdout the child may still write. The line has
+    // to fit beside that promise, including this child's own window. The
+    // hole left out of the grant is that room. The credit is not stdin, so
+    // it does not enter K_out, and it is not added to the cost again.
     const cancelReserve = this.#maxCancelBytes(rec, msg.correlationId);
     const cancelIds = this.#maxCancelIds(rec, msg.correlationId);
     const reserve = CONTROL_RESERVE.grant + cancelReserve;
     const admitCost = bytes + idBytes + reserve + cancelIds;
-    const heldCredit = this.#overlapCredit(rec);
-    if (this.#overBudget(rec, bytes + idBytes + heldCredit, bytes, reserve, cancelIds)) {
-      // Own bytes fit B_t and the process ceiling, including credit promised
-      // to a sibling and the cancel lane's identifiers. The miss is this
-      // child's unspent window, a full K_out, or both. Hold the frame and
-      // write it once there is room. A probe that does not shrink is
-      // rejected; waiting would not help it.
+    if (this.#overBudget(rec, bytes + idBytes, bytes, reserve, cancelIds)) {
+      // Own bytes fit B_t and beside every live window, including this
+      // child's. The miss is a full K_out. Hold the frame and write it once
+      // the queue moves. A call that does not fit beside advertised credit
+      // is rejected; parking it would keep those bytes in the window.
       if (!this.#bytesOver(rec, bytes + idBytes, reserve, cancelIds)) {
         this.#parkCall(rec, msg, line, bytes, idBytes, ingressTs, reserve, cancelIds);
         return;
@@ -1498,7 +1513,7 @@ export class Supervisor {
     // must not add either of them again. idReserve is the cancel lane's
     // identifiers. It is userspace only and is not added to K_out.
     if (this.#pluginBytes(rec) + cost + userspace > this.#childCeiling(rec)
-        || !this.#fitsGlobal(cost + userspace, rec)) {
+        || !this.#fitsGlobal(cost + userspace, null)) {
       this.caps.total = true;
       this.#reject(msg, 'total-cap', true);
       return;
@@ -1558,10 +1573,11 @@ export class Supervisor {
           }
           continue;
         }
-        // Line bytes and identifier bytes are already in the sums. The
-        // overlap is other in-flight calls, not this parked one.
-        const overlap = this.#overlapCredit(rec);
-        if (!this.#overBudget(rec, overlap, next.bytes, next.reserve, next.idReserve || 0)) {
+        // Line bytes and identifier bytes are already in the sums. Every
+        // live window, including this child's, is already in #globalHeld.
+        // Adding the window here would count it twice and the line would
+        // never be promoted.
+        if (!this.#overBudget(rec, 0, next.bytes, next.reserve, next.idReserve || 0)) {
           rec.parked.shift();
           rec.parkedBytes = Math.max(0, rec.parkedBytes - next.bytes);
           if (rec.parked.length === 0) rec.parkSince = null;
@@ -1615,15 +1631,6 @@ export class Supervisor {
       : DEFAULT_DEADLINE_MS;
     if (!Number.isFinite(ingressTs)) return budget;
     return budget - (performance.now() - ingressTs);
-  }
-
-  // Send credit overlaps calls already written. Parked calls are reserved
-  // but not in flight, and charging them against the window would pin the
-  // first one behind its own reservation.
-  #overlapCredit(rec) {
-    if (!rec.flowOk || !(rec.sendWindow > 0)) return 0;
-    const inFlight = rec.callPending - rec.parked.length;
-    return inFlight > 0 ? rec.sendWindow : 0;
   }
 
   #unpark(rec, correlationId) {
@@ -1884,19 +1891,20 @@ export class Supervisor {
     return sum;
   }
 
-  // Userspace bytes already retained, plus send credit promised to every other
-  // live child. `except` is the child being charged; its own window is not in
-  // the sum. Spawn and a reply that is not this child's stdout pass null and
-  // count every live window. The promised bytes are not in bufferedBytes()
-  // until that child writes them.
+  // Userspace bytes already retained, plus send credit promised to live
+  // children. `except` omits that child's window. Retaining paths pass null
+  // and count every window. #creditRoom passes the child being granted: the
+  // budget it returns is additional credit, and the current window is then
+  // subtracted from it. The promised bytes are not in bufferedBytes() until
+  // that child writes them.
   #globalHeld(except) {
     return this.bufferedBytes() + this.#siblingCredit(except);
   }
 
-  // One check for every path that adds bytes or reserves room beside the
-  // promised windows. `extra` is the new userspace bytes. `except` is the
-  // child whose own window is already the overlap for this admission; null
-  // counts every live window. A sum equal to B_g still fits.
+  // One check for every path that keeps userspace bytes. `extra` is the new
+  // bytes. `except` is null on those paths, so every live window is in the
+  // sum. A sum equal to B_g still fits. Omitting a window here lets the new
+  // bytes occupy credit that child was already told it may write.
   #fitsGlobal(extra, except = null) {
     const n = Number.isInteger(extra) && extra > 0 ? extra : 0;
     return this.#globalHeld(except) + n <= this.#globalCap();
@@ -1997,10 +2005,49 @@ export class Supervisor {
     return reserve;
   }
 
+  #replyStampOverhead(rec) {
+    // #complete adds version, grants, timestamps, and the length prefix on
+    // top of the stdout line. That growth is not part of the line the child
+    // spends. Leaving it inside the advertised window makes a credit-compliant
+    // reply miss B_g once the stamp is attached. Wide timestamps bound the
+    // digits performance.now() can add. The value is fixed for this generation,
+    // so the grant path does not rebuild it on every refill. A version that
+    // cannot be framed leaves no credit: the reply cannot be delivered.
+    if (Number.isInteger(rec.stampOverhead)) return rec.stampOverhead;
+    try {
+      const mux = encodeMux({
+        kind: 'result',
+        for: 'call',
+        pluginId: rec.credential.pluginId,
+        correlationId: 0,
+        payload: '',
+        sendTs: 1e15,
+        ingressTs: 1e15,
+        egressTs: 1e15,
+        version: rec.credential.version,
+        generation: rec.credential.generation,
+        grants: [...rec.credential.grants],
+      });
+      const line = Buffer.byteLength(encodeNdjson({
+        kind: 'result',
+        correlationId: 0,
+        payload: '',
+      }));
+      rec.stampOverhead = Math.max(0, mux.length - line);
+    } catch {
+      rec.stampOverhead = this.#globalCap();
+    }
+    return rec.stampOverhead;
+  }
+
   #creditRoom(rec) {
     const hole = this.#callHole();
-    const childRoom = this.#childCeiling(rec) - this.#pluginBytes(rec) - hole;
-    const globalRoom = this.#globalCap() - this.#globalHeld(rec) - hole - this.#peerShareReserve(rec);
+    // The stamp is reserved before the grant, beside the call hole. A line
+    // that fills the resulting window still fits once #complete attaches it,
+    // including while this child's unspent remainder is still advertised.
+    const stamp = this.#replyStampOverhead(rec);
+    const childRoom = this.#childCeiling(rec) - this.#pluginBytes(rec) - hole - stamp;
+    const globalRoom = this.#globalCap() - this.#globalHeld(rec) - hole - this.#peerShareReserve(rec) - stamp;
     return Math.min(childRoom, globalRoom);
   }
 
@@ -2078,14 +2125,14 @@ export class Supervisor {
       || this.callPendingTotal + this.cancelPendingTotal >= this.capsConfig.pendingGlobal;
   }
 
-  // Child and process ceilings only. The kernel queue and this child's own
-  // unspent window are not this check: a call that fails those can wait.
-  // Credit promised to a sibling is part of the process ceiling. Parking
-  // into that promise fills the bytes the sibling was told it may write.
+  // Child and process ceilings, including every live send window. The kernel
+  // queue is not this check: a call that fails only K_out can wait. A call
+  // that fails this check does not fit beside credit already advertised, and
+  // parking it would fill that promise.
   #bytesOver(rec, accounted, reserve, idReserve = 0) {
     const userspace = reserve + Math.max(0, idReserve);
     if (this.#pluginBytes(rec) + accounted + userspace > this.#childCeiling(rec)) return true;
-    if (!this.#fitsGlobal(accounted + userspace, rec)) return true;
+    if (!this.#fitsGlobal(accounted + userspace, null)) return true;
     return false;
   }
 
@@ -2093,12 +2140,13 @@ export class Supervisor {
   // adds to K_out. `reserve` is the wire control capacity (one grant and one
   // cancel frame) that must still fit beside it, in userspace and in K_out.
   // `idReserve` is the cancel lane's identifiers. It fits in userspace only.
-  // Sibling send credit is inside `#globalHeld` and is not part of `stdinBytes`.
+  // Every live send window is inside `#globalHeld(null)` and is not part of
+  // `stdinBytes`. `accounted` must not include a window already in that sum.
   #overBudget(rec, accounted, stdinBytes, reserve, idReserve = 0) {
     const ceiling = this.#childCeiling(rec);
     const userspace = reserve + Math.max(0, idReserve);
     if (this.#pluginBytes(rec) + accounted + userspace > ceiling) return true;
-    if (!this.#fitsGlobal(accounted + userspace, rec)) return true;
+    if (!this.#fitsGlobal(accounted + userspace, null)) return true;
     if (rec.flowOk && rec.kOut != null) {
       const kernel = this.#stdinQueued(rec);
       if (!Number.isInteger(kernel)) return true;
@@ -2370,10 +2418,12 @@ export class Supervisor {
     if (resulting > this.#childCeiling(rec)) return false;
     const queued = held.buf ? held.buf.length : 0;
     const extra = queued - held.bytes;
-    // The parked bytes are already in bufferedBytes(). Only the growth has
-    // to clear the sibling windows. A pure move stays on the read budget.
-    if (extra > 0 && !this.#fitsGlobal(extra, rec)) return false;
-    return this.bufferedBytes() - held.bytes + queued <= this.#globalCap();
+    // The parked bytes are already in bufferedBytes(). Growth is new bytes
+    // and has to clear every live window, including this child's remainder.
+    // A pure move adds nothing. The bytes that land still sit beside those
+    // windows: the held copy leaves the sum as the queued copy joins it.
+    if (extra > 0 && !this.#fitsGlobal(extra, null)) return false;
+    return this.bufferedBytes() - held.bytes + queued + this.#siblingCredit(null) <= this.#globalCap();
   }
 
   // Never discard unread bytes. A tail that fits stays in `stash`. A tail that
@@ -2784,12 +2834,13 @@ export class Supervisor {
     const resulting = this.#pluginBytes(rec) - pendingIds + buf.length;
     // The pending identifiers are already in the sums. The mux frame can be
     // larger: version, grants, and timestamps are stamped here. That growth
-    // has to fit beside every other child's send window. A data line spent
-    // this child's window, so the remainder is not charged again. A cancel
-    // ack did not spend it, and the frame sits beside that credit.
+    // sits beside every live send window, including the unspent remainder of
+    // this child's window. The stdout line already left the framer. A data
+    // line already left the window; the remainder is still advertised. A
+    // cancel ack never spent the window. Omitting either remainder lets the
+    // stamp occupy credit the child has not written yet.
     const expansion = buf.length - pendingIds;
-    const except = msg.kind === 'cancelled' ? null : rec;
-    if (resulting > ceiling || (expansion > 0 && !this.#fitsGlobal(expansion, except))) {
+    if (resulting > ceiling || (expansion > 0 && !this.#fitsGlobal(expansion, null))) {
       this.caps.total = true;
       const still = this.#take(pluginId, msg.correlationId, lane);
       if (still) {
@@ -3235,9 +3286,9 @@ export class Supervisor {
     return false;
   }
 
-  // Commit only. Callers admit through #fitsGlobal first. A second check
-  // here would count this child's own window against a reply #complete
-  // already allowed.
+  // Commit only. Callers admit through #fitsGlobal(extra, null) first. A
+  // second check would count this frame again, on top of the windows that
+  // admission already included.
   #enqueueBuf(buf, priority, pluginId) {
     const high = priority >= 10;
     const map = high ? this.hi : this.lo;
