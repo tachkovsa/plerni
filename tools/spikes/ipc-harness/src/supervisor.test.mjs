@@ -879,6 +879,204 @@ test('a never-terminating sibling is faulted when the global budget is below the
   }
 });
 
+test('a paused partial does not outlive room freed by a release', { timeout: 90_000 }, async () => {
+  const totalGlobal = 100_000;
+  const userspaceCap = (sup) => {
+    let kernel = 0;
+    for (const rec of sup.children.values()) {
+      if (!rec.dead && rec.flowOk) kernel += rec.kIn + rec.kOut + sup.readBytes;
+    }
+    return sup.capsConfig.totalGlobal - kernel - (sup.kMuxIn + sup.kMuxOut + sup.readBytes);
+  };
+  const openPartial = (rec) => rec.framer.pendingBytes() > 0 && !rec.framer.hasPendingNewline();
+  // Room for one bounded read of C. A prefix above half the cap still has
+  // that room once the calls that crowded it are gone.
+  const pausedWithRoom = (sup, rec) => {
+    if (rec.dead || rec.pauseReason !== 'global' || !openPartial(rec)) return false;
+    return sup.bufferedBytes() + sup.readBytes <= userspaceCap(sup);
+  };
+  const longId = (n) => `p${n}${'x'.repeat(800)}`;
+  // expire holds ids on the partial writer, which never answers.
+  // cancel is pre-admitted while the mux is open, then the child is held
+  // so the ack is the release after the partial has paused.
+  // complete and exit hold ids on a stopped echo, then resume or kill it.
+  const sequences = [
+    ['expire'],
+    ['cancel'],
+    ['complete'],
+    ['exit'],
+    ['cancel', 'expire'],
+    ['complete', 'exit'],
+  ];
+  for (const sequence of sequences) {
+    const pair = await connectPair({
+      sweeper: false,
+      caps: { totalGlobal, pending: 64, partial: 1024 * 1024, total: 1024 * 1024 },
+    });
+    const stop = (id) => {
+      const proc = pair.sup.children.get(id)?.child;
+      if (proc && proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL');
+    };
+    try {
+      const needsEcho = sequence.some((op) => op === 'complete' || op === 'exit');
+      const needsCredit = sequence.some((op) => op === 'cancel');
+      let echo = null;
+      let credit = null;
+      const calls = [];
+      const cohorts = sequence.map((op) => ({ op, pluginId: '', credential: null, ids: [] }));
+      let n = 0;
+      pair.sup.spawn({
+        pluginId: 'nt',
+        script: neverPath,
+        pending: 64,
+        total: 1024 * 1024,
+      });
+      const partial = pair.sup.children.get('nt');
+      if (needsEcho) {
+        echo = pair.sup.spawn({
+          pluginId: 'echo',
+          script: echoPath,
+          pending: 64,
+          total: 1024 * 1024,
+        });
+        assert.equal(await stopChild(echo.pid), true);
+      }
+      if (needsCredit) {
+        credit = pair.sup.spawn({
+          pluginId: 'credit',
+          script: creditPath,
+          pending: 64,
+          total: 1024 * 1024,
+        });
+        // Hold the partial writer so its stdout does not pause the mux
+        // before the cancels are admitted.
+        assert.equal(await stopChild(partial.child.pid), true);
+        const cohort = cohorts.find((row) => row.op === 'cancel');
+        cohort.pluginId = 'credit';
+        cohort.credential = credit.credential;
+        const creditRec = pair.sup.children.get('credit');
+        const granted = await waitUntil(() => creditRec.grantSettled && creditRec.outbound === 0, 2_000);
+        assert.equal(granted, true, String(creditRec.outbound));
+        assert.equal(await stopChild(credit.pid), true);
+        for (let i = 0; i < 2; i++) {
+          n += 1;
+          const id = longId(n);
+          cohort.ids.push(id);
+          calls.push(pair.stub.call({
+            pluginId: 'credit',
+            credential: credit.credential,
+            correlationId: id,
+            port: 'db',
+            method: 'get',
+            payload: { n },
+          }, 8_000).catch((err) => err));
+        }
+        const delivered = await waitUntil(
+          () => cohort.ids.every((id) => pair.sup.pending.has('credit', id, 'call')),
+          2_000,
+        );
+        assert.equal(delivered, true, JSON.stringify({
+          outbound: creditRec.outbound,
+          writing: creditRec.stdinWriting,
+          queued: pair.sup.flowPending(creditRec.stdinProbe),
+          pending: cohort.ids.map((id) => pair.sup.pending.has('credit', id, 'call')),
+        }));
+        for (const id of cohort.ids) {
+          calls.push(pair.stub.cancel({
+            pluginId: 'credit',
+            credential: credit.credential,
+            correlationId: id,
+          }, 8_000).catch((err) => err));
+        }
+        const armed = await waitUntil(
+          () => cohort.ids.every((id) => pair.sup.pending.has('credit', id, 'cancel')),
+          2_000,
+        );
+        assert.equal(armed, true, String(creditRec.outbound));
+        process.kill(partial.child.pid, 'SIGCONT');
+      }
+      for (const cohort of cohorts) {
+        if (cohort.ids.length > 0) continue;
+        if (cohort.op === 'expire') {
+          cohort.pluginId = 'nt';
+          cohort.credential = pair.sup.children.get('nt').credential;
+        } else {
+          cohort.pluginId = 'echo';
+          cohort.credential = echo.credential;
+        }
+        const timeoutMs = cohort.op === 'expire' ? 1_500 : 8_000;
+        for (let i = 0; i < 12; i++) {
+          n += 1;
+          const id = longId(n);
+          cohort.ids.push(id);
+          calls.push(pair.stub.call({
+            pluginId: cohort.pluginId,
+            credential: cohort.credential,
+            correlationId: id,
+            port: 'db',
+            method: 'get',
+            payload: { n },
+          }, timeoutMs).catch((err) => err));
+        }
+      }
+      const crowded = await waitUntil(() => {
+        const cap = userspaceCap(pair.sup);
+        return partial.pauseReason === 'global'
+          && openPartial(partial)
+          && partial.framer.pendingBytes() > cap / 2
+          && pair.sup.pending.size > 0;
+      }, 3_000);
+      assert.equal(crowded, true, JSON.stringify({
+        sequence,
+        pause: partial.pauseReason,
+        partial: partial.framer.pendingBytes(),
+        cap: userspaceCap(pair.sup),
+        pending: pair.sup.pending.size,
+        buffered: pair.sup.bufferedBytes(),
+      }));
+      // The open line is already in the framer. Stopping the writer makes
+      // its kernel backlog finite, so a later completion is not crowded out
+      // by a stream that refills every byte the release frees. The recount
+      // still sees the paused partial.
+      assert.equal(await stopChild(partial.child.pid), true);
+      for (const cohort of cohorts) {
+        if (cohort.op === 'cancel') {
+          process.kill(credit.pid, 'SIGCONT');
+        } else if (cohort.op === 'complete') {
+          process.kill(echo.pid, 'SIGCONT');
+        } else if (cohort.op === 'exit') {
+          process.kill(echo.pid, 'SIGKILL');
+        }
+        const released = await waitUntil(
+          () => cohort.ids.every((id) => !pair.sup.pending.has(cohort.pluginId, id, 'call')),
+          3_000,
+        );
+        assert.equal(released, true, JSON.stringify({
+          op: cohort.op,
+          pending: pair.sup.pending.size,
+        }));
+        const cleared = await waitUntil(() => !pausedWithRoom(pair.sup, partial), 2_000);
+        assert.equal(cleared, true, JSON.stringify({
+          sequence,
+          op: cohort.op,
+          pause: partial.pauseReason,
+          dead: partial.dead,
+          partial: partial.framer.pendingBytes(),
+          buffered: pair.sup.bufferedBytes(),
+          cap: userspaceCap(pair.sup),
+          read: pair.sup.readBytes,
+        }));
+      }
+      await Promise.allSettled(calls);
+    } finally {
+      stop('nt');
+      stop('echo');
+      stop('credit');
+      await pair.close();
+    }
+  }
+});
+
 test('a hostile child is faulted instead of blocking a healthy sibling', { timeout: 90_000 }, async () => {
   const reserved = measureFlowReserve();
   assert.ok(reserved);
@@ -1905,6 +2103,176 @@ test('a parked call reserves its correlation id', { timeout: 10_000 }, async () 
       pending: pair.sup.pending.size,
       parked: rec.parked.length,
     }));
+  } finally {
+    const proc = pair.sup.children.get('echo')?.child;
+    if (proc && proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL');
+    await pair.close();
+  }
+});
+
+test('promoting a parked call recomputes the cancel reserve', { timeout: 20_000 }, async () => {
+  const pair = await connectPair({
+    sweeper: false,
+    caps: { pending: 64, total: 8 * 1024 * 1024 },
+  });
+  try {
+    const kid = pair.sup.spawn({
+      pluginId: 'echo',
+      script: echoPath,
+      pending: 64,
+      total: 8 * 1024 * 1024,
+    });
+    const rec = pair.sup.children.get('echo');
+    const granted = await waitUntil(() => rec.grantSettled && rec.outbound === 0, 2_000);
+    assert.equal(granted, true, String(rec.outbound));
+    assert.equal(await stopChild(rec.child.pid), true);
+    const grant = stdinControlReserve().grant;
+    const shortId = 1;
+    const longId = 'L'.repeat(1000);
+    const cancelBytes = (id) => Buffer.byteLength(encodeNdjson({ kind: 'cancel', correlationId: id }));
+    const oldReserve = grant + cancelBytes(shortId);
+    const newReserve = grant + cancelBytes(longId);
+    assert.ok(newReserve > oldReserve, `${newReserve} vs ${oldReserve}`);
+    let releaseWrite = null;
+    const stdin = rec.child.stdin;
+    const orig = stdin.write.bind(stdin);
+    stdin.write = (chunk, enc, cb) => {
+      const done = typeof enc === 'function' ? enc : cb;
+      if (releaseWrite == null) {
+        orig(chunk, () => {});
+        releaseWrite = () => {
+          if (typeof done === 'function') done();
+        };
+        return false;
+      }
+      return orig(chunk, enc, cb);
+    };
+    // A short filler is what the stopped child actually leaves in the pipe.
+    // A multi-kilobyte write stops at the kernel buffer, so FIONREAD never
+    // reaches the encoded length and the later size check is guessing.
+    const fillerPayload = { n: 1 };
+    const fillerBytes = Buffer.byteLength(encodeNdjson({
+      kind: 'call',
+      correlationId: 'fill',
+      port: 'db',
+      method: 'get',
+      payload: fillerPayload,
+    }));
+    const filler = pair.stub.call({
+      pluginId: 'echo',
+      credential: kid.credential,
+      correlationId: 'fill',
+      port: 'db',
+      method: 'get',
+      payload: fillerPayload,
+    }, 8_000).catch((err) => err);
+    const held = await waitUntil(
+      () => rec.stdinWriting && (pair.sup.flowPending(rec.stdinProbe) ?? 0) >= fillerBytes,
+      1_000,
+    );
+    assert.equal(held, true, JSON.stringify({
+      writing: rec.stdinWriting,
+      queued: pair.sup.flowPending(rec.stdinProbe),
+      fillerBytes,
+    }));
+    const kernel = pair.sup.flowPending(rec.stdinProbe);
+    const outbound = rec.outbound;
+    const lineFor = (pad) => encodeNdjson({
+      kind: 'call',
+      correlationId: shortId,
+      port: 'db',
+      method: 'get',
+      payload: { pad },
+    });
+    // Largest payload the saved reserve would still promote once the held
+    // write is no longer double-counted. Admission still sees that write,
+    // so the same payload parks. The longer id's cancel does not fit beside it.
+    let lo = 0;
+    let hi = rec.kOut;
+    let pad = '';
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      const len = Buffer.byteLength(lineFor('y'.repeat(mid)));
+      if (kernel + len + oldReserve <= rec.kOut) {
+        pad = 'y'.repeat(mid);
+        lo = mid + 1;
+      } else {
+        hi = mid - 1;
+      }
+    }
+    const earlyBytes = Buffer.byteLength(lineFor(pad));
+    assert.ok(outbound > 0, String(outbound));
+    assert.ok(kernel + outbound + earlyBytes + oldReserve > rec.kOut, `${earlyBytes} outbound ${outbound}`);
+    assert.ok(kernel + earlyBytes + oldReserve <= rec.kOut, `${earlyBytes} old ${oldReserve} kernel ${kernel}`);
+    assert.ok(kernel + earlyBytes + newReserve > rec.kOut, `${earlyBytes} new ${newReserve} kernel ${kernel}`);
+    const early = pair.stub.call({
+      pluginId: 'echo',
+      credential: kid.credential,
+      correlationId: shortId,
+      port: 'db',
+      method: 'get',
+      payload: { pad },
+    }, 8_000).catch((err) => err);
+    const late = pair.stub.call({
+      pluginId: 'echo',
+      credential: kid.credential,
+      correlationId: longId,
+      port: 'db',
+      method: 'get',
+      payload: { n: 1 },
+    }, 8_000).catch((err) => err);
+    const parked = await waitUntil(() => {
+      const earlyParked = rec.parked.some((entry) => Object.is(entry.msg.correlationId, shortId));
+      const latePending = pair.sup.pending.has('echo', longId, 'call');
+      if (earlyParked) holdPark(rec);
+      return earlyParked && latePending;
+    }, 1_000);
+    assert.equal(parked, true, JSON.stringify({
+      parked: rec.parked.map((entry) => entry.msg.correlationId),
+      late: pair.sup.pending.has('echo', longId, 'call'),
+      lateCode: null,
+      kOut: rec.kOut,
+      kernel,
+      earlyBytes,
+      oldReserve,
+      newReserve,
+    }));
+    releaseWrite();
+    const drained = await waitUntil(() => rec.stdinWriting === false, 1_000);
+    assert.equal(drained, true, String(rec.stdinWriting));
+    assert.equal(
+      rec.parked.some((entry) => Object.is(entry.msg.correlationId, shortId)),
+      true,
+      'early payload was promoted with the reserve saved at admission',
+    );
+    assert.equal(
+      rec.stdinPayload.some((entry) => Object.is(entry.correlationId, shortId)),
+      false,
+    );
+    let cancelCode = null;
+    const cancel = pair.stub.cancel({
+      pluginId: 'echo',
+      credential: kid.credential,
+      correlationId: longId,
+    }, 1_000).then((row) => row, (err) => {
+      cancelCode = err?.code ?? 'error';
+      return err;
+    });
+    const admitted = await waitUntil(
+      () => pair.sup.pending.has('echo', longId, 'cancel') || cancelCode != null,
+      1_000,
+    );
+    assert.equal(admitted, true, String(cancelCode));
+    assert.notEqual(cancelCode, 'total-cap', JSON.stringify({
+      code: cancelCode,
+      kernel: pair.sup.flowPending(rec.stdinProbe),
+      outbound: rec.outbound,
+      parked: rec.parked.map((entry) => entry.bytes),
+    }));
+    assert.equal(pair.sup.pending.has('echo', longId, 'cancel'), true);
+    const proc = pair.sup.children.get('echo')?.child;
+    if (proc && proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL');
+    await Promise.allSettled([filler, early, late, cancel]);
   } finally {
     const proc = pair.sup.children.get('echo')?.child;
     if (proc && proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL');
@@ -4285,11 +4653,35 @@ test('cancel acks do not recycle data credit', { timeout: 10_000 }, async () => 
       total: 1024 * 1024,
     });
     const rec = pair.sup.children.get('credit');
-    const granted = await waitUntil(
-      () => rec.grantSettled && rec.outbound === 0 && rec.sendWindow >= fittingLine,
-      2_000,
-    );
-    assert.equal(granted, true, String(rec.sendWindow));
+    // The first grant can settle while the wrapper still holds its
+    // environment block. Releasing that block frees room, and the quiet
+    // flush advertises it. Snapshot only after that reservation is gone
+    // and the flush it caused has gone idle, so the later ack window is
+    // not charged for those bytes.
+    let idleSince = null;
+    const granted = await waitUntil(() => {
+      const hold = rec.envHold;
+      const envGone = !hold || !(hold.bytes > 0);
+      const idle = envGone
+        && rec.grantSettled
+        && rec.outbound === 0
+        && !rec.refillArmed
+        && rec.creditFlush == null
+        && rec.sendWindow >= fittingLine;
+      if (!idle) {
+        idleSince = null;
+        return false;
+      }
+      const now = performance.now();
+      if (idleSince == null) idleSince = now;
+      return now - idleSince >= 60;
+    }, 2_000);
+    assert.equal(granted, true, JSON.stringify({
+      window: rec.sendWindow,
+      env: rec.envHold?.bytes ?? 0,
+      flush: rec.creditFlush != null,
+      outbound: rec.outbound,
+    }));
     const origin = rec.creditSent;
     assert.ok(origin < oversizedLine, `${origin} already covers ${oversizedLine}`);
     assert.ok(origin >= fittingLine, `${origin} < ${fittingLine}`);

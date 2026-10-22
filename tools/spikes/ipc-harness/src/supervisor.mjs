@@ -887,6 +887,16 @@ export class Supervisor {
   // A resume() inside the stdout callback is cancelled when that callback
   // returns false, and readPosted stays set. The socket is paused, the child
   // is not, and nothing posts the next read. That pair is not a budget hold.
+  // A global withhold is not a pause. Once a short tail is queued, that
+  // tail is the read, and it can fit when a full C does not. Cancel acks
+  // and completions are that tail: leaving them unread holds the call.
+  #retryHeldReads() {
+    for (const rec of this.children.values()) {
+      if (rec.dead || rec.paused || !rec.readHeld || rec.inStdoutRead) continue;
+      this.#considerRead(rec);
+    }
+  }
+
   #repairStuckReads() {
     for (const rec of this.children.values()) {
       if (rec.dead || rec.paused || rec.inStdoutRead || !rec.readPosted) continue;
@@ -1288,6 +1298,9 @@ export class Supervisor {
     // read leaves the frame unfinished and the rejection unsent. The stall
     // is the other shape: this partial and an unfinished stdout line that
     // cannot take its next read either. #noteMuxBudget closes that pair.
+    // The onread buffer is C. A short queue is not a short read: bytes can
+    // arrive before the pull, and charging only the current tail would
+    // assemble a frame the cap cannot hold.
     if (this.bufferedBytes() + this.readBytes > this.#globalCap()) {
       this.#pauseInput();
       return false;
@@ -1311,9 +1324,17 @@ export class Supervisor {
       }
       // A pause sticks until something recounts. Stdout used to do that when
       // a child echoed a grant; a quiet child never will. The probe is the
-      // recount, and it still resumes only under the global low water.
-      // A mux frame and a stdout line that block each other never recount
-      // into room, so the probe is also the fault for that pair.
+      // recount. A drained environment block is the same quiet case: the
+      // wrapper has read fd 5, and nothing else will notice until a later
+      // stdout byte. Releasing it here lets the credit flush run before
+      // that byte. An open stdout partial above the low water is resumed
+      // from the release path, not from this timer. A mux frame and a
+      // stdout line that block each other never recount into room, so the
+      // probe is also the fault for that pair.
+      if (this.#releaseSettledEnv()) {
+        this.#maybeResumeAll();
+        return;
+      }
       if (this.#noteMuxBudget()) return;
       if (this.#faultUndrainableStdout()) {
         this.#maybeResumeAll();
@@ -1323,9 +1344,29 @@ export class Supervisor {
       // readPosted plus a paused stdout is a cancelled resume. The child is
       // not budget-paused, and the bytes already in the kernel are not a new read.
       this.#repairStuckReads();
+      // A withhold charges a full C while the kernel queue is empty. A later
+      // cancel ack or result is only that tail. The socket is not paused, so
+      // it will not signal the short read; the probe is what looks again.
+      this.#retryHeldReads();
       if (this.muxReadPosted) return;
       this.#considerMuxRead();
     }, PROBE_INTERVAL_MS);
+  }
+
+  // The spawn turn can grant credit while fd 5 is still reserved. Once the
+  // wrapper has read that block, the reservation is gone. A quiet child
+  // does not write the stdout that would notice, so the probe does.
+  #releaseSettledEnv() {
+    let released = false;
+    for (const rec of this.children.values()) {
+      const hold = rec.envHold;
+      if (!hold || rec.dead || !(hold.bytes > 0) || !hold.settle) continue;
+      const kernel = Number.isInteger(hold.probe) ? fionread(hold.probe) : null;
+      if (kernel !== 0) continue;
+      this.#clearEnv(rec);
+      released = true;
+    }
+    return released;
   }
 
   #clearMuxProbe() {
@@ -1359,6 +1400,26 @@ export class Supervisor {
     // Drainable queues can still open a full read. An unfinished stdout
     // line cannot. Walk children only once the buffer is already tight.
     return this.#stdoutPartialBlocked();
+  }
+
+  // The next stdout read, in bytes. A paused child is not handed a short
+  // tail: resume posts a full C, and so does an empty kernel queue. A live
+  // queue shorter than C only needs that tail.
+  #boundedStdoutRead(rec) {
+    const unread = this.#stdoutPending(rec);
+    if (!Number.isInteger(unread) || unread < 0) return null;
+    if (rec.paused || rec.readHeld || unread === 0) return this.readBytes;
+    return Math.min(this.readBytes, unread);
+  }
+
+  // An open line can take its next read beside the bytes still retained.
+  // Half the cap is not that test: a prefix above the low water still fits
+  // once the calls that crowded it have been released.
+  #partialReadFits(rec) {
+    if (!(this.#openPartialBytes(rec) > 0)) return false;
+    const incoming = this.#boundedStdoutRead(rec);
+    if (!Number.isInteger(incoming)) return false;
+    return this.bufferedBytes() + incoming <= this.#globalCap();
   }
 
   // Bytes of an open stdout line. A complete frame can still be pulled, so
@@ -1398,11 +1459,10 @@ export class Supervisor {
         if (!(stuck > 0)) continue;
         const unread = this.#stdoutPending(rec);
         if (!Number.isInteger(unread) || unread < 0) continue;
-        // An empty queue still owes a full C on the next post. A child that
-        // is already paused will not be handed a short tail: resume waits
-        // for the low water, and an open line above that line never reaches
-        // it. A tail shorter than C counts only while the read is still
-        // allowed to proceed.
+        // An empty queue still owes a full C on the next post. A paused
+        // child is not handed a short tail: resume posts a full C. A tail
+        // shorter than C counts only while the read is still allowed to
+        // proceed.
         const held = rec.paused || rec.readHeld || unread === 0;
         const incoming = held ? this.readBytes : Math.min(this.readBytes, unread);
         rows.push({ rec, stuck, incoming });
@@ -1574,9 +1634,11 @@ export class Supervisor {
   // #noteMuxBudget faults that pair instead of pausing both. An open stdout
   // line whose next read does not fit beside the other open lines cannot
   // complete either. #faultUndrainableStdout faults that child with
-  // total-cap. A prefix that still fits stays paused, and drainable bytes
-  // can still open its read. #failAll writes
-  // only after the bridge is already unusable. Spawn charges #globalHeld(null)
+  // total-cap. A release recounts every global pause: a prefix that can
+  // take its next bounded read resumes, including above the low water, and
+  // the same fault runs when that read does not fit. Drainable bytes sit
+  // outside the stuck sum, so a later release can still open the read.
+  // #failAll writes only after the bridge is already unusable. Spawn charges #globalHeld(null)
   // plus the kernel reserves against totalGlobal. A stdout read is posted
   // only when bufferedBytes() plus the bytes it will pull fit B_g. A waiting
   // read can pull C. A kernel queue shorter than C is only that tail.
@@ -1593,6 +1655,10 @@ export class Supervisor {
   // A check against B_t that omits the window lets parked or admitted calls
   // fill the reply the child was credited to write, and the next in-credit
   // line then crosses B_t and faults total-cap.
+  // Promotion recomputes the cancel frame and the cancel-lane identifiers
+  // from the calls still pending. The reserve stored at admission is the
+  // largest id owed then; a later call can owe a larger one, and writing
+  // the earlier payload into that hole leaves the later cancel no room.
   //
   // Bytes. Every path that keeps new per-child userspace charges it beside
   // this child's unspent window (#fitsChild). Admission (#overBudget,
@@ -1782,15 +1848,18 @@ export class Supervisor {
         // Line bytes and identifier bytes are already in the sums. Every
         // live window, including this child's, is already in #globalHeld.
         // Adding the window here would count it twice and the line would
-        // never be promoted.
-        if (!this.#overBudget(rec, 0, next.bytes, next.reserve, next.idReserve || 0)) {
+        // never be promoted. The control hole is the largest cancel still
+        // owed, not the smaller one saved when this call was parked.
+        const reserve = CONTROL_RESERVE.grant + this.#maxCancelBytes(rec);
+        const idReserve = this.#maxCancelIds(rec);
+        if (!this.#overBudget(rec, 0, next.bytes, reserve, idReserve)) {
           rec.parked.shift();
           rec.parkedBytes = Math.max(0, rec.parkedBytes - next.bytes);
           if (rec.parked.length === 0) rec.parkSince = null;
           this.#enqueueStdin(rec, next.line, next.bytes, 'call', next.msg.correlationId);
           continue;
         }
-        if (this.#bytesOver(rec, 0, next.reserve, next.idReserve || 0)) {
+        if (this.#bytesOver(rec, 0, reserve, idReserve)) {
           this.caps.total = true;
           this.#rejectParked(rec, 'total-cap');
           return;
@@ -2943,6 +3012,9 @@ export class Supervisor {
     this.socket.pause();
   }
 
+  // Below the low water the producer may write again. Above it the
+  // unfinished frame stays in the kernel: the onread buffer is C, and
+  // pulling a queued tail would cross the cap the pause is holding.
   #resumeInput() {
     if (!this.inputPaused || this.closed || this.framingFault) return;
     if (this.bufferedBytes() > this.#globalCap() / 2) return;
@@ -2997,7 +3069,15 @@ export class Supervisor {
     for (const rec of this.children.values()) {
       if (!rec.paused || rec.dead) continue;
       if (rec.pauseReason === 'global') {
-        if (globalLow || this.#holdFits(rec)) this.#unpause(rec);
+        const open = this.#openPartialBytes(rec) > 0;
+        // A release of identifiers, a parked line, or a sibling can free a
+        // bounded read while the prefix is still above half the cap. Resume
+        // when that read fits. When it does not, fault a line the open
+        // prefixes themselves can never finish. Drainable bytes are not
+        // that case; the next release recounts.
+        if (open && this.#partialReadFits(rec)) this.#unpause(rec);
+        else if (open) this.#faultUndrainableStdout();
+        else if (globalLow || this.#holdFits(rec)) this.#unpause(rec);
       } else if (rec.pauseReason === 'partial') {
         if (globalOpen && rec.framer.pendingBytes() <= this.partialLowWater) this.#unpause(rec);
       } else if (rec.pauseReason === 'total') {
