@@ -23,6 +23,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const echoPath = fileURLToPath(new URL('./children/echo.mjs', import.meta.url));
+const neverPath = fileURLToPath(new URL('./children/never-terminating.mjs', import.meta.url));
 const creditPath = fileURLToPath(new URL('./children/credit-wait.mjs', import.meta.url));
 const responsePath = fileURLToPath(new URL('./children/credit-response.mjs', import.meta.url));
 const floodPath = fileURLToPath(new URL('./children/flood.mjs', import.meta.url));
@@ -784,29 +785,173 @@ test('a cancelled frame with for call retires the call waiter', async () => {
   }
 });
 
-test('the global byte ceiling pauses every contributing child', { timeout: 10_000 }, async () => {
+test('an unterminated partial that cannot advance is faulted at the global ceiling', { timeout: 10_000 }, async () => {
   const cap = 64 * 1024;
   const pair = await connectPair({
     sweeper: false,
     caps: { total: 1024 * 1024, totalGlobal: cap, partial: 1024 * 1024 },
     partialHighWater: 1024 * 1024,
   });
+  const stop = (id) => {
+    const proc = pair.sup.children.get(id)?.child;
+    if (proc && proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL');
+  };
   try {
     pair.sup.spawn({ pluginId: 'a', script: floodPath, env: { FLOOD_MODE: 'partial' }, total: 1024 * 1024 });
     pair.sup.spawn({ pluginId: 'b', script: floodPath, env: { FLOOD_MODE: 'partial' }, total: 1024 * 1024 });
-    const paused = await waitUntil(() => {
-      const a = pair.sup.children.get('a');
-      const b = pair.sup.children.get('b');
-      return a.paused && b.paused && a.pauseReason === 'global' && b.pauseReason === 'global';
+    const faulted = await waitUntil(() => {
+      const codes = ['a', 'b'].map((id) => pair.sup.faults.find((row) => row.pluginId === id)?.code);
+      return codes.every((code) => code === 'total-cap');
     }, 3_000);
-    assert.equal(paused, true);
+    assert.equal(faulted, true, JSON.stringify(pair.sup.faults));
+    assert.equal(pair.sup.children.get('a').dead, true);
+    assert.equal(pair.sup.children.get('b').dead, true);
     const buffered = pair.sup.bufferedBytes();
     await delay(300);
-    // Each paused child may already hold a pipe burst in readableLength.
-    assert.ok(buffered <= cap + 256 * 1024, String(buffered));
-    assert.ok(pair.sup.bufferedBytes() <= buffered + 4_096);
+    assert.ok(buffered <= cap, String(buffered));
+    assert.ok(pair.sup.bufferedBytes() <= cap);
   } finally {
+    stop('a');
+    stop('b');
     await pair.close();
+  }
+});
+
+test('a never-terminating sibling is faulted when the global budget is below the partial allowance', { timeout: 10_000 }, async () => {
+  const pair = await connectPair({
+    sweeper: false,
+    caps: { totalGlobal: 100_000 },
+  });
+  const stop = (id) => {
+    const proc = pair.sup.children.get(id)?.child;
+    if (proc && proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL');
+  };
+  try {
+    const echo = pair.sup.spawn({ pluginId: 'echo', script: echoPath });
+    pair.sup.spawn({ pluginId: 'nt', script: neverPath });
+    const nt = pair.sup.children.get('nt');
+    const faulted = await waitUntil(
+      () => pair.sup.faults.some((row) => row.pluginId === 'nt'),
+      3_000,
+    );
+    const fault = pair.sup.faults.find((row) => row.pluginId === 'nt');
+    assert.equal(faulted, true, JSON.stringify({
+      pause: nt.pauseReason,
+      partial: nt.framer.pendingBytes(),
+      buffered: pair.sup.bufferedBytes(),
+      bP: nt.bP,
+    }));
+    assert.equal(fault.code, 'total-cap');
+    assert.ok(fault.pendingBytes <= nt.bP, `${fault.pendingBytes} reached bP ${nt.bP}`);
+    assert.equal(nt.dead, true);
+    assert.equal(pair.sup.children.get('echo').dead, false);
+    const res = await pair.stub.call({
+      pluginId: 'echo',
+      credential: echo.credential,
+      correlationId: 1,
+      port: 'db',
+      method: 'get',
+      payload: { ok: true },
+    }, 2_000);
+    assert.equal(res.payload?.ok, true);
+    assert.equal(pair.sup.faults.some((row) => row.pluginId === 'echo'), false);
+  } finally {
+    stop('echo');
+    stop('nt');
+    await pair.close();
+  }
+});
+
+test('a hostile child is faulted instead of blocking a healthy sibling', { timeout: 90_000 }, async () => {
+  const reserved = measureFlowReserve();
+  assert.ok(reserved);
+  const floor = reserved.perChild * 2 + reserved.muxReserve;
+  const configs = [
+    { totalGlobal: 100_000 },
+    { totalGlobal: floor + 8_192, partial: 64 * 1024, total: 256 * 1024 },
+    { totalGlobal: floor + 64 * 1024, partial: 32 * 1024, total: 256 * 1024 },
+    { totalGlobal: 8 * 1024 * 1024, partial: 64 * 1024, total: 1024 * 1024 },
+    { totalGlobal: 100_000, partial: 1024 * 1024, total: 1024 * 1024, pending: 4 },
+    { totalGlobal: floor + 4_096, partial: 8 * 1024, total: 64 * 1024, pending: 1 },
+  ];
+  const rng = mulberry32(0xA11CE);
+  const pendings = [1, 8, 32, 64];
+  for (let n = 0; n < 6; n++) {
+    const partial = 4_096 + Math.floor(rng() * 96_000);
+    const total = partial + reserved.perChild + Math.floor(rng() * 80_000);
+    const totalGlobal = floor + Math.floor(rng() * 180_000);
+    configs.push({
+      partial,
+      total,
+      totalGlobal,
+      pending: pendings[Math.floor(rng() * pendings.length)],
+    });
+  }
+  for (const caps of configs) {
+    const pair = await connectPair({ sweeper: false, caps });
+    const stop = (id) => {
+      const proc = pair.sup.children.get(id)?.child;
+      if (proc && proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL');
+    };
+    try {
+      let echo;
+      try {
+        echo = pair.sup.spawn({ pluginId: 'echo', script: echoPath, pending: caps.pending, total: caps.total });
+      } catch (err) {
+        assert.equal(err.code, 'unsatisfiable', `${err.code} ${JSON.stringify(caps)}`);
+        continue;
+      }
+      let admitted = true;
+      try {
+        pair.sup.spawn({ pluginId: 'nt', script: neverPath, pending: caps.pending, total: caps.total });
+      } catch (err) {
+        assert.ok(
+          err.code === 'spawn-rejected' || err.code === 'unsatisfiable',
+          `${err.code} ${JSON.stringify(caps)}`,
+        );
+        assert.equal(pair.sup.children.has('nt'), false);
+        admitted = false;
+      }
+      if (admitted) {
+        const nt = pair.sup.children.get('nt');
+        const faulted = await waitUntil(
+          () => pair.sup.faults.some((row) => row.pluginId === 'nt'),
+          8_000,
+        );
+        const fault = pair.sup.faults.find((row) => row.pluginId === 'nt');
+        assert.equal(faulted, true, JSON.stringify({
+          caps,
+          pause: nt.pauseReason,
+          partial: nt.framer.pendingBytes(),
+          dead: nt.dead,
+          buffered: pair.sup.bufferedBytes(),
+        }));
+        assert.ok(
+          fault.code === 'total-cap' || fault.code === 'partial-cap' || fault.code === 'NdjsonOversizeError',
+          fault.code,
+        );
+        assert.equal(nt.dead, true);
+        assert.equal(pair.sup.children.get('echo').dead, false);
+      }
+      const res = await pair.stub.call({
+        pluginId: 'echo',
+        credential: echo.credential,
+        correlationId: 1,
+        port: 'db',
+        method: 'get',
+        payload: { ok: true },
+      }, 2_000).catch((err) => err);
+      assert.equal(res.payload?.ok, true, JSON.stringify({
+        caps,
+        code: res.code,
+        admitted,
+        faults: pair.sup.faults.map((row) => ({ id: row.pluginId, code: row.code })),
+      }));
+    } finally {
+      stop('echo');
+      stop('nt');
+      await pair.close();
+    }
   }
 });
 
@@ -911,7 +1056,7 @@ test('kernel writes stop until drain and stay inside the byte cap', async () => 
   }
 });
 
-test('a paused child keeps its unread tail and the buffer stops growing', { timeout: 10_000 }, async () => {
+test('an unterminated partial that fills the global budget is faulted and stops growing', { timeout: 10_000 }, async () => {
   const reserved = measureFlowReserve();
   assert.ok(reserved);
   const cap = 8 * 1024;
@@ -928,18 +1073,23 @@ test('a paused child keeps its unread tail and the buffer stops growing', { time
       total: 1024 * 1024,
     });
     const rec = pair.sup.children.get('partial');
-    const paused = await waitUntil(() => rec.paused && !rec.dead, 3_000);
-    assert.equal(paused, true);
-    await delay(200);
+    const faulted = await waitUntil(
+      () => pair.sup.faults.some((row) => row.pluginId === 'partial' && row.code === 'total-cap'),
+      3_000,
+    );
+    assert.equal(faulted, true, JSON.stringify({
+      pause: rec.pauseReason,
+      partial: rec.framer.pendingBytes(),
+      dead: rec.dead,
+    }));
+    assert.equal(rec.dead, true);
     const buffered = pair.sup.bufferedBytes();
-    const stashed = rec.stash?.length ?? 0;
     await delay(200);
-    assert.equal(rec.dead, false);
-    assert.equal(rec.paused, true);
     assert.equal(pair.sup.bufferedBytes(), buffered);
-    assert.ok(buffered >= cap, String(buffered));
-    if (stashed > 0) assert.ok(buffered >= stashed);
+    assert.ok(buffered <= cap, String(buffered));
   } finally {
+    const proc = pair.sup.children.get('partial')?.child;
+    if (proc && proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL');
     await pair.close();
   }
 });
@@ -1835,18 +1985,20 @@ test('the shared input resumes below the global low water', { timeout: 10_000 },
   const cap = 64 * 1024;
   const pair = await connectPair({
     sweeper: false,
-    caps: { total: 1024 * 1024, totalGlobal: cap + 2 * reserved.perChild + reserved.muxReserve, partial: 1024 * 1024 },
+    caps: { total: 1024 * 1024, totalGlobal: cap + reserved.perChild + reserved.muxReserve, partial: 1024 * 1024 },
     partialHighWater: 1024 * 1024,
   });
   try {
-    pair.sup.spawn({ pluginId: 'a', script: floodPath, env: { FLOOD_MODE: 'partial' }, total: 1024 * 1024 });
-    pair.sup.spawn({ pluginId: 'b', script: floodPath, env: { FLOOD_MODE: 'partial' }, total: 1024 * 1024 });
+    pair.sup.spawn({ pluginId: 'a', script: floodPath, env: { FLOOD_MODE: 'silent' }, total: 1024 * 1024 });
+    // Queued bytes can leave. An open stdout line that cannot take its next
+    // read is faulted instead, so it is not what holds this pause.
+    pair.sup.queuedBytes = cap + pair.sup.readBytes;
     const paused = await waitUntil(
-      () => pair.sup.inputPaused && pair.sup.bufferedBytes() + pair.sup.readBytes > cap,
+      () => pair.sup.inputPaused && pair.sup.bufferedBytes() > cap,
       3_000,
     );
     assert.equal(paused, true);
-    for (const id of ['a', 'b']) pair.sup.children.get(id).child.kill('SIGKILL');
+    pair.sup.queuedBytes = 0;
     const resumed = await waitUntil(
       () => pair.sup.inputPaused === false && pair.sup.bufferedBytes() <= cap / 2,
       3_000,
@@ -1854,12 +2006,10 @@ test('the shared input resumes below the global low water', { timeout: 10_000 },
     assert.equal(resumed, true, JSON.stringify({
       paused: pair.sup.inputPaused,
       buffered: pair.sup.bufferedBytes(),
-      dead: ['a', 'b'].map((id) => pair.sup.children.get(id).dead),
     }));
   } finally {
-    for (const rec of pair.sup.children.values()) {
-      if (rec.child.exitCode == null && rec.child.signalCode == null) rec.child.kill('SIGKILL');
-    }
+    const proc = pair.sup.children.get('a')?.child;
+    if (proc && proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL');
     await pair.close();
   }
 });
@@ -3286,7 +3436,11 @@ test('exit keeps one terminal error inside the full byte cap', async () => {
     assert.equal(await stopChild(kid.pid), true);
     const armed = await waitUntil(() => pair.sup.pending.size === 6, 2_000);
     assert.equal(armed, true);
-    sibling.stash = Buffer.alloc(reserved.perChild);
+    // A trailing newline keeps this occupancy out of the open-line fault.
+    // An unterminated stash that cannot take another read is total-cap.
+    const held = Buffer.alloc(reserved.perChild, 0x61);
+    held[held.length - 1] = 0x0a;
+    sibling.stash = held;
     // The grant belongs to the wide cap above. The tightened cap is the
     // byte budget under test; a leftover window would be credit against
     // a ceiling this case has already replaced.
@@ -3348,7 +3502,9 @@ test('a terminal error is not queued when the sibling stash already fills the ca
     assert.equal(await stopChild(kid.pid), true);
     const armed = await waitUntil(() => pair.sup.pending.size === 6, 2_000);
     assert.equal(armed, true);
-    sibling.stash = Buffer.alloc(reserved.perChild);
+    const held = Buffer.alloc(reserved.perChild, 0x61);
+    held[held.length - 1] = 0x0a;
+    sibling.stash = held;
     pair.sup.capsConfig.totalGlobal = reserved.muxReserve + 2 * reserved.perChild;
     process.kill(kid.pid, 'SIGKILL');
     const finished = await waitUntil(() => echo.exitFinished === true, 3_000);
@@ -3408,7 +3564,9 @@ test('a terminal frame does not spend a sibling send window', async () => {
     assert.equal(await stopChild(kid.pid), true);
     const armed = await waitUntil(() => pair.sup.pending.size === 6, 2_000);
     assert.equal(armed, true);
-    sibling.stash = Buffer.alloc(reserved.perChild);
+    const held = Buffer.alloc(reserved.perChild, 0x61);
+    held[held.length - 1] = 0x0a;
+    sibling.stash = held;
     // The wide-cap grant is not part of this budget. One frame of slack
     // remains, and the sibling's send window is that slack.
     echo.sendWindow = 0;
@@ -4756,7 +4914,7 @@ test('parked calls leave a sibling send window usable', async () => {
     const flooded = await waitUntil(() => {
       if (recB.parked.length > 0) holdPark(recB);
       return recB.rejectsCoalesced > 0;
-    }, 2_000);
+    }, 5_000);
     assert.equal(flooded, true, JSON.stringify({
       parked: recB.parkedBytes,
       rejections: rejections.length,

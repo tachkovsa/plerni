@@ -942,6 +942,14 @@ export class Supervisor {
       // A partial mux frame can be what filled this room. Fault that pair
       // here: the mux socket will not deliver another chunk while it is paused.
       this.#noteMuxBudget();
+      if (this.framingFault) return false;
+      // An open stdout line cannot shrink. When its next read does not fit
+      // beside the other open lines, the frame can never complete. Fault
+      // that child. Pausing it holds the budget until a sibling times out.
+      if (this.#faultUndrainableStdout()) {
+        this.#maybeResumeAll();
+        return false;
+      }
       // A child with nothing in userspace is still held. Pausing it would
       // wait for bytes it does not have; the probe has to run anyway.
       if (this.#pluginBytes(rec) > 0) this.#pause(rec, 'global');
@@ -1307,6 +1315,10 @@ export class Supervisor {
       // A mux frame and a stdout line that block each other never recount
       // into room, so the probe is also the fault for that pair.
       if (this.#noteMuxBudget()) return;
+      if (this.#faultUndrainableStdout()) {
+        this.#maybeResumeAll();
+        return;
+      }
       if (this.inputPaused) this.#resumeInput();
       // readPosted plus a paused stdout is a cancelled resume. The child is
       // not budget-paused, and the bytes already in the kernel are not a new read.
@@ -1347,6 +1359,76 @@ export class Supervisor {
     // Drainable queues can still open a full read. An unfinished stdout
     // line cannot. Walk children only once the buffer is already tight.
     return this.#stdoutPartialBlocked();
+  }
+
+  // Bytes of an open stdout line. A complete frame can still be pulled, so
+  // pending bytes that already contain a newline are not part of this sum.
+  // A stashed tail with a newline can be parsed. A tail of the same open
+  // line cannot shrink until a later read, which is what this counts.
+  #openPartialBytes(rec) {
+    if (!rec || rec.dead || !rec.flowOk) return 0;
+    let stuck = 0;
+    const pending = rec.framer.pendingBytes();
+    if (pending > 0 && !rec.framer.hasPendingNewline()) stuck += pending;
+    const stash = rec.stash;
+    if (stash && stash.length > 0 && !stash.includes(0x0a)) stuck += stash.length;
+    return stuck;
+  }
+
+  // An open line whose next read does not fit beside the other open lines
+  // can never complete: those lines do not shrink, and a short read is not
+  // used. An empty kernel queue still posts a full C, so a line that cannot
+  // accept C more bytes is already stuck. A queued tail shorter than C only
+  // needs that tail. Fault the stuck child with total-cap. A prefix that
+  // still fits beside the other open lines stays. Drainable bytes (finished
+  // frames, the mux bridge) are not in the sum, so they can still open a
+  // later read. A child that already fills the cap on its own is faulted
+  // first. The largest remaining line is faulted when only the set of open
+  // lines blocks the read, which leaves a smaller prefix room to finish.
+  #faultUndrainableStdout() {
+    if (this.closed || this.framingFault || this.invalidReason) return false;
+    let faulted = false;
+    for (;;) {
+      const cap = this.#globalCap();
+      const rows = [];
+      let stuckSum = 0;
+      for (const rec of this.children.values()) {
+        if (rec.dead || rec.exitDrain || rec.exitFinished || !rec.flowOk) continue;
+        const stuck = this.#openPartialBytes(rec);
+        if (!(stuck > 0)) continue;
+        const unread = this.#stdoutPending(rec);
+        if (!Number.isInteger(unread) || unread < 0) continue;
+        // An empty queue still owes a full C on the next post. A child that
+        // is already paused will not be handed a short tail: resume waits
+        // for the low water, and an open line above that line never reaches
+        // it. A tail shorter than C counts only while the read is still
+        // allowed to proceed.
+        const held = rec.paused || rec.readHeld || unread === 0;
+        const incoming = held ? this.readBytes : Math.min(this.readBytes, unread);
+        rows.push({ rec, stuck, incoming });
+        stuckSum += stuck;
+      }
+      const alone = rows.filter((row) => row.stuck + row.incoming > cap);
+      if (alone.length > 0) {
+        for (const row of alone) this.#faultOpenPartial(row.rec);
+        faulted = true;
+        continue;
+      }
+      const blocked = rows.filter((row) => stuckSum + row.incoming > cap);
+      if (blocked.length === 0) return faulted;
+      let largest = blocked[0];
+      for (const row of blocked) {
+        if (row.stuck > largest.stuck) largest = row;
+      }
+      this.#faultOpenPartial(largest.rec);
+      faulted = true;
+    }
+  }
+
+  #faultOpenPartial(rec) {
+    if (!rec || rec.dead) return;
+    this.caps.total = true;
+    this.#fault(rec, 'total-cap');
   }
 
   // An incomplete child line whose next kernel read does not fit beside the
@@ -1489,7 +1571,11 @@ export class Supervisor {
   // every window or rejected without keeping the bytes. Refusing the read
   // would stall that rejection. An unfinished mux frame that also leaves an
   // unfinished stdout line unable to take its next read cannot shrink, and
-  // #noteMuxBudget faults that pair instead of pausing both. #failAll writes
+  // #noteMuxBudget faults that pair instead of pausing both. An open stdout
+  // line whose next read does not fit beside the other open lines cannot
+  // complete either. #faultUndrainableStdout faults that child with
+  // total-cap. A prefix that still fits stays paused, and drainable bytes
+  // can still open its read. #failAll writes
   // only after the bridge is already unusable. Spawn charges #globalHeld(null)
   // plus the kernel reserves against totalGlobal. A stdout read is posted
   // only when bufferedBytes() plus the bytes it will pull fit B_g. A waiting
@@ -2838,6 +2924,7 @@ export class Supervisor {
   }
 
   #pauseOverGlobal() {
+    if (this.#faultUndrainableStdout()) return;
     this.caps.total = true;
     this.#pauseInput();
     for (const rec of this.children.values()) {
