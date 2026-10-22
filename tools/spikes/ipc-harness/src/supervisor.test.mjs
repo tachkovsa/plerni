@@ -2485,13 +2485,15 @@ test('pending identifiers stay charged after the child reads them', async () => 
     assert.equal(held, true);
     assert.ok(pair.sup.bufferedBytes() <= 40_000, String(pair.sup.bufferedBytes()));
     assert.ok(pair.stub.bufferedBytes() <= 40_000, String(pair.stub.bufferedBytes()));
-    // The stdin line alone fits the remaining per-plugin room. The retained id does not.
+    // The retained id stays charged. A second cancel of a longer id does not
+    // fit beside it, and its error frame would also spend the unspent window,
+    // so the caller times out instead of receiving that frame.
     const again = await pair.stub.cancel({
       pluginId: 'ig',
       credential: kid.credential,
       correlationId: 'q'.repeat(8_000),
     }, 1_000).catch((err) => err);
-    assert.equal(again.code, 'total-cap');
+    assert.equal(again.code, 'timeout');
     assert.equal(pair.sup.pending.size, 1);
     assert.ok(pair.sup.bufferedBytes() >= floor, String(pair.sup.bufferedBytes()));
     assert.ok(pair.stub.bufferedBytes() >= floor, String(pair.stub.bufferedBytes()));
@@ -3180,7 +3182,10 @@ test('a parked reply releases its identifiers and stays inside the caps', async 
     const charged = pair.sup.queueDepth('echo').pluginBytes;
     const other = charged - rec.loBytes - idBytes;
     assert.ok(other >= 0, String(other));
-    rec.loBytes = rec.bT - measured + slack - idBytes - other;
+    // The unspent window is reserved beside this fill. Counting it as free
+    // bytes would make the deferred reply look larger than B_t.
+    const credit = rec.sendWindow > 0 ? rec.sendWindow : 0;
+    rec.loBytes = rec.bT - measured + slack - idBytes - other - credit;
     assert.ok(rec.loBytes >= 0, String(rec.loBytes));
     rec.paused = false;
     rec.pauseReason = null;
@@ -3458,6 +3463,8 @@ test('a live rejection is not queued once the child holds B_t', async () => {
     const rec = pair.sup.children.get('echo');
     const flushed = await waitUntil(() => rec.creditSent > 0 && rec.outbound === 0, 2_000);
     assert.equal(flushed, true);
+    // One rejection frame of slack beside the advertised window. The window
+    // stays reserved; the byte fill is the rest of B_t.
     const frame = encodeMux({
       kind: 'rejected',
       code: 'total-cap',
@@ -3466,7 +3473,16 @@ test('a live rejection is not queued once the child holds B_t', async () => {
       correlationId: 1,
       generation: kid.credential.generation,
     });
-    rec.idBytes = rec.bT - frame.length;
+    const occupied = Math.max(0, pair.sup.queueDepth('echo').pluginBytes - rec.idBytes);
+    const credit = rec.sendWindow > 0 ? rec.sendWindow : 0;
+    rec.idBytes = rec.bT - frame.length - credit - occupied;
+    assert.ok(rec.idBytes >= 0, JSON.stringify({
+      idBytes: rec.idBytes,
+      credit,
+      occupied,
+      ceiling: rec.bT,
+      frame: frame.length,
+    }));
     const admitted = await pair.stub.call({
       pluginId: 'echo',
       credential: kid.credential,
@@ -5126,18 +5142,168 @@ test('reply expansion reserves the replying child remaining credit', async () =>
   }
 });
 
+test('parked calls leave the replying child its advertised credit', async () => {
+  const pending = 128;
+  const replyPad = 40_000;
+  const total = 256 * 1024;
+  const pair = await connectPair({
+    sweeper: false,
+    caps: {
+      pending,
+      pendingGlobal: 256,
+      partial: 1024 * 1024,
+      total,
+      totalGlobal: 8 * 1024 * 1024,
+    },
+  });
+  const stop = () => {
+    const proc = pair.sup.children.get('credit')?.child;
+    if (proc && proc.exitCode == null && proc.signalCode == null) proc.kill('SIGKILL');
+  };
+  const callLine = (id, pad) => Buffer.byteLength(encodeNdjson({
+    kind: 'call',
+    correlationId: id,
+    port: 'db',
+    method: 'get',
+    payload: 'q'.repeat(pad),
+  }));
+  const replyLine = Buffer.byteLength(encodeNdjson({
+    kind: 'result',
+    correlationId: 1,
+    payload: 'p'.repeat(replyPad),
+  }));
+  const fillers = [];
+  const settled = [];
+  try {
+    const kid = pair.sup.spawn({
+      pluginId: 'credit',
+      script: responsePath,
+      pending,
+      total,
+    });
+    const rec = pair.sup.children.get('credit');
+    const granted = await waitUntil(
+      () => rec.grantSettled && rec.outbound === 0 && rec.sendWindow > replyLine,
+      2_000,
+    );
+    assert.equal(granted, true, JSON.stringify({
+      window: rec.sendWindow,
+      replyLine,
+      ceiling: rec.bT,
+    }));
+    assert.equal(await stopChild(rec.child.pid), true);
+    const reply = pair.stub.call({
+      pluginId: 'credit',
+      credential: kid.credential,
+      correlationId: 1,
+      port: 'db',
+      method: 'get',
+      payload: { pad: replyPad },
+    }, 3_000).catch((err) => err);
+    const armed = await waitUntil(() => pair.sup.pending.has('credit', 1, 'call'), 1_000);
+    assert.equal(armed, true, 'the compliant call was not admitted');
+    for (let id = 2; id <= pending; id++) {
+      fillers.push(pair.stub.call({
+        pluginId: 'credit',
+        credential: kid.credential,
+        correlationId: id,
+        port: 'db',
+        method: 'get',
+        payload: 'q'.repeat(4_000),
+      }, 3_000).then((row) => {
+        settled.push(row);
+        return row;
+      }, (err) => {
+        settled.push(err);
+        return err;
+      }));
+    }
+    const parked = await waitUntil(() => {
+      if (rec.parked.length > 0) holdPark(rec);
+      return rec.parkedBytes > 0;
+    }, 2_000);
+    assert.equal(parked, true, JSON.stringify({
+      parkedBytes: rec.parkedBytes,
+      window: rec.sendWindow,
+      ceiling: rec.bT,
+    }));
+    const rejected = await waitUntil(
+      () => settled.some((row) => row?.code === 'total-cap' || row?.code === 'timeout'),
+      2_000,
+    );
+    assert.equal(rejected, true, 'no call was rejected once the window was reserved');
+    assertAccountingInvariants(pair.sup, rec);
+    const pluginBytes = pair.sup.queueDepth('credit').pluginBytes;
+    const gap = rec.bT - pluginBytes - rec.sendWindow;
+    const oldRoom = rec.bT - pluginBytes;
+    assert.ok(oldRoom > gap, JSON.stringify({ pluginBytes, window: rec.sendWindow, ceiling: rec.bT }));
+    assert.ok(replyLine <= rec.sendWindow, JSON.stringify({ replyLine, window: rec.sendWindow }));
+    let probePad = 1;
+    while (probePad < 8_000 && callLine(pending + 1, probePad) <= gap) probePad += 1;
+    const probeLen = callLine(pending + 1, probePad);
+    assert.ok(probeLen > gap, JSON.stringify({ probeLen, gap, oldRoom }));
+    assert.ok(probeLen < oldRoom, JSON.stringify({ probeLen, gap, oldRoom, window: rec.sendWindow }));
+    const beforeParked = rec.parkedBytes;
+    const probe = await pair.stub.call({
+      pluginId: 'credit',
+      credential: kid.credential,
+      correlationId: pending + 1,
+      port: 'db',
+      method: 'get',
+      payload: 'q'.repeat(probePad),
+    }, 400).catch((err) => err);
+    assert.ok(probe.code === 'total-cap' || probe.code === 'timeout', JSON.stringify({
+      code: probe.code,
+      parked: rec.parkedBytes,
+      window: rec.sendWindow,
+      bytes: pluginBytes,
+    }));
+    assert.equal(rec.parkedBytes, beforeParked, 'the probe was parked into advertised credit');
+    assert.equal(rec.dead, false);
+    assertAccountingInvariants(pair.sup, rec);
+    rec.stdoutSocket.emit('data', Buffer.from(encodeNdjson({
+      kind: 'result',
+      correlationId: 1,
+      payload: 'p'.repeat(replyPad),
+    })));
+    const done = await reply;
+    assert.equal(done.payload?.length, replyPad, JSON.stringify({
+      code: done.code,
+      kind: done.kind,
+      pause: rec.pauseReason,
+      dead: rec.dead,
+      fault: pair.sup.faults.at(-1)?.code,
+      parked: rec.parkedBytes,
+      window: rec.sendWindow,
+      bytes: pair.sup.queueDepth('credit').pluginBytes,
+      ceiling: rec.bT,
+    }));
+    assert.equal(rec.dead, false);
+    assert.equal(rec.child.signalCode, null);
+    assert.notEqual(rec.pauseReason, 'total');
+    assert.equal(pair.sup.faults.some((row) => row.code === 'total-cap'), false);
+    assertAccountingInvariants(pair.sup, rec);
+  } finally {
+    stop();
+    await Promise.allSettled(fillers);
+    await pair.close();
+  }
+});
+
 // Checked after every scripted and seeded admission step:
 // admitKeep === max(admitFloor, live admitted costs), and that value fits B_t and B_g.
 // Each parked id is pending once, and a parked id whose cancel is still pending
 // is not sitting in the stdin payload queue.
 // A call line is not written after its cancel line while that cancel is in force.
 // sendWindow + creditSpent === creditSent. bufferedBytes plus every live window
-// fits B_g. A grant that runs while every peer is already live leaves each
-// child a window that can carry a small result; a window advertised before
-// the peer existed stays as advertised. Reply expansion counts the replying
-// child's remaining window as well as every sibling. A quiet flush adds
-// withheld data credit and does not shrink sendWindow. Cancel acks and grant
-// lines are not that data, so the flush does not advertise them again.
+// fits B_g. Each live child's plugin bytes plus its own unspent window fit
+// B_t: pending is a count, and parked, buffered, and admitted bytes are
+// inside that sum. A grant that runs while every peer is already live leaves
+// each child a window that can carry a small result; a window advertised
+// before the peer existed stays as advertised. Reply expansion counts the
+// replying child's remaining window as well as every sibling. A quiet flush
+// adds withheld data credit and does not shrink sendWindow. Cancel acks and
+// grant lines are not that data, so the flush does not advertise them again.
 function assertAccountingInvariants(sup, rec) {
   const ceiling = rec.flowOk ? rec.bT : rec.limits.total;
   let kernel = 0;
@@ -5198,6 +5364,18 @@ function assertAccountingInvariants(sup, rec) {
     windows,
     globalCap,
   }));
+  for (const child of sup.children.values()) {
+    if (child.dead || !child.flowOk) continue;
+    const bytes = sup.queueDepth(child.credential.pluginId).pluginBytes;
+    const credit = child.sendWindow > 0 ? child.sendWindow : 0;
+    assert.ok(bytes + credit <= child.bT, JSON.stringify({
+      plugin: child.credential.pluginId,
+      bytes,
+      credit,
+      ceiling: child.bT,
+      parked: child.parkedBytes,
+    }));
+  }
 }
 
 function stdinMessages(written) {
@@ -5607,6 +5785,16 @@ test('a parked long correlation id can still be cancelled', { timeout: 10_000 },
       const openRec = openPair.sup.children.get(pluginId);
       const openGrant = await waitUntil(() => openRec.grantSettled && openRec.outbound === 0, 2_000);
       assert.equal(openGrant, true, String(openRec.creditSent));
+      // This half is the identifier budget. The window already granted would
+      // occupy the bytes the long id has to fit in, so it is not part of
+      // the figure under test. Refill stays armed so the window is not
+      // advertised again before the cancel.
+      openRec.creditSpent = openRec.creditSent;
+      openRec.sendWindow = 0;
+      openRec.refillArmed = true;
+      if (openRec.creditFlush) clearTimeout(openRec.creditFlush);
+      openRec.creditFlush = null;
+      openRec.creditFlushDue = null;
       assert.equal(await stopChild(openRec.child.pid), true);
       const filler = openPair.stub.call({
         pluginId,

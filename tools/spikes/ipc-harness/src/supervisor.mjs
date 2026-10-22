@@ -874,11 +874,14 @@ export class Supervisor {
       this.#accountReserved(rec);
       return false;
     }
-    // Credit is not in bufferedBytes(). Subtracting the open window from
-    // this slice treats the response as free and lets bufferedBytes() pass
-    // B_g once a mux frame already fills the room. A waiting read can pull
-    // a full C. A queue that is already shorter than C only needs room for
-    // that tail, so the last bytes of a response are not stuck behind C.
+    // Credit is not in bufferedBytes() or, until this read spends it, a
+    // second copy of the per-child ceiling. Data stdout lowers the window
+    // by the bytes actually pulled, in the same turn, so this slice does
+    // not subtract the open window. Subtracting it would refuse a reply
+    // the child was credited to write, on B_g and on B_t. A waiting read
+    // can pull a full C. A queue that is already shorter than C only needs
+    // room for that tail, so the last bytes of a response are not stuck
+    // behind C.
     const incoming = unread > 0 ? Math.min(this.readBytes, unread) : this.readBytes;
     if (this.bufferedBytes() + incoming > this.#globalCap()) {
       // A partial mux frame can be what filled this room. Fault that pair
@@ -1091,6 +1094,24 @@ export class Supervisor {
   // B_t while flow control is on. The configured total is the vacuity ceiling.
   #childCeiling(rec) {
     return this.enforceFlow && rec.flowOk ? rec.bT : rec.limits.total;
+  }
+
+  // Advertised credit is not in #pluginBytes. Grants raise it and data
+  // stdout lowers it. A per-child check that omits it admits bytes into
+  // the reply the child was already told it may write.
+  #advertisedCredit(rec) {
+    return rec.sendWindow > 0 ? rec.sendWindow : 0;
+  }
+
+  // `extra` is new userspace charged to this child. The unspent window is
+  // counted once, here, and is not part of `extra`. A sum equal to the
+  // ceiling still fits. The reply stamp is not added here. #creditRoom
+  // already withholds it from the grant, and #complete's frame already
+  // contains it. Adding it again would reject a call whose own bytes fit
+  // beside the window.
+  #fitsChild(rec, extra) {
+    const n = Number.isInteger(extra) && extra > 0 ? extra : 0;
+    return this.#pluginBytes(rec) + this.#advertisedCredit(rec) + n <= this.#childCeiling(rec);
   }
 
   // One mux read is at most C. A read is posted only when muxUnread is inside
@@ -1422,6 +1443,46 @@ export class Supervisor {
   // the cancel lane retains them in addition to the call lane, and they
   // are not a second stdin frame. A payload still in the unsent queue is
   // dropped when its call or cancel expires.
+  //
+  // Per-child caps. The same promise is B_t, not only B_g. #pluginBytes is
+  // the child's retained userspace (framer, outbound, parked, hi/lo, ids,
+  // deferred, stash, stdout readableLength). It does not include sendWindow.
+  // A check against B_t that omits the window lets parked or admitted calls
+  // fill the reply the child was credited to write, and the next in-credit
+  // line then crosses B_t and faults total-cap.
+  //
+  // Bytes. Every path that keeps new per-child userspace charges it beside
+  // this child's unspent window (#fitsChild). Admission (#overBudget,
+  // #bytesOver), parking (#parkCall), cancel, and the grant line all do.
+  // Promotion rechecks with the line already in #pluginBytes and does not
+  // add the window a second time. Expansion (#complete) compares the mux
+  // frame, which already holds the stamp, plus the remaining window.
+  // A data line has already left that window; a cancel ack never spent it.
+  // #holdFits uses that same sum when a deferred reply is released.
+  // Rejection frames and flood frames go through #fitsChild before
+  // #enqueueBuf. The grant withholds the reply stamp before credit is
+  // issued. These admissions do not subtract that stamp a second time.
+  // Pending. The cap is a count of call and cancel lanes. It does not take
+  // bytes. The identifier bytes and the line that come with a pending lane
+  // are the byte charge, and they go through #fitsChild.
+  // Parked. parkedBytes is inside #pluginBytes. A line that fits B_t only
+  // by occupying the unspent window is total-cap, not parked.
+  // Buffered. Stdout bytes are inside #pluginBytes. A data read spends the
+  // window in the same turn, one for one, before the line is parsed, so
+  // #readPermitted and #retainTail do not add the window. Adding it would
+  // refuse the reply the child was credited to write. The partial cap is
+  // that unterminated prefix; for data it is spent credit, not a second
+  // copy of the window. #accountReserved compares #pluginBytes with B_t
+  // after the spend. The unspent remainder is not added there, or a reply
+  // that stayed inside its credit would be killed. hi and lo are frame
+  // counts. Their bytes are already in #pluginBytes and have passed
+  // #fitsChild. Spawn's new child has no window yet. Other children's
+  // windows are in the global spawn check. #creditRoom sizes new credit
+  // beside #pluginBytes and the current window; it does not spend the
+  // window. #enqueueBuf only commits bytes the caller already admitted.
+  // #failAll writes after the bridge is unusable. queueMuxBytes and
+  // terminal frames are shared userspace: they pass #fitsGlobal and are
+  // not charged to a child's B_t.
   #onMux(msg) {
     if (msg.kind !== 'call' && msg.kind !== 'cancel') return;
     const rec = this.children.get(msg.pluginId);
@@ -1512,7 +1573,7 @@ export class Supervisor {
     // reservation below, and the line joins parkedBytes, so a later check
     // must not add either of them again. idReserve is the cancel lane's
     // identifiers. It is userspace only and is not added to K_out.
-    if (this.#pluginBytes(rec) + cost + userspace > this.#childCeiling(rec)
+    if (!this.#fitsChild(rec, cost + userspace)
         || !this.#fitsGlobal(cost + userspace, null)) {
       this.caps.total = true;
       this.#reject(msg, 'total-cap', true);
@@ -2131,7 +2192,9 @@ export class Supervisor {
   // parking it would fill that promise.
   #bytesOver(rec, accounted, reserve, idReserve = 0) {
     const userspace = reserve + Math.max(0, idReserve);
-    if (this.#pluginBytes(rec) + accounted + userspace > this.#childCeiling(rec)) return true;
+    // B_t includes this child's unspent window. The global sum includes
+    // every live window. Neither check may spend advertised credit.
+    if (!this.#fitsChild(rec, accounted + userspace)) return true;
     if (!this.#fitsGlobal(accounted + userspace, null)) return true;
     return false;
   }
@@ -2141,11 +2204,12 @@ export class Supervisor {
   // cancel frame) that must still fit beside it, in userspace and in K_out.
   // `idReserve` is the cancel lane's identifiers. It fits in userspace only.
   // Every live send window is inside `#globalHeld(null)` and is not part of
-  // `stdinBytes`. `accounted` must not include a window already in that sum.
+  // `stdinBytes`. This child's window is inside `#fitsChild` and is not part
+  // of `accounted` either. `accounted` must not include a window already in
+  // either sum.
   #overBudget(rec, accounted, stdinBytes, reserve, idReserve = 0) {
-    const ceiling = this.#childCeiling(rec);
     const userspace = reserve + Math.max(0, idReserve);
-    if (this.#pluginBytes(rec) + accounted + userspace > ceiling) return true;
+    if (!this.#fitsChild(rec, accounted + userspace)) return true;
     if (!this.#fitsGlobal(accounted + userspace, null)) return true;
     if (rec.flowOk && rec.kOut != null) {
       const kernel = this.#stdinQueued(rec);
@@ -2415,7 +2479,9 @@ export class Supervisor {
     const ids = pending && !pending.idsReleased ? (pending.idBytes ?? 0) : 0;
     const need = held.buf ? held.buf.length : (held.need ?? 0);
     const resulting = this.#pluginBytes(rec) - held.bytes - ids + need;
-    if (resulting > this.#childCeiling(rec)) return false;
+    // The frame already includes its stamp. The remaining window is still
+    // advertised and is not inside the held bytes.
+    if (resulting + this.#advertisedCredit(rec) > this.#childCeiling(rec)) return false;
     const queued = held.buf ? held.buf.length : 0;
     const extra = queued - held.bytes;
     // The parked bytes are already in bufferedBytes(). Growth is new bytes
@@ -2428,7 +2494,11 @@ export class Supervisor {
 
   // Never discard unread bytes. A tail that fits stays in `stash`. A tail that
   // would pass the cap is pushed back onto the child's stdout and the child
-  // stays paused, so the next resume sees the same bytes in order.
+  // stays paused, so the next resume sees the same bytes in order. The chunk
+  // was already classified, and data bytes already left the window, before
+  // this runs. The room is the ceiling minus #pluginBytes, which holds that
+  // spent prefix. The unspent window is not subtracted: it is not a second
+  // copy of this tail.
   #retainTail(rec, tail) {
     if (tail.length === 0 || rec.dead) return;
     const perChild = rec.flowOk ? rec.bT : rec.limits.total;
@@ -2488,6 +2558,9 @@ export class Supervisor {
   // may have crossed. An unterminated frame cannot shrink, so that crossing is
   // a typed fault. Bytes at or under MAX_RESIDUAL are partial-cap. The framer
   // throws NdjsonOversizeError only once the residual is greater than that.
+  // The comparison is #pluginBytes after the spend, not #pluginBytes plus the
+  // window. Data bytes in the framer replaced that window one for one. Adding
+  // the remainder would fault a reply that stayed inside its credit.
   #accountReserved(rec) {
     const pending = rec.framer.pendingBytes();
     const noNewline = !rec.framer.hasPendingNewline();
@@ -2836,11 +2909,14 @@ export class Supervisor {
     // larger: version, grants, and timestamps are stamped here. That growth
     // sits beside every live send window, including the unspent remainder of
     // this child's window. The stdout line already left the framer. A data
-    // line already left the window; the remainder is still advertised. A
-    // cancel ack never spent the window. Omitting either remainder lets the
-    // stamp occupy credit the child has not written yet.
+    // line already left the window, so `credit` is only the remainder and the
+    // payload is inside `resulting`. A cancel ack never spent the window, so
+    // `credit` is the whole advertisement and the ack sits beside it. The
+    // stamp is inside `resulting` and is not added again. Omitting the
+    // remainder lets the frame occupy credit the child has not written yet.
     const expansion = buf.length - pendingIds;
-    if (resulting > ceiling || (expansion > 0 && !this.#fitsGlobal(expansion, null))) {
+    const credit = this.#advertisedCredit(rec);
+    if (resulting + credit > ceiling || (expansion > 0 && !this.#fitsGlobal(expansion, null))) {
       this.caps.total = true;
       const still = this.#take(pluginId, msg.correlationId, lane);
       if (still) {
@@ -2900,8 +2976,9 @@ export class Supervisor {
     }
     const buf = encodeMux({ kind: 'flood', pluginId: rec.credential.pluginId, correlationId: 0 });
     // Additional mux bytes. Every live window, including this child's unspent
-    // credit, has to leave room for the frame.
-    if (!this.#fitsGlobal(buf.length, null)) {
+    // credit, has to leave room for the frame. B_t has to leave that room too:
+    // the flood frame lands in this child's queue.
+    if (!this.#fitsChild(rec, buf.length) || !this.#fitsGlobal(buf.length, null)) {
       this.caps.total = true;
       this.#pause(rec, 'global');
       return;
@@ -3257,7 +3334,7 @@ export class Supervisor {
     // only when it fits in B_t and beside every live send window; the rest
     // are coalesced so a sibling's credited response can still land.
     if (live) {
-      const overChild = this.#pluginBytes(rec) + buf.length > this.#childCeiling(rec);
+      const overChild = !this.#fitsChild(rec, buf.length);
       const overGlobal = !this.#fitsGlobal(buf.length, null);
       if (overChild || overGlobal) {
         this.caps.total = true;
