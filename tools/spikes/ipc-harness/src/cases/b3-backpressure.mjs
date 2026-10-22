@@ -3,6 +3,8 @@
 
 import { fileURLToPath } from 'node:url';
 import { connectPair, partialCapHolds, totalCapHolds } from '../supervisor.mjs';
+import { assessFlow } from '../flow_budget.mjs';
+import { flowHelperAvailable, measureFlowReserve } from '../flow_socket.mjs';
 import { CONTRACT, RSS_GROWTH_LIMIT, delay, measureSeries, openLoop, preflight, treeRss, waitUntil } from '../measure.mjs';
 
 const floodPath = fileURLToPath(new URL('../children/flood.mjs', import.meta.url));
@@ -13,34 +15,174 @@ function until(fn, ms) {
   return waitUntil(fn, ms);
 }
 
-// Framer residual plus the unprocessed rest of the stdout chunk. Both are
-// already buffered when the partial cap faults. A missing tail is not zero.
-export function partialFrameHighWater(pendingBytes, inFlightTailBytes) {
-  if (!Number.isFinite(pendingBytes) || !Number.isFinite(inFlightTailBytes)) return null;
-  if (inFlightTailBytes < 0) return null;
-  return pendingBytes + inFlightTailBytes;
+// Framer residual, the unprocessed rest of the read, and FIONREAD. A missing
+// tail or unread count is not zero: the sum cannot be scored without them.
+export function partialFrameHighWater(pendingBytes, inFlightTailBytes, stdoutUnread = 0) {
+  if (!Number.isFinite(pendingBytes) || !Number.isFinite(inFlightTailBytes) || !Number.isFinite(stdoutUnread)) {
+    return null;
+  }
+  if (inFlightTailBytes < 0 || stdoutUnread < 0) return null;
+  return pendingBytes + inFlightTailBytes + stdoutUnread;
 }
 
-// A null or unavailable pipe probe is an invalid run. A measured count is scored,
-// including a count that misses the cap.
-export function scoreTotalProbe({ pipeUnread, pipeCapacity, accounted, cap, afterCleanup }) {
-  const measured = Number.isInteger(pipeUnread)
-    && pipeUnread >= 0
-    && Number.isInteger(pipeCapacity)
-    && pipeCapacity > 0;
-  const vacuity = totalCapHolds(afterCleanup, cap) === false;
+// A null probe is an invalid run. A measured count is scored, including a
+// count that misses the cap. afterCleanup is refused even when it is 0.
+export function scoreTotalProbe(row) {
+  const stdoutUnread = row.stdoutUnread ?? row.pipeUnread;
+  const stdinQueued = row.stdinQueued ?? 0;
+  const kIn = row.kIn ?? row.pipeCapacity;
+  const kOut = row.kOut ?? row.pipeCapacity;
+  const measured = Number.isInteger(stdoutUnread)
+    && stdoutUnread >= 0
+    && Number.isInteger(kIn)
+    && kIn > 0
+    && row.accounted != null;
+  const vacuity = totalCapHolds(row.afterCleanup, row.cap, { afterCleanup: true }) === false;
   if (!measured) return { outcome: 'invalid', bound: null, vacuity };
-  const pipeCounted = pipeUnread <= pipeCapacity;
   return {
     outcome: 'scored',
-    bound: pipeCounted && totalCapHolds(accounted, cap),
+    bound: totalCapHolds(row.accounted, row.cap, { stdoutUnread, stdinQueued, kIn, kOut }),
     vacuity,
   };
 }
 
+// A partial fault whose FIONREAD terms are missing cannot be scored. A missing
+// fault is a cap result, not an invalid run.
+export function partialSnapshotInvalid(enforceFlow, fault) {
+  if (!enforceFlow || !fault) return false;
+  return fault.stdoutUnread == null
+    || fault.kIn == null
+    || fault.pendingBytes == null
+    || fault.inFlightTailBytes == null;
+}
+
+function probeOpts(pipeProbe) {
+  if (typeof pipeProbe !== 'function') return {};
+  return {
+    pipeProbe,
+    flowPending: (fd) => {
+      const row = pipeProbe(fd);
+      if (!row || !Number.isInteger(row.unread) || row.unread < 0) return null;
+      return row.unread;
+    },
+  };
+}
+
+const TRIP_PARTIAL = 32 * 1024;
+const TRIP_TOTAL = 48 * 1024;
+const DEFAULT_PARTIAL = 64 * 1024;
+const DEFAULT_TOTAL = 256 * 1024;
+const DEFAULT_GLOBAL = 1024 * 1024;
+
+// ADR-0006 Consequences, filled from the measured kernel terms. S is the
+// zero-child userspace ceiling: shared bytes are admitted inside B_g, and
+// with no child reserved that ceiling is totalGlobal minus the mux terms.
+export function t7Estimate(measured, caps = {}) {
+  const kIn = measured?.kIn;
+  const kOut = measured?.kOut;
+  const kMuxIn = measured?.kMuxIn;
+  const kMuxOut = measured?.kMuxOut;
+  const c = measured?.readBytes;
+  const terms = [kIn, kOut, kMuxIn, kMuxOut, c];
+  if (!terms.every((value) => Number.isInteger(value) && value > 0)) return null;
+  const r = Number.isInteger(caps.runners) && caps.runners > 0 ? caps.runners : 1;
+  const n = Number.isInteger(caps.childCount) && caps.childCount > 0 ? caps.childCount : 1;
+  const fill = (name, p, t, totalGlobal) => {
+    const s = totalGlobal - kMuxIn - kMuxOut - c;
+    const summed = n * t + s + kMuxIn + kMuxOut + c;
+    const perProcess = Math.min(summed, totalGlobal);
+    return {
+      name,
+      p,
+      t,
+      s,
+      n,
+      totalGlobal,
+      partialWithin: kIn + c <= p,
+      totalWithin: kIn + kOut + c <= t,
+      perProcess,
+      perHost: r * perProcess,
+    };
+  };
+  return {
+    kIn,
+    kOut,
+    kMuxIn,
+    kMuxOut,
+    c,
+    r,
+    rows: [
+      fill('default', caps.partial ?? DEFAULT_PARTIAL, caps.total ?? DEFAULT_TOTAL, caps.totalGlobal ?? DEFAULT_GLOBAL),
+      fill('trip', TRIP_PARTIAL, TRIP_TOTAL, caps.totalGlobal ?? DEFAULT_GLOBAL),
+    ],
+  };
+}
+
+function muxDetail(measured) {
+  if (!measured || !Number.isInteger(measured.kMuxIn) || !Number.isInteger(measured.kMuxOut)) return null;
+  const readBytes = Number.isInteger(measured.readBytes) ? measured.readBytes : 0;
+  return {
+    kMuxIn: measured.kMuxIn,
+    kMuxOut: measured.kMuxOut,
+    muxReserve: Number.isInteger(measured.muxReserve)
+      ? measured.muxReserve
+      : measured.kMuxIn + measured.kMuxOut + readBytes,
+    muxSndbuf: Number.isInteger(measured.muxSndbuf) ? measured.muxSndbuf : null,
+    muxRcvbuf: Number.isInteger(measured.muxRcvbuf) ? measured.muxRcvbuf : null,
+  };
+}
+
+function helperReady(opts) {
+  if (typeof opts.helperAvailable === 'function') return opts.helperAvailable() === true;
+  return flowHelperAvailable();
+}
+
 export async function tripCaps(opts = {}) {
+  if (!helperReady(opts)) {
+    return { pass: null, outcome: 'invalid', detail: { reason: 'reservation-unavailable' } };
+  }
   const detail = {};
-  const probe = typeof opts.pipeProbe === 'function' ? { pipeProbe: opts.pipeProbe } : {};
+  const enforceFlow = opts.enforceFlow !== false;
+  const measured = opts.reserve ?? measureFlowReserve();
+  const mux = muxDetail(measured);
+  if (mux) detail.mux = mux;
+  if (measured) detail.t7 = t7Estimate(measured);
+  if (enforceFlow && opts.pipeProbe == null) {
+    if (!measured) {
+      return { pass: null, outcome: 'invalid', detail: { reason: 'reservation-unavailable', mux } };
+    }
+    const injected = opts.reserve != null;
+    if (!injected && (!Number.isInteger(measured.kMuxIn) || !Number.isInteger(measured.kMuxOut))) {
+      return { pass: null, outcome: 'invalid', detail: { reason: 'reservation-unavailable' } };
+    }
+    const verdict = assessFlow({
+      partialCap: TRIP_PARTIAL,
+      totalCap: TRIP_TOTAL,
+      totalGlobal: 1024 * 1024,
+      sndbufIn: measured.sndbufIn,
+      sndbufOut: measured.sndbufOut,
+      readBytes: measured.readBytes,
+      childCount: 1,
+      muxIn: Number.isInteger(measured.kMuxIn) ? measured.kMuxIn : 0,
+      muxOut: Number.isInteger(measured.kMuxOut) ? measured.kMuxOut : 0,
+    });
+    if (verdict.outcome !== 'ok') {
+      return {
+        pass: false,
+        outcome: 'unsatisfiable',
+        detail: {
+          protocol: '3.0',
+          cause: verdict.reason,
+          flip: 'unsatisfiable budget on the shipping runtime',
+          t7: detail.t7 ?? null,
+          ...verdict,
+        },
+      };
+    }
+    detail.reserve = verdict;
+  }
+  const probe = { ...probeOpts(opts.pipeProbe), enforceFlow };
+  if (typeof opts.flowPending === 'function') probe.flowPending = opts.flowPending;
   const pendingPair = await connectPair({ ...probe, sweeper: false, caps: { pending: 4, partial: 1024 * 1024, total: 8 * 1024 * 1024 } });
   try {
     const silent = pendingPair.sup.spawn({
@@ -63,11 +205,17 @@ export async function tripCaps(opts = {}) {
     const rejected = settled.filter((result) => result.code === 'pending-cap').length;
     const admitted = settled.length - rejected;
     detail.pending = { tripped: pendingPair.sup.caps.pending, admitted, rejected };
+    if (pendingPair.sup.flip) {
+      return { pass: false, outcome: 'scored', detail: { ...detail, flip: pendingPair.sup.flip, reason: pendingPair.sup.flip } };
+    }
+    if (pendingPair.sup.invalidReason) {
+      return { pass: null, outcome: 'invalid', detail: { reason: pendingPair.sup.invalidReason, mux: detail.mux ?? null } };
+    }
   } finally {
     await pendingPair.close();
   }
 
-  const partialCap = 32 * 1024;
+  const partialCap = TRIP_PARTIAL;
   const partialPair = await connectPair({
     ...probe,
     sweeper: false,
@@ -76,26 +224,67 @@ export async function tripCaps(opts = {}) {
   try {
     partialPair.sup.spawn({ pluginId: 'partial', script: floodPath, env: { FLOOD_MODE: 'partial' } });
     const tripped = await until(
-      () => partialPair.sup.faults.some((fault) => fault.pluginId === 'partial'),
+      () => partialPair.sup.invalidReason
+        || partialPair.sup.faults.some((fault) => fault.pluginId === 'partial'),
       5_000,
     );
+    if (partialPair.sup.flip) {
+      return { pass: false, outcome: 'scored', detail: { ...detail, flip: partialPair.sup.flip, reason: partialPair.sup.flip } };
+    }
+    if (partialPair.sup.invalidReason) {
+      return { pass: null, outcome: 'invalid', detail: { reason: partialPair.sup.invalidReason, mux: detail.mux ?? null } };
+    }
     const fault = partialPair.sup.faults.find((row) => row.pluginId === 'partial');
     const pendingBytes = fault?.pendingBytes ?? null;
     const inFlightTailBytes = fault?.inFlightTailBytes ?? null;
-    const highWater = partialFrameHighWater(pendingBytes, inFlightTailBytes);
+    const stdoutUnread = fault?.stdoutUnread ?? null;
+    const kIn = fault?.kIn ?? null;
+    const pipeCapacity = fault?.pipeCapacity ?? null;
+    // Enforced runs carry K_in. The unenforced pipe has no SO_SNDBUF term;
+    // its measured F_GETPIPE_SZ is the capacity in the high-water sum.
+    const capacity = Number.isInteger(kIn) && kIn > 0 ? kIn : pipeCapacity;
+    const highWater = stdoutUnread == null
+      ? null
+      : partialFrameHighWater(pendingBytes, inFlightTailBytes, stdoutUnread);
+    const withinKernel = Number.isInteger(capacity) && capacity > 0
+      && stdoutUnread != null && stdoutUnread <= capacity;
     detail.partial = {
       tripped: tripped && partialPair.sup.caps.partial === true,
       pendingBytes,
       inFlightTailBytes,
+      stdoutUnread,
+      kIn,
+      pipeCapacity,
+      capacity,
+      cap: partialCap,
       highWater,
       code: fault?.code ?? null,
-      bound: Boolean(fault) && fault.code === 'partial-cap' && partialCapHolds(highWater, partialCap),
+      // The historical 36864 + 32768 snapshot is not ≤ 32768. Dropping the
+      // tail, or allowing one extra 4096, fails partialCapHolds.
+      bound: Boolean(fault)
+        && fault.code === 'partial-cap'
+        && withinKernel
+        && partialCapHolds(highWater, partialCap)
+        && partialCapHolds(36864 + 32768, partialCap) === false,
     };
   } finally {
     await partialPair.close();
   }
+  const partialFault = detail.partial.code == null ? null : {
+    stdoutUnread: detail.partial.stdoutUnread,
+    kIn: detail.partial.kIn,
+    pendingBytes: detail.partial.pendingBytes,
+    inFlightTailBytes: detail.partial.inFlightTailBytes,
+  };
+  if (partialSnapshotInvalid(enforceFlow, partialFault)) {
+    return {
+      pass: null,
+      outcome: 'invalid',
+      detail: { reason: 'partial-probe-unavailable', partial: detail.partial },
+    };
+  }
 
-  const totalCap = 48 * 1024;
+  const totalCap = TRIP_TOTAL;
   const totalPair = await connectPair({
     ...probe,
     sweeper: false,
@@ -105,9 +294,16 @@ export async function tripCaps(opts = {}) {
   try {
     totalPair.sup.spawn({ pluginId: 'total', script: floodPath, env: { FLOOD_MODE: 'partial' } });
     const tripped = await until(
-      () => totalPair.sup.faults.some((fault) => fault.pluginId === 'total' && fault.code === 'total-cap'),
+      () => totalPair.sup.invalidReason
+        || totalPair.sup.faults.some((fault) => fault.pluginId === 'total' && fault.code === 'total-cap'),
       3_000,
     );
+    if (totalPair.sup.flip) {
+      return { pass: false, outcome: 'scored', detail: { ...detail, flip: totalPair.sup.flip, reason: totalPair.sup.flip } };
+    }
+    if (totalPair.sup.invalidReason) {
+      return { pass: null, outcome: 'invalid', detail: { reason: totalPair.sup.invalidReason, mux: detail.mux ?? null } };
+    }
     const fault = totalPair.sup.faults.find((row) => row.pluginId === 'total' && row.code === 'total-cap');
     const buffered = fault?.bufferedBytes ?? null;
     const inFlightTailBytes = fault?.inFlightTailBytes ?? null;
@@ -118,6 +314,10 @@ export async function tripCaps(opts = {}) {
     const scored = scoreTotalProbe({
       pipeUnread,
       pipeCapacity,
+      stdoutUnread: fault?.stdoutUnread ?? pipeUnread,
+      stdinQueued: fault?.stdinQueued ?? 0,
+      kIn: fault?.kIn ?? pipeCapacity,
+      kOut: fault?.kOut ?? pipeCapacity,
       accounted,
       cap: totalCap,
       afterCleanup,
@@ -127,9 +327,12 @@ export async function tripCaps(opts = {}) {
       buffered,
       inFlightTailBytes,
       pipeUnread,
+      stdinQueued: fault?.stdinQueued ?? null,
       pipeCapacity,
       accounted,
       afterCleanup,
+      cap: totalCap,
+      capacity: pipeCapacity ?? fault?.kIn ?? null,
       // High-water, including the chunk tail, plus the measured unread socket.
       // An unavailable probe leaves bound null; it is not a scored miss.
       bound: scored.bound,
@@ -212,13 +415,50 @@ export async function tripCaps(opts = {}) {
 }
 
 const PARTIAL_MARK = 32 * 1024;
-const BYTE_CAP = 16 * 1024;
 const PENDING_CAP = 8;
 const LO_CAP = 32;
 const OFFERED_RATE = 5;
 const FILL_MS = 10_000;
 
+// Unterminated output trips total-cap only while B_t < B_p. The byte child
+// therefore sits just above the kernel reserve and strictly under the partial
+// trip: total ∈ [K_in + K_out + C, PARTIAL_MARK + K_out).
+function holdByteCap(reserved) {
+  if (!reserved) return 16 * 1024;
+  const floor = reserved.perChild;
+  const exclusive = PARTIAL_MARK + reserved.kOut;
+  if (!Number.isInteger(floor) || floor >= exclusive) return 16 * 1024;
+  return Math.min(floor + reserved.readBytes, exclusive - 1);
+}
+
+const HOLD_NEAR_MISS = Object.freeze({ pending: false, partial: false, bytes: false, lo: false });
+
+// The sibling wait is the last place a probe can go invalid. A flip-only
+// recheck would still return a row holdOk() can score as a pass.
+export function holdAfterSibling(sup, answered, base) {
+  if (sup?.invalidReason) {
+    return {
+      ...base,
+      invalidReason: sup.invalidReason,
+      growth: null,
+      measurable: false,
+      answered: false,
+      near: HOLD_NEAR_MISS,
+    };
+  }
+  if (sup?.flip) {
+    return {
+      ...base,
+      flip: sup.flip,
+      answered: false,
+      near: HOLD_NEAR_MISS,
+    };
+  }
+  return { ...base, answered };
+}
+
 async function holdRep({ warmupMs, windowMs, readRss }) {
+  const byteCap = holdByteCap(measureFlowReserve());
   const pair = await connectPair({
     sweeper: false,
     caps: {
@@ -251,7 +491,7 @@ async function holdRep({ warmupMs, windowMs, readRss }) {
       pluginId: 'bytes',
       script: floodPath,
       env: { FLOOD_MODE: 'partial' },
-      total: BYTE_CAP,
+      total: byteCap,
     });
     const frames = pair.sup.spawn({
       pluginId: 'frames',
@@ -286,14 +526,53 @@ async function holdRep({ warmupMs, windowMs, readRss }) {
       payload: { who: 'sib' },
     }, 120_000).catch((err) => err);
     const filled = await until(() => {
+      if (pair.sup.invalidReason || pair.sup.flip) return true;
       const pending = pair.sup.queueDepth('silent').pending >= PENDING_CAP;
       const partialBytes = pair.sup.faults.some((fault) => fault.pluginId === 'partial' && fault.code === 'partial-cap');
       const byteFault = pair.sup.faults.some((fault) => fault.pluginId === 'bytes' && fault.code === 'total-cap');
-      const byteBytes = byteFault || pair.sup.queueDepth('bytes').pluginBytes >= BYTE_CAP;
+      const byteBytes = byteFault || pair.sup.queueDepth('bytes').pluginBytes >= byteCap;
       const lo = pair.sup.queueDepth('frames').lo >= LO_CAP;
       const hi = pair.sup.faults.some((fault) => fault.pluginId === 'forger' && fault.code === 'hi-cap');
       return pending && partialBytes && byteBytes && lo && hi;
     }, FILL_MS);
+    if (pair.sup.flip) {
+      return {
+        flip: pair.sup.flip,
+        growth: null,
+        measurable: false,
+        rss0: null,
+        maxRss: null,
+        arrivals: 0,
+        filled: false,
+        warmedMs: 0,
+        offered: 0,
+        issued: 0,
+        skipped: 0,
+        answered: false,
+        caps: { ...pair.sup.caps },
+        near: { pending: false, partial: false, bytes: false, lo: false },
+        samples: 0,
+      };
+    }
+    if (pair.sup.invalidReason) {
+      return {
+        invalidReason: pair.sup.invalidReason,
+        growth: null,
+        measurable: false,
+        rss0: null,
+        maxRss: null,
+        arrivals: 0,
+        filled: false,
+        warmedMs: 0,
+        offered: 0,
+        issued: 0,
+        skipped: 0,
+        answered: false,
+        caps: { ...pair.sup.caps },
+        near: { pending: false, partial: false, bytes: false, lo: false },
+        samples: 0,
+      };
+    }
     for (const spawned of [partial, bytes]) {
       const rec = pair.sup.children.get(spawned.credential.pluginId);
       if (!rec?.dead) continue;
@@ -329,8 +608,9 @@ async function holdRep({ warmupMs, windowMs, readRss }) {
     const loop = await openLoop({
       ms: windowMs,
       rate: OFFERED_RATE,
+      stop: () => pair.sup.invalidReason != null || pair.sup.flip != null,
       tick: () => {
-        if (rssLost) return;
+        if (rssLost || pair.sup.invalidReason) return;
         arrivals++;
         pair.stub.call({
           pluginId: 'sib',
@@ -376,13 +656,31 @@ async function holdRep({ warmupMs, windowMs, readRss }) {
         samples: samples.length,
       };
     }
+    if (pair.sup.invalidReason) {
+      return {
+        invalidReason: pair.sup.invalidReason,
+        growth: null,
+        measurable: false,
+        rss0,
+        maxRss,
+        arrivals,
+        filled,
+        warmedMs,
+        offered: loop.offered,
+        issued: loop.issued,
+        skipped: loop.skipped,
+        answered: false,
+        caps: { ...pair.sup.caps },
+        near: { pending: false, partial: false, bytes: false, lo: false },
+        samples: samples.length,
+      };
+    }
     pair.stub.socket.resume();
     const answered = await Promise.race([
       siblingCall,
       delay(2_000).then(() => null),
     ]);
-    const near = (pred) => samples.length > 0 && samples.filter(pred).length / samples.length >= 0.8;
-    return {
+    const decided = holdAfterSibling(pair.sup, answered?.payload?.who === 'sib', {
       growth: maxRss - rss0,
       rss0,
       maxRss,
@@ -392,20 +690,68 @@ async function holdRep({ warmupMs, windowMs, readRss }) {
       offered: loop.offered,
       issued: loop.issued,
       skipped: loop.skipped,
-      answered: answered?.payload?.who === 'sib',
       caps: { ...pair.sup.caps },
+      samples: samples.length,
+    });
+    if (decided.invalidReason || decided.flip) return decided;
+    const near = (pred) => samples.length > 0 && samples.filter(pred).length / samples.length >= 0.8;
+    return {
+      ...decided,
       near: {
         pending: near((row) => row.pending >= PENDING_CAP),
         partial: near((row) => row.partialFault && row.partial === 0),
-        bytes: near((row) => row.bytesFault || (row.bytes >= BYTE_CAP && row.bytes <= BYTE_CAP + 192 * 1024)),
+        bytes: near((row) => row.bytesFault || (row.bytes >= byteCap && row.bytes <= byteCap + 192 * 1024)),
         lo: near((row) => row.lo >= LO_CAP),
       },
-      samples: samples.length,
     };
   } finally {
     pair.stub.socket.resume();
     await pair.close();
   }
+}
+
+// The unenforced run is scored on the numbers it measured, against the same
+// P and T. A missing K_in is not itself a miss: the pipe's measured capacity
+// is the kernel term. pass is true only when both totals stayed inside the
+// caps, which means enforcement made no difference and the control fails.
+export function scoreUnenforced(trip) {
+  const partial = trip?.detail?.partial ?? null;
+  const total = trip?.detail?.total ?? null;
+  const highWater = partial?.highWater;
+  const partialCap = partial?.cap;
+  const accounted = total?.accounted;
+  const totalCap = total?.cap;
+  const partialCapacity = partial?.capacity;
+  const totalCapacity = total?.capacity ?? total?.pipeCapacity;
+  const row = {
+    partial: {
+      highWater: Number.isFinite(highWater) ? highWater : null,
+      cap: Number.isFinite(partialCap) ? partialCap : null,
+      capacity: Number.isFinite(partialCapacity) ? partialCapacity : null,
+    },
+    total: {
+      accounted: Number.isFinite(accounted) ? accounted : null,
+      cap: Number.isFinite(totalCap) ? totalCap : null,
+      capacity: Number.isFinite(totalCapacity) ? totalCapacity : null,
+    },
+  };
+  const measured = row.partial.highWater != null
+    && row.partial.cap != null
+    && row.partial.capacity != null
+    && row.partial.capacity > 0
+    && row.total.accounted != null
+    && row.total.cap != null
+    && row.total.capacity != null
+    && row.total.capacity > 0;
+  if (!measured) {
+    return { outcome: 'invalid', reason: 'unenforced-unscored', pass: null, failed: null, ...row };
+  }
+  const partialOver = row.partial.highWater > row.partial.cap;
+  const totalOver = row.total.accounted > row.total.cap;
+  row.partial.over = partialOver;
+  row.total.over = totalOver;
+  const failed = [partialOver ? 'partial' : null, totalOver ? 'total' : null].filter(Boolean);
+  return { outcome: 'scored', pass: failed.length === 0, failed, ...row };
 }
 
 function holdOk(row) {
@@ -421,11 +767,57 @@ export async function b3(opts = {}) {
   if (readRss([process.pid]) == null) {
     return { pass: null, outcome: 'invalid', detail: { reason: 'rss-unreadable', limit: RSS_GROWTH_LIMIT } };
   }
-  const tripped = await tripCaps({ pipeProbe: opts.pipeProbe });
-  if (tripped.outcome === 'invalid') {
-    return { pass: null, outcome: 'invalid', detail: { reason: 'pipe-probe-unavailable', caps: tripped.detail } };
+  if (!helperReady(opts)) {
+    return { pass: null, outcome: 'invalid', detail: { reason: 'reservation-unavailable' } };
   }
-  if (opts.hold === false) return tripped;
+  // Same host, same trip caps. The unenforced run is scored on highWater > P
+  // or accounted > T. Numbers that stay inside the caps fail this control.
+  // A missing measurement is invalid, not a scored miss.
+  let unenforced = null;
+  if (opts.unenforced !== undefined || (opts.pipeProbe == null && opts.enforceFlow !== false)) {
+    const trip = opts.unenforced !== undefined
+      ? opts.unenforced
+      : await tripCaps({ enforceFlow: false, helperAvailable: opts.helperAvailable });
+    if (trip?.outcome === 'invalid') {
+      return { pass: null, outcome: 'invalid', detail: { reason: 'unenforced-unscored', vacuity: trip.detail } };
+    }
+    if (trip?.outcome === 'unsatisfiable') {
+      return { pass: false, outcome: 'scored', detail: { reason: 'unenforced-unsatisfiable', vacuity: trip.detail } };
+    }
+    unenforced = scoreUnenforced(trip);
+    if (unenforced.outcome !== 'scored') {
+      return { pass: null, outcome: 'invalid', detail: { reason: 'unenforced-unscored', vacuity: unenforced } };
+    }
+    if (unenforced.pass) {
+      return {
+        pass: false,
+        outcome: 'scored',
+        detail: { reason: 'unenforced-within-caps', unenforcedPass: true, vacuity: unenforced },
+      };
+    }
+  }
+  const tripped = await tripCaps({
+    pipeProbe: opts.pipeProbe,
+    enforceFlow: opts.enforceFlow,
+    helperAvailable: opts.helperAvailable,
+    reserve: opts.reserve,
+  });
+  if (tripped.outcome === 'invalid') {
+    return { pass: null, outcome: 'invalid', detail: { reason: 'pipe-probe-unavailable', caps: tripped.detail, vacuity: unenforced } };
+  }
+  if (tripped.outcome === 'unsatisfiable') {
+    return { ...tripped, detail: { ...tripped.detail, unenforcedPass: unenforced ? false : null, vacuity: unenforced } };
+  }
+  if (opts.hold === false) {
+    return {
+      ...tripped,
+      detail: {
+        ...tripped.detail,
+        unenforcedPass: unenforced ? false : null,
+        vacuity: unenforced,
+      },
+    };
+  }
   const warmupMs = opts.warmupMs ?? CONTRACT.warmupMs;
   const windowMs = opts.windowMs ?? CONTRACT.windowMs;
   const repsN = opts.reps ?? CONTRACT.reps;
@@ -439,10 +831,26 @@ export async function b3(opts = {}) {
     return { pass: null, outcome: 'invalid', detail: { env: series.env, caps: tripped, holds: series.rows, rerun: series.rerun } };
   }
   const holds = series.rows;
+  const flipped = holds.find((row) => row.flip);
+  if (flipped) {
+    return {
+      pass: false,
+      outcome: 'scored',
+      detail: { reason: flipped.flip, flip: flipped.flip, env: series.env, caps: tripped.detail, holds, mux: tripped.detail?.mux ?? null },
+    };
+  }
+  const probeLost = holds.find((row) => row.invalidReason);
+  if (probeLost) {
+    return {
+      pass: null,
+      outcome: 'invalid',
+      detail: { reason: probeLost.invalidReason, env: series.env, caps: tripped.detail, holds },
+    };
+  }
   if (holds.some((row) => row.measurable === false || row.growth == null)) {
     return { pass: null, outcome: 'invalid', detail: { env: series.env, reason: 'rss-unreadable', caps: tripped, holds, limit: RSS_GROWTH_LIMIT } };
   }
-  const pass = tripped.pass && holds.every(holdOk);
+  const pass = tripped.pass && holds.every(holdOk) && (unenforced == null || unenforced.pass === false);
   return {
     pass,
     outcome: 'scored',
@@ -450,6 +858,10 @@ export async function b3(opts = {}) {
       env: series.env,
       limit: RSS_GROWTH_LIMIT,
       caps: tripped.detail,
+      unenforcedPass: unenforced ? false : null,
+      vacuity: unenforced,
+      mux: tripped.detail?.mux ?? null,
+      t7: tripped.detail?.t7 ?? null,
       growth: holds.map((row) => row.growth),
       holds,
       frozen: { warmupMs, windowMs, reps: repsN },

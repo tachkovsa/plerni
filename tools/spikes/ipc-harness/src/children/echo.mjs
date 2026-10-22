@@ -8,6 +8,10 @@ import { NdjsonFramer, encodeNdjson } from '../framing.mjs';
 const framer = new NdjsonFramer();
 let framingError = false;
 let stdinPaused = false;
+const padRequest = Number(process.env.ECHO_PAD);
+const echoPad = Number.isInteger(padRequest) && padRequest > 0 && padRequest <= 1024 * 1024
+  ? padRequest
+  : 0;
 
 function writeEcho(line) {
   const ok = process.stdout.write(line);
@@ -26,6 +30,17 @@ function onData(chunk) {
   try {
     framer.feed(chunk);
     for (const msg of framer.frames()) {
+      // A grant is credit, not a request. Echoing it spends the send window
+      // and the supervisor grants that echo back, so the pipe never goes quiet.
+      if (msg.kind === 'grant') continue;
+      if (echoPad > 0 && msg.kind === 'call') {
+        writeEcho(encodeNdjson({
+          kind: 'result',
+          correlationId: msg.correlationId,
+          payload: 'q'.repeat(echoPad),
+        }));
+        continue;
+      }
       writeEcho(encodeNdjson({ ...msg, echoed: true }));
     }
   } catch (e) {

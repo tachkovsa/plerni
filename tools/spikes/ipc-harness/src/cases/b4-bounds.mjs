@@ -3,6 +3,8 @@
 
 import { fileURLToPath } from 'node:url';
 import { connectPair, HARD_FRAME } from '../supervisor.mjs';
+import { MAX_RESIDUAL } from '../framing.mjs';
+import { measureFlowReserve } from '../flow_socket.mjs';
 import { delay } from '../measure.mjs';
 
 function child(name) {
@@ -27,13 +29,17 @@ async function roundTrip(stub, credential) {
   return res.payload?.ok === true && res.pluginId === credential.pluginId;
 }
 
-export async function b4() {
+export async function b4(opts = {}) {
   const detail = {};
-  // The framer throws only once the residual is greater than HARD_FRAME + 1.
-  // The partial cap is that same threshold, so feed() throws NdjsonOversizeError
-  // before the supervisor can fault partial-cap, for any stdout chunk size.
-  // Total is above 1 MiB so the per-plugin byte pause is not what rejects it.
-  const partialCap = HARD_FRAME + 1;
+  // P = MAX_RESIDUAL + K_in + C, so B_p = MAX_RESIDUAL. The last admitted read
+  // can push the framer past that threshold. partial-cap before the framer has
+  // seen more than MAX_RESIDUAL fails this case. Buffering exactly
+  // MAX_RESIDUAL unterminated bytes does not throw.
+  const reserved = opts.reserve === undefined ? measureFlowReserve() : opts.reserve;
+  if (!reserved) {
+    return { pass: null, outcome: 'invalid', detail: { reason: 'reservation-unavailable' } };
+  }
+  const partialCap = MAX_RESIDUAL + reserved.kIn + reserved.readBytes;
   const pair = await connectPair({
     sweeper: false,
     caps: { partial: partialCap, total: 8 * 1024 * 1024, totalGlobal: 8 * 1024 * 1024 },
@@ -41,6 +47,11 @@ export async function b4() {
   try {
     const good = pair.sup.spawn({ pluginId: 'good', script: echoPath });
     pair.sup.spawn({ pluginId: 'bad', script: child('malformed') });
+    // The first grant promises the shared userspace budget. A child started
+    // after that grant does not fit beside it. Admit this one now, and keep
+    // it stopped so its unterminated bytes stay out of the malformed check.
+    const nt = pair.sup.spawn({ pluginId: 'nt', script: child('never-terminating') });
+    process.kill(nt.pid, 'SIGSTOP');
     const malformedDeadline = Date.now() + 2_000;
     while (!pair.sup.faults.some((f) => f.pluginId === 'bad') && Date.now() < malformedDeadline) {
       await delay(10);
@@ -52,7 +63,7 @@ export async function b4() {
       siblingRoundTrip: await roundTrip(pair.stub, good.credential),
     };
 
-    pair.sup.spawn({ pluginId: 'nt', script: child('never-terminating') });
+    process.kill(nt.pid, 'SIGCONT');
     const ntDeadline = Date.now() + 15_000;
     while (!pair.sup.faults.some((f) => f.pluginId === 'nt') && Date.now() < ntDeadline) {
       await delay(20);

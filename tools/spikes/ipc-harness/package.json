@@ -4,8 +4,13 @@
   "type": "module",
   "scripts": {
     "spike": "node src/run.mjs",
+    "spike:b1": "node src/run-case.mjs b1",
+    "spike:b2": "node src/run-case.mjs b2",
     "spike:b3": "node src/run-b3.mjs",
-    "test": "node --test src/framing.test.mjs src/authority.test.mjs src/supervisor.test.mjs",
+    "spike:b4": "node src/run-case.mjs b4",
+    "spike:b5": "node src/run-case.mjs b5",
+    "spike:b6": "node src/run-case.mjs b6",
+    "test": "node --test src/framing.test.mjs src/authority.test.mjs src/flow_budget.test.mjs src/flow_socket.test.mjs src/confine.test.mjs src/flow_control.test.mjs src/supervisor.test.mjs",
     "test:races": "node --test --test-concurrency=1 src/races/clock.test.mjs src/races/control.test.mjs src/races/races.test.mjs && node --test --test-concurrency=1 --test-name-pattern \"B6 vacuity without identity stamping\" src/supervisor.test.mjs"
   },
   "dependencies": {

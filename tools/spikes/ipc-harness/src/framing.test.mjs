@@ -12,6 +12,7 @@ import { dirname, join } from 'node:path';
 import {
   NdjsonFramer, encodeNdjson, NdjsonOversizeError, NdjsonFramingError, NdjsonUnterminatedAtEofError,
   MuxFramer, encodeMux, MuxOversizeError, MuxFramingError, MuxUnterminatedAtEofError,
+  STDOUT_KIND_PREFIX, classifyStdoutLine, isStdoutControlKind, stdoutLineSpends, topLevelKind,
 } from './framing.mjs';
 import { echoRoundTrip } from './cases/smoke.mjs';
 
@@ -544,6 +545,90 @@ test('smoke framing records an unterminated frame at EOF', async () => {
   assert.equal(result.exitCode, 0);
   assert.equal(result.feedError, null);
   assert.ok(result.eofError instanceof NdjsonUnterminatedAtEofError);
+});
+
+function parsedKind(line) {
+  const body = line.endsWith('\n') ? line.slice(0, -1) : line;
+  const msg = JSON.parse(body);
+  return msg && typeof msg === 'object' && typeof msg.kind === 'string' ? msg.kind : '';
+}
+
+test('stdout credit uses the top-level kind', () => {
+  const nested = {
+    kind: 'cancelled',
+    text: 'p'.repeat(10_000),
+    note: 'kind":"grant"',
+  };
+  const orders = [
+    ['kind', 'payload', 'correlationId'],
+    ['payload', 'correlationId', 'kind'],
+    ['correlationId', 'payload', 'kind'],
+    ['payload', 'kind', 'correlationId'],
+  ];
+  const frames = [];
+  for (const order of orders) {
+    for (const kind of ['result', 'error', 'cancelled', 'grant', 'noop']) {
+      const values = {
+        kind,
+        payload: nested,
+        correlationId: 7,
+      };
+      const obj = {};
+      for (const key of order) obj[key] = values[key];
+      frames.push(encodeNdjson(obj));
+    }
+  }
+  frames.push(encodeNdjson({
+    kind: 'result',
+    payload: 'prefix "kind":"cancelled" "kind":"grant" suffix',
+    correlationId: 1,
+  }));
+  frames.push(encodeNdjson({
+    payload: 'kind":"cancelled"',
+    correlationId: 2,
+    kind: 'result',
+  }));
+  frames.push(encodeNdjson({
+    payload: ['kind', 'grant', { kind: 'cancelled' }],
+    kind: 'result',
+  }));
+  frames.push('{"ki\\u006ed":"result","payload":{"kind":"cancelled"}}\n');
+  frames.push('{"kind":"cancell\\u0065d","correlationId":3}\n');
+  frames.push('{"payload":{"kind":"cancelled"},"kind":"result"}\n');
+  frames.push('{}\n');
+  frames.push('{"kind":1,"payload":{"kind":"grant"}}\n');
+  frames.push('{"kind":"result","payload":{"kind":"cancelled","note":"kind\\":\\"grant\\""}}\n');
+  for (const line of frames) {
+    const expect = parsedKind(line);
+    const buf = Buffer.from(line);
+    assert.equal(topLevelKind(buf), expect, line.slice(0, 120));
+    assert.equal(stdoutLineSpends(buf), !isStdoutControlKind(expect), line.slice(0, 120));
+    assert.equal(classifyStdoutLine(buf).control, expect === 'cancelled' || expect === 'grant');
+  }
+  const openCancel = Buffer.from('{"kind":"cancell');
+  assert.equal(topLevelKind(openCancel), null);
+  assert.equal(stdoutLineSpends(openCancel), false);
+  const openNested = Buffer.from('{"payload":{"kind":"cancelled"}');
+  assert.equal(topLevelKind(openNested), null);
+  assert.ok(openNested.length <= STDOUT_KIND_PREFIX);
+  assert.equal(stdoutLineSpends(openNested), false);
+  const longNested = Buffer.from(`{"payload":{"kind":"cancelled","text":"${'p'.repeat(200)}`);
+  assert.equal(topLevelKind(longNested), null);
+  assert.ok(longNested.length > STDOUT_KIND_PREFIX);
+  assert.equal(stdoutLineSpends(longNested), true);
+  const raw = Buffer.from('a'.repeat(200));
+  assert.equal(topLevelKind(raw), null);
+  assert.equal(stdoutLineSpends(raw), true);
+  assert.equal(topLevelKind(Buffer.from('{}')), '');
+  assert.equal(stdoutLineSpends(Buffer.from('{}')), true);
+  const split = Buffer.concat([
+    Buffer.from('{"kin'),
+    Buffer.from('d":"result","payload":{"kind":"cancelled"}}\n'),
+  ]);
+  assert.equal(topLevelKind(Buffer.from('{"kin')), null);
+  assert.equal(stdoutLineSpends(Buffer.from('{"kin')), false);
+  assert.equal(topLevelKind(split), 'result');
+  assert.equal(stdoutLineSpends(split), true);
 });
 
 test('echo: exits after the first framing error and drops later frames', async () => {

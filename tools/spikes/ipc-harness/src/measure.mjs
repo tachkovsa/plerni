@@ -144,13 +144,13 @@ export function waitUntil(fn, ms) {
 
 // Fixed-rate open loop. Missed slots are not burst-replayed.
 // `skipped` counts schedule slots jumped after falling more than 50 ms behind.
-export async function openLoop({ ms, rate, tick, onSkip }) {
+export async function openLoop({ ms, rate, tick, onSkip, stop }) {
   const start = performance.now();
   const period = 1000 / rate;
   let next = start;
   let issued = 0;
   let skipped = 0;
-  while (performance.now() - start < ms) {
+  while (performance.now() - start < ms && !stop?.()) {
     const now = performance.now();
     let budget = 0;
     while (next <= now && budget < 128 && performance.now() - start < ms) {
