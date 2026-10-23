@@ -490,6 +490,37 @@ test('a readable open line is not faulted because a sibling prefix blocks one re
   assert.equal(book.paused('second'), false);
 });
 
+test('a later call cannot take the credit an earlier reply still needs', () => {
+  const book = createCreditBook({ globalCap: 14_000 });
+  assert.equal(book.addChild({ id: 'a', ceiling: 14_000 }).ok, true);
+  const first = admissionCost({ pluginId: 'a', correlationId: 1, payload: 'x' });
+  assert.equal(book.admit({
+    childId: 'a',
+    correlationId: 1,
+    held: first.held,
+    reservation: first.reservation,
+    replyBytes: 10_000,
+  }).decision, 'admitted');
+  const second = admissionCost({
+    pluginId: 'a',
+    correlationId: 2,
+    payload: 'x'.repeat(6000),
+  });
+  assert.equal(book.admit({
+    childId: 'a',
+    correlationId: 2,
+    held: second.held,
+    reservation: second.reservation,
+    replyBytes: 100,
+  }).decision, 'admitted');
+  for (let i = 0; i < 4; i++) {
+    book.replenish('a');
+    book.flush('a');
+  }
+  assert.ok(book.window('a') >= 10_000 + 100, JSON.stringify(book.inspect('a')));
+  assertAccount(book);
+});
+
 test('keepBytes withholds only the excess over the shared hole', () => {
   const slot = admissionSlot();
   const hole = slot;
@@ -543,6 +574,35 @@ test('a credit-compliant child never hangs and reserves recompute on release', (
       assertAccount(book);
       continue;
     }
+    const live = [{ correlation, reply }];
+    const payload2 = Math.floor(rng() * 6000);
+    const correlation2 = correlation + 50_000;
+    const cost2 = admissionCost({
+      pluginId: 'a',
+      correlationId: correlation2,
+      payload: 'y'.repeat(payload2),
+    });
+    const reply2 = 1 + Math.floor(rng() * promised);
+    const heldBeforeSecond = book.inspect('a').held;
+    const notedBeforeSecond = book.headroom('a');
+    const decision2 = book.admit({
+      childId: 'a',
+      correlationId: correlation2,
+      held: cost2.held,
+      reservation: cost2.reservation,
+      replyBytes: reply2,
+    });
+    if (decision2.decision === 'admitted') {
+      live.push({ correlation: correlation2, reply: reply2 });
+    } else {
+      assert.equal(decision2.reason, 'total-cap', `seed ${seed}`);
+      assert.equal(book.headroom('a'), notedBeforeSecond, `seed ${seed}`);
+      assert.equal(book.inspect('a').held, heldBeforeSecond, `seed ${seed}`);
+    }
+    const need = live.reduce((sum, row) => sum + row.reply, 0);
+    cover(book, 'a', need);
+    assert.ok(book.window('a') >= need, JSON.stringify({ seed, need, live, inspect: book.inspect('a') }));
+    if (live.length > 1) book.settle('a', correlation2, 'timeout');
     cover(book, 'a', reply);
     assert.ok(book.window('a') >= reply, JSON.stringify({ seed, reply, inspect: book.inspect('a') }));
     assert.equal(book.spend('a', reply), reply);

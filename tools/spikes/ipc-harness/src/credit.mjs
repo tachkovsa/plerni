@@ -7,10 +7,12 @@
 //
 // Headroom is the largest live call cost, withheld so a later call of that
 // size still fits beside advertised credit. The withhold is capped so the
-// grant still covers the usable reply promised at spawn. A cost above the
-// child ceiling or the process ceiling is not headroom. Timeout and reject
-// drop the cost. A completed call may leave a floor; the same cap applies.
-// Every grant reads the current bytes, windows, and live costs.
+// grant still covers the usable reply promised at spawn and every admitted
+// reply that is still outstanding, together. A later call that would shrink
+// the window below that sum is rejected. A cost above the child ceiling or
+// the process ceiling is not headroom. Timeout and reject drop the cost. A
+// completed call may leave a floor; the same cap applies. Every grant reads
+// the current bytes, windows, and live costs.
 //
 // A call that arrives after credit was granted is checked against the full
 // reservation — the outbound line plus the control reserve — beside the
@@ -121,11 +123,11 @@ export function keepBytes(room, hole, pending, noted, admitSlot) {
   return Math.min(Math.max(0, room), extra);
 }
 
-// Headroom may not shrink the grant below the reply promised at spawn.
-export function capKeep(room, raw, promised) {
-  if (!(promised > 0)) return raw;
-  const protect = Math.min(promised, Math.max(0, room));
-  return Math.min(raw, Math.max(0, room - protect));
+// Headroom may not shrink the grant below the protected reply bytes.
+export function capKeep(room, raw, protect) {
+  if (!(protect > 0)) return raw;
+  const floor = Math.min(protect, Math.max(0, room));
+  return Math.min(raw, Math.max(0, room - floor));
 }
 
 // Each peer carries its own promised floor. The recipient's floor is `usable`
@@ -288,9 +290,10 @@ export class CreditBook {
       return { decision: 'rejected', reason: 'total-cap' };
     }
     child.held += held;
-    child.reservations.set(correlationId, { reservation, held });
+    child.reservations.set(correlationId, { reservation, held, replyBytes });
     const plan = this.#plan(child);
-    if (replyBytes > 0 && child.window + plan.deficit < replyBytes) {
+    const need = this.#replyNeed(child);
+    if (need > 0 && child.window + plan.deficit < need) {
       child.held -= held;
       child.reservations.delete(correlationId);
       return { decision: 'rejected', reason: 'total-cap' };
@@ -546,7 +549,16 @@ export class CreditBook {
     const ceiling = Math.min(child.ceiling, this.#globalCap);
     if (noted > ceiling) noted = child.historical;
     const raw = keepBytes(room, this.#hole(), child.pending, noted, this.#admitSlot);
-    return { raw, keep: capKeep(room, raw, child.promised) };
+    const protect = Math.max(child.promised, this.#replyNeed(child));
+    return { raw, keep: capKeep(room, raw, protect) };
+  }
+
+  #replyNeed(child) {
+    let need = 0;
+    for (const row of child.reservations.values()) {
+      if (row.replyBytes > 0) need += row.replyBytes;
+    }
+    return need;
   }
 
   #noted(child) {
