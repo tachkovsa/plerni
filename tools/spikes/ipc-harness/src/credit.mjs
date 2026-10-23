@@ -12,12 +12,19 @@
 // drop the cost. A completed call may leave a floor; the same cap applies.
 // Every grant reads the current bytes, windows, and live costs.
 //
+// A call that arrives after credit was granted is checked against the full
+// reservation — the outbound line plus the control reserve — beside the
+// advertised window and both ceilings. Only the identifier bytes are retained.
+//
 // A child paused for the process ceiling resumes when its next bounded read
 // fits. Half the ceiling is not required. A paused child, or an empty kernel
 // queue, is posted a full read of C. A shorter queued tail counts only while
-// the read is already allowed to proceed. An open line that cannot take the
-// read, and whose open lines alone block it, is faulted total-cap. Bytes
-// that can still be released are not that fault.
+// the read is already allowed to proceed. Deferred growth is checked at the
+// size after that growth, against the child ceiling and the process ceiling.
+// An open line is faulted total-cap only when no open line can take its next
+// read and free bytes. Combined prefixes that block one line are not that
+// fault while another open line can still be read. Bytes that a later
+// release can free are not that fault either.
 //
 // Dumpability after exec or re-exec, and authentication of the pre-start
 // helper cache, are not this module. ADR-0004 decision 4 records them as
@@ -121,24 +128,29 @@ export function capKeep(room, raw, promised) {
   return Math.min(raw, Math.max(0, room - protect));
 }
 
-export function shareReserve(peerWindows, recipientHeld, usable, globalWithout, childRoom, keep, pool) {
-  const n = peerWindows.length + 1;
+// Each peer carries its own promised floor. The recipient's floor is `usable`
+// and is not applied to peers that were promised a different ceiling.
+export function shareReserve(peers, recipientHeld, usable, globalWithout, childRoom, keep, pool) {
+  const n = peers.length + 1;
   if (n <= 1) return 0;
   const share = Math.floor(Math.max(0, pool) / n);
+  const windowOf = (peer) => (peer.window > 0 ? peer.window : 0);
+  const promisedOf = (peer) => (peer.promised > 0 ? peer.promised : 0);
   if (!(usable > 0)) {
     let reserve = 0;
-    for (const held of peerWindows) {
-      const window = held > 0 ? held : 0;
+    for (const peer of peers) {
+      const window = windowOf(peer);
       if (window < share) reserve += share - window;
     }
     return reserve;
   }
   let floor = 0;
   let fullExtra = 0;
-  for (const held of peerWindows) {
-    const window = held > 0 ? held : 0;
-    floor += Math.max(0, usable - window);
-    const base = Math.max(window, usable);
+  for (const peer of peers) {
+    const window = windowOf(peer);
+    const promised = promisedOf(peer);
+    floor += Math.max(0, promised - window);
+    const base = Math.max(window, promised);
     if (base < share) fullExtra += share - base;
   }
   const heldWindow = recipientHeld > 0 ? recipientHeld : 0;
@@ -267,10 +279,12 @@ export class CreditBook {
     if (reservation > ceiling || reservation > this.#globalCap) {
       return { decision: 'rejected', reason: 'total-cap' };
     }
-    if (child.held + held + child.window > child.ceiling) {
+    // The reservation is transient: the line and the control reserve must fit
+    // beside the window now, and only `held` (the identifiers) stays charged.
+    if (child.held + reservation + child.window > child.ceiling) {
       return { decision: 'rejected', reason: 'total-cap' };
     }
-    if (this.#buffered() + held + this.#windows(null) > this.#globalCap) {
+    if (this.#buffered() + reservation + this.#windows(null) > this.#globalCap) {
       return { decision: 'rejected', reason: 'total-cap' };
     }
     child.held += held;
@@ -418,6 +432,8 @@ export class CreditBook {
         for (const row of alone) this.#fault(row.child, faulted);
         continue;
       }
+      const buffered = this.#buffered();
+      if (rows.some((row) => buffered + row.incoming <= this.#globalCap)) break;
       const blocked = rows.filter((row) => stuckSum + row.incoming > this.#globalCap);
       if (blocked.length === 0) break;
       let largest = blocked[0];
@@ -547,7 +563,10 @@ export class CreditBook {
     for (const other of this.#live()) {
       n += 1;
       if (other === child) continue;
-      peers.push(other.window > 0 ? other.window : 0);
+      peers.push({
+        window: other.window > 0 ? other.window : 0,
+        promised: other.promised > 0 ? other.promised : 0,
+      });
     }
     if (n <= 1) return 0;
     const hole = this.#hole();
@@ -570,8 +589,13 @@ export class CreditBook {
 
   #initialCreditFits({ ceiling, pending, stamp, hole, usable }) {
     const peers = [];
-    for (const child of this.#live()) peers.push(child.window > 0 ? child.window : 0);
-    const sibling = peers.reduce((sum, window) => sum + window, 0);
+    for (const child of this.#live()) {
+      peers.push({
+        window: child.window > 0 ? child.window : 0,
+        promised: child.promised > 0 ? child.promised : 0,
+      });
+    }
+    const sibling = peers.reduce((sum, peer) => sum + peer.window, 0);
     const buffered = this.#buffered();
     const pool = Math.max(0, this.#globalCap - hole - buffered);
     const globalWithout = this.#globalCap - buffered - sibling - hole - stamp;
@@ -606,8 +630,8 @@ export class CreditBook {
 
   #holdFits(child) {
     if (!(child.deferred > 0)) return false;
-    if (child.held + child.window > child.ceiling) return false;
     const extra = Math.max(0, child.deferred - child.held);
+    if (child.held + extra + child.window > child.ceiling) return false;
     return this.#buffered() + extra + this.#windows(null) <= this.#globalCap;
   }
 

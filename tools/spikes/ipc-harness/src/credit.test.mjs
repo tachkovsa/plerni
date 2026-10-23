@@ -369,6 +369,127 @@ test('a deferred reply resumes a global pause without waiting for a new read', (
   assert.deepEqual(book.considerResume().resumed, ['a']);
 });
 
+test('a call that arrives after a grant is checked against the full reservation', () => {
+  const { book, childCeiling } = tightBook();
+  const granted = book.replenish('credit');
+  assert.equal(granted.credit, 6832);
+  assert.equal(book.window('credit'), 6832);
+  const cost = admissionCost({
+    pluginId: 'credit',
+    correlationId: 7,
+    payload: 'x'.repeat(5800),
+  });
+  assert.equal(cost.lineBytes, 5874);
+  assert.equal(cost.held, 9);
+  assert.equal(cost.reservation, 5965);
+  assert.ok(book.window('credit') + cost.lineBytes + cost.held > childCeiling);
+  const decision = book.admit({
+    childId: 'credit',
+    correlationId: 7,
+    held: cost.held,
+    reservation: cost.reservation,
+    replyBytes: USABLE_RESPONSE,
+  });
+  assert.equal(decision.decision, 'rejected');
+  assert.equal(decision.reason, 'total-cap');
+  assert.equal(book.inspect('credit').held, 0);
+  assert.equal(book.headroom('credit'), 0);
+  assert.equal(book.window('credit'), 6832);
+  const small = admissionCost({
+    pluginId: 'credit',
+    correlationId: 8,
+    payload: 'x',
+  });
+  assert.ok(book.window('credit') + small.reservation <= childCeiling);
+  const later = book.admit({
+    childId: 'credit',
+    correlationId: 8,
+    held: small.held,
+    reservation: small.reservation,
+    replyBytes: USABLE_RESPONSE,
+  });
+  assert.equal(later.decision, 'admitted');
+  assert.equal(book.inspect('credit').held, small.held);
+  assertAccount(book);
+});
+
+test('deferred growth past the child ceiling does not resume a global pause', () => {
+  const book = createCreditBook({ globalCap: 100_000, pending: 1 });
+  assert.equal(book.addChild({ id: 'a', ceiling: 5000, pending: 1 }).ok, true);
+  assert.equal(book.retain('a', 4000), true);
+  assert.equal(book.setShared(93_000), true);
+  assert.equal(book.pause('a', 'global'), true);
+  assert.equal(book.setDeferred('a', 6000), true);
+  const over = book.considerResume();
+  assert.deepEqual(over.faulted, []);
+  assert.deepEqual(over.resumed, []);
+  assert.equal(book.paused('a'), true);
+  assert.equal(book.setDeferred('a', 4500), true);
+  const fit = book.considerResume();
+  assert.deepEqual(fit.faulted, []);
+  assert.deepEqual(fit.resumed, ['a']);
+  assert.equal(book.paused('a'), false);
+});
+
+test('mixed ceilings reserve each peer its own promised floor', () => {
+  const book = createCreditBook({ globalCap: 7000, pending: 1 });
+  const first = book.addChild({ id: 'a', ceiling: 7000, pending: 1 });
+  assert.equal(first.ok, true);
+  assert.equal(first.promised, USABLE_RESPONSE);
+  const cost = admissionCost({
+    pluginId: 'a',
+    correlationId: 1,
+    payload: 'x',
+  });
+  const admitted = book.admit({
+    childId: 'a',
+    correlationId: 1,
+    held: cost.held,
+    reservation: cost.reservation,
+    replyBytes: USABLE_RESPONSE,
+  });
+  assert.equal(admitted.decision, 'admitted');
+  const second = book.addChild({ id: 'b', ceiling: 2000, pending: 1 });
+  assert.equal(second.ok, true);
+  assert.equal(second.promised, 791);
+  for (let i = 0; i < 4; i++) {
+    book.replenish('a');
+    book.flush('a');
+    book.replenish('b');
+    book.flush('b');
+  }
+  assert.ok(book.window('a') >= USABLE_RESPONSE);
+  assert.ok(book.window('b') >= 791);
+  assertAccount(book);
+});
+
+test('a readable open line is not faulted because a sibling prefix blocks one read', () => {
+  const cap = 10_000;
+  const book = createCreditBook({ globalCap: cap, pending: 1 });
+  assert.equal(book.addChild({ id: 'first', ceiling: cap, pending: 1 }).ok, true);
+  assert.equal(book.addChild({ id: 'second', ceiling: cap, pending: 1 }).ok, true);
+  book.replenish('first');
+  book.flush('first');
+  book.replenish('second');
+  book.flush('second');
+  assert.ok(book.window('first') >= 4000);
+  assert.ok(book.window('second') >= 4000);
+  assert.equal(book.spend('first', 4000), 4000);
+  assert.equal(book.spend('second', 4000), 4000);
+  assert.equal(book.setOpenPartial('first', 4000), true);
+  assert.equal(book.setOpenPartial('second', 4000), true);
+  assert.equal(book.pause('first', 'global'), true);
+  assert.equal(book.setKernelUnread('second', 1), true);
+  assert.equal(book.inspect('first').buffered, 8000);
+  const result = book.considerResume();
+  assert.deepEqual(result.faulted, []);
+  assert.deepEqual(result.resumed, []);
+  assert.equal(book.paused('first'), true);
+  assert.ok(book.inspect('first'));
+  assert.ok(book.inspect('second'));
+  assert.equal(book.paused('second'), false);
+});
+
 test('keepBytes withholds only the excess over the shared hole', () => {
   const slot = admissionSlot();
   const hole = slot;
