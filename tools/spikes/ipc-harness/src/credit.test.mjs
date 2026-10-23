@@ -490,6 +490,59 @@ test('a readable open line is not faulted because a sibling prefix blocks one re
   assert.equal(book.paused('second'), false);
 });
 
+test('a paused child resumes when the read spends credit the reply already holds', () => {
+  const book = createCreditBook({ globalCap: 20_000, pending: 1 });
+  assert.equal(book.addChild({ id: 'a', ceiling: 14_000, pending: 1 }).ok, true);
+  const cost = admissionCost({ pluginId: 'a', correlationId: 1, payload: 'x' });
+  assert.equal(book.admit({
+    childId: 'a',
+    correlationId: 1,
+    held: cost.held,
+    reservation: cost.reservation,
+    replyBytes: 10_000,
+  }).decision, 'admitted');
+  const granted = book.replenish('a');
+  assert.equal(granted.credit, 12_787);
+  assert.equal(book.spend('a', 4000), 4000);
+  assert.equal(book.setOpenPartial('a', 4000), true);
+  assert.equal(book.inspect('a').held, 4004);
+  assert.equal(book.window('a'), 8787);
+  assert.equal(book.setShared(20_000), true);
+  assert.equal(book.pause('a', 'global'), true);
+  assert.deepEqual(book.considerResume().resumed, []);
+  const released = book.releaseShared(20_000);
+  assert.equal(released.released, 20_000);
+  assert.deepEqual(released.faulted, []);
+  assert.deepEqual(released.resumed, ['a']);
+  assert.equal(book.paused('a'), false);
+  assertAccount(book);
+});
+
+test('faulting the tight pending child does not strand a sibling reply', () => {
+  const book = createCreditBook({ globalCap: 100_000 });
+  assert.equal(book.addChild({ id: 'a', ceiling: 100_000 }).ok, true);
+  assert.equal(book.addChild({ id: 'b', ceiling: 100_000, pending: 1 }).ok, true);
+  const cost = admissionCost({ pluginId: 'a', correlationId: 1, payload: 'x' });
+  assert.equal(book.admit({
+    childId: 'a',
+    correlationId: 1,
+    held: cost.held,
+    reservation: cost.reservation,
+    replyBytes: 80_000,
+  }).decision, 'admitted');
+  assert.equal(book.retain('b', 96_000), true);
+  assert.equal(book.setOpenPartial('b', 96_000), true);
+  const faulted = book.considerResume();
+  assert.deepEqual(faulted.faulted, ['b']);
+  assert.equal(book.inspect('b'), null);
+  for (let i = 0; i < 4; i++) {
+    book.replenish('a');
+    book.flush('a');
+  }
+  assert.ok(book.window('a') >= 80_000, JSON.stringify(book.inspect('a')));
+  assertAccount(book);
+});
+
 test('a sibling spawn cannot take the credit an admitted reply still needs', () => {
   const book = createCreditBook({ globalCap: 14_000, pending: 1 });
   assert.equal(book.addChild({ id: 'a', ceiling: 14_000, pending: 1 }).ok, true);
@@ -564,13 +617,20 @@ test('admitted replies stay sendable across spawns, admits, and releases', () =>
     const children = [];
     let seq = 1;
     const needOf = (child) => child.replies.reduce((sum, row) => sum + row.reply, 0);
+    const remainingOf = (child) => Math.max(0, needOf(child) - child.received);
+    const dropFaulted = (ids) => {
+      const doomed = new Set(ids);
+      for (let i = children.length - 1; i >= 0; i--) {
+        if (doomed.has(children[i].id)) children.splice(i, 1);
+      }
+    };
     const assertSendable = () => {
       for (const child of children) {
-        const need = needOf(child);
+        const need = remainingOf(child);
         if (need > 0) cover(book, child.id, need);
       }
       for (const child of children) {
-        const need = needOf(child);
+        const need = remainingOf(child);
         if (need <= 0) continue;
         assert.ok(book.window(child.id) >= need, JSON.stringify({
           seed,
@@ -581,15 +641,16 @@ test('admitted replies stay sendable across spawns, admits, and releases', () =>
       }
       assertAccount(book);
     };
-    for (let step = 0; step < 12; step++) {
+    for (let step = 0; step < 16; step++) {
       const roll = rng();
-      if (children.length === 0 || (children.length < 4 && roll < 0.34)) {
-        const id = `c${children.length}`;
+      if (children.length === 0 || (children.length < 4 && roll < 0.28)) {
+        const id = `c${seq++}`;
         const ceiling = slot + 1 + Math.floor(rng() * Math.max(usable, Math.floor(globalCap / 2)));
-        const added = book.addChild({ id, ceiling, pending: 1 });
-        if (added.ok) children.push({ id, replies: [] });
+        const pending = rng() < 0.5 ? 1 : 32;
+        const added = book.addChild({ id, ceiling, pending });
+        if (added.ok) children.push({ id, ceiling, replies: [], received: 0 });
         else assert.ok(added.reason === 'spawn-rejected' || added.reason === 'unsatisfiable', `seed ${seed}`);
-      } else if (roll < 0.72) {
+      } else if (roll < 0.56) {
         const child = children[Math.floor(rng() * children.length)];
         const payload = Math.floor(rng() * 4000);
         const correlation = seq++;
@@ -613,21 +674,57 @@ test('admitted replies stay sendable across spawns, admits, and releases', () =>
           assert.equal(book.inspect(child.id).held, view.held, `seed ${seed}`);
           assert.equal(book.headroom(child.id), view.noted, `seed ${seed}`);
         }
-      } else {
+      } else if (roll < 0.74) {
         const owners = children.filter((child) => child.replies.length > 0);
         if (owners.length > 0) {
           const child = owners[Math.floor(rng() * owners.length)];
           const index = Math.floor(rng() * child.replies.length);
           const row = child.replies.splice(index, 1)[0];
-          cover(book, child.id, row.reply);
-          assert.ok(book.window(child.id) >= row.reply, `seed ${seed}`);
+          const owed = Math.max(0, row.reply - child.received);
+          cover(book, child.id, owed);
+          assert.ok(book.window(child.id) >= owed, `seed ${seed}`);
           const roomBefore = book.inspect(child.id).room;
-          assert.equal(book.spend(child.id, row.reply), row.reply);
-          book.release(child.id, row.reply);
+          assert.equal(book.spend(child.id, owed), owed);
+          child.received = Math.max(0, child.received - row.reply);
+          book.release(child.id, owed);
           assert.ok(book.inspect(child.id).room >= roomBefore, `seed ${seed} release`);
           const outcome = rng() < 0.5 ? 'timeout' : 'complete';
           assert.equal(book.settle(child.id, row.correlation, outcome).released, true);
         }
+      } else if (roll < 0.88) {
+        for (const child of children) book.pause(child.id, 'global');
+        const partial = children.find((child) => child.replies.length > 0 && book.window(child.id) > 0);
+        if (partial) {
+          const room = Math.min(book.window(partial.id), remainingOf(partial));
+          const part = Math.min(room, 1 + Math.floor(rng() * Math.max(1, room)));
+          const spent = book.spend(partial.id, part);
+          partial.received += spent;
+          if (spent > 0) book.setOpenPartial(partial.id, Math.min(spent, book.inspect(partial.id).held));
+        }
+        book.setShared(globalCap);
+        const blocked = book.considerResume();
+        assert.deepEqual(blocked.resumed, []);
+        book.setShared(0);
+        book.considerResume();
+        const buffered = children.reduce((sum, child) => sum + book.inspect(child.id).held, 0);
+        if (buffered + book.readBytes <= globalCap) {
+          for (const child of children) {
+            const view = book.inspect(child.id);
+            const owed = Math.max(book.promised(child.id), remainingOf(child));
+            const uncovered = Math.max(0, owed - view.window);
+            if (view.held + book.readBytes + uncovered <= child.ceiling) {
+              assert.equal(book.paused(child.id), false, `seed ${seed} resume ${child.id}`);
+            }
+          }
+        }
+      } else if (children.length >= 2) {
+        const victim = children[Math.floor(rng() * children.length)];
+        assert.equal(book.retain(victim.id, globalCap), true);
+        const held = book.inspect(victim.id).held;
+        assert.equal(book.setOpenPartial(victim.id, held), true);
+        const faulted = book.considerResume();
+        assert.ok(faulted.faulted.includes(victim.id), `seed ${seed} fault`);
+        dropFaulted(faulted.faulted);
       }
       assertSendable();
     }
