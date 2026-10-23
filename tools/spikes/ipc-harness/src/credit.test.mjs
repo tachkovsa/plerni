@@ -490,6 +490,29 @@ test('a readable open line is not faulted because a sibling prefix blocks one re
   assert.equal(book.paused('second'), false);
 });
 
+test('a sibling spawn cannot take the credit an admitted reply still needs', () => {
+  const book = createCreditBook({ globalCap: 14_000, pending: 1 });
+  assert.equal(book.addChild({ id: 'a', ceiling: 14_000, pending: 1 }).ok, true);
+  const cost = admissionCost({ pluginId: 'a', correlationId: 1, payload: 'x' });
+  assert.equal(book.admit({
+    childId: 'a',
+    correlationId: 1,
+    held: cost.held,
+    reservation: cost.reservation,
+    replyBytes: 10_000,
+  }).decision, 'admitted');
+  const sibling = book.addChild({ id: 'b', ceiling: 14_000, pending: 1 });
+  assert.equal(sibling.ok, false);
+  assert.equal(sibling.reason, 'spawn-rejected');
+  for (let i = 0; i < 4; i++) {
+    book.replenish('a');
+    book.flush('a');
+  }
+  assert.ok(book.window('a') >= 10_000, JSON.stringify(book.inspect('a')));
+  assert.equal(book.promised('b'), 0);
+  assertAccount(book);
+});
+
 test('a later call cannot take the credit an earlier reply still needs', () => {
   const book = createCreditBook({ globalCap: 14_000 });
   assert.equal(book.addChild({ id: 'a', ceiling: 14_000 }).ok, true);
@@ -531,105 +554,82 @@ test('keepBytes withholds only the excess over the shared hole', () => {
   assert.ok(6990 - capKeep(6990, raw, USABLE_RESPONSE) >= USABLE_RESPONSE);
 });
 
-test('a credit-compliant child never hangs and reserves recompute on release', () => {
+test('admitted replies stay sendable across spawns, admits, and releases', () => {
   const slot = admissionSlot();
   const usable = USABLE_RESPONSE;
   for (let seed = 1; seed <= 48; seed++) {
     const rng = mulberry32(seed);
-    const ceiling = slot + usable + 1 + Math.floor(rng() * 30_000);
-    const globalCap = ceiling + slot + usable + Math.floor(rng() * 40_000);
+    const globalCap = slot + usable * 4 + Math.floor(rng() * 80_000);
     const book = createCreditBook({ globalCap, pending: 1, admitSlot: slot });
-    const added = book.addChild({ id: 'a', ceiling, pending: 1 });
-    assert.equal(added.ok, true, `seed ${seed}`);
-    const promised = book.promised('a');
-    assert.ok(promised > 0);
-    if (rng() < 0.4) {
-      const peerCeiling = slot + usable + 1 + Math.floor(rng() * 20_000);
-      const peer = book.addChild({ id: 'b', ceiling: peerCeiling, pending: 1 });
-      if (peer.ok) {
-        cover(book, 'b', peer.promised);
-        assert.ok(book.window('b') >= peer.promised, `seed ${seed} peer`);
-      } else {
-        assert.equal(peer.reason, 'spawn-rejected');
+    const children = [];
+    let seq = 1;
+    const needOf = (child) => child.replies.reduce((sum, row) => sum + row.reply, 0);
+    const assertSendable = () => {
+      for (const child of children) {
+        const need = needOf(child);
+        if (need > 0) cover(book, child.id, need);
       }
-    }
-    const payload = Math.floor(rng() * 6000);
-    const correlation = 1 + Math.floor(rng() * 10_000);
-    const cost = admissionCost({
-      pluginId: 'a',
-      correlationId: correlation,
-      payload: 'x'.repeat(payload),
-    });
-    const reply = 1 + Math.floor(rng() * promised);
-    const decision = book.admit({
-      childId: 'a',
-      correlationId: correlation,
-      held: cost.held,
-      reservation: cost.reservation,
-      replyBytes: reply,
-    });
-    if (decision.decision !== 'admitted') {
-      assert.equal(decision.reason, 'total-cap');
-      assert.equal(book.headroom('a'), 0, `seed ${seed}`);
+      for (const child of children) {
+        const need = needOf(child);
+        if (need <= 0) continue;
+        assert.ok(book.window(child.id) >= need, JSON.stringify({
+          seed,
+          id: child.id,
+          need,
+          inspect: book.inspect(child.id),
+        }));
+      }
       assertAccount(book);
-      continue;
-    }
-    const live = [{ correlation, reply }];
-    const payload2 = Math.floor(rng() * 6000);
-    const correlation2 = correlation + 50_000;
-    const cost2 = admissionCost({
-      pluginId: 'a',
-      correlationId: correlation2,
-      payload: 'y'.repeat(payload2),
-    });
-    const reply2 = 1 + Math.floor(rng() * promised);
-    const heldBeforeSecond = book.inspect('a').held;
-    const notedBeforeSecond = book.headroom('a');
-    const decision2 = book.admit({
-      childId: 'a',
-      correlationId: correlation2,
-      held: cost2.held,
-      reservation: cost2.reservation,
-      replyBytes: reply2,
-    });
-    if (decision2.decision === 'admitted') {
-      live.push({ correlation: correlation2, reply: reply2 });
-    } else {
-      assert.equal(decision2.reason, 'total-cap', `seed ${seed}`);
-      assert.equal(book.headroom('a'), notedBeforeSecond, `seed ${seed}`);
-      assert.equal(book.inspect('a').held, heldBeforeSecond, `seed ${seed}`);
-    }
-    const need = live.reduce((sum, row) => sum + row.reply, 0);
-    cover(book, 'a', need);
-    assert.ok(book.window('a') >= need, JSON.stringify({ seed, need, live, inspect: book.inspect('a') }));
-    if (live.length > 1) book.settle('a', correlation2, 'timeout');
-    cover(book, 'a', reply);
-    assert.ok(book.window('a') >= reply, JSON.stringify({ seed, reply, inspect: book.inspect('a') }));
-    assert.equal(book.spend('a', reply), reply);
-    const roomBeforeRelease = book.inspect('a').room;
-    book.release('a', reply);
-    const roomAfterRelease = book.inspect('a').room;
-    assert.ok(roomAfterRelease >= roomBeforeRelease, `seed ${seed} release`);
-    const notedBefore = book.headroom('a');
-    assert.equal(notedBefore, cost.reservation);
-    book.settle('a', correlation, 'timeout');
-    assert.equal(book.headroom('a'), 0, `seed ${seed} timeout`);
-    const follow = book.inspect('a');
-    assert.ok(follow.budget >= promised || follow.room < promised, `seed ${seed} recompute`);
-    if (follow.room >= promised) {
-      const again = book.admit({
-        childId: 'a',
-        correlationId: correlation + 1,
-        held: 2,
-        reservation: Math.min(slot, ceiling),
-        replyBytes: promised,
-      });
-      if (again.decision === 'admitted') {
-        cover(book, 'a', promised);
-        assert.ok(book.window('a') >= promised, JSON.stringify({ seed, inspect: book.inspect('a') }));
-        book.settle('a', correlation + 1, 'timeout');
+    };
+    for (let step = 0; step < 12; step++) {
+      const roll = rng();
+      if (children.length === 0 || (children.length < 4 && roll < 0.34)) {
+        const id = `c${children.length}`;
+        const ceiling = slot + 1 + Math.floor(rng() * Math.max(usable, Math.floor(globalCap / 2)));
+        const added = book.addChild({ id, ceiling, pending: 1 });
+        if (added.ok) children.push({ id, replies: [] });
+        else assert.ok(added.reason === 'spawn-rejected' || added.reason === 'unsatisfiable', `seed ${seed}`);
+      } else if (roll < 0.72) {
+        const child = children[Math.floor(rng() * children.length)];
+        const payload = Math.floor(rng() * 4000);
+        const correlation = seq++;
+        const cost = admissionCost({
+          pluginId: child.id,
+          correlationId: correlation,
+          payload: 'x'.repeat(payload),
+        });
+        const reply = 1 + Math.floor(rng() * usable);
+        const view = book.inspect(child.id);
+        const decision = book.admit({
+          childId: child.id,
+          correlationId: correlation,
+          held: cost.held,
+          reservation: cost.reservation,
+          replyBytes: reply,
+        });
+        if (decision.decision === 'admitted') child.replies.push({ correlation, reply });
+        else {
+          assert.equal(decision.reason, 'total-cap', `seed ${seed}`);
+          assert.equal(book.inspect(child.id).held, view.held, `seed ${seed}`);
+          assert.equal(book.headroom(child.id), view.noted, `seed ${seed}`);
+        }
+      } else {
+        const owners = children.filter((child) => child.replies.length > 0);
+        if (owners.length > 0) {
+          const child = owners[Math.floor(rng() * owners.length)];
+          const index = Math.floor(rng() * child.replies.length);
+          const row = child.replies.splice(index, 1)[0];
+          cover(book, child.id, row.reply);
+          assert.ok(book.window(child.id) >= row.reply, `seed ${seed}`);
+          const roomBefore = book.inspect(child.id).room;
+          assert.equal(book.spend(child.id, row.reply), row.reply);
+          book.release(child.id, row.reply);
+          assert.ok(book.inspect(child.id).room >= roomBefore, `seed ${seed} release`);
+          const outcome = rng() < 0.5 ? 'timeout' : 'complete';
+          assert.equal(book.settle(child.id, row.correlation, outcome).released, true);
+        }
       }
+      assertSendable();
     }
-    assertAccount(book);
   }
 });

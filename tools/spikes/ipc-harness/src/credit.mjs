@@ -5,14 +5,17 @@
 // A credit-compliant child writes a reply only when the advertised window
 // covers that line. The book keeps that window reachable.
 //
-// Headroom is the largest live call cost, withheld so a later call of that
-// size still fits beside advertised credit. The withhold is capped so the
-// grant still covers the usable reply promised at spawn and every admitted
-// reply that is still outstanding, together. A later call that would shrink
-// the window below that sum is rejected. A cost above the child ceiling or
-// the process ceiling is not headroom. Timeout and reject drop the cost. A
-// completed call may leave a floor; the same cap applies. Every grant reads
-// the current bytes, windows, and live costs.
+// One commitment per child: the spawn floor, any outstanding replies above
+// that floor, and the control reserve the shared admission hole does not
+// already cover. Admission, spawn, grant planning, headroom, resume, and
+// release all use that figure. A spawn or a call that cannot leave every
+// commitment sendable together is rejected. Headroom is the largest live
+// call cost, withheld so a later call of that size still fits beside
+// advertised credit, and it is capped so the grant still covers the
+// commitment. A cost above the child ceiling or the process ceiling is not
+// headroom. Timeout and reject drop the cost. A completed call may leave a
+// floor; the same cap applies. Every grant reads the current bytes, windows,
+// and live costs.
 //
 // A call that arrives after credit was granted is checked against the full
 // reservation — the outbound line plus the control reserve — beside the
@@ -123,6 +126,22 @@ export function keepBytes(room, hole, pending, noted, admitSlot) {
   return Math.min(Math.max(0, room), extra);
 }
 
+// Committed send bytes for one child. The spawn floor and the outstanding
+// replies share a window (a larger reply replaces the floor). The control
+// reserve sits beside that window. Callers pass the part of the reserve the
+// shared admission hole does not already withhold.
+export function committedBytes(promised, replies, control) {
+  const floor = promised > 0 ? promised : 0;
+  const outstanding = replies > 0 ? replies : 0;
+  const reserve = control > 0 ? control : 0;
+  return floor + Math.max(0, outstanding - floor) + reserve;
+}
+
+function controlReserveBytes() {
+  const reserve = controlReserve();
+  return reserve.grant + reserve.cancel;
+}
+
 // Headroom may not shrink the grant below the protected reply bytes.
 export function capKeep(room, raw, protect) {
   if (!(protect > 0)) return raw;
@@ -130,19 +149,22 @@ export function capKeep(room, raw, protect) {
   return Math.min(raw, Math.max(0, room - floor));
 }
 
-// Each peer carries its own promised floor. The recipient's floor is `usable`
-// and is not applied to peers that were promised a different ceiling.
-export function shareReserve(peers, recipientHeld, usable, globalWithout, childRoom, keep, pool) {
+// Each peer carries its own commitment. The recipient's commitment is not
+// copied onto peers that were promised a different ceiling or a larger reply.
+export function shareReserve(peers, recipientHeld, committed, globalWithout, childRoom, keep, pool) {
   const n = peers.length + 1;
   if (n <= 1) return 0;
   const share = Math.floor(Math.max(0, pool) / n);
   const windowOf = (peer) => (peer.window > 0 ? peer.window : 0);
-  const promisedOf = (peer) => (peer.promised > 0 ? peer.promised : 0);
-  if (!(usable > 0)) {
+  const committedOf = (peer) => (peer.committed > 0 ? peer.committed : 0);
+  if (!(committed > 0)) {
     let reserve = 0;
     for (const peer of peers) {
       const window = windowOf(peer);
-      if (window < share) reserve += share - window;
+      const owed = committedOf(peer);
+      if (owed > window) reserve += owed - window;
+      const base = Math.max(window, owed);
+      if (base < share) reserve += share - base;
     }
     return reserve;
   }
@@ -150,18 +172,18 @@ export function shareReserve(peers, recipientHeld, usable, globalWithout, childR
   let fullExtra = 0;
   for (const peer of peers) {
     const window = windowOf(peer);
-    const promised = promisedOf(peer);
-    floor += Math.max(0, promised - window);
-    const base = Math.max(window, promised);
+    const owed = committedOf(peer);
+    floor += Math.max(0, owed - window);
+    const base = Math.max(window, owed);
     if (base < share) fullExtra += share - base;
   }
   const heldWindow = recipientHeld > 0 ? recipientHeld : 0;
-  if (heldWindow >= usable) return floor + fullExtra;
+  if (heldWindow >= committed) return floor + fullExtra;
   const withFloor = Math.min(childRoom, globalWithout - floor) - keep;
-  if (withFloor < usable) return floor;
+  if (withFloor < committed) return floor;
   const uncapped = Math.min(childRoom, globalWithout - floor - fullExtra) - keep;
-  if (uncapped >= usable) return floor + fullExtra;
-  const extra = Math.max(0, globalWithout - floor - keep - usable);
+  if (uncapped >= committed) return floor + fullExtra;
+  const extra = Math.max(0, globalWithout - floor - keep - committed);
   return floor + Math.min(fullExtra, extra);
 }
 
@@ -267,6 +289,10 @@ export class CreditBook {
       deferred: 0,
       dead: false,
     });
+    if (!this.#grantsCoverCommitments()) {
+      this.#children.delete(id);
+      return { ok: false, reason: 'spawn-rejected' };
+    }
     return { ok: true, promised: usable };
   }
 
@@ -291,9 +317,7 @@ export class CreditBook {
     }
     child.held += held;
     child.reservations.set(correlationId, { reservation, held, replyBytes });
-    const plan = this.#plan(child);
-    const need = this.#replyNeed(child);
-    if (need > 0 && child.window + plan.deficit < need) {
+    if (!this.#grantsCoverCommitments()) {
       child.held -= held;
       child.reservations.delete(correlationId);
       return { decision: 'rejected', reason: 'total-cap' };
@@ -340,7 +364,7 @@ export class CreditBook {
     const released = Math.min(child.held, n);
     child.held -= released;
     if (child.openPartial > child.held) child.openPartial = child.held;
-    return { released, ...this.considerResume() };
+    return { released, ...this.#afterCreditChange() };
   }
 
   settle(childId, correlationId, outcome) {
@@ -355,7 +379,7 @@ export class CreditBook {
     child.reservations.delete(correlationId);
     child.held = Math.max(0, child.held - row.held);
     if (child.openPartial > child.held) child.openPartial = child.held;
-    return { released: true, ...this.considerResume() };
+    return { released: true, ...this.#afterCreditChange() };
   }
 
   retain(childId, n) {
@@ -375,7 +399,7 @@ export class CreditBook {
     if (!nonNegativeInt(n)) return { released: 0, ...emptyResume() };
     const released = Math.min(this.#shared, n);
     this.#shared -= released;
-    return { released, ...this.considerResume() };
+    return { released, ...this.#afterCreditChange() };
   }
 
   pause(childId, reason) {
@@ -448,7 +472,7 @@ export class CreditBook {
     const resumed = [];
     for (const child of this.#live()) {
       if (!child.paused || child.pauseReason !== 'global') continue;
-      if (this.#readFits(child) || this.#holdFits(child)) {
+      if ((this.#readFits(child) || this.#holdFits(child)) && this.#resumeLeavesCommitments(child)) {
         child.paused = false;
         child.pauseReason = null;
         resumed.push(child.id);
@@ -549,8 +573,38 @@ export class CreditBook {
     const ceiling = Math.min(child.ceiling, this.#globalCap);
     if (noted > ceiling) noted = child.historical;
     const raw = keepBytes(room, this.#hole(), child.pending, noted, this.#admitSlot);
-    const protect = Math.max(child.promised, this.#replyNeed(child));
-    return { raw, keep: capKeep(room, raw, protect) };
+    return { raw, keep: capKeep(room, raw, this.#commitment(child)) };
+  }
+
+  #commitment(child) {
+    const reserve = controlReserveBytes();
+    const control = Math.max(0, reserve - this.#hole());
+    return committedBytes(child.promised, this.#replyNeed(child), control);
+  }
+
+  #grantsCoverCommitments() {
+    for (const child of this.#live()) {
+      const owed = this.#commitment(child);
+      if (!(owed > 0)) continue;
+      const plan = this.#plan(child);
+      if (child.window + plan.deficit < owed) return false;
+    }
+    return true;
+  }
+
+  #afterCreditChange() {
+    // Release and settle change held bytes and outstanding replies. Resume
+    // then uses the same commitment the next grant will protect.
+    return this.considerResume();
+  }
+
+  #resumeLeavesCommitments(child) {
+    if (!(this.#replyNeed(child) > 0)) return true;
+    const owed = this.#commitment(child);
+    const extra = Math.max(0, child.deferred - child.held);
+    const incoming = this.#readFits(child) ? this.#incoming(child) : 0;
+    const added = Math.max(extra, Number.isInteger(incoming) ? incoming : 0);
+    return child.held + added + Math.max(child.window, owed) <= child.ceiling;
   }
 
   #replyNeed(child) {
@@ -577,12 +631,12 @@ export class CreditBook {
       if (other === child) continue;
       peers.push({
         window: other.window > 0 ? other.window : 0,
-        promised: other.promised > 0 ? other.promised : 0,
+        committed: this.#commitment(other),
       });
     }
     if (n <= 1) return 0;
     const hole = this.#hole();
-    const usable = this.#usableFloor(child.ceiling, child.pending, child.stamp, hole);
+    const usable = this.#commitment(child);
     const buffered = this.#buffered();
     const pool = Math.max(0, this.#globalCap - hole - buffered);
     const globalWithout = this.#globalCap - buffered - this.#windows(child) - hole - child.stamp;
@@ -604,7 +658,7 @@ export class CreditBook {
     for (const child of this.#live()) {
       peers.push({
         window: child.window > 0 ? child.window : 0,
-        promised: child.promised > 0 ? child.promised : 0,
+        committed: this.#commitment(child),
       });
     }
     const sibling = peers.reduce((sum, peer) => sum + peer.window, 0);
@@ -613,10 +667,11 @@ export class CreditBook {
     const globalWithout = this.#globalCap - buffered - sibling - hole - stamp;
     const childRoom = ceiling - hole - stamp;
     const keep = keepBytes(Math.min(childRoom, globalWithout), hole, pending, 0, this.#admitSlot);
-    const reserved = shareReserve(peers, 0, usable, globalWithout, childRoom, keep, pool);
+    const committed = committedBytes(usable, 0, Math.max(0, controlReserveBytes() - hole));
+    const reserved = shareReserve(peers, 0, committed, globalWithout, childRoom, keep, pool);
     const room = Math.min(childRoom, globalWithout - reserved);
     const credit = Math.max(0, replenishCredit(room, keep, 0));
-    return credit >= usable;
+    return credit >= committed;
   }
 
   #hole(extra) {
@@ -643,7 +698,12 @@ export class CreditBook {
   #holdFits(child) {
     if (!(child.deferred > 0)) return false;
     const extra = Math.max(0, child.deferred - child.held);
-    if (child.held + extra + child.window > child.ceiling) return false;
+    const queued = child.held + extra + child.window;
+    if (queued > child.ceiling) return false;
+    if (this.#replyNeed(child) > 0) {
+      const owed = this.#commitment(child);
+      if (queued + Math.max(0, owed - child.window) > child.ceiling) return false;
+    }
     return this.#buffered() + extra + this.#windows(null) <= this.#globalCap;
   }
 
