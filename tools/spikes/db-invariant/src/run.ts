@@ -9,6 +9,7 @@ import { a1Pinning } from './cases/a1-pinning.ts';
 import { a2Oracle } from './cases/a2-oracle.ts';
 import { a3Pgbouncer, drainAppBackends, resetAppTenantDefault } from './cases/a3-pgbouncer.ts';
 import { a4Protocol } from './cases/a4-protocol.ts';
+import { a4bNamed } from './cases/a4b-named.ts';
 import { poolAbort } from './battery/pool-abort.ts';
 import { interleave } from './battery/interleave.ts';
 import { contaminatedSession } from './battery/contaminated-session.ts';
@@ -48,6 +49,7 @@ try {
   await vacuityControl();
   await a3Pgbouncer();
   await a4Protocol();
+  await a4bNamed();
   await poolAbort();
   await interleave();
   await contaminatedSession();

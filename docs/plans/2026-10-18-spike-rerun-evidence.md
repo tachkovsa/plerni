@@ -150,3 +150,22 @@ Kept so the §3.0 record has its lines. This is not the verdict. The scored part
 ## A5
 
 A5 is the 2026-10-17 CI measurement cited in the A report: bench-dispatch run 39044052211, commit `c94d9a92aa85a4a97e8f4fdd57ce6171b00f6239`. This T6 session did not repeat that curve.
+
+## A4b named-statement branch
+
+Backing lines for the A4b section of `2026-10-18-spike-a-report.md`. Three invocations after `reset.sh` and `seed.mjs`. Each exited 0 with 47 JSONL rows and 0 failing cases. Node v22.23.4. PostgreSQL 18.6. PgBouncer 1.26.0, `pool_mode=transaction`, `max_prepared_statements=200`. The lines above this heading stay on `max_prepared_statements=0`. Passwords are not recorded.
+
+```text
+[PASS] A4b pooler tracks named statements @ pooled — {"max_prepared_statements":200,"readError":null,"required":"> 0","driverLevel":false,"destination":"named-statement branch","note":"At 0 PgBouncer does not track named statements. That is not a driver failure."}
+[PASS] A4b A2a clean-deny @ pooled — {"rows":0,"guard":true}
+[PASS] A4b mid-transaction error rollback @ pooled — {"code":"22012","installedPid":1075,"after":{"pid":1075,"absent":true,"rows":0,"guard":true}}
+[PASS] A4b mid-transaction error rollback @ pooled — {"code":"22012","installedPid":1262,"after":{"pid":1262,"absent":true,"rows":0,"guard":true}}
+[PASS] A4b mid-transaction error rollback @ pooled — {"code":"22012","installedPid":1424,"after":{"pid":1424,"absent":true,"rows":0,"guard":true}}
+[PASS] A4b contamination lifecycle @ pooled — {"detectedOnExecutingBackend":true,"terminatedAndGone":true,"absenceOnReplacement":true,"positiveControl":true,"retries":1,"boundedRetry":true,"cleanupMs":22,"deadPid":1077,"backendGoneMs":5,"replacementPid":1079,"followPid":1079,"rivalPid":1079,"rivalGuc":null,"rivalWaiting":1,"rivalHeldOff":true,"rivalTimedOut":false,"alerts":["SECURITY contamination on backend 1077: GUC plerni.tenant_id session-set to '11111111-1111-1111-1111-111111111111'"],"thrown":null}
+[PASS] A4b contamination lifecycle @ pooled — {"detectedOnExecutingBackend":true,"terminatedAndGone":true,"absenceOnReplacement":true,"positiveControl":true,"retries":1,"boundedRetry":true,"cleanupMs":23,"deadPid":1264,"backendGoneMs":4,"replacementPid":1266,"followPid":1266,"rivalPid":1266,"rivalGuc":null,"rivalWaiting":1,"rivalHeldOff":true,"rivalTimedOut":false,"alerts":["SECURITY contamination on backend 1264: GUC plerni.tenant_id session-set to '11111111-1111-1111-1111-111111111111'"],"thrown":null}
+[PASS] A4b contamination lifecycle @ pooled — {"detectedOnExecutingBackend":true,"terminatedAndGone":true,"absenceOnReplacement":true,"positiveControl":true,"retries":1,"boundedRetry":true,"cleanupMs":23,"deadPid":1426,"backendGoneMs":5,"replacementPid":1428,"followPid":1428,"rivalPid":1428,"rivalGuc":null,"rivalWaiting":1,"rivalHeldOff":true,"rivalTimedOut":false,"alerts":["SECURITY contamination on backend 1426: GUC plerni.tenant_id session-set to '11111111-1111-1111-1111-111111111111'"],"thrown":null}
+[PASS] A4b named statement names @ pooled — {"extended":102,"named":102,"unnamedExtended":0,"distinctNames":13,"instrumentation":"pg.Query.submit parse+bind; not pg_prepared_statements"}
+[PASS] A4 unnamed statement names @ direct+pooled — {"observed":75,"extended":34,"simple":41,"nonempty":[],"loadError":null,"instrumentation":"pg.Query.submit parse+bind; not pg_prepared_statements"}
+```
+
+The pooler line, the name-count line, the clean-deny line, and the unnamed-discipline line were identical on all three invocations. A2b read tenant B's three labels on one backend. A2c saw context absent, 0 rows, and the guard, on that same backend. A1 pinning kept one `pg_backend_pid()` across 3 statements in each of 8 concurrent transactions. Those rows are in the gitignored JSONL.

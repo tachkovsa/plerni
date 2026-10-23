@@ -537,9 +537,10 @@ function lifecycleDetail(rec: Recovery): Record<string, unknown> {
   };
 }
 
-export async function a3Pgbouncer(): Promise<void> {
+/** A1–A3 on the pooled datasource. `prefix` separates the unnamed A3 rows from the A4b rerun. */
+export async function pooledA1ThroughA3(prefix: string): Promise<void> {
   await recordProbe(
-    { case: 'A3 A1 pinning', datasource: 'pooled' },
+    { case: `${prefix} A1 pinning`, datasource: 'pooled' },
     async () => {
       const pinned = await pooledPinning();
       return { pass: pinned.pass, detail: { statementsPerTransaction: 3, concurrent: 8, runs: pinned.runs } };
@@ -550,7 +551,7 @@ export async function a3Pgbouncer(): Promise<void> {
   const oracle = pooled(1);
   try {
     await recordProbe(
-      { case: 'A3 A2a clean-deny', datasource: 'pooled' },
+      { case: `${prefix} A2a clean-deny`, datasource: 'pooled' },
       async () => {
         let rows = -1;
         let guard = false;
@@ -564,7 +565,7 @@ export async function a3Pgbouncer(): Promise<void> {
     );
     let positivePid = 0;
     await recordProbe(
-      { case: 'A3 A2b positive control', datasource: 'pooled' },
+      { case: `${prefix} A2b positive control`, datasource: 'pooled' },
       async () => {
         const ev = blankEv();
         const positive = await withTenant(oracle, TENANT_B, ev, terminateBackendByPid, async (trx) => {
@@ -579,7 +580,7 @@ export async function a3Pgbouncer(): Promise<void> {
       () => rawPositive(TENANT_B),
     );
     await recordProbe(
-      { case: 'A3 A2c leak-freedom', datasource: 'pooled' },
+      { case: `${prefix} A2c leak-freedom`, datasource: 'pooled' },
       async () => {
         const leak = await absenceOn(oracle);
         return {
@@ -597,7 +598,7 @@ export async function a3Pgbouncer(): Promise<void> {
   const rollback = pooled(1);
   try {
     await recordProbe(
-      { case: 'A3 mid-transaction error rollback', datasource: 'pooled' },
+      { case: `${prefix} mid-transaction error rollback`, datasource: 'pooled' },
       async () => {
         const ev = blankEv();
         let installedPid = 0;
@@ -628,7 +629,7 @@ export async function a3Pgbouncer(): Promise<void> {
   const life = pooled(1);
   try {
     await recordProbe(
-      { case: 'A3 contamination lifecycle', datasource: 'pooled' },
+      { case: `${prefix} contamination lifecycle`, datasource: 'pooled' },
       async () => {
         const ev = blankEv();
         await sql`SELECT set_config('plerni.tenant_id', ${TENANT_A}, false)`.execute(life);
@@ -640,6 +641,10 @@ export async function a3Pgbouncer(): Promise<void> {
   } finally {
     await life.destroy();
   }
+}
+
+export async function a3Pgbouncer(): Promise<void> {
+  await pooledA1ThroughA3('A3');
 
   // direct is not the A3 hypothesis; one positive control confirms the same protocol off the pool.
   const side = direct();
