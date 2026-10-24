@@ -369,6 +369,38 @@ test('a deferred reply resumes a global pause without waiting for a new read', (
   assert.deepEqual(book.considerResume().resumed, ['a']);
 });
 
+test('a deferred reply is promoted without reserving a new read', () => {
+  // Issue #57 (a). The frame is already in userspace. A full read of C also
+  // fits in the process ceiling, and that read does not fit in the child ceiling.
+  const book = createCreditBook({ globalCap: 20_000, pending: 1 });
+  assert.equal(book.addChild({ id: 'a', ceiling: 14_000, pending: 1 }).ok, true);
+  const cost = admissionCost({ pluginId: 'a', correlationId: 1, payload: 'x' });
+  assert.equal(book.admit({
+    childId: 'a',
+    correlationId: 1,
+    held: cost.held,
+    reservation: cost.reservation,
+    replyBytes: 10_000,
+  }).decision, 'admitted');
+  assert.equal(book.replenish('a').credit, 12_787);
+  assert.equal(book.spend('a', 10_000), 10_000);
+  assert.equal(book.setDeferred('a', 10_000), true);
+  assert.equal(book.pause('a', 'global'), true);
+  const view = book.inspect('a');
+  assert.equal(view.held, 10_004);
+  assert.equal(view.window, 2787);
+  assert.equal(view.held + view.window, 12_791);
+  assert.ok(view.held + view.window <= 14_000);
+  assert.ok(view.buffered + book.readBytes <= 20_000);
+  assert.ok(view.held + book.readBytes > 14_000);
+  const resumed = book.considerResume();
+  assert.deepEqual(resumed.faulted, []);
+  assert.deepEqual(resumed.resumed, ['a']);
+  assert.equal(book.paused('a'), false);
+  assert.deepEqual(book.considerResume(), { resumed: [], faulted: [] });
+  assertAccount(book);
+});
+
 test('a call that arrives after a grant is checked against the full reservation', () => {
   const { book, childCeiling } = tightBook();
   const granted = book.replenish('credit');
@@ -488,6 +520,37 @@ test('a readable open line is not faulted because a sibling prefix blocks one re
   assert.ok(book.inspect('first'));
   assert.ok(book.inspect('second'));
   assert.equal(book.paused('second'), false);
+});
+
+test('a near-cap reply finishes on its remaining kernel tail', () => {
+  // Issue #57 (b). Two full reads leave 808 bytes queued. A paused full read
+  // of C does not fit, and the measured tail does.
+  const book = createCreditBook({ globalCap: 10_000, pending: 1 });
+  assert.equal(book.addChild({ id: 'a', ceiling: 10_000, pending: 1 }).ok, true);
+  const cost = admissionCost({ pluginId: 'a', correlationId: 1, payload: 'x' });
+  assert.equal(book.admit({
+    childId: 'a',
+    correlationId: 1,
+    held: cost.held,
+    reservation: cost.reservation,
+    replyBytes: 9_000,
+  }).decision, 'admitted');
+  assert.equal(book.replenish('a').credit, 9_000);
+  assert.equal(book.spend('a', 4096), 4096);
+  assert.equal(book.spend('a', 4096), 4096);
+  assert.equal(book.setOpenPartial('a', 8192), true);
+  assert.equal(book.setKernelUnread('a', 808), true);
+  assert.equal(book.pause('a', 'global'), true);
+  assert.equal(book.window('a'), 808);
+  assert.equal(book.inspect('a').held, 8196);
+  assert.ok(8192 + book.readBytes > 10_000);
+  assert.ok(8192 + 808 <= 10_000);
+  const result = book.considerResume();
+  assert.deepEqual(result.faulted, []);
+  assert.deepEqual(result.resumed, ['a']);
+  assert.equal(book.paused('a'), false);
+  assert.ok(book.inspect('a'));
+  assertAccount(book);
 });
 
 test('a paused child resumes when the read spends credit the reply already holds', () => {
@@ -728,5 +791,76 @@ test('admitted replies stay sendable across spawns, admits, and releases', () =>
       }
       assertSendable();
     }
+    assertDeferredPromotion(rng);
+    assertNearCapTail(rng);
   }
 });
+
+// Issue #57 (a), varied. The deferred frame fits the child ceiling beside the
+// window. A full read of C fits the process ceiling and does not fit the child.
+function assertDeferredPromotion(rng) {
+  const read = 4096;
+  const ceiling = 12_000 + Math.floor(rng() * 6_000);
+  const globalCap = ceiling + read + 1_000 + Math.floor(rng() * 10_000);
+  const reply = (ceiling - read) + 1 + Math.floor(rng() * (read - 8));
+  const book = createCreditBook({ globalCap, pending: 1 });
+  assert.equal(book.addChild({ id: 'a', ceiling, pending: 1 }).ok, true);
+  const cost = admissionCost({ pluginId: 'a', correlationId: 1, payload: 'x' });
+  assert.equal(book.admit({
+    childId: 'a',
+    correlationId: 1,
+    held: cost.held,
+    reservation: cost.reservation,
+    replyBytes: reply,
+  }).decision, 'admitted');
+  cover(book, 'a', reply);
+  assert.ok(book.window('a') >= reply);
+  assert.equal(book.spend('a', reply), reply);
+  assert.equal(book.setDeferred('a', reply), true);
+  assert.equal(book.pause('a', 'global'), true);
+  const view = book.inspect('a');
+  assert.ok(view.held + book.readBytes > ceiling);
+  assert.ok(view.held + view.window <= ceiling);
+  assert.ok(view.buffered + book.readBytes <= globalCap);
+  const result = book.considerResume();
+  assert.deepEqual(result.faulted, []);
+  assert.deepEqual(result.resumed, ['a']);
+  assert.equal(book.paused('a'), false);
+  assertAccount(book);
+}
+
+// Issue #57 (b), varied. Full C-sized reads stop short of the cap. The queued
+// remainder fits, and the child is not faulted for a read it is not posting.
+function assertNearCapTail(rng) {
+  const read = 4096;
+  const margin = 800;
+  const slack = margin + 1 + Math.floor(rng() * (read - margin - 2));
+  const globalCap = read * 2 + slack;
+  const remainder = 1 + Math.floor(rng() * Math.min(read - 1, slack - margin));
+  const reply = read * 2 + remainder;
+  const spent = read * 2;
+  const book = createCreditBook({ globalCap, pending: 1 });
+  assert.equal(book.addChild({ id: 'a', ceiling: globalCap, pending: 1 }).ok, true);
+  const cost = admissionCost({ pluginId: 'a', correlationId: 1, payload: 'x' });
+  assert.equal(book.admit({
+    childId: 'a',
+    correlationId: 1,
+    held: cost.held,
+    reservation: cost.reservation,
+    replyBytes: reply,
+  }).decision, 'admitted');
+  cover(book, 'a', reply);
+  assert.ok(book.window('a') >= reply);
+  assert.equal(book.spend('a', spent), spent);
+  assert.equal(book.setOpenPartial('a', spent), true);
+  assert.equal(book.setKernelUnread('a', remainder), true);
+  assert.equal(book.pause('a', 'global'), true);
+  assert.ok(spent + book.readBytes > globalCap);
+  assert.ok(spent + remainder <= globalCap);
+  const result = book.considerResume();
+  assert.deepEqual(result.faulted, []);
+  assert.deepEqual(result.resumed, ['a']);
+  assert.equal(book.paused('a'), false);
+  assert.ok(book.inspect('a'));
+  assertAccount(book);
+}
