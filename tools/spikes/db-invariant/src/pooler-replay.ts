@@ -9,7 +9,7 @@ import { sql, type Kysely } from 'kysely';
 import {
   adminShow, discardPoolerSessions, pooled, rawApp, rawAppPooled, terminateBackendByPid, type Db,
 } from './client.ts';
-import { PINNED_SEARCH_PATH, withTenant } from './context.ts';
+import { MAX_RETRY, PINNED_SEARCH_PATH, withTenant } from './context.ts';
 import { TENANT_A, TENANT_B } from './cases/a2-oracle.ts';
 import { blankEv, drainAppBackends, onlyTenant, readRows, recordProbe } from './cases/a3-pgbouncer.ts';
 
@@ -268,6 +268,9 @@ async function discardClearsReplay(): Promise<{ pass: boolean; detail: Record<st
     const dirty = await snapKysely(db);
     await terminateBackendByPid(dirty.pid);
     const replayed = await snapKysely(db);
+    // This probe measures the cache. It discards by hand, then polls for a clean
+    // checkout, then calls withTenant. It does not exercise withTenant's discard.
+    // surviving-client.test.ts is the protocol regression.
     const closed = discardPoolerSessions(db);
     const cleaned = await readAfterDiscard(db);
     const ev = blankEv();
@@ -297,6 +300,91 @@ async function discardClearsReplay(): Promise<{ pass: boolean; detail: Record<st
   }
 }
 
+interface AccessIdentity {
+  pid: number;
+  tenant_guc: string | null;
+  current_user: string;
+  session_user: string;
+  search_path: string;
+}
+
+const ACCESS_SQL = `SELECT pg_backend_pid() AS pid,
+  NULLIF(current_setting('plerni.tenant_id', true), '') AS tenant_guc,
+  current_user, session_user,
+  current_setting('search_path') AS search_path,
+  'tenant-access' AS phase`;
+
+/**
+ * A second client on the backend that still holds another tenant's session GUC
+ * and SET ROLE. withTenant must not run tenant access on that backend.
+ */
+async function withTenantRejectsLeakedIdentity(): Promise<{ pass: boolean; detail: Record<string, unknown> }> {
+  await drainAppBackends();
+  const contaminator = rawAppPooled();
+  const db = pooled(1);
+  await contaminator.connect();
+  try {
+    await contaminator.query(`SELECT set_config('plerni.tenant_id', $1, false)`, [TENANT_A]);
+    await contaminator.query(`SET ROLE plerni_plugin_a`);
+    const dirty = await snapRaw(contaminator);
+    const seen: AccessIdentity[] = [];
+    const ev = blankEv();
+    const rows = await withTenant(db, TENANT_B, ev, terminateBackendByPid, async (trx) => {
+      const r = await sql<AccessIdentity>`${sql.raw(ACCESS_SQL)}`.execute(trx);
+      const row = r.rows[0];
+      if (!row) throw new Error('tenant access returned no identity row');
+      seen.push({
+        pid: Number(row.pid),
+        tenant_guc: row.tenant_guc == null || row.tenant_guc === '' ? null : String(row.tenant_guc),
+        current_user: String(row.current_user),
+        session_user: String(row.session_user),
+        search_path: String(row.search_path),
+      });
+      return readRows(trx);
+    });
+    const access = seen[0];
+    const foreignAccess = seen.some((row) =>
+      row.pid === dirty.pid
+      || row.tenant_guc === TENANT_A
+      || row.tenant_guc !== TENANT_B
+      || row.current_user !== row.session_user
+      || row.current_user === 'plerni_plugin_a'
+      || row.current_user !== 'plerni_app'
+      || row.search_path !== PINNED_SEARCH_PATH);
+    const accessClean = seen.length === 1 && access !== undefined && !foreignAccess;
+    const sawLeak = ev.alerts.some((alert) =>
+      alert.includes(String(dirty.pid))
+      && alert.includes(TENANT_A)
+      && alert.includes('role leaked')
+      && alert.includes('plerni_plugin_a'));
+    const pass = dirty.tenant_guc === TENANT_A
+      && dirty.current_user === 'plerni_plugin_a'
+      && dirty.current_user !== dirty.session_user
+      && sawLeak
+      && ev.terminatedBackendPids.includes(dirty.pid)
+      && ev.terminatedBackendPids.length <= MAX_RETRY
+      && ev.attempts <= MAX_RETRY + 1
+      && accessClean
+      && onlyTenant(rows, TENANT_B);
+    return {
+      pass,
+      detail: {
+        dirtyPid: dirty.pid,
+        seen,
+        attempts: ev.attempts,
+        terminations: ev.terminatedBackendPids.length,
+        discardedPoolerSessions: ev.discardedPoolerSessions,
+        alerts: ev.alerts,
+        positive: onlyTenant(rows, TENANT_B),
+      },
+    };
+  } finally {
+    await contaminator.end().catch(() => {});
+    await db.destroy();
+    await drainAppBackends();
+  }
+}
+
 export async function poolerReplay(): Promise<void> {
   try {
     await recordProbe(
@@ -312,6 +400,11 @@ export async function poolerReplay(): Promise<void> {
     await recordProbe(
       { case: 'pooler cross-client session leak', datasource: 'pooled' },
       crossClientLeak,
+      rawNewDirectSession,
+    );
+    await recordProbe(
+      { case: 'pooler withTenant rejects leaked identity', datasource: 'pooled(1)' },
+      withTenantRejectsLeakedIdentity,
       rawNewDirectSession,
     );
     await recordProbe(

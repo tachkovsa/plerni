@@ -41,6 +41,21 @@ export function kyselyOf(dsn: string, max = 10): Kysely<Db> {
   const pool = new pg.Pool({ connectionString: dsn, max });
   pool.on('error', (e) => { idlePoolErrors.push(String(e)); });
   pool.on('connect', (client) => { client.on('error', (e) => { idlePoolErrors.push(String(e)); }); });
+  return bindPool(pool);
+}
+
+/**
+ * Register a pool the spike already built. The surviving-client test uses this
+ * so `discardPoolerSessions` sees the same sockets `withTenant` is holding.
+ * The object must expose pg's `connect`/`end` and the `_clients` list the
+ * discard walks. It is not a second production pool.
+ */
+export function kyselyOfPool(pool: pg.Pool): Kysely<Db> {
+  pool.on('error', (e) => { idlePoolErrors.push(String(e)); });
+  return bindPool(pool);
+}
+
+function bindPool(pool: pg.Pool): Kysely<Db> {
   const db = new Kysely<Db>({ dialect: new PostgresDialect({ pool }) });
   pools.set(db, pool);
   return db;

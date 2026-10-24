@@ -46,7 +46,7 @@ On confirmed contamination, in this order:
 ## Consequences
 
 - "Fresh connection" in plan §2 means a new client session to the pooler, not only a new backend pid.
-- The spike's `withTenant` discards those sockets after the kill is confirmed. The idle-server regression is `pooler discard clears replay`: terminate-only leaves `search_path` set, discard clears it, and the protocol does not terminate again.
+- The spike's `withTenant` discards those sockets after the kill is confirmed. `pooler discard clears replay` measures the cache by closing the socket itself, then calls `withTenant` on the cleaned session. The load-bearing proof is the controlled driver in `surviving-client.test.ts`: the kill leaves the client up, `withTenant` is the only cleanup, `discardedPoolerSessions` is at least 1, and recovery finishes inside the retry budget. Removing the discard from `withTenant` fails that test. A linked kill on this pooler still closes the client, so the in-transaction battery keeps recording 0.
 - Production code that copies the protocol has to close the pooler session as well as the backend. Closing only the backend is the wedge issue #36 describes.
 
 ## Flip conditions
