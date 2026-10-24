@@ -8,7 +8,7 @@
 // A missing prepared statement at 0 is a config outcome, never a driver-level one.
 import { adminShow } from '../client.ts';
 import { installNamedStatements } from '../named-statements.ts';
-import { pooledA1ThroughA3, recordProbe } from './a3-pgbouncer.ts';
+import { pooledA1ThroughA3, recordProbe, type Probe } from './a3-pgbouncer.ts';
 import { watchOutboundNames, type ObservedName } from './a4-protocol.ts';
 
 async function preparedLimit(): Promise<number | null> {
@@ -19,18 +19,18 @@ async function preparedLimit(): Promise<number | null> {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-export async function a4bNamed(): Promise<void> {
-  let limit: number | null = null;
-  let readError: string | null = null;
-  try {
-    limit = await preparedLimit();
-  } catch (e) {
-    readError = e instanceof Error ? e.message : String(e);
-  }
-  const enabled = limit !== null && limit > 0;
-  await recordProbe(
-    { case: 'A4b pooler tracks named statements', datasource: 'pooled' },
-    async () => ({
+/** One SHOW CONFIG read. recordProbe calls this once per diagnostic attempt. */
+export function preparedTrackingProbe(read: () => Promise<number | null>): () => Promise<Probe> {
+  return async () => {
+    let limit: number | null = null;
+    let readError: string | null = null;
+    try {
+      limit = await read();
+    } catch (e) {
+      readError = e instanceof Error ? e.message : String(e);
+    }
+    const enabled = limit !== null && limit > 0;
+    return {
       pass: enabled,
       detail: {
         max_prepared_statements: limit,
@@ -40,10 +40,23 @@ export async function a4bNamed(): Promise<void> {
         destination: enabled ? 'named-statement branch' : 'config',
         note: 'At 0 PgBouncer does not track named statements. That is not a driver failure.',
       },
-    }),
-    async () => ({ max_prepared_statements: limit, readError }),
+    };
+  };
+}
+
+export async function a4bNamed(): Promise<void> {
+  const tracked = await recordProbe(
+    { case: 'A4b pooler tracks named statements', datasource: 'pooled' },
+    preparedTrackingProbe(preparedLimit),
+    async () => {
+      try {
+        return { max_prepared_statements: await preparedLimit() };
+      } catch (e) {
+        return { readError: e instanceof Error ? e.message : String(e) };
+      }
+    },
   );
-  if (!enabled) return;
+  if (!tracked.pass) return;
 
   const restore = installNamedStatements();
   const seen: ObservedName[] = [];

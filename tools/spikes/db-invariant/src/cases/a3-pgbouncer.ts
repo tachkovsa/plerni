@@ -162,21 +162,19 @@ async function takeProbe(probe: () => Promise<Probe>): Promise<Probe> {
   }
 }
 
-export async function recordProbe(
-  meta: { case: string; datasource: string },
-  probe: () => Promise<Probe>,
-  raw: () => Promise<unknown>,
-): Promise<Probe> {
+/**
+ * The three-run diagnosis without recording and without the §3.0 admin/raw
+ * attachment. A passing probe returns immediately. An upstream invalid run is
+ * not retried. Otherwise the probe runs three times: any pass among the three
+ * is environmental noise (invalid run), and three failures are established.
+ */
+export async function attemptProbe(probe: () => Promise<Probe>): Promise<Probe> {
   const first = await takeProbe(probe);
-  if (first.pass) {
-    record({ ...meta, pass: true, detail: first.detail });
-    return first;
-  }
+  if (first.pass) return first;
   // The caller already knows this run is noise (an upstream probe was invalid).
   // Three identical failures would be recorded as an established failure.
   if (first.detail.outcome === 'environmental-noise') {
     const detail = { ...first.detail, verdict: 'invalid-run-no-verdict' };
-    record({ ...meta, pass: false, detail });
     return { pass: false, detail };
   }
   const runs = [false];
@@ -193,8 +191,25 @@ export async function recordProbe(
     repeatErrors,
     outcome: noise ? 'environmental-noise' : 'established-failure',
     verdict: noise ? 'invalid-run-no-verdict' : 'unlabeled-pending-section-3.0',
-    section30: await section30(raw),
   };
+  return { pass: false, detail };
+}
+
+export async function recordProbe(
+  meta: { case: string; datasource: string },
+  probe: () => Promise<Probe>,
+  raw: () => Promise<unknown>,
+): Promise<Probe> {
+  const result = await attemptProbe(probe);
+  // A pass, and an upstream invalid run, carry no `runs` array and attach no
+  // §3.0 evidence. A mixed or established result does, including its retries.
+  const earlyNoise = result.detail.verdict === 'invalid-run-no-verdict'
+    && !Array.isArray(result.detail.runs);
+  if (result.pass || earlyNoise) {
+    record({ ...meta, pass: result.pass, detail: result.detail });
+    return result;
+  }
+  const detail = { ...result.detail, section30: await section30(raw) };
   record({ ...meta, pass: false, detail });
   return { pass: false, detail };
 }
