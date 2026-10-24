@@ -5,13 +5,24 @@
 // This driver keeps the socket open across the kill and replays search_path onto
 // the next backend until that socket is destroyed. withTenant is the only cleanup.
 // There is no sleep and no outside discard.
+// client.ts exits at import unless every harness DSN is already set, and these
+// value imports pull it in, so the stand-ins are assigned before the dynamic
+// import. Nothing here connects.
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { sql, type Kysely } from 'kysely';
 import type pg from 'pg';
-import { kyselyOfPool, type Db } from './client.ts';
-import { MAX_RETRY, PINNED_SEARCH_PATH, withTenant, type HygieneEvidence } from './context.ts';
-import { TENANT_A, TENANT_B } from './cases/a2-oracle.ts';
+import type { Db } from './client.ts';
+import type { HygieneEvidence } from './context.ts';
+
+process.env.HARNESS_DIRECT_DSN ??= 'postgres://plerni_app@localhost:1/plerni';
+process.env.HARNESS_POOLED_DSN ??= 'postgres://plerni_app@localhost:1/plerni';
+process.env.HARNESS_ADMIN_DSN ??= 'postgres://plerni_admin_ro@localhost:1/pgbouncer';
+process.env.HARNESS_ROOT_DSN ??= 'postgres://postgres@localhost:1/plerni';
+
+const { kyselyOfPool } = await import('./client.ts');
+const { MAX_RETRY, PINNED_SEARCH_PATH, withTenant } = await import('./context.ts');
+const { TENANT_A, TENANT_B } = await import('./cases/a2-oracle.ts');
 
 const SESSION_USER = 'plerni_app';
 const LEAKED_ROLE = 'plerni_plugin_a';
