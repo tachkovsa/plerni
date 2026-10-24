@@ -6,8 +6,9 @@
 // this installer is removed before the battery. max_prepared_statements must be
 // > 0 or PgBouncer does not track the names (PgBouncer 1.26.0 doc/config.md).
 // A missing prepared statement at 0 is a config outcome, never a driver-level one.
-import { adminShow } from '../client.ts';
+import { adminShow, rawAppPooled } from '../client.ts';
 import { installNamedStatements } from '../named-statements.ts';
+import { PIN_CONCURRENT, PIN_SAMPLES, pidsViaRawPg, type PinClient } from './a1-pinning.ts';
 import { pooledA1ThroughA3, rawAppSteps, recordProbe, type Probe } from './a3-pgbouncer.ts';
 import { watchOutboundNames, type ObservedName } from './a4-protocol.ts';
 
@@ -90,6 +91,54 @@ export async function namingRawPg(
   return rawNamingEvidence(run);
 }
 
+/** A1's concurrent raw-pg pinning control. `open` is rawAppPooled for the A4b rerun. */
+export async function pooledRawPinningProbe(open: () => PinClient): Promise<Probe> {
+  const pids = await pidsViaRawPg(open);
+  return {
+    pass: pids.length === PIN_CONCURRENT
+      && pids.every((row) => row.length === PIN_SAMPLES && new Set(row).size === 1),
+    detail: {
+      via: 'raw-pg',
+      datasource: 'pooled',
+      concurrent: PIN_CONCURRENT,
+      statementsPerTransaction: PIN_SAMPLES,
+      pids,
+    },
+  };
+}
+
+/**
+ * Named-statement window. The pooled raw pinning control runs here, on the
+ * success path, through whatever opener the caller supplies (rawAppPooled).
+ */
+export async function runNamedA4b(
+  openRawPooled: () => PinClient,
+  workload: (seen: ObservedName[]) => Promise<readonly ObservedName[]>,
+  rawNames: () => Promise<unknown>,
+): Promise<void> {
+  const restore = installNamedStatements();
+  const seen: ObservedName[] = [];
+  const unwatch = watchOutboundNames(seen);
+  try {
+    await recordProbe(
+      { case: 'A4b pooled raw-pg pinning', datasource: 'pooled' },
+      () => pooledRawPinningProbe(openRawPooled),
+      () => pooledRawPinningProbe(openRawPooled),
+    );
+    await recordProbe(
+      { case: 'A4b named statement names', datasource: 'pooled' },
+      namedStatementProbe(async () => {
+        seen.length = 0;
+        return workload(seen);
+      }),
+      () => namingRawPg(unwatch, rawNames),
+    );
+  } finally {
+    unwatch();
+    restore();
+  }
+}
+
 /** One naming workload. recordProbe calls this once per diagnostic attempt. */
 export function namedStatementProbe(
   run: () => Promise<readonly ObservedName[]>,
@@ -125,24 +174,12 @@ export async function a4bNamed(): Promise<void> {
   );
   if (!tracked.pass) return;
 
-  const restore = installNamedStatements();
-  const seen: ObservedName[] = [];
-  const unwatch = watchOutboundNames(seen);
-  try {
-    await recordProbe(
-      { case: 'A4b named statement names', datasource: 'pooled' },
-      namedStatementProbe(async () => {
-        seen.length = 0;
-        await pooledA1ThroughA3('A4b');
-        return seen.slice();
-      }),
-      () => namingRawPg(unwatch, () => rawAppSteps([{
-        text: RAW_NAMING_STEP.text,
-        values: [...RAW_NAMING_STEP.values],
-      }])),
-    );
-  } finally {
-    unwatch();
-    restore();
-  }
+  await runNamedA4b(
+    rawAppPooled,
+    async (seen) => {
+      await pooledA1ThroughA3('A4b', () => pooledRawPinningProbe(rawAppPooled));
+      return seen.slice();
+    },
+    () => rawAppSteps([{ text: RAW_NAMING_STEP.text, values: [...RAW_NAMING_STEP.values] }]),
+  );
 }

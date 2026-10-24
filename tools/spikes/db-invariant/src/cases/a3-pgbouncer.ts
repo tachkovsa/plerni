@@ -553,14 +553,17 @@ function lifecycleDetail(rec: Recovery): Record<string, unknown> {
 }
 
 /** A1–A3 on the pooled datasource. `prefix` separates the unnamed A3 rows from the A4b rerun. */
-export async function pooledA1ThroughA3(prefix: string): Promise<void> {
+export async function pooledA1ThroughA3(
+  prefix: string,
+  pinRaw: () => Promise<unknown> = rawPinning,
+): Promise<void> {
   await recordProbe(
     { case: `${prefix} A1 pinning`, datasource: 'pooled' },
     async () => {
       const pinned = await pooledPinning();
       return { pass: pinned.pass, detail: { statementsPerTransaction: 3, concurrent: 8, runs: pinned.runs } };
     },
-    rawPinning,
+    pinRaw,
   );
 
   const oracle = pooled(1);

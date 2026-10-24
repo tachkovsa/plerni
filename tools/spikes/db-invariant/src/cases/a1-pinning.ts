@@ -2,18 +2,23 @@
 // whole life. Pass: pg_backend_pid() constant across ≥3 statements per transaction under
 // concurrent load, on the Kysely path AND an identical raw-pg control. Both main datasources.
 import { sql, type Kysely } from 'kysely';
-import pg from 'pg';
 import { direct, pooled, rawApp, rawAppPooled, type Db } from '../client.ts';
 import { record } from '../evidence.ts';
 
-const CONCURRENT = 8;
-const SAMPLES = 3;
+export const PIN_CONCURRENT = 8;
+export const PIN_SAMPLES = 3;
+
+export interface PinClient {
+  connect(): Promise<unknown>;
+  query(queryText: string): Promise<{ rows: Array<{ pid: number }> }>;
+  end(): Promise<unknown>;
+}
 
 async function pidsViaKysely(db: Kysely<Db>): Promise<number[][]> {
-  return Promise.all(Array.from({ length: CONCURRENT }, () =>
+  return Promise.all(Array.from({ length: PIN_CONCURRENT }, () =>
     db.transaction().execute(async (trx) => {
       const pids: number[] = [];
-      for (let i = 0; i < SAMPLES; i++) {
+      for (let i = 0; i < PIN_SAMPLES; i++) {
         const r = await sql<{ pid: number }>`SELECT pg_backend_pid() AS pid, pg_sleep(0.01)`.execute(trx);
         pids.push(r.rows[0]!.pid);
       }
@@ -21,16 +26,17 @@ async function pidsViaKysely(db: Kysely<Db>): Promise<number[][]> {
     })));
 }
 
-async function pidsViaRawPg(open: () => pg.Client): Promise<number[][]> {
-  return Promise.all(Array.from({ length: CONCURRENT }, async () => {
+/** Concurrent raw-pg pinning. A1 and A4b share this control; the opener selects the datasource. */
+export async function pidsViaRawPg(open: () => PinClient): Promise<number[][]> {
+  return Promise.all(Array.from({ length: PIN_CONCURRENT }, async () => {
     const c = open();
     await c.connect();
     const pids: number[] = [];
     try {
       await c.query('BEGIN');
-      for (let i = 0; i < SAMPLES; i++) {
+      for (let i = 0; i < PIN_SAMPLES; i++) {
         const r = await c.query('SELECT pg_backend_pid() AS pid, pg_sleep(0.01)');
-        pids.push(r.rows[0].pid);
+        pids.push(r.rows[0]!.pid);
       }
       await c.query('COMMIT');
     } finally {

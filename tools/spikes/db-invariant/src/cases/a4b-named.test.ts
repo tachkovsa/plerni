@@ -12,7 +12,9 @@ process.env.HARNESS_ADMIN_DSN ??= 'postgres://plerni_admin_ro@localhost:1/pgboun
 process.env.HARNESS_ROOT_DSN ??= 'postgres://postgres@localhost:1/plerni';
 
 const { attemptProbe } = await import('./a3-pgbouncer.ts');
-const { namingRawPg, namedStatementProbe, preparedTrackingProbe, RAW_NAMING_STEP } = await import('./a4b-named.ts');
+const {
+  namingRawPg, namedStatementProbe, pooledRawPinningProbe, preparedTrackingProbe, RAW_NAMING_STEP, runNamedA4b,
+} = await import('./a4b-named.ts');
 const { watchOutboundNames } = await import('./a4-protocol.ts');
 const pg = (await import('pg')).default;
 
@@ -108,4 +110,72 @@ test('the raw naming control statement carries values and no explicit protocol n
   assert.equal('name' in RAW_NAMING_STEP, false);
   assert.deepEqual(RAW_NAMING_STEP.values, ['goal']);
   assert.match(RAW_NAMING_STEP.text, /^SELECT /);
+});
+
+function pinningClient(pids: number[]) {
+  let sample = 0;
+  const queries: string[] = [];
+  return {
+    queries,
+    async connect() {},
+    async query(text: string) {
+      queries.push(text);
+      if (text.includes('pg_backend_pid')) {
+        const pid = pids[sample] ?? pids[pids.length - 1]!;
+        sample += 1;
+        return { rows: [{ pid }] };
+      }
+      return { rows: [] };
+    },
+    async end() {},
+  };
+}
+
+test('the pooled raw pinning control opens eight clients and requires a constant pid', async () => {
+  let opens = 0;
+  const clients: ReturnType<typeof pinningClient>[] = [];
+  const probe = await pooledRawPinningProbe(() => {
+    opens += 1;
+    const client = pinningClient([40, 40, 40]);
+    clients.push(client);
+    return client;
+  });
+  assert.equal(opens, 8);
+  assert.equal(probe.pass, true);
+  assert.equal(probe.detail.via, 'raw-pg');
+  assert.equal(probe.detail.datasource, 'pooled');
+  for (const client of clients) {
+    assert.deepEqual(client.queries, [
+      'BEGIN',
+      'SELECT pg_backend_pid() AS pid, pg_sleep(0.01)',
+      'SELECT pg_backend_pid() AS pid, pg_sleep(0.01)',
+      'SELECT pg_backend_pid() AS pid, pg_sleep(0.01)',
+      'COMMIT',
+    ]);
+  }
+});
+
+test('the pooled raw pinning control fails when a backend pid changes', async () => {
+  const probe = await pooledRawPinningProbe(() => pinningClient([1, 2, 1]));
+  assert.equal(probe.pass, false);
+});
+
+test('A4b runs the pooled raw pinning control while naming is installed', async () => {
+  const original = pg.Client.prototype.query;
+  let opens = 0;
+  try {
+    await runNamedA4b(
+      () => {
+        opens += 1;
+        assert.notEqual(pg.Client.prototype.query, original);
+        return pinningClient([9, 9, 9]);
+      },
+      async () => [{ name: 'n1', protocol: 'extended' }],
+      async () => { throw new Error('naming raw control runs only after the name probe fails'); },
+    );
+  } finally {
+    pg.Client.prototype.query = original;
+  }
+  assert.equal(opens, 8);
+  assert.equal(pg.Client.prototype.query, original);
 });
