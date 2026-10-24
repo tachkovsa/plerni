@@ -44,6 +44,27 @@ export function preparedTrackingProbe(read: () => Promise<number | null>): () =>
   };
 }
 
+/** One naming workload. recordProbe calls this once per diagnostic attempt. */
+export function namedStatementProbe(
+  run: () => Promise<readonly ObservedName[]>,
+): () => Promise<Probe> {
+  return async () => {
+    const seen = await run();
+    const extended = seen.filter((row) => row.protocol === 'extended');
+    const unnamed = extended.filter((row) => row.name === '');
+    return {
+      pass: extended.length > 0 && unnamed.length === 0,
+      detail: {
+        extended: extended.length,
+        named: extended.length - unnamed.length,
+        unnamedExtended: unnamed.length,
+        distinctNames: new Set(extended.map((row) => row.name)).size,
+        instrumentation: 'pg.Query.submit parse+bind; not pg_prepared_statements',
+      },
+    };
+  };
+}
+
 export async function a4bNamed(): Promise<void> {
   const tracked = await recordProbe(
     { case: 'A4b pooler tracks named statements', datasource: 'pooled' },
@@ -62,22 +83,14 @@ export async function a4bNamed(): Promise<void> {
   const seen: ObservedName[] = [];
   const unwatch = watchOutboundNames(seen);
   try {
-    await pooledA1ThroughA3('A4b');
-    const extended = seen.filter((row) => row.protocol === 'extended');
-    const unnamed = extended.filter((row) => row.name === '');
     await recordProbe(
       { case: 'A4b named statement names', datasource: 'pooled' },
-      async () => ({
-        pass: extended.length > 0 && unnamed.length === 0,
-        detail: {
-          extended: extended.length,
-          named: extended.length - unnamed.length,
-          unnamedExtended: unnamed.length,
-          distinctNames: new Set(extended.map((row) => row.name)).size,
-          instrumentation: 'pg.Query.submit parse+bind; not pg_prepared_statements',
-        },
+      namedStatementProbe(async () => {
+        seen.length = 0;
+        await pooledA1ThroughA3('A4b');
+        return seen.slice();
       }),
-      async () => extended.slice(0, 5),
+      async () => seen.filter((row) => row.protocol === 'extended').slice(0, 5),
     );
   } finally {
     unwatch();

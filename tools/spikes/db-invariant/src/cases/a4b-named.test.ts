@@ -11,7 +11,7 @@ process.env.HARNESS_ADMIN_DSN ??= 'postgres://plerni_admin_ro@localhost:1/pgboun
 process.env.HARNESS_ROOT_DSN ??= 'postgres://postgres@localhost:1/plerni';
 
 const { attemptProbe } = await import('./a3-pgbouncer.ts');
-const { preparedTrackingProbe } = await import('./a4b-named.ts');
+const { namedStatementProbe, preparedTrackingProbe } = await import('./a4b-named.ts');
 
 test('a failed pooler read that later recovers is an invalid run', async () => {
   let calls = 0;
@@ -23,6 +23,30 @@ test('a failed pooler read that later recovers is an invalid run', async () => {
   const result = await attemptProbe(preparedTrackingProbe(read));
   assert.equal(calls, 3);
   assert.equal(result.pass, false);
+  assert.equal(result.detail.outcome, 'environmental-noise');
+  assert.equal(result.detail.verdict, 'invalid-run-no-verdict');
+  assert.deepEqual(result.detail.runs, [false, true, true]);
+});
+
+test('an intermittent unnamed statement that later stays named is an invalid run', async () => {
+  let calls = 0;
+  const run = async () => {
+    calls += 1;
+    if (calls === 1) {
+      return [
+        { name: '', protocol: 'extended' as const },
+        { name: 'n1', protocol: 'extended' as const },
+      ];
+    }
+    return [
+      { name: 'n1', protocol: 'extended' as const },
+      { name: 'n2', protocol: 'extended' as const },
+    ];
+  };
+  const result = await attemptProbe(namedStatementProbe(run));
+  assert.equal(calls, 3);
+  assert.equal(result.pass, false);
+  assert.equal(result.detail.unnamedExtended, 1);
   assert.equal(result.detail.outcome, 'environmental-noise');
   assert.equal(result.detail.verdict, 'invalid-run-no-verdict');
   assert.deepEqual(result.detail.runs, [false, true, true]);
