@@ -1,6 +1,6 @@
 # Dev harness
 
-Minimal compose substrate both P0 spikes run against: PostgreSQL 18 (digest-pinned) + PgBouncer 1.26 (`pool_mode = transaction`, digest-pinned). From it grow the P1 isolation suite and the `onprem/` compose skeleton.
+Minimal compose substrate both P0 spikes run against: PostgreSQL 18 (digest-pinned) + PgBouncer 1.26 (`pool_mode = transaction`, `max_prepared_statements = 200`, digest-pinned). From it grow the P1 isolation suite and the `onprem/` compose skeleton. `200` is PgBouncer 1.26.0's documented default. The harness used `0` until A4 measured unnamed-statement overhead above 20%; A4b reruns A1–A3 on the pool with named client statements, which PgBouncer does not track at `0`.
 
 **Honesty note:** this single-host compose topology relaxes the production egress-denied topology (spec §4.4) — the runner/plugin isolation boundary is *not* modeled here, and this file says so rather than pretending.
 

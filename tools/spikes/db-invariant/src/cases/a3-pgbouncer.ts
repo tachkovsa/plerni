@@ -162,21 +162,19 @@ async function takeProbe(probe: () => Promise<Probe>): Promise<Probe> {
   }
 }
 
-export async function recordProbe(
-  meta: { case: string; datasource: string },
-  probe: () => Promise<Probe>,
-  raw: () => Promise<unknown>,
-): Promise<Probe> {
+/**
+ * The three-run diagnosis without recording and without the §3.0 admin/raw
+ * attachment. A passing probe returns immediately. An upstream invalid run is
+ * not retried. Otherwise the probe runs three times: any pass among the three
+ * is environmental noise (invalid run), and three failures are established.
+ */
+export async function attemptProbe(probe: () => Promise<Probe>): Promise<Probe> {
   const first = await takeProbe(probe);
-  if (first.pass) {
-    record({ ...meta, pass: true, detail: first.detail });
-    return first;
-  }
+  if (first.pass) return first;
   // The caller already knows this run is noise (an upstream probe was invalid).
   // Three identical failures would be recorded as an established failure.
   if (first.detail.outcome === 'environmental-noise') {
     const detail = { ...first.detail, verdict: 'invalid-run-no-verdict' };
-    record({ ...meta, pass: false, detail });
     return { pass: false, detail };
   }
   const runs = [false];
@@ -193,8 +191,25 @@ export async function recordProbe(
     repeatErrors,
     outcome: noise ? 'environmental-noise' : 'established-failure',
     verdict: noise ? 'invalid-run-no-verdict' : 'unlabeled-pending-section-3.0',
-    section30: await section30(raw),
   };
+  return { pass: false, detail };
+}
+
+export async function recordProbe(
+  meta: { case: string; datasource: string },
+  probe: () => Promise<Probe>,
+  raw: () => Promise<unknown>,
+): Promise<Probe> {
+  const result = await attemptProbe(probe);
+  // A pass, and an upstream invalid run, carry no `runs` array and attach no
+  // §3.0 evidence. A mixed or established result does, including its retries.
+  const earlyNoise = result.detail.verdict === 'invalid-run-no-verdict'
+    && !Array.isArray(result.detail.runs);
+  if (result.pass || earlyNoise) {
+    record({ ...meta, pass: result.pass, detail: result.detail });
+    return result;
+  }
+  const detail = { ...result.detail, section30: await section30(raw) };
   record({ ...meta, pass: false, detail });
   return { pass: false, detail };
 }
@@ -537,20 +552,24 @@ function lifecycleDetail(rec: Recovery): Record<string, unknown> {
   };
 }
 
-export async function a3Pgbouncer(): Promise<void> {
+/** A1–A3 on the pooled datasource. `prefix` separates the unnamed A3 rows from the A4b rerun. */
+export async function pooledA1ThroughA3(
+  prefix: string,
+  pinRaw: () => Promise<unknown> = rawPinning,
+): Promise<void> {
   await recordProbe(
-    { case: 'A3 A1 pinning', datasource: 'pooled' },
+    { case: `${prefix} A1 pinning`, datasource: 'pooled' },
     async () => {
       const pinned = await pooledPinning();
       return { pass: pinned.pass, detail: { statementsPerTransaction: 3, concurrent: 8, runs: pinned.runs } };
     },
-    rawPinning,
+    pinRaw,
   );
 
   const oracle = pooled(1);
   try {
     await recordProbe(
-      { case: 'A3 A2a clean-deny', datasource: 'pooled' },
+      { case: `${prefix} A2a clean-deny`, datasource: 'pooled' },
       async () => {
         let rows = -1;
         let guard = false;
@@ -564,7 +583,7 @@ export async function a3Pgbouncer(): Promise<void> {
     );
     let positivePid = 0;
     await recordProbe(
-      { case: 'A3 A2b positive control', datasource: 'pooled' },
+      { case: `${prefix} A2b positive control`, datasource: 'pooled' },
       async () => {
         const ev = blankEv();
         const positive = await withTenant(oracle, TENANT_B, ev, terminateBackendByPid, async (trx) => {
@@ -579,7 +598,7 @@ export async function a3Pgbouncer(): Promise<void> {
       () => rawPositive(TENANT_B),
     );
     await recordProbe(
-      { case: 'A3 A2c leak-freedom', datasource: 'pooled' },
+      { case: `${prefix} A2c leak-freedom`, datasource: 'pooled' },
       async () => {
         const leak = await absenceOn(oracle);
         return {
@@ -597,7 +616,7 @@ export async function a3Pgbouncer(): Promise<void> {
   const rollback = pooled(1);
   try {
     await recordProbe(
-      { case: 'A3 mid-transaction error rollback', datasource: 'pooled' },
+      { case: `${prefix} mid-transaction error rollback`, datasource: 'pooled' },
       async () => {
         const ev = blankEv();
         let installedPid = 0;
@@ -628,7 +647,7 @@ export async function a3Pgbouncer(): Promise<void> {
   const life = pooled(1);
   try {
     await recordProbe(
-      { case: 'A3 contamination lifecycle', datasource: 'pooled' },
+      { case: `${prefix} contamination lifecycle`, datasource: 'pooled' },
       async () => {
         const ev = blankEv();
         await sql`SELECT set_config('plerni.tenant_id', ${TENANT_A}, false)`.execute(life);
@@ -640,6 +659,10 @@ export async function a3Pgbouncer(): Promise<void> {
   } finally {
     await life.destroy();
   }
+}
+
+export async function a3Pgbouncer(): Promise<void> {
+  await pooledA1ThroughA3('A3');
 
   // direct is not the A3 hypothesis; one positive control confirms the same protocol off the pool.
   const side = direct();

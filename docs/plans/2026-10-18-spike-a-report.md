@@ -114,6 +114,28 @@ Two fixtures prove the failure on band 50, then restore the committed files:
 
 The clean tree passed the gate on bands 50, 75, 200, and 400 in the T4b run (exit 0, `drift-gate: ok`). Both fixtures exited 0 after the gate exited 1 and the diff showed the drifted column. A staged extra line on the band-50 interface exited 1 before migrate. Those transcripts are in the T4b pull request. This T6 session did not repeat the gate.
 
+## A4b named-statement branch
+
+The 2026-10-18 invocations above left this experiment open. Issue #34 is that experiment: `max_prepared_statements` above 0, then A1–A3 again on the pooled datasource with named client statements. The default client is still unnamed. A4 still requires empty statement names. Naming is installed only for the A4b cases and removed before the battery.
+
+PgBouncer 1.26.0 documents `max_prepared_statements` default 200 (`doc/config.md` on tag `pgbouncer_1_26_0`). The harness ini now sets 200. At 0 the pooler does not track protocol-level named statements, and a missing prepared statement on that setting is a config outcome, not a driver failure. `server_reset_query` stays `DISCARD ALL` with `server_reset_query_always=0`, so transaction mode does not discard the server-side cache between transactions.
+
+Node v22.23.4. PostgreSQL 18.6. PgBouncer 1.26.0. Admin `SHOW CONFIG`: `pool_mode=transaction`, `max_prepared_statements=200` (the same row's default column is 200), `default_pool_size=10`. Three invocations. Each followed `reset.sh` and `seed.mjs`, exited 0, and wrote 47 JSONL rows with 0 failing cases. JSONL stays gitignored. Passwords are not recorded.
+
+| Check | Three runs |
+|---|---|
+| Pooler tracking | `max_prepared_statements` 200. `driverLevel` false. |
+| A1 pinning | 8 concurrent transactions, 3 statements each, one `pg_backend_pid()` per transaction. |
+| A2a clean-deny | 0 rows, app guard raised. |
+| A2b positive control | Tenant B's three labels, no termination. |
+| A2c leak-freedom | Context absent, 0 rows, guard raised, same backend as the positive control. |
+| Rollback | SQLSTATE `22012`, context absent on that same backend, no termination. |
+| Contamination lifecycle | Detected on the executing backend, terminated and gone, absence checked on the replacement, positive control passed, retries 1. Cleanup 22 ms, 23 ms, and 23 ms. `backendGoneMs` 5, 4, and 5. |
+| Named statements | 102 extended-protocol observations, 102 named, 0 unnamed, 13 distinct names. Instrumentation is `pg.Query.submit` parse and bind, not `pg_prepared_statements`. |
+| A4 unnamed discipline | Still pass: 75 statements, 0 non-empty names, on direct and pooled. |
+
+Transaction commands (`begin`, `commit`, `rollback`) stay simple queries, which is how Kysely 0.29.6 sends them and how PgBouncer sees the transaction end. Workload SQL, including parameterless `SELECT`, goes out as a protocol-level named statement. The name is a hash of the SQL text. PgBouncer rewrites that client name to its own `PGBOUNCER_*` name and prepares the statement on whichever server connection the transaction lands on.
+
 ## Replacement-validation track
 
-Plan §8 opens the replacement-validation track when a verdict replaces the shipped substrate, and the track carries a revised capacity estimate. A1, A2, A3, A4's unnamed discipline, and A5 stay on the results the suite demonstrated. A4b stays issue #34. The partial-cap re-spike in the Spike B report was opened by the original FAIL. The framer residual at dev `1b1f536c6fa874369ce1d30e9337f4224961be93` closed the oversize defect. This commit's partial high-water is 69632 bytes, so that clause is FAIL. The B3 total-buffer clause is FAIL. Per plan §8 the B3 FAIL opens the replacement-validation track, and the maintainer's decision is pending between (a) accepting the measured per-child bound (caps + one read chunk + kernel socket receive buffer) and (b) a flow-control redesign. This round starts neither. The capacity annex remains T7.
+Plan §8 opens the replacement-validation track when a verdict replaces the shipped substrate, and the track carries a revised capacity estimate. A1, A2, A3, A4's unnamed discipline, and A5 stay on the results the suite demonstrated. A4b is the section below. The partial-cap re-spike in the Spike B report was opened by the original FAIL. The framer residual at dev `1b1f536c6fa874369ce1d30e9337f4224961be93` closed the oversize defect. This commit's partial high-water is 69632 bytes, so that clause is FAIL. The B3 total-buffer clause is FAIL. Per plan §8 the B3 FAIL opens the replacement-validation track, and the maintainer's decision is pending between (a) accepting the measured per-child bound (caps + one read chunk + kernel socket receive buffer) and (b) a flow-control redesign. This round starts neither. The capacity annex remains T7.

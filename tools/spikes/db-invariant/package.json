@@ -5,7 +5,7 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "spike": "node src/run.ts",
-    "test": "node --test bench/band.test.mjs bench/brace-expand.test.mjs bench/corpus.test.mjs bench/corpus-lint.test.mjs bench/measure.test.mjs bench/typecheck-smoke.test.mjs",
+    "test": "node --test bench/band.test.mjs bench/brace-expand.test.mjs bench/corpus.test.mjs bench/corpus-lint.test.mjs bench/measure.test.mjs bench/typecheck-smoke.test.mjs src/named-statements.test.ts src/cases/a4b-named.test.ts",
     "bench:schema": "node bench/gen-schema.mjs",
     "bench:corpus": "node bench/gen-corpus.mjs",
     "bench:lint": "node bench/corpus-lint.mjs",
