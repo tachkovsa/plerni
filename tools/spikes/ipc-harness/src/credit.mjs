@@ -23,11 +23,15 @@
 //
 // A child paused for the process ceiling resumes when its next bounded read
 // fits. Half the ceiling is not required. A paused child, or an empty kernel
-// queue, is posted a full read of C. A shorter queued tail counts only while
-// the read is already allowed to proceed. That read spends the advertised
-// window one for one, and reply bytes already in userspace are not reserved
-// again. Deferred growth is checked at the size after that growth, against
-// the child ceiling and the process ceiling. The shared admission hole does
+// queue, is posted a full read of C. A shorter queued tail does not resume
+// that child on its own. An open line finishes on the kernel tail already
+// queued, including while the child is paused, so a credit-compliant
+// remainder is not faulted. That read spends the advertised window one for
+// one, and reply bytes already in userspace are not reserved again. The
+// spawn floor is the next grant's promise and is not reserved beside an
+// in-flight reply. Deferred growth is checked at the size after that growth,
+// against the child ceiling and the process ceiling. Promoting a deferred
+// frame does not also reserve a new read. The shared admission hole does
 // not grow past the room a surviving commitment still needs.
 // An open line is faulted total-cap only when no open line can take its next
 // read and free bytes. Combined prefixes that block one line are not that
@@ -458,7 +462,7 @@ export class CreditBook {
       let stuckSum = 0;
       for (const child of this.#live()) {
         if (!(child.openPartial > 0)) continue;
-        const incoming = this.#incoming(child);
+        const incoming = this.#openIncoming(child);
         if (!Number.isInteger(incoming)) continue;
         rows.push({ child, stuck: child.openPartial, incoming });
         stuckSum += child.openPartial;
@@ -481,11 +485,10 @@ export class CreditBook {
     const resumed = [];
     for (const child of this.#live()) {
       if (!child.paused || child.pauseReason !== 'global') continue;
-      if ((this.#readFits(child) || this.#holdFits(child)) && this.#resumeLeavesCommitments(child)) {
-        child.paused = false;
-        child.pauseReason = null;
-        resumed.push(child.id);
-      }
+      if (!this.#canResume(child)) continue;
+      child.paused = false;
+      child.pauseReason = null;
+      resumed.push(child.id);
     }
     return { resumed, faulted };
   }
@@ -601,29 +604,44 @@ export class CreditBook {
   }
 
   #afterCreditChange() {
-    // Release and settle change held bytes and outstanding replies. Resume
-    // then uses the same commitment the next grant will protect.
+    // Release and settle change held bytes and outstanding replies.
+    // Resume then rechecks paused children against the bytes that remain.
     return this.considerResume();
   }
 
-  #resumeLeavesCommitments(child) {
+  // Promotion, a full read, and a measured open-line tail are separate.
+  // Any one that fits the child ceiling resumes the child. A full read is
+  // not charged against a deferred frame, and a queued tail is not widened
+  // to C just because the child is paused.
+  #canResume(child) {
+    if (this.#holdFits(child) && this.#resumeLeavesCommitments(child, 0)) return true;
+    if (this.#readFits(child)) {
+      const incoming = this.#incoming(child);
+      const read = Number.isInteger(incoming) ? incoming : 0;
+      if (this.#resumeLeavesCommitments(child, read)) return true;
+    }
+    const tail = this.#queuedTail(child);
+    if (!this.#tailFits(child) || !Number.isInteger(tail)) return false;
+    return this.#resumeLeavesCommitments(child, tail);
+  }
+
+  #resumeLeavesCommitments(child, read) {
     if (!(this.#replyNeed(child) > 0)) return true;
     const extra = Math.max(0, child.deferred - child.held);
-    const incoming = this.#readFits(child) ? this.#incoming(child) : 0;
-    const read = Number.isInteger(incoming) ? incoming : 0;
     // The read spends the window. Reply bytes already received sit in held.
-    // Only the part of the remaining commitment the window does not cover is
-    // reserved beside that read.
-    const uncovered = Math.max(0, this.#stillOwed(child) - Math.max(0, child.window));
+    // Only the part of the remaining reply the window does not cover is
+    // reserved beside that read. The spawn floor is not part of this sum.
+    const uncovered = Math.max(0, this.#replyRemainder(child) - Math.max(0, child.window));
     return child.held + extra + read + uncovered <= child.ceiling;
   }
 
-  #stillOwed(child) {
+  #replyRemainder(child) {
     const need = this.#replyNeed(child);
     const received = Math.min(child.replyIn, need);
+    const remaining = Math.max(0, need - received);
     const reserve = controlReserveBytes();
     const control = Math.max(0, reserve - this.#hole());
-    return committedBytes(child.promised, need - received, control);
+    return remaining + control;
   }
 
   #replyNeed(child) {
@@ -752,11 +770,30 @@ export class CreditBook {
     const extra = Math.max(0, child.deferred - child.held);
     const queued = child.held + extra + child.window;
     if (queued > child.ceiling) return false;
-    if (this.#replyNeed(child) > 0) {
-      const uncovered = Math.max(0, this.#stillOwed(child) - Math.max(0, child.window));
-      if (queued + uncovered > child.ceiling) return false;
-    }
     return this.#buffered() + extra + this.#windows(null) <= this.#globalCap;
+  }
+
+  // Bytes already sitting in the kernel. An empty queue is not a tail: the
+  // next post is still a full read of C. A missing probe is not a tail.
+  #queuedTail(child) {
+    if (!Number.isInteger(child.unread) || child.unread <= 0) return null;
+    return Math.min(this.#readBytes, child.unread);
+  }
+
+  // An open line is judged on the bytes that are already queued. Pausing
+  // does not widen that tail to C. An empty queue still owes a full read.
+  #openIncoming(child) {
+    const tail = this.#queuedTail(child);
+    if (tail != null) return tail;
+    return this.#incoming(child);
+  }
+
+  #tailFits(child) {
+    if (!(child.openPartial > 0)) return false;
+    const incoming = this.#queuedTail(child);
+    if (!Number.isInteger(incoming)) return false;
+    if (child.held + incoming > child.ceiling) return false;
+    return this.#buffered() + incoming <= this.#globalCap;
   }
 
   #fault(child, faulted) {
