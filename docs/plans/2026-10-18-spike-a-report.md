@@ -136,6 +136,39 @@ Node v22.23.4. PostgreSQL 18.6. PgBouncer 1.26.0. Admin `SHOW CONFIG`: `pool_mod
 
 Transaction commands (`begin`, `commit`, `rollback`) stay simple queries, which is how Kysely 0.29.6 sends them and how PgBouncer sees the transaction end. Workload SQL, including parameterless `SELECT`, goes out as a protocol-level named statement. The name is a hash of the SQL text. PgBouncer rewrites that client name to its own `PGBOUNCER_*` name and prepares the statement on whichever server connection the transaction lands on.
 
+## Pooled search_path replay
+
+Issue #36. The #33 battery recovered a pooled `search_path` contamination by killing the backend while the checkout was held. That passes on this pooler because a linked kill closes the client socket (`discardedPoolerSessions` 0 on the battery row: the socket is already gone). It does not describe the pooler's cache. [ADR-0007](../adr/0007-pooled-contamination-recovery.md) is the decision. Sources: PgBouncer 1.26.0 `doc/config.md` and `src/varcache.c` / `src/objects.c` on tag `pgbouncer_1_26_0`.
+
+Admin `SHOW CONFIG` and `SHOW VERSION`, plus `current_setting('server_version')` on the direct app role. Three invocations, each inside the suite command below. Node v22.23.4. PostgreSQL 18.6. PgBouncer 1.26.0.
+
+| Setting | Value | Default | Changeable |
+|---|---|---|---|
+| `pool_mode` | transaction | session | yes |
+| `track_extra_parameters` | empty | empty | no |
+| `server_reset_query` | DISCARD ALL | DISCARD ALL | yes |
+| `server_reset_query_always` | 0 | 0 | yes |
+| `ignore_startup_parameters` | empty | empty | yes |
+| `max_prepared_statements` | 200 | 200 | yes |
+| `default_pool_size` | 10 | 20 | yes |
+
+`track_extra_parameters` empty does not mean `search_path` is untracked. On PostgreSQL 18 it is in the built-in variable cache.
+
+Same client, idle backend terminated, new pid, three invocations. The client socket stayed up.
+
+| Setting | Replayed onto the new backend |
+|---|---|
+| `search_path`, `TimeZone`, `application_name`, `IntervalStyle`, `DateStyle`, `default_transaction_read_only` | yes |
+| `plerni.tenant_id`, `SET ROLE` | no |
+
+A second client on that same backend sees the tracked settings at its own defaults (`search_path` is the pinned `public`) and still sees the custom GUC and the leaked role. A direct new session does not keep `search_path`. The replay is the pooler.
+
+Killing the backend during an open transaction, with no query in flight, destroys the client socket. The follow-up query is `Client has encountered a connection error and is not queryable`. That is the battery's accidental recovery.
+
+The recovery the protocol uses closes the pooler client session. On a size-1 pool the idle kill leaves `search_path=pg_catalog`. Discard closes one socket. The next checkout shows the login defaults, including on the backend the replay was using, and `withTenant` then reads tenant B's rows with zero terminations. `server_reset_query_always` stays 0.
+
+The suite command is the one in the rerun section above. These five cases are in that command. Three invocations, each after `reset.sh` and `seed.mjs`, exited 0 with 0 failing cases. JSONL stays gitignored. Passwords are not recorded. The lines are in `docs/plans/2026-10-18-spike-rerun-evidence.md`.
+
 ## Replacement-validation track
 
 Plan §8 opens the replacement-validation track when a verdict replaces the shipped substrate, and the track carries a revised capacity estimate. A1, A2, A3, A4's unnamed discipline, and A5 stay on the results the suite demonstrated. A4b is the section below. The partial-cap re-spike in the Spike B report was opened by the original FAIL. The framer residual at dev `1b1f536c6fa874369ce1d30e9337f4224961be93` closed the oversize defect. This commit's partial high-water is 69632 bytes, so that clause is FAIL. The B3 total-buffer clause is FAIL. Per plan §8 the B3 FAIL opens the replacement-validation track, and the maintainer's decision is pending between (a) accepting the measured per-child bound (caps + one read chunk + kernel socket receive buffer) and (b) a flow-control redesign. This round starts neither. The capacity annex remains T7.

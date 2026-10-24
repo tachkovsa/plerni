@@ -22,7 +22,7 @@ const LABELS = ['assignment', 'goal', 'review'];
 export interface TenantRow { tenant_id: string; label: string }
 
 export function blankEv(): HygieneEvidence {
-  return { terminatedBackendPids: [], attempts: 0, alerts: [] };
+  return { terminatedBackendPids: [], attempts: 0, alerts: [], discardedPoolerSessions: 0 };
 }
 
 export async function readRows(trx: Transaction<Db>): Promise<TenantRow[]> {

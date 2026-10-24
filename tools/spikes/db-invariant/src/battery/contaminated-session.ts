@@ -143,10 +143,10 @@ export async function contaminatedSession(): Promise<void> {
     await directPath.destroy();
   }
 
-  // Pooled: killing the backend while the checkout is still held makes the driver drop that
-  // client. The retry is a new client, so a client-tracked search_path is not replayed onto it.
-  // Releasing a still-queryable client and killing afterwards is the ordering that leaves the
-  // tracked value in place. Config is recorded on the passing path.
+  // Pooled: search_path is in PgBouncer's built-in variable cache on PostgreSQL 18, so an
+  // empty track_extra_parameters does not stop replay onto a surviving client. The protocol
+  // discards that client session after the backend kill. Killing while the server is still
+  // linked also closes the client on this pooler; the discard covers a socket that stays up.
   const path = await freshPool();
   try {
     const observed = await recordProbe(
@@ -161,8 +161,9 @@ export async function contaminatedSession(): Promise<void> {
           detail: {
             ...detailOf(rec, 1),
             searchAlerts,
+            discardedPoolerSessions: ev.discardedPoolerSessions,
             config: await searchPathConfig(),
-            mechanism: 'The driver drops a client whose backend dies during the checkout. The retry is a new client, so client-tracked search_path is not replayed.',
+            mechanism: 'Discard the pooler client session after the backend kill. A surviving client replays search_path; an empty track_extra_parameters does not disable that cache.',
           },
         };
       },

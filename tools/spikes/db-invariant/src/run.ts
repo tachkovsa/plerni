@@ -13,6 +13,7 @@ import { a4bNamed } from './cases/a4b-named.ts';
 import { poolAbort } from './battery/pool-abort.ts';
 import { interleave } from './battery/interleave.ts';
 import { contaminatedSession } from './battery/contaminated-session.ts';
+import { poolerReplay } from './pooler-replay.ts';
 import { gucForgery } from './battery/guc-forgery.ts';
 
 async function vacuityControl(): Promise<void> {
@@ -52,6 +53,7 @@ try {
   await a4bNamed();
   await poolAbort();
   await interleave();
+  await poolerReplay();
   await contaminatedSession();
   await gucForgery();
 } finally {

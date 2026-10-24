@@ -39,7 +39,7 @@ async function backendAlive(pid: number): Promise<boolean> {
 
 export async function a2Oracle(): Promise<void> {
   for (const [label, make] of [['direct', () => direct()], ['pooled', () => pooled(1)]] as const) {
-    const ev: HygieneEvidence = { terminatedBackendPids: [], attempts: 0, alerts: [] };
+    const ev: HygieneEvidence = { terminatedBackendPids: [], attempts: 0, alerts: [], discardedPoolerSessions: 0 };
     let db = make(); // pool size 1: the follow-up provably reuses the same connection
 
     // (a) clean-deny: a transaction deliberately missing the context install.

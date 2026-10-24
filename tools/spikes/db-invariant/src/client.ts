@@ -53,14 +53,37 @@ export function poolWaitingCount(db: Kysely<Db>): number {
   return pool.waitingCount;
 }
 
+interface PoolClient {
+  connection?: { stream?: { destroyed?: boolean; destroy: () => void } };
+}
+
+function poolClients(db: Kysely<Db>): PoolClient[] {
+  const pool = pools.get(db);
+  if (!pool) return [];
+  return (pool as unknown as { _clients?: PoolClient[] })._clients ?? [];
+}
+
+/**
+ * Close every client socket on this pool. Each socket is one PgBouncer client
+ * session, and that session owns the variable cache that replays tracked
+ * parameters (including search_path on PostgreSQL 18) onto the next backend.
+ * A backend kill does not clear the cache while the socket stays up.
+ * Returns how many sockets were still open.
+ */
+export function discardPoolerSessions(db: Kysely<Db>): number {
+  let closed = 0;
+  for (const client of poolClients(db)) {
+    const stream = client.connection?.stream;
+    if (!stream || stream.destroyed) continue;
+    stream.destroy();
+    closed++;
+  }
+  return closed;
+}
+
 /** Drop sockets on this pool so a wedged checkout cannot hold the process open. */
 export function unblockPool(db: Kysely<Db>): void {
-  const pool = pools.get(db);
-  if (!pool) return;
-  const clients = (pool as unknown as {
-    _clients?: Array<{ connection?: { stream?: { destroy: () => void } } }>;
-  })._clients ?? [];
-  for (const client of clients) client.connection?.stream?.destroy();
+  discardPoolerSessions(db);
 }
 
 export const direct = (max = 10) => kyselyOf(DIRECT, max);

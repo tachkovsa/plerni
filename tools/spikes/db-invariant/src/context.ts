@@ -5,12 +5,16 @@
 //   current_user = session_user (a leaked session-level SET ROLE survives transaction-mode
 //   pooling) plus search_path equals the pinned value → ③ contamination: the privileged
 //   terminator kills that backend before this checkout is released (a waiter must not be
-//   handed the contaminated session), security alert, bounded retry ≤2 on a fresh
-//   connection, then loud failure → ④ clean:
+//   handed the contaminated session), then the pooler client session is discarded.
+//   PgBouncer 1.26 keeps search_path in its built-in variable cache on PostgreSQL 18
+//   even when track_extra_parameters is empty, and replays it onto the next backend
+//   for as long as that client socket lives. Killing an unlinked server does not
+//   clear the cache. Security alert, bounded retry ≤2 on a new pooler session, then
+//   loud failure → ④ clean:
 //   set_config('plerni.tenant_id', tenant, true) + readback must equal the authorized tenant →
 // ⑤ tenant access.
 import { sql, type Kysely, type Transaction } from 'kysely';
-import { unblockPool, type Db } from './client.ts';
+import { discardPoolerSessions, unblockPool, type Db } from './client.ts';
 
 export const CONTEXT_GUCS = ['plerni.tenant_id'] as const;
 export const PINNED_SEARCH_PATH = 'public';
@@ -23,6 +27,8 @@ export interface HygieneEvidence {
   terminatedBackendPids: number[];
   attempts: number;
   alerts: string[];
+  /** Pooler client sockets closed so a tracked parameter cannot be replayed. */
+  discardedPoolerSessions: number;
 }
 
 interface SessionStateRow {
@@ -138,6 +144,10 @@ export async function withTenant<T>(
               throw new Error(`contaminated backend ${pid} accepted a query after terminate`);
             }
             ev.terminatedBackendPids.push(pid);
+            // The active kill often closes this socket (PgBouncer unlinks an SV_ACTIVE
+            // server by disconnecting the client). Discard anyway: an idle or surviving
+            // socket would replay search_path onto the retry's backend.
+            ev.discardedPoolerSessions += discardPoolerSessions(db);
           }
           throw e;
         }
