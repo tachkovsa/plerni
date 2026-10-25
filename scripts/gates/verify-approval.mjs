@@ -15,6 +15,15 @@
  * maintainer.pub stays in the digest. No extra diff flags: the digest is the
  * byte stream of that command.
  *
+ * Signers must compute that digest with --print-scope, passing the same
+ * base and head this verifier will use:
+ *   node scripts/gates/verify-approval.mjs --base <base> --head <head> --print-scope
+ * That command pins git's default diff settings (prefixes, color, context,
+ * rename detection, and the diff algorithm) and ignores GIT_EXTERNAL_DIFF.
+ * A hand-rolled `git diff` follows a custom local diff setting and emits a
+ * different byte stream. Hashing that stream produces a different digest.
+ * This verifier rejects it. The mismatch fails closed.
+ *
  * A change to either half of an artifact pair (the json or the detached sig),
  * including a deletion or a rename, is verified or rejected. A signature-only
  * edit is not an empty scope.
@@ -75,12 +84,38 @@ const fail = (message) => {
   process.exit(1);
 };
 
-const git = (cwd, args) =>
-  execFileSync("git", args, {
+const git = (cwd, args, envOverrides) => {
+  const env = { ...process.env };
+  if (envOverrides) {
+    for (const [key, value] of Object.entries(envOverrides)) {
+      if (value == null) delete env[key];
+      else env[key] = value;
+    }
+  }
+  return execFileSync("git", args, {
     cwd,
+    env,
     stdio: ["ignore", "pipe", "pipe"],
     maxBuffer: 32 * 1024 * 1024,
   });
+};
+
+// Command-line -c overrides local and global git config. The values are
+// git's defaults, so a clean `git diff` and this command hash the same bytes.
+// An empty diff.external is not usable: git then tries to execute it.
+const DIFF_DEFAULTS = [
+  "-c", "core.quotePath=true",
+  "-c", "color.ui=false",
+  "-c", "color.diff=false",
+  "-c", "diff.mnemonicPrefix=false",
+  "-c", "diff.noprefix=false",
+  "-c", "diff.context=3",
+  "-c", "diff.interHunkContext=0",
+  "-c", "diff.indentHeuristic=true",
+  "-c", "diff.renames=true",
+  "-c", "diff.algorithm=myers",
+  "-c", "diff.suppressBlankEmpty=false",
+];
 
 const resolveCommit = (cwd, rev) => {
   try {
@@ -100,7 +135,9 @@ const gitShow = (cwd, rev, path) => {
 
 const scopedDiff = (cwd, base, head) => {
   try {
-    return git(cwd, ["diff", base, head, "--", ...SCOPE_PATHS]);
+    return git(cwd, [...DIFF_DEFAULTS, "diff", base, head, "--", ...SCOPE_PATHS], {
+      GIT_EXTERNAL_DIFF: null,
+    });
   } catch (err) {
     fail(`cannot read the scoped diff (${err.message}) — FAIL CLOSED`);
   }

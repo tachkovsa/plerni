@@ -14,6 +14,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { parse as parseYaml } from "yaml";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const fixtures = join(here, "fixtures");
@@ -452,7 +453,20 @@ const scopeOf = (dir, base, head) => {
   return hash;
 };
 const plainScope = (dir, base, head) => {
+  const env = { ...process.env };
+  delete env.GIT_EXTERNAL_DIFF;
   const diff = execFileSync("git", [
+    "-c", "core.quotePath=true",
+    "-c", "color.ui=false",
+    "-c", "color.diff=false",
+    "-c", "diff.mnemonicPrefix=false",
+    "-c", "diff.noprefix=false",
+    "-c", "diff.context=3",
+    "-c", "diff.interHunkContext=0",
+    "-c", "diff.indentHeuristic=true",
+    "-c", "diff.renames=true",
+    "-c", "diff.algorithm=myers",
+    "-c", "diff.suppressBlankEmpty=false",
     "diff", base, head, "--",
     ".github/workflows/",
     "scripts/gates/",
@@ -460,7 +474,7 @@ const plainScope = (dir, base, head) => {
     "tools/spikes/*/bench/.artifacts/",
     ":(exclude)scripts/gates/approvals/*.json",
     ":(exclude)scripts/gates/approvals/*.json.sig",
-  ], { cwd: dir });
+  ], { cwd: dir, env });
   return createHash("sha256").update(diff).digest("hex");
 };
 const writeSignedArtifact = (dir, keyFile, scope) => {
@@ -621,6 +635,36 @@ const harnessScopeMatches =
   harnessOutsideHash === plainScope(harnessScope.dir, harnessScope.base, harnessOutside) &&
   harnessOutsideHash === "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" &&
   harnessInsideHash !== harnessOutsideHash;
+const customDiff = repoWithBaseKey(approvalKeyA);
+writeFileSync(join(customDiff.dir, ".github/workflows/p0-gates.yml"), "custom-diff\n");
+const customHead = commitTree(customDiff.dir, "ci: change workflow under a custom diff config");
+approvalGit(customDiff.dir, ["config", "diff.mnemonicPrefix", "true"]);
+approvalGit(customDiff.dir, ["config", "diff.noprefix", "true"]);
+approvalGit(customDiff.dir, ["config", "color.ui", "always"]);
+const customStable = scopeOf(customDiff.dir, customDiff.base, customHead);
+const customDefault = plainScope(customDiff.dir, customDiff.base, customHead);
+const customRaw = createHash("sha256")
+  .update(execFileSync("git", [
+    "diff", customDiff.base, customHead, "--",
+    ".github/workflows/",
+    "scripts/gates/",
+    "tools/harness/sql/",
+    "tools/spikes/*/bench/.artifacts/",
+    ":(exclude)scripts/gates/approvals/*.json",
+    ":(exclude)scripts/gates/approvals/*.json.sig",
+  ], { cwd: customDiff.dir }))
+  .digest("hex");
+const customDiffStable = customStable === customDefault && customStable !== customRaw;
+cases.push({
+  name: "verify-approval scope digest ignores custom local git diff settings",
+  cmd: [
+    process.execPath,
+    ["-e", customDiffStable ? "console.log('scope digest stable')" : "console.error('scope digest followed local diff settings'); process.exit(1)"],
+  ],
+  expectExit: 0,
+  expectOutput: /scope digest stable/,
+});
+
 cases.push({
   name: "verify-approval scope is tools/harness/sql and not the rest of the harness",
   cmd: [
@@ -714,6 +758,9 @@ cases.push({
   expectExit: 1,
   expectOutput: /scanner exit 0 contradicts a planted finding — a leak must exit 1(?![\s\S]*negative proof OK)/,
 });
+// Report mode (--report and --scanner-exit) is the only coverage of a
+// completed scan whose planted finding is missing. These cases do not run
+// the live scanner.
 cases.push({
   name: "secrets negative proof rejects a completed scan that lacks the planted rule",
   cmd: gate("secrets-negative.mjs", "--report", wrongRuleReport, "--scanner-exit", "1"),
@@ -769,33 +816,105 @@ cases.push({
   expectOutput: /scanner failed \(no exit code\) — a crash is not a finding(?![\s\S]*negative proof OK)/,
 });
 
-const gatesWorkflow = readFileSync(join(here, "../../.github/workflows/p0-gates.yml"), "utf8");
-const approvalWorkflow = readFileSync(join(here, "../../.github/workflows/approval-artifact.yml"), "utf8");
-const workflowWired =
-  gatesWorkflow.includes("node scripts/gates/secrets-negative.mjs") &&
-  !gatesWorkflow.includes("verify-approval.mjs") &&
-  gatesWorkflow.includes("scanner failure, not evidence") &&
-  gatesWorkflow.includes("absent finding") &&
-  gatesWorkflow.includes("nonzero exit alone is not proof") &&
-  gatesWorkflow.includes("no exit code") &&
-  !gatesWorkflow.includes("secrets negative proof OK (gitleaks exit") &&
-  approvalWorkflow.includes("pull_request_target:") &&
-  approvalWorkflow.includes("github.event.pull_request.base.sha") &&
-  approvalWorkflow.includes("github.event.before") &&
-  approvalWorkflow.includes("git merge-base") &&
-  approvalWorkflow.includes("github.event.pull_request.head.sha") &&
-  approvalWorkflow.includes('git fetch --no-tags origin "$HEAD_SHA"') &&
-  approvalWorkflow.includes("node scripts/gates/verify-approval.mjs") &&
-  approvalWorkflow.includes("11d5960a326750d5838078e36cf38b85af677262") &&
-  approvalWorkflow.includes("github.event.pull_request.base.sha || github.sha") &&
-  !approvalWorkflow.includes("pull/${PR_NUMBER}/head") &&
-  !approvalWorkflow.includes("FETCH_HEAD") &&
-  !approvalWorkflow.includes("git show HEAD:scripts/gates/approvals/maintainer.pub");
+const parseWorkflow = (text, label) => {
+  const doc = parseYaml(text);
+  if (!doc || typeof doc !== "object" || Array.isArray(doc)) {
+    throw new Error(`${label} did not parse as a workflow mapping`);
+  }
+  return doc;
+};
+const stepList = (job) => (Array.isArray(job?.steps) ? job.steps : []);
+const runsOf = (doc) =>
+  Object.values(doc.jobs ?? {}).flatMap((job) =>
+    stepList(job).map((step) => (typeof step?.run === "string" ? step.run : "")),
+  );
+const workflowWiringProblems = () => {
+  const gates = parseWorkflow(
+    readFileSync(join(here, "../../.github/workflows/p0-gates.yml"), "utf8"),
+    "p0-gates.yml",
+  );
+  const approval = parseWorkflow(
+    readFileSync(join(here, "../../.github/workflows/approval-artifact.yml"), "utf8"),
+    "approval-artifact.yml",
+  );
+  const problems = [];
+  const negative = stepList(gates.jobs?.secrets).filter(
+    (step) => typeof step?.run === "string" && step.run.trim() === "node scripts/gates/secrets-negative.mjs",
+  );
+  if (negative.length !== 1) problems.push("secrets job must run secrets-negative.mjs exactly once");
+  if (runsOf(gates).some((run) => run.includes("verify-approval.mjs"))) {
+    problems.push("p0-gates must not run verify-approval.mjs");
+  }
+  const trigger = approval.on;
+  if (!trigger || typeof trigger !== "object" || Array.isArray(trigger) || !Object.hasOwn(trigger, "pull_request_target")) {
+    problems.push("approval workflow must trigger on pull_request_target");
+  }
+  const branches = trigger && typeof trigger === "object" ? trigger.push?.branches : undefined;
+  if (!Array.isArray(branches) || !branches.includes("dev")) problems.push("approval workflow push branches must include dev");
+  const permissions = approval.permissions;
+  if (!permissions || permissions.contents !== "read" || Object.keys(permissions).length !== 1) {
+    problems.push("approval workflow permissions must be contents: read only");
+  }
+  const job = approval.jobs?.["approval-artifact"];
+  if (!job || typeof job !== "object" || Array.isArray(job)) problems.push("approval-artifact job is missing");
+  if (job?.permissions != null) problems.push("approval job must not raise permissions");
+  const steps = stepList(job);
+  const checkouts = steps.filter((step) => typeof step?.uses === "string" && step.uses.startsWith("actions/checkout@"));
+  if (checkouts.length !== 1) problems.push("approval workflow must have one actions/checkout step");
+  const checkout = checkouts[0];
+  const pin = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262";
+  if (checkout && checkout.uses !== pin) problems.push("checkout must be pinned to the reviewed action sha");
+  const baseRef = "${{ github.event_name == 'pull_request_target' && github.event.pull_request.base.sha || github.sha }}";
+  if (checkout && checkout.with?.ref !== baseRef) problems.push("checkout ref must be the base sha");
+  if (checkout && checkout.with?.["fetch-depth"] !== 0) problems.push("checkout fetch-depth must be 0");
+  if (checkout && checkout.with?.["persist-credentials"] !== false) problems.push("checkout persist-credentials must be false");
+  const fetchStep = steps.find((step) => step?.env && Object.hasOwn(step.env, "HEAD_SHA"));
+  if (!fetchStep) problems.push("fetch step must pass HEAD_SHA");
+  if (fetchStep && fetchStep.env.HEAD_SHA !== "${{ github.event.pull_request.head.sha }}") {
+    problems.push("HEAD_SHA must be the event head sha");
+  }
+  if (fetchStep && fetchStep.if !== "github.event_name == 'pull_request_target'") {
+    problems.push("fetch step must run only for pull_request_target");
+  }
+  const fetchRun = typeof fetchStep?.run === "string" ? fetchStep.run : "";
+  if (!fetchRun.includes('git fetch --no-tags origin "$HEAD_SHA"')) problems.push("fetch must request the event head sha");
+  if (fetchRun.includes("pull/${PR_NUMBER}/head") || fetchRun.includes("FETCH_HEAD")) {
+    problems.push("fetch must not use the moving pull ref or FETCH_HEAD");
+  }
+  const verify = steps.find((step) => typeof step?.run === "string" && step.run.includes("verify-approval.mjs"));
+  if (!verify) problems.push("verify step must run verify-approval.mjs");
+  const baseExpr = "${{ github.event_name == 'pull_request_target' && github.event.pull_request.base.sha || github.event.before }}";
+  const headExpr = "${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || 'HEAD' }}";
+  if (verify?.env?.APPROVAL_BASE !== baseExpr) problems.push("APPROVAL_BASE must be the base sha or event.before");
+  if (verify?.env?.APPROVAL_HEAD !== headExpr) problems.push("APPROVAL_HEAD must be the event head sha or HEAD");
+  const verifyRun = typeof verify?.run === "string" ? verify.run : "";
+  if (!verifyRun.includes('base=$(git merge-base "$APPROVAL_BASE" "$APPROVAL_HEAD")')) {
+    problems.push("pull request base must be the merge-base");
+  }
+  if (!verifyRun.includes('node scripts/gates/verify-approval.mjs --base "$base" --head "$APPROVAL_HEAD" --event "$APPROVAL_EVENT"')) {
+    problems.push("verify step must run the base copy of verify-approval.mjs");
+  }
+  if (verifyRun.includes("git show HEAD:scripts/gates/approvals/maintainer.pub") || verifyRun.includes("FETCH_HEAD")) {
+    problems.push("verify step must not read the head key or FETCH_HEAD");
+  }
+  return problems.join("; ");
+};
+let workflowWiringReport = "";
+try {
+  workflowWiringReport = workflowWiringProblems();
+} catch (err) {
+  workflowWiringReport = err instanceof Error ? err.message : String(err);
+}
 cases.push({
   name: "approval verification runs from the base workflow, not the pull request checkout",
   cmd: [
     process.execPath,
-    ["-e", workflowWired ? "console.log('workflow wiring OK')" : "console.error('workflow wiring missing'); process.exit(1)"],
+    [
+      "-e",
+      workflowWiringReport
+        ? `console.error(${JSON.stringify(`workflow wiring: ${workflowWiringReport}`)}); process.exit(1)`
+        : "console.log('workflow wiring OK')",
+    ],
   ],
   expectExit: 0,
   expectOutput: /workflow wiring OK/,
