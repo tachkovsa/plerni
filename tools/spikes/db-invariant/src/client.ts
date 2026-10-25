@@ -41,6 +41,21 @@ export function kyselyOf(dsn: string, max = 10): Kysely<Db> {
   const pool = new pg.Pool({ connectionString: dsn, max });
   pool.on('error', (e) => { idlePoolErrors.push(String(e)); });
   pool.on('connect', (client) => { client.on('error', (e) => { idlePoolErrors.push(String(e)); }); });
+  return bindPool(pool);
+}
+
+/**
+ * Register a pool the spike already built. The surviving-client test uses this
+ * so `discardPoolerSessions` sees the same sockets `withTenant` is holding.
+ * The object must expose pg's `connect`/`end` and the `_clients` list the
+ * discard walks. It is not a second production pool.
+ */
+export function kyselyOfPool(pool: pg.Pool): Kysely<Db> {
+  pool.on('error', (e) => { idlePoolErrors.push(String(e)); });
+  return bindPool(pool);
+}
+
+function bindPool(pool: pg.Pool): Kysely<Db> {
   const db = new Kysely<Db>({ dialect: new PostgresDialect({ pool }) });
   pools.set(db, pool);
   return db;
@@ -53,14 +68,37 @@ export function poolWaitingCount(db: Kysely<Db>): number {
   return pool.waitingCount;
 }
 
+interface PoolClient {
+  connection?: { stream?: { destroyed?: boolean; destroy: () => void } };
+}
+
+function poolClients(db: Kysely<Db>): PoolClient[] {
+  const pool = pools.get(db);
+  if (!pool) return [];
+  return (pool as unknown as { _clients?: PoolClient[] })._clients ?? [];
+}
+
+/**
+ * Close every client socket on this pool. Each socket is one PgBouncer client
+ * session, and that session owns the variable cache that replays tracked
+ * parameters (including search_path on PostgreSQL 18) onto the next backend.
+ * A backend kill does not clear the cache while the socket stays up.
+ * Returns how many sockets were still open.
+ */
+export function discardPoolerSessions(db: Kysely<Db>): number {
+  let closed = 0;
+  for (const client of poolClients(db)) {
+    const stream = client.connection?.stream;
+    if (!stream || stream.destroyed) continue;
+    stream.destroy();
+    closed++;
+  }
+  return closed;
+}
+
 /** Drop sockets on this pool so a wedged checkout cannot hold the process open. */
 export function unblockPool(db: Kysely<Db>): void {
-  const pool = pools.get(db);
-  if (!pool) return;
-  const clients = (pool as unknown as {
-    _clients?: Array<{ connection?: { stream?: { destroy: () => void } } }>;
-  })._clients ?? [];
-  for (const client of clients) client.connection?.stream?.destroy();
+  discardPoolerSessions(db);
 }
 
 export const direct = (max = 10) => kyselyOf(DIRECT, max);
