@@ -24,6 +24,9 @@ jobs:
       # a bad flag, a missing report, a signal or other termination with no exit code,
       # or any exit other than 0 or 1. A completed scan whose
       # report lacks that rule and file is an absent finding.
+      # That completed-scan case (the scan ran, the planted finding is
+      # missing) is covered in report mode only, by gate-health passing
+      # --report and --scanner-exit. It is not a live scanner run.
       # Exit 0 together with that finding is not proof: a leak must exit 1.
       # Neither may pass. A nonzero exit alone is not proof. The repo
       # allowlist is not loaded here; it applies only to the history scan.

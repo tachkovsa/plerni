@@ -24,7 +24,9 @@ jobs:
         with:
           ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.base.sha || github.sha }}
           fetch-depth: 0
-          persist-credentials: true
+          # The later fetch of the event head sha uses the public remote.
+          # The token is not kept in git config after checkout.
+          persist-credentials: false
 
       - name: fetch the pull request head sha
         if: github.event_name == 'pull_request_target'
