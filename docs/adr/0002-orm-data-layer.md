@@ -130,7 +130,7 @@ These match D06 and plan §3.0. The spike's pass means none of them is open.
 
 ## Review
 
-Tenancy content is high-risk. This file is the proposed decision. It is not a review receipt. Acceptance needs a receipt on the accepting revision: reviewed head SHA, reviewer role, accountable sponsor, verification summary, outcome, opaque evidence ID, and a family-separation assertion (a human reviewer, or a reviewer outside the family that generated the text). The author of this record does not write that receipt. Status stays Proposed until that receipt exists and this status moves to Accepted.
+Tenancy content is high-risk. This file is the proposed decision. It is not a review receipt. Acceptance needs a receipt on the accepting revision: reviewed head SHA, reviewer role, accountable sponsor, verification summary, outcome, opaque evidence ID, and a family-separation assertion. This record was assembled from independent drafts and a merged text. The reviewer is a human, or an agent from a different model family than every family that produced any of those drafts or the merged text. When any of those families is unknown, the reviewer is a human. The assertion states that separation, or states that the review is human because a family is unknown. The author of this record does not write that receipt. Status stays Proposed until that receipt exists and this status moves to Accepted.
 
 ## Sources
 
