@@ -3,6 +3,9 @@
 **Status:** v7 — final; incorporates γ's disposition check on v6 (2 MAJOR + 5 MINOR, all one-clause edits, applied verbatim). Chain complete per γ: this pass + the maintainer's sign-off. · **Date:** 2026-10-13
 
 **Amendment (2026-10-25, issue #15):** T7 is the contributor roadmap (`docs/ROADMAP.md`), not a capacity annex. The arithmetic bar, the Monte Carlo rule, and `docs/plans/capacity-annex.md` are withdrawn. T7 is not gated on spike verdicts and is not high-risk. Spike reports keep their buffer figures as evidence for the open replacement track. Those figures are not a schedule.
+
+**Errata (2026-10-26, issue #25):** T2, T3a, and T5a host ports are `127.0.0.1:54320` (direct) and `127.0.0.1:54321` (PgBouncer). Container listen ports stay 5432 and 6432. Host ports are 54320/54321, not 5432/6432: the standard ports are commonly occupied on dev machines. The datasource contract is the topology (direct, pooled, admin console — the plan §2), not the port number. Spike clients take DSNs from `HARNESS_DIRECT_DSN`, `HARNESS_POOLED_DSN`, `HARNESS_ADMIN_DSN`, and `HARNESS_ROOT_DSN`. `tools/harness/README.md` already states the host ports.
+
 **Source of truth:** the P0 plan — **after T1 merges it lives at `docs/plans/2026-10-13-p0-implementation-plan.md`** (v12 content). Every task cites it as **"the plan §X"**. Where documents disagree, the plan wins — report the conflict, don't improvise.
 
 **Audience contract (binding):** every task states Goal · Read-first · Exact files · Steps · Acceptance (commands + expected observations) · NOT-list · Risk class · PR split. An executor without conversational context must be able to finish the task. Contradiction with a referenced doc → STOP and file a question.
@@ -55,7 +58,7 @@ pnpm-lock.yaml                   # EDIT — tools/harness is already a workspace
 .gitignore                       # EDIT — add tools/harness/pgbouncer/userlist.txt
 ```
 **Steps:**
-1. `docker-compose.yml`: `postgres` (image `postgres:18`, digest-pinned at implementation time, digest recorded in README) + `pgbouncer` (image `edoburu/pgbouncer:v1.26.0-p0`, digest-pinned). Healthchecks both. Ports `5432` (direct), `6432` (PgBouncer). `POSTGRES_PASSWORD` passes from env (`${POSTGRES_PASSWORD:?unset}`) — no literal. No Valkey/S3.
+1. `docker-compose.yml`: `postgres` (image `postgres:18`, digest-pinned at implementation time, digest recorded in README) + `pgbouncer` (image `edoburu/pgbouncer:v1.26.0-p0`, digest-pinned). Healthchecks both. Publish host `127.0.0.1:54320` → container `5432` (direct) and host `127.0.0.1:54321` → container `6432` (PgBouncer). Container listen ports stay 5432/6432. Host ports are 54320/54321, not 5432/6432 (issue #25: the standard ports are commonly occupied on dev machines; the datasource contract is the topology, not the port number). `POSTGRES_PASSWORD` passes from env (`${POSTGRES_PASSWORD:?unset}`) — no literal. No Valkey/S3.
 2. `pgbouncer.ini`: `[databases]` mapping (`plerni = host=postgres …`, and the console is dbname `pgbouncer`); `pool_mode = transaction`; `max_prepared_statements = 0`; `auth_type = scram-sha-256`; `auth_file = /etc/pgbouncer/userlist.txt`; **`default_pool_size = 10` pinned** (T5c's saturated-pool case keys on it); **`stats_users = plerni_admin_ro`** (read-only console — `admin_users` would grant PAUSE/SHUTDOWN; the plan promises read-only). Comment every non-default line.
 3. **Credentials (all named, env-only):** `POSTGRES_PASSWORD` (compose superuser; also reset.sh's admin credential and the `ALTER ROLE` injection path in T3b), `PLERNI_APP_PASSWORD`, `PLERNI_MIGRATE_PASSWORD`, `PLERNI_ADMIN_PASSWORD`. `render-secrets.mjs` → gitignored `userlist.txt`; unset var → non-zero exit naming it.
 4. `sql/001_roles.sql`: `plerni_app` (NOBYPASSRLS, LOGIN) · `plerni_migrate` · `plerni_admin_ro`; passwords via psql `-v`; **plus** `ALTER ROLE plerni_app SET search_path TO <fixture schema>` (the pinned value T3a's protocol asserts — plan §2/γ-N3) **plus** a membership fixture: role `plerni_plugin_a` with `GRANT plerni_plugin_a TO plerni_app` (enables T3b's SET ROLE injection — without membership the injection can't be built and an executor would grant something broad, δ-M5).
@@ -63,11 +66,11 @@ pnpm-lock.yaml                   # EDIT — tools/harness is already a workspace
 6. `sql/003_fencing_authority.sql`: five-state status enum, `heartbeat_at`, `created_at`; **grants**: `plerni_app` gets SELECT/INSERT/UPDATE on it (the spike's executor and sweeper act as this role). Comment: harness-owned; spikes consume, never redefine.
 7. `reset.sh`: render-secrets → compose up → wait healthy → create `plerni` DB → apply sql/001–003 via the superuser credential from env. Idempotent, fail-loud.
 8. `seed.mjs`: tenants A/B, overlapping `label`, prints counts.
-9. README: quickstart; three connection strings; heartbeat-traffic note (renewals use a **dedicated direct connection on 5432**, never the main pooled datasource — plan §4 B2); honesty note on topology relaxation (spec §4.4). PR body notes the license-audit scope change (workspace member added).
+9. README: quickstart; three connection strings on host ports 54320 (direct) and 54321 (pooled and the admin console); heartbeat-traffic note (renewals use a **dedicated direct connection on 54320**, never the main pooled datasource — plan §4 B2); honesty note on topology relaxation (spec §4.4). PR body notes the license-audit scope change (workspace member added).
 **Acceptance (paste outputs):**
 - `docker compose -f tools/harness/docker-compose.yml config --no-interpolate` renders (never paste interpolated output — that would publish the credential, §0); `up -d` → both healthy ≤60 s.
-- `psql` via 5432 and 6432 → `select 1` answers.
-- `psql "… port=6432 dbname=pgbouncer user=plerni_admin_ro" -c 'SHOW CONFIG'` → rows (read-only console via stats_users).
+- `psql` via host ports 54320 and 54321 → `select 1` answers.
+- `psql "… port=54321 dbname=pgbouncer user=plerni_admin_ro" -c 'SHOW CONFIG'` → rows (read-only console via stats_users).
 - `./reset.sh && node seed.mjs` → 2 tenants; no context → `select count(*) from plerni_tenant` = `0`; with `SET plerni.tenant_id='<A>'` → only A's rows.
 - `\d fencing_authority` → five-state constraint; `SELECT rolname FROM pg_roles WHERE rolname LIKE 'plerni%'` → 4 roles incl. `plerni_plugin_a`.
 - `pnpm install --frozen-lockfile` green (lockfile updated); `git status` → userlist.txt ignored.
@@ -83,7 +86,7 @@ pnpm-lock.yaml                   # EDIT — tools/harness is already a workspace
 tools/spikes/db-invariant/
   package.json                  # private; name: "@plerni-spike/db-invariant"; "type": "module"; deps: pg@8.23.1, kysely@0.29.6; devDeps: typescript@5.9.3; scripts: "typecheck": "tsc --noEmit", "spike": "node src/run.ts"
   tsconfig.json                 # extends ../../../tsconfig.base.json; adds "allowImportingTsExtensions": true AND "noEmit": true (required combination under the base's NodeNext + verbatimModuleSyntax — without it conventional ESM .ts fails with TS1287, β-M4)
-  src/client.ts                 # THREE datasources: direct (5432), pooled (6432/plerni), pgbouncer-admin (6432/pgbouncer, read-only SHOW)
+  src/client.ts                 # THREE datasources from env (HARNESS_DIRECT_DSN, HARNESS_POOLED_DSN, HARNESS_ADMIN_DSN; HARNESS_ROOT_DSN for the superuser path): direct (host 54320), pooled (host 54321/plerni), pgbouncer-admin (host 54321/pgbouncer, read-only SHOW)
   src/context.ts                # ordered hygiene protocol, verbatim from plan §2
   src/evidence.ts               # JSONL evidence writer
   src/cases/a1-pinning.ts
@@ -157,7 +160,7 @@ tools/spikes/ipc-harness/
 (and `pnpm-lock.yaml` — EDIT, follows the manifest; the workspace glob itself is T2's, δ-N6)
 **Steps:**
 1. `framing.mjs` first — **two distinct codecs, never conflated** (δ-m4): NDJSON-over-stdio (child link; the never-terminated-frame case lives here) and length-prefixed mux frames (bridge). Property tests use a **seeded PRNG** (hand-rolled, no new dependency): arbitrary byte streams never corrupt frames; oversize (>1 MiB), incremental-oversize, never-terminated, malformed → typed errors; per-connection partial-frame buffer cap enforced. No per-frame checksum (not in the plan — no new scope).
-2. `authority.mjs` verbatim per plan B2: QUEUED at submission (sweeper never touches); `QUEUED→ACTIVE` stamps `heartbeat_at`; conditional transitions (`WHERE id=:x AND status='ACTIVE'`); renewal on the **reserved path** (dedicated direct connection on 5432); cadence **5 s** and lease **20 s** pinned for the spike (lease ≥ 3× cadence + scheduling delay — plan B2); sweeper `ACTIVE→ABANDONED` on expired lease; terminal retention; **shutdown: stop renewal scheduling immediately before issuing the conditional COMMITTED update → resolve the effects transaction → drain renewals** (bound and record last-renewal→row-lock interval).
+2. `authority.mjs` verbatim per plan B2: QUEUED at submission (sweeper never touches); `QUEUED→ACTIVE` stamps `heartbeat_at`; conditional transitions (`WHERE id=:x AND status='ACTIVE'`); renewal on the **reserved path** (dedicated direct connection, DSN `HARNESS_DIRECT_DSN`, host default 54320); cadence **5 s** and lease **20 s** pinned for the spike (lease ≥ 3× cadence + scheduling delay — plan B2); sweeper `ACTIVE→ABANDONED` on expired lease; terminal retention; **shutdown: stop renewal scheduling immediately before issuing the conditional COMMITTED update → resolve the effects transaction → drain renewals** (bound and record last-renewal→row-lock interval).
 3. `echo.mjs` + `smoke.mjs`: round-trip over stdio framing; authority transitions on harness PG.
 **Acceptance:** property tests + smoke pass with evidence JSONL.
 **NOT:** no IPC library; no TLS; no other children; no heartbeats inside the effects transaction; no unrequested features (checksums etc.).
