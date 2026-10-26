@@ -97,7 +97,7 @@ The identity-stamping vacuity control is a pass of the runner because the exploi
 
 ADR-0004 cites this section. The label above applies to all of it: the authority row is the minimal real authority, and the full broker proof remains P2 acceptance.
 
-Cadence is 5 s and the lease is 20 s. Renewal traffic for the capacity annex is about `active executions / cadence` UPDATE transactions per second. Smoke, on the pooled main path, recorded 2 renewals in a 12 s effects phase (last renewal-to-lock 2003 ms) and 3 renewals in a 16 s phase (1006 ms). A slow renewal that held the row lock measured last renewal-to-lock 2 ms and lock wait 2010 ms, inside the 5000 ms bound.
+Cadence is 5 s and the lease is 20 s. Renewal traffic is about `active executions / cadence` UPDATE transactions per second. Issue #15 withdrew the schedule annex that would have consumed this figure. Smoke, on the pooled main path, recorded 2 renewals in a 12 s effects phase (last renewal-to-lock 2003 ms) and 3 renewals in a 16 s phase (1006 ms). A slow renewal that held the row lock measured last renewal-to-lock 2 ms and lock wait 2010 ms, inside the 5000 ms bound.
 
 | Case | Suite result | What the passing oracle required |
 |---|---|---|
@@ -122,8 +122,8 @@ B1, B2, B4, B5, B6, and the race battery stay on framed NDJSON, the supervisor-s
 
 ### Revised capacity note
 
-T7 still writes the annex. The partial-cap track stays open. This note is what that open track and the failed total-buffer rerun attach.
+Issue #15 later withdrew the capacity annex; T7 is the contributor roadmap (`docs/ROADMAP.md`). The partial-cap track stays open. This note is what that open track and the failed total-buffer rerun attach. It is not a schedule.
 
 The enforced partial cap is 32768 bytes per child. The framer residual is 36864 bytes. The scored high-water, including the in-flight tail, is 69632 bytes in all three runs, above the cap plus one 4096-byte read chunk. The scored total cap is 49152 bytes for that one child, plus one 4096-byte read chunk. The three accounted totals were 106496, 57344, and 155648. The stdout socket's measured receive buffer was 131072 bytes. The cap does not cover the chunk tail plus the unread socket bytes.
 
-Renewal traffic stays `active executions / cadence` UPDATE transactions per second. RSS growth on the holds stayed at or under 67108864. The largest sample was 17641472. This note does not compute the rest of the T7 annex.
+Renewal traffic stays `active executions / cadence` UPDATE transactions per second. RSS growth on the holds stayed at or under 67108864. The largest sample was 17641472. This note does not compute a schedule. The annex that would have used these figures was withdrawn (issue #15).

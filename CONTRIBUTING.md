@@ -1,5 +1,7 @@
 # Contributing to Plerni
 
+New here? Start with the [roadmap](docs/ROADMAP.md): what Plerni is, the phases, and the current [good first issues](https://github.com/tachkovsa/plerni/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22). People in HR, learning and development, and education technology can contribute without writing code.
+
 ## Legal
 
 All contributions are made under the Apache-2.0 license. The [Developer Certificate of Origin](https://developercertificate.org/) remains the licensing standard, but **a `Signed-off-by:` line is not required at the current stage**, and the commit-policy gate does not check for one. A human may still add a sign-off; an agent does not certify the DCO. Sign-off is distinct from a cryptographic commit signature.

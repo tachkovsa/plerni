@@ -15,6 +15,10 @@ This file records the review chain for `2026-10-13-p0-implementation-plan.md` an
 
 **Detailed implementation plan:** family γ ×3 rounds + family δ ×2 rounds + family β ×1 round (74 findings total, all resolved) → final ACCEPT by γ.
 
-**Family separation (plan §9):** β authored the §12 theme-discovery content and materially shaped the §5 method; γ and δ authored adopted fix text — therefore the capacity annex (deliverable 5) is reviewed by the human maintainer, and ADR-0005 is never β-reviewed. γ-originated fix lines in the plan are covered by the maintainer's human genesis receipt on the landing PR.
+**Family separation (plan §9):** β authored the §12 theme-discovery content and materially shaped the §5 method; γ and δ authored adopted fix text — therefore the capacity annex (then deliverable 5) was to be reviewed by the human maintainer, and ADR-0005 is never β-reviewed. The annex was withdrawn after this review; see the amendment below. γ-originated fix lines in the plan are covered by the maintainer's human genesis receipt on the landing PR.
 
-**Outcome:** ACCEPT. Acceptance applies to the plans; P0 completion requires executing the prescribed controls and recording observed spike and gate evidence (spec §15).
+**Outcome:** ACCEPT. Acceptance applies to the plans as reviewed; P0 completion requires executing the prescribed controls and recording observed spike and gate evidence (spec §15).
+
+## Later amendment
+
+Issue #15 (maintainer decision 2026-10-25) withdrew deliverable 5, the capacity annex, after this review. The human-maintainer review of that annex is not an open obligation. ADR-0005 is still never β-reviewed. The replacement is [`../ROADMAP.md`](../ROADMAP.md). The §5 method text remains in the plan so this chain's dispositions still have a referent.

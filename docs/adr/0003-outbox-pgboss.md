@@ -3,7 +3,7 @@
 - **Status:** Accepted · **Date:** 2026-10-14
 - **Spec:** [`../specs/2026-10-12-plerni-design.md`](../specs/2026-10-12-plerni-design.md) §7 (queue & events), §16.17 (duplicate/loss battery)
 - **Register:** [`../decision-register.html`](../decision-register.html) — **D10**
-- **Plan:** [`../plans/2026-10-13-p0-implementation-plan.md`](../plans/2026-10-13-p0-implementation-plan.md) §5 (capacity method), §8 (replacement-validation branch)
+- **Plan:** [`../plans/2026-10-13-p0-implementation-plan.md`](../plans/2026-10-13-p0-implementation-plan.md) §8 (replacement-validation branch). Plan §5 is the withdrawn schedule model (issue #15). Throughput for this record is the measured formula in Consequences, not that model.
 
 ## Context
 
