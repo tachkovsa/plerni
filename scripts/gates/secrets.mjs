@@ -12,9 +12,11 @@
  * Scanner output is discarded. The diagnostic prints only an allowlisted
  * rule id and file basename, never the report body.
  *
- * Resolution order: --scanner, else the pinned image used by
- * .github/workflows/p0-gates.yml when docker is installed, else the
- * official v8.30.1 release archive. Archive checksums are the published
+ * Resolution order: --scanner, else the digest-pinned v8.30.1 image when
+ * docker is installed, else the official v8.30.1 release archive.
+ * The image pin is the registry Docker-Content-Digest of tag v8.30.1
+ * (oci index, 2026-10-26). The linux/amd64 and linux/arm64 configs in
+ * that index are labeled v8.30.1. Archive checksums are the published
  * v8.30.1 checksums file:
  * https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_checksums.txt
  */
@@ -25,7 +27,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 
-const IMAGE = "zricethezav/gitleaks:v8.30.1";
+const IMAGE = "zricethezav/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f";
 const VERSION = "8.30.1";
 const RULE_ID = /^[A-Za-z0-9._-]{1,80}$/;
 const FILE_NAME = /^[A-Za-z0-9._-]{1,200}$/;
