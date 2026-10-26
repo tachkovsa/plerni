@@ -58,6 +58,7 @@ Help define what the core must handle before the kernel is designed in P1. The d
 **People who write code**
 
 - Read the spec and the decision records before adding a capability. A new capability starts as a spec, then a plan, then tasks.
+- Review of a high-risk change or an ADR follows [`ai/model-routing.md`](ai/model-routing.md). When every drafting model family is known, the reviewer is a person or a different model family, and the receipt says so. When a drafting family is unknown, the maintainer's decision of 2026-10-26 accepts a review by the project's assistant reviewer plus a clean Codex review of the exact commit. That receipt names the commit, says the review was done under that rule, and carries no claim that a person reviewed it and no claim that the model families were separate.
 - Keep the kernel free of learning-domain words. The governed list is [`gates/domain-nouns.txt`](gates/domain-nouns.txt). Those ideas belong in a plugin.
 - Connect plugins only through public contracts and the event bus.
 - Tests, decision records, and doc corrections are useful during P0. The open engineering tasks on the P0 milestone (the data-layer and UI-kit decision records, and the gate checks) are tracked work. They are specialist tasks, separate from the starter list below.
