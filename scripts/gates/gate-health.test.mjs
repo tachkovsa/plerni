@@ -3,10 +3,11 @@
  * gate-health suite (spec §12, principle 16): proves the gates can fail AND
  * that they pass clean input. Every gate runs against deliberately-bad fixtures
  * (must block with its own diagnostic — a crash is not proof) and against
- * positive controls (must pass). The secrets gate's negative proof asserts the
- * planted gitleaks finding (see .github/workflows/p0-gates.yml). The approval
- * verifier's four fail-closed cases are artifact missing, digest mismatch,
- * bad signature, and head-key substitution.
+ * positive controls (must pass). The secrets gate blocks the planted synthetic
+ * fixture and accepts clean input (scripts/gates/secrets.mjs). Its negative
+ * proof asserts the planted gitleaks finding (see .github/workflows/p0-gates.yml).
+ * The approval verifier's four fail-closed cases are artifact missing, digest
+ * mismatch, bad signature, and head-key substitution.
  */
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
@@ -814,6 +815,49 @@ cases.push({
   env: { PATH: fakeBin },
   expectExit: 1,
   expectOutput: /scanner failed \(no exit code\) — a crash is not a finding(?![\s\S]*negative proof OK)/,
+});
+
+const cleanRoot = join(secretsDir, "clean");
+mkdirSync(cleanRoot);
+writeFileSync(join(cleanRoot, "note.txt"), "Clean deployment note for the positive control.\n");
+const findingScanner = join(secretsDir, "finding-scanner");
+writeFileSync(findingScanner, `#!/bin/sh
+prev=
+report=
+for arg in "$@"; do
+  if [ "$prev" = "--report-path" ]; then
+    report=$arg
+  fi
+  prev=$arg
+done
+printf '%s' '[{"RuleID":"generic-api-key","File":"secret.txt"}]' > "$report"
+exit 0
+`, { mode: 0o755 });
+const crashScanner = join(secretsDir, "crash-scanner");
+writeFileSync(crashScanner, "#!/bin/sh\nexit 2\n", { mode: 0o755 });
+cases.push({
+  name: "secrets gate blocks the planted fake secret fixture",
+  cmd: gate("secrets.mjs", "--root", join(fixtures, "gitleaks")),
+  expectExit: 1,
+  expectOutput: /secrets gate: finding rule generic-api-key file secret\.txt(?![\s\S]*secrets gate OK)/,
+});
+cases.push({
+  name: "secrets gate accepts clean input",
+  cmd: gate("secrets.mjs", "--root", cleanRoot),
+  expectExit: 0,
+  expectOutput: /^secrets gate OK\n$/,
+});
+cases.push({
+  name: "secrets gate rejects a clean scanner exit that still reports a finding",
+  cmd: gate("secrets.mjs", "--root", cleanRoot, "--scanner", findingScanner),
+  expectExit: 1,
+  expectOutput: /secrets gate: finding rule generic-api-key file secret\.txt(?![\s\S]*secrets gate OK)/,
+});
+cases.push({
+  name: "secrets gate rejects a scanner crash",
+  cmd: gate("secrets.mjs", "--root", cleanRoot, "--scanner", crashScanner),
+  expectExit: 1,
+  expectOutput: /scanner failed \(exit 2\)(?![\s\S]*secrets gate OK)/,
 });
 
 const parseWorkflow = (text, label) => {
