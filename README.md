@@ -8,6 +8,7 @@ Plerni is a self-hostable LXP (Learning Experience Platform): competency/skill m
 
 **P0 — Foundations.** There is nothing to run yet. The current state of the design lives in:
 
+- [`docs/ROADMAP.md`](docs/ROADMAP.md) — what Plerni is, the phases, and where to help (plain language; start here)
 - [`docs/specs/2026-10-12-plerni-design.md`](docs/specs/2026-10-12-plerni-design.md) — the full product & architecture specification (adversarially reviewed across four independent model families, pseudonymized per AGENTS.md §0)
 - [`docs/decision-register.html`](docs/decision-register.html) — 32 architectural decisions with rationale, evidence, and flip conditions (open in a browser)
 - [`docs/adr/`](docs/adr/) — architectural decision records

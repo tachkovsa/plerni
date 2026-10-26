@@ -1,6 +1,8 @@
 # P0 Detailed Implementation Plan v7 — executable task specs
 
 **Status:** v7 — final; incorporates γ's disposition check on v6 (2 MAJOR + 5 MINOR, all one-clause edits, applied verbatim). Chain complete per γ: this pass + the maintainer's sign-off. · **Date:** 2026-10-13
+
+**Amendment (2026-10-25, issue #15):** T7 is the contributor roadmap (`docs/ROADMAP.md`), not a capacity annex. The arithmetic bar, the Monte Carlo rule, and `docs/plans/capacity-annex.md` are withdrawn. T7 is not gated on spike verdicts and is not high-risk. Spike reports keep their buffer figures as evidence for the open replacement track. Those figures are not a schedule.
 **Source of truth:** the P0 plan — **after T1 merges it lives at `docs/plans/2026-10-13-p0-implementation-plan.md`** (v12 content). Every task cites it as **"the plan §X"**. Where documents disagree, the plan wins — report the conflict, don't improvise.
 
 **Audience contract (binding):** every task states Goal · Read-first · Exact files · Steps · Acceptance (commands + expected observations) · NOT-list · Risk class · PR split. An executor without conversational context must be able to finish the task. Contradiction with a referenced doc → STOP and file a question.
@@ -192,18 +194,18 @@ tools/spikes/ipc-harness/
 **Goal:** both reports filed and independently reproduced.
 **Read first:** the plan §3/§4 (verdict mapping, §3.0, replacement branch §8).
 **Files:** `docs/plans/<ISO run date>-spike-a-report.md` + `…-spike-b-report.md` (real dates, never placeholders).
-**Steps:** 1. Consolidate evidence JSONL (T3a–T5c) into per-hypothesis verdicts with §3.0 diagnosis records for any FAIL. 2. **The B report carries the evidence label verbatim: "transport + minimal-real-authority; full broker proof remains P2 acceptance"** — and the queued-work/second-executor results are part of the recovery story ADR-0004 cites. 3. The cross-family reviewer checks out the pinned revision and reruns both suites from scratch; outputs attached. 4. Any flip verdict → the replacement-validation track (plan §8) with revised capacity estimate; P0 never closes on "green or flipped".
+**Steps:** 1. Consolidate evidence JSONL (T3a–T5c) into per-hypothesis verdicts with §3.0 diagnosis records for any FAIL. 2. **The B report carries the evidence label verbatim: "transport + minimal-real-authority; full broker proof remains P2 acceptance"** — and the queued-work/second-executor results are part of the recovery story ADR-0004 cites. 3. The cross-family reviewer checks out the pinned revision and reruns both suites from scratch; outputs attached. 4. Any flip verdict → the replacement-validation track (plan §8) with a written note of the technical consequence. That note does not reopen a schedule model (issue #15). P0 never closes on "green or flipped".
 **Acceptance:** reports merged; reviewer rerun reproduced verdicts; receipt covers the rerun evidence (git head SHA).
 **NOT:** no verdict without rerunnable evidence; no papering over environmental-noise; no dropping the evidence label.
 
-## T7 · `docs: capacity annex` (risk: policy-high; **reviewer: the human maintainer** — plan §9: β/γ/δ all have material authorship in the method)
+## T7 · `docs: contributor roadmap` (risk: low · one PR)
 
-**Goal:** `docs/plans/capacity-annex.md` answering the ≤9-month bar arithmetically (plan §5).
-**Read first:** the plan §5 (all eight points, incl. the stated team; the pinned telemetry sheet: per-PR cycle time, review round-trip hours, per-job CI durations, rework ratio; the P80 ≤ 9 months decision rule with Monte-Carlo joint distribution, 10,000 samples, stated independence assumption; the `calendar = feature / 0.85` formula) + Annex L (incl. the retention-sizing consumer) + spec §15–16.
-**Files:** `docs/plans/capacity-annex.md`.
-**Steps:** 1. Decompose P1/P2/P3 exit criteria into work packages (effort range in PRs + risk class). 2. State the team; mark priors vs measured P0 telemetry (the pinned four-item sheet). 3. Calendar + CI models (all invocations; public-repo concurrency honesty). 4. Renewal-traffic input (≈ active/cadence UPDATE tx/s) + Annex L volume class. 5. Cut ladder: Class A (honestly near-empty) vs Class B (spec amendments, maintainer sign-off, never counted by default). 6. Bar answer: P50 and P80; **met iff P80 ≤ 9 months**; else the gap is reported.
-**Acceptance:** maintainer review receipt in the PR (git head SHA); bar answered with arithmetic shown; "doesn't fit" is a valid deliverable.
-**NOT:** no spike→15-subsystems calibration claims; no deferred-scope savings; no point-estimate bar claims.
+**Goal:** `docs/ROADMAP.md`, linked from the README and CONTRIBUTING. Replaces the withdrawn capacity annex (plan amendment 2026-10-25, issue #15). Plain language for contributors from HR, L&D, and EdTech, including people who do not write code.
+**Read first:** issue #15 (body and comments: the analysts section and the standards research) · spec §1 and §15 · decision register D12, D23, D24 · the plan amendment at the top of `docs/plans/2026-10-13-p0-implementation-plan.md`.
+**Files:** `docs/ROADMAP.md` · `README.md` · `CONTRIBUTING.md` · the P0 plan and this file, where they still assign the capacity annex · the P0 Foundations milestone description.
+**Steps:** 1. State what Plerni is and its principles (everything else is a plugin; AI proposes, humans commit; self-hostable). 2. State phases P0–P5 from spec §15, with no dates. 3. Split where help is wanted: non-coders (domain, content, translations, UX feedback) and developers. 4. Curate the `good first issue` items. The label already exists; issues #63–#66 carry it. 5. Link CONTRIBUTING, the design spec, the decision register, and the ADRs. 6. Include an analysts section linking #63–#66, and describe the standards from the issue comment as planned plugins. D24 keeps SCORM, xAPI, and LTI out of v1. Plugin JavaScript in the host page is a P5 question (D12). 7. Retire the annex in the plan text and the milestone description. Do not write `docs/plans/capacity-annex.md`.
+**Acceptance:** `docs/ROADMAP.md` exists and is linked from the README and CONTRIBUTING; the P0 plan's exit criteria no longer require the nine-month bar; the milestone description no longer assigns the annex.
+**NOT:** no dates on phases; no schedule model; no promise that v1 ships the deferred standards; no plugin JavaScript in the host before P5; no learning-domain nouns moved into the kernel; no secrets, machine paths, or private tooling in the page.
 
 ## T8–T11 · ADRs (one PR per ADR; T8/T10 gated on spike verdicts)
 
@@ -268,8 +270,8 @@ tools/spikes/ipc-harness/
 
 ## Sequencing, PR budget, and review routing
 
-Order (plan §8): **T1 → {T2, T9, T11, T12, T13}** in parallel (T13 early — it installs the artifact verifier); then **T2 → {T3a ∥ T5a}** → T3b ∥ {T4a-0 (`ci:` precursor workflow PR, after T13) → T4a} → T4b ∥ T5b → T5c → T6 → T7 → {T8, T10 gated} → **T14 (after T13's verifier is merged)** → T15. (T5a depends only on T2 — δ-m1.)
-High-risk tasks (T2, T3a, T3b, T4a, T4b, T5a, T5b, T5c, T6, T7, T8, T10, T11, T13, T14) require a revision-bound review receipt (PR-body receipt against the final head SHA) from a family different from every generator (plan §9). Small-model executors: only low/medium tasks (T1, T9, T12, T15), one task per session, one PR per task.
+Order (plan §8, as amended 2026-10-25): **T1 → {T2, T7, T9, T11, T12, T13}** in parallel (T13 early — it installs the artifact verifier; T7 is the roadmap and is not on the spike chain); then **T2 → {T3a ∥ T5a}** → T3b ∥ {T4a-0 (`ci:` precursor workflow PR, after T13) → T4a} → T4b ∥ T5b → T5c → T6 → {T8, T10 gated} → **T14 (after T13's verifier is merged)** → T15. (T5a depends only on T2 — δ-m1.)
+High-risk tasks (T2, T3a, T3b, T4a, T4b, T5a, T5b, T5c, T6, T8, T10, T11, T13, T14) require a revision-bound review receipt (PR-body receipt against the final head SHA) from a family different from every generator (plan §9). Small-model executors: only low/medium tasks (T1, T7, T9, T12, T15), one task per session, one PR per task. T7 left the high-risk list when the annex was withdrawn.
 PR-size budget: >800 handwritten lines → split further, record the split in the issue.
 
 ## Review trail of this document
