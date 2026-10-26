@@ -274,7 +274,7 @@ tools/spikes/ipc-harness/
 ## Sequencing, PR budget, and review routing
 
 Order (plan §8, as amended 2026-10-25): **T1 → {T2, T7, T9, T11, T12, T13}** in parallel (T13 early — it installs the artifact verifier; T7 is the roadmap and is not on the spike chain); then **T2 → {T3a ∥ T5a}** → T3b ∥ {T4a-0 (`ci:` precursor workflow PR, after T13) → T4a} → T4b ∥ T5b → T5c → T6 → {T8, T10 gated} → **T14 (after T13's verifier is merged)** → T15. (T5a depends only on T2 — δ-m1.)
-High-risk tasks (T2, T3a, T3b, T4a, T4b, T5a, T5b, T5c, T6, T8, T10, T11, T13, T14) require a revision-bound review receipt (PR-body receipt against the final head SHA) from a family different from every generator (plan §9). Small-model executors: only low/medium tasks (T1, T7, T9, T12, T15), one task per session, one PR per task. T7 left the high-risk list when the annex was withdrawn.
+High-risk tasks (T2, T3a, T3b, T4a, T4b, T5a, T5b, T5c, T6, T8, T10, T11, T13, T14) require a revision-bound review receipt (PR-body receipt against the final head SHA) from a family different from every generator when those families are known (plan §9). When a drafting family is unknown, the maintainer decision of 2026-10-26 in `docs/ai/model-routing.md` applies: the maintainer-designated assistant reviewer plus a clean Codex review of that exact head. The receipt names the head, states that the review was done under this maintainer rule, and carries no human-review claim and no family-separation claim. Small-model executors: only low/medium tasks (T1, T7, T9, T12, T15), one task per session, one PR per task. T7 left the high-risk list when the annex was withdrawn.
 PR-size budget: >800 handwritten lines → split further, record the split in the issue.
 
 ## Review trail of this document

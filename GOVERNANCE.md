@@ -7,13 +7,13 @@
 
 ## Decision-making
 
-- Architecture decisions are recorded as ADRs in `docs/adr/` and require maintainer approval.
+- Architecture decisions are recorded as ADRs in `docs/adr/` and require maintainer approval. Acceptance review follows `docs/ai/model-routing.md`, including the maintainer decision of 2026-10-26 for an unknown drafting family (assistant reviewer plus a clean Codex review of the exact head).
 - New SDK capabilities or trust boundaries require an ADR before implementation (surface-area budget).
 - Migration approval authority is defined by policy (currently: cross-family agent review with a signed approval artifact; see spec §4.6 and §13). The maintainer owns the policy.
 
 ## Escalation
 
-Disagreements escalate to the maintainer. High-risk changes (authorization, tenancy, cryptography, plugin admission, migrations, CI/gates, release credentials, policy changes) require verification by a human or an agent of a different model family than every generator, evidenced by a revision-bound review receipt (`docs/ai/model-routing.md`, principle 18); identities stay private per AGENTS.md §0. AI review findings elsewhere are advisory; mechanical gates block. Migration approval artifacts still apply (spec §4.6). The signed approval artifact for gate-config changes is waived at the current stage (owner decision, 2026-10-15; `docs/ai/model-routing.md`).
+Disagreements escalate to the maintainer. High-risk changes (authorization, tenancy, cryptography, plugin admission, migrations, CI/gates, release credentials, policy changes) require verification by a human or an agent of a different model family than every generator when those families are known, evidenced by a revision-bound review receipt (`docs/ai/model-routing.md`, principle 18); identities stay private per AGENTS.md §0. When the drafting model family is unknown, the maintainer decision of 2026-10-26 in that file applies: the maintainer-designated assistant reviewer plus a clean Codex review of the exact head is enough to accept an ADR or merge the pull request. A human review is not required on that path. The receipt names that exact head, states that the review was done under this maintainer rule, and carries no human-review claim and no family-separation claim. AI review findings elsewhere are advisory; mechanical gates block. Migration approval artifacts still apply (spec §4.6). The signed approval artifact for gate-config changes is waived at the current stage (owner decision, 2026-10-15; `docs/ai/model-routing.md`).
 
 ## Branch protection (dev — the default branch)
 
