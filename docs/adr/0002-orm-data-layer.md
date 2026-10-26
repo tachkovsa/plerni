@@ -132,7 +132,7 @@ These match D06 and plan §3.0. The spike's pass means none of them is open.
 
 Tenancy content is high-risk. The drafting model families for this record are unknown. Maintainer decision 2026-10-26 ([`../ai/model-routing.md`](../ai/model-routing.md)) accepts an ADR in that case on a review by the project's maintainer-designated assistant reviewer plus a clean Codex review of the exact head. A human review is not required on that path.
 
-Pull request [#68](https://github.com/tachkovsa/plerni/pull/68) merged this record after that pair of reviews. The decision text they reviewed is head `4c7ca4a85e31211a7384beced26ed63e57e09a35`. The squash merge is `79417625d242c96d7655558fcbb9166291b3dc4d`. Codex completed its review of that head with no findings. The assistant review receipt on the pull request names the same head, records the clean Codex review, and states that the reviewer was the project assistant under the maintainer's 2026-10-26 decision because the drafting family is unknown. Required checks on the pull request were green, and the review threads were resolved.
+Pull request [#68](https://github.com/tachkovsa/plerni/pull/68) merged this record after that pair of reviews. The decision text they reviewed is head `4c7ca4a85e31211a7384beced26ed63e57e09a35`. The squash merge is `79417625d242c96d7655558fcbb9166291b3dc4d`. The evidence reference is the public assistant receipt comment [6411352934](https://github.com/tachkovsa/plerni/pull/68#issuecomment-6411352934), bound to that head, plus the Codex clean review comment [6409993014](https://github.com/tachkovsa/plerni/pull/68#issuecomment-6409993014) on the same head. The assistant receipt names that head, records the clean Codex review, and states that the reviewer was the project assistant under the maintainer's 2026-10-26 decision because the drafting family is unknown. Required checks on the pull request were green, and the review threads were resolved.
 
 This section is the acceptance record for that review. It is not a new review of a later commit.
 
@@ -142,7 +142,7 @@ This section is the acceptance record for that review. It is not a new review of
 - **Verification summary:** The assistant receipt checked the decision against D06, D05, D07, and D08, and against spec §4.3, §4.8, and §5 (no plugin database connection, SQL-only plugin migrations, transaction-local tenant context). Spike A verdicts and flip conditions match plan §3.0. Version moves past the measured pins stay unadopted. Codex completed its review of the reviewed head with no findings.
 - **Outcome:** Accepted
 - **Rule:** reviewed under the maintainer rule of 2026-10-26. This receipt names that exact head. It carries no human-review claim and no family-separation claim.
-- **Public record:** pull request #68. The opaque family-separation evidence ID is not used on this path, because the receipt does not claim family separation.
+- **Evidence reference:** public assistant receipt comment [6411352934](https://github.com/tachkovsa/plerni/pull/68#issuecomment-6411352934) on pull request #68, bound to head `4c7ca4a85e31211a7384beced26ed63e57e09a35`, and Codex clean review comment [6409993014](https://github.com/tachkovsa/plerni/pull/68#issuecomment-6409993014) on that same head. This receipt carries no human-review claim and no family-separation claim.
 
 ## Sources
 
