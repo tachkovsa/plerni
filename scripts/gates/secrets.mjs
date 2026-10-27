@@ -25,23 +25,49 @@
  * that index are labeled v8.30.1. Archive checksums are the published
  * v8.30.1 checksums file:
  * https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_checksums.txt
+ * The third field is the sha256 of the archive member named gitleaks,
+ * taken after that archive matched the published checksum.
+ *
+ * The archive fallback keeps its copy in the per-user cache
+ * (XDG_CACHE_HOME when set, otherwise ~/.cache). Each directory from
+ * that root through the version directory must be owned by the current
+ * user and not writable by group or other. A cached binary is executed
+ * only when its own bytes match the pinned member digest. Stamp files
+ * in the cache are never read.
  */
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { chmodSync, closeSync, constants, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { parseArgs } from "node:util";
 
 const IMAGE = "zricethezav/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f";
 const VERSION = "8.30.1";
 const RULE_ID = /^[A-Za-z0-9._-]{1,80}$/;
 const FILE_NAME = /^[A-Za-z0-9._-]{1,200}$/;
+const HEX64 = /^[0-9a-f]{64}$/;
 const ARCHIVES = {
-  "linux-x64": ["gitleaks_8.30.1_linux_x64.tar.gz", "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"],
-  "linux-arm64": ["gitleaks_8.30.1_linux_arm64.tar.gz", "e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080"],
-  "darwin-x64": ["gitleaks_8.30.1_darwin_x64.tar.gz", "dfe101a4db2255fc85120ac7f3d25e4342c3c20cf749f2c20a18081af1952709"],
-  "darwin-arm64": ["gitleaks_8.30.1_darwin_arm64.tar.gz", "b40ab0ae55c505963e365f271a8d3846efbc170aa17f2607f13df610a9aeb6a5"],
+  "linux-x64": [
+    "gitleaks_8.30.1_linux_x64.tar.gz",
+    "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb",
+    "88f91962aa2f93ac6ab281d553b9e125f5197bbbce38f9f2437f7299c32e5509",
+  ],
+  "linux-arm64": [
+    "gitleaks_8.30.1_linux_arm64.tar.gz",
+    "e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080",
+    "00e91bbe655bd7c47753e8cfe61cb76ea1a5d7e7702fe161ee40102b46b3823b",
+  ],
+  "darwin-x64": [
+    "gitleaks_8.30.1_darwin_x64.tar.gz",
+    "dfe101a4db2255fc85120ac7f3d25e4342c3c20cf749f2c20a18081af1952709",
+    "cee01fea7173f1b779dff188e1c26ecbcb4027d394acc573b23aaf0be260e291",
+  ],
+  "darwin-arm64": [
+    "gitleaks_8.30.1_darwin_arm64.tar.gz",
+    "b40ab0ae55c505963e365f271a8d3846efbc170aa17f2607f13df610a9aeb6a5",
+    "ba52fb1bfabbcde42f032afad3d6e0b19dff8ed105229a16e7caa338bbc0e84f",
+  ],
 };
 
 const { values } = parseArgs({
@@ -71,22 +97,124 @@ const hasDocker = () => {
   }
 };
 
+const cacheUid = () => {
+  const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+  if (typeof uid !== "number") fail("scanner cache is not private — FAIL CLOSED");
+  return uid;
+};
+
+const isSafeAbsolute = (value) => {
+  if (typeof value !== "string" || value.length === 0 || value.length > 4096) return false;
+  if (!value.startsWith("/") || value.includes("\0")) return false;
+  return value.split("/").every((part) => part !== "." && part !== "..");
+};
+
+const lstatOrNull = (path) => {
+  try {
+    return lstatSync(path, { throwIfNoEntry: false });
+  } catch {
+    fail("scanner cache is not private — FAIL CLOSED");
+  }
+  return null;
+};
+
+const assertPrivate = (st, kind) => {
+  if (st.isSymbolicLink()) fail("scanner cache is not private — FAIL CLOSED");
+  if (kind === "dir" ? !st.isDirectory() : !st.isFile()) fail("scanner cache is not private — FAIL CLOSED");
+  if (st.uid !== cacheUid()) fail("scanner cache is not private — FAIL CLOSED");
+  if ((st.mode & 0o022) !== 0) fail("scanner cache is not private — FAIL CLOSED");
+};
+
+// Create a missing directory at mode 0700. Never chmod a directory, and
+// never create one whose parent is group- or other-writable.
+const ensurePrivateDir = (dir) => {
+  let st = lstatOrNull(dir);
+  if (!st) {
+    const parent = lstatOrNull(dirname(dir));
+    if (!parent) fail("scanner cache is not private — FAIL CLOSED");
+    assertPrivate(parent, "dir");
+    try {
+      mkdirSync(dir, { mode: 0o700 });
+    } catch {
+      fail("scanner cache is not private — FAIL CLOSED");
+    }
+    st = lstatOrNull(dir);
+  }
+  if (!st) fail("scanner cache is not private — FAIL CLOSED");
+  assertPrivate(st, "dir");
+};
+
+const privateCacheDir = () => {
+  cacheUid();
+  const xdg = process.env.XDG_CACHE_HOME;
+  let dir;
+  if (typeof xdg === "string" && xdg.length > 0) {
+    if (!isSafeAbsolute(xdg)) fail("scanner cache is not private — FAIL CLOSED");
+    dir = xdg;
+  } else {
+    const home = homedir();
+    if (!isSafeAbsolute(home)) fail("scanner cache is not private — FAIL CLOSED");
+    dir = join(home, ".cache");
+  }
+  ensurePrivateDir(dir);
+  for (const part of ["plerni", "gitleaks", VERSION, `${process.platform}-${process.arch}`]) {
+    dir = join(dir, part);
+    ensurePrivateDir(dir);
+  }
+  return dir;
+};
+
+// O_NOFOLLOW: a symlink planted in the cache is not a readable binary.
+const readRegularFile = (path) => {
+  if ((constants.O_NOFOLLOW ?? 0) === 0) fail("scanner cache is not private — FAIL CLOSED");
+  let fd;
+  try {
+    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  } catch (err) {
+    if (err && err.code === "ENOENT") return null;
+    fail("scanner cache is not private — FAIL CLOSED");
+  }
+  try {
+    const st = fstatSync(fd);
+    assertPrivate(st, "file");
+    if (!Number.isSafeInteger(st.size) || st.size < 0 || st.size > 80 * 1024 * 1024) {
+      fail("pinned scanner checksum mismatch — FAIL CLOSED");
+    }
+    const bytes = Buffer.alloc(st.size);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const n = readSync(fd, bytes, offset, bytes.length - offset, offset);
+      if (n <= 0) fail("pinned scanner checksum mismatch — FAIL CLOSED");
+      offset += n;
+    }
+    return bytes;
+  } finally {
+    closeSync(fd);
+  }
+};
+
+const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
+
 const pinnedBinary = () => {
   const spec = ARCHIVES[`${process.platform}-${process.arch}`];
-  if (!spec) fail("pinned scanner is not published for this platform — FAIL CLOSED");
-  const [file, sha256] = spec;
-  const cache = join(tmpdir(), "plerni-gitleaks", VERSION, `${process.platform}-${process.arch}`);
-  const binary = join(cache, "gitleaks");
-  const archiveStamp = join(cache, "archive.sha256");
-  const binaryStamp = join(cache, "binary.sha256");
-  if (existsSync(binary) && existsSync(archiveStamp) && existsSync(binaryStamp)) {
-    const storedArchive = readFileSync(archiveStamp, "utf8").trim();
-    const storedBinary = readFileSync(binaryStamp, "utf8").trim();
-    const actual = createHash("sha256").update(readFileSync(binary)).digest("hex");
-    if (storedArchive === sha256 && storedBinary === actual) return binary;
+  if (!Array.isArray(spec)) fail("pinned scanner is not published for this platform — FAIL CLOSED");
+  const [file, archiveSha256, binarySha256] = spec;
+  if (typeof file !== "string" || !HEX64.test(archiveSha256) || !HEX64.test(binarySha256)) {
+    fail("pinned scanner checksum mismatch — FAIL CLOSED");
   }
-  mkdirSync(cache, { recursive: true });
-  const archive = join(cache, `${file}.download`);
+  const dir = privateCacheDir();
+  const binary = join(dir, "gitleaks");
+  const cached = readRegularFile(binary);
+  if (cached) {
+    if (sha256(cached) !== binarySha256) fail("cached scanner does not match the pinned binary — FAIL CLOSED");
+    return binary;
+  }
+  const archive = join(dir, `.${file}.${process.pid}.partial`);
+  try {
+    rmSync(archive, { force: true });
+  } catch {
+    fail("scanner cache is not private — FAIL CLOSED");
+  }
   const url = `https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/${file}`;
   try {
     execFileSync("curl", ["-fsSL", "--retry", "3", "--retry-delay", "1", "-o", archive, url], {
@@ -96,26 +224,66 @@ const pinnedBinary = () => {
     rmSync(archive, { force: true });
     fail("pinned scanner download failed — FAIL CLOSED");
   }
-  const got = createHash("sha256").update(readFileSync(archive)).digest("hex");
-  if (got !== sha256) {
+  const archiveStat = lstatOrNull(archive);
+  if (!archiveStat || archiveStat.isSymbolicLink() || !archiveStat.isFile() || archiveStat.uid !== cacheUid()) {
+    rmSync(archive, { force: true });
+    fail("scanner cache is not private — FAIL CLOSED");
+  }
+  if ((archiveStat.mode & 0o022) !== 0) {
+    try {
+      chmodSync(archive, 0o600);
+    } catch {
+      rmSync(archive, { force: true });
+      fail("scanner cache is not private — FAIL CLOSED");
+    }
+  }
+  const archiveBytes = readRegularFile(archive);
+  if (!archiveBytes || sha256(archiveBytes) !== archiveSha256) {
     rmSync(archive, { force: true });
     fail("pinned scanner checksum mismatch — FAIL CLOSED");
   }
-  let bytes;
+  let extracted;
   try {
-    bytes = execFileSync("tar", ["-xOf", archive, "gitleaks"], { maxBuffer: 80 * 1024 * 1024 });
+    extracted = execFileSync("tar", ["-xOf", archive, "gitleaks"], { maxBuffer: 80 * 1024 * 1024 });
   } catch {
     rmSync(archive, { force: true });
     fail("pinned scanner archive has no gitleaks binary — FAIL CLOSED");
   }
   rmSync(archive, { force: true });
-  if (!Buffer.isBuffer(bytes) || bytes.length < 1000) fail("pinned scanner archive has no gitleaks binary — FAIL CLOSED");
-  const tmpBin = join(cache, "gitleaks.download");
-  writeFileSync(tmpBin, bytes, { mode: 0o755 });
-  chmodSync(tmpBin, 0o755);
-  renameSync(tmpBin, binary);
-  writeFileSync(archiveStamp, sha256);
-  writeFileSync(binaryStamp, createHash("sha256").update(bytes).digest("hex"));
+  if (!Buffer.isBuffer(extracted) || sha256(extracted) !== binarySha256) {
+    fail("pinned scanner checksum mismatch — FAIL CLOSED");
+  }
+  const tmpBin = join(dir, `.gitleaks.${process.pid}.partial`);
+  try {
+    rmSync(tmpBin, { force: true });
+  } catch {
+    fail("scanner cache is not private — FAIL CLOSED");
+  }
+  try {
+    writeFileSync(tmpBin, extracted, { mode: 0o700, flag: "wx" });
+    chmodSync(tmpBin, 0o700);
+    const written = readRegularFile(tmpBin);
+    if (!written || sha256(written) !== binarySha256) {
+      try {
+        rmSync(tmpBin, { force: true });
+      } catch {
+        fail("scanner cache is not private — FAIL CLOSED");
+      }
+      fail("pinned scanner checksum mismatch — FAIL CLOSED");
+    }
+    renameSync(tmpBin, binary);
+  } catch {
+    try {
+      rmSync(tmpBin, { force: true });
+    } catch {
+      fail("scanner cache is not private — FAIL CLOSED");
+    }
+    fail("pinned scanner checksum mismatch — FAIL CLOSED");
+  }
+  const confirmed = readRegularFile(binary);
+  if (!confirmed || sha256(confirmed) !== binarySha256) {
+    fail("cached scanner does not match the pinned binary — FAIL CLOSED");
+  }
   return binary;
 };
 
