@@ -3,14 +3,17 @@
  * gate-health suite (spec §12, principle 16): proves the gates can fail AND
  * that they pass clean input. Every gate runs against deliberately-bad fixtures
  * (must block with its own diagnostic — a crash is not proof) and against
- * positive controls (must pass). The secrets gate's negative proof asserts the
- * planted gitleaks finding (see .github/workflows/p0-gates.yml). The approval
- * verifier's four fail-closed cases are artifact missing, digest mismatch,
- * bad signature, and head-key substitution.
+ * positive controls (must pass). The secrets gate blocks the planted synthetic
+ * fixture and accepts clean input (scripts/gates/secrets.mjs). A cached
+ * scanner whose bytes do not match the pinned binary digest fails closed.
+ * Its negative proof asserts the planted gitleaks finding
+ * (see .github/workflows/p0-gates.yml).
+ * The approval verifier's four fail-closed cases are artifact missing, digest
+ * mismatch, bad signature, and head-key substitution.
  */
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -814,6 +817,114 @@ cases.push({
   env: { PATH: fakeBin },
   expectExit: 1,
   expectOutput: /scanner failed \(no exit code\) — a crash is not a finding(?![\s\S]*negative proof OK)/,
+});
+
+const cleanRoot = join(secretsDir, "clean");
+mkdirSync(cleanRoot);
+writeFileSync(join(cleanRoot, "note.txt"), "Clean deployment note for the positive control.\n");
+const findingScanner = join(secretsDir, "finding-scanner");
+writeFileSync(findingScanner, `#!/bin/sh
+prev=
+report=
+for arg in "$@"; do
+  if [ "$prev" = "--report-path" ]; then
+    report=$arg
+  fi
+  prev=$arg
+done
+printf '%s' '[{"RuleID":"generic-api-key","File":"secret.txt"}]' > "$report"
+exit 0
+`, { mode: 0o755 });
+const crashScanner = join(secretsDir, "crash-scanner");
+writeFileSync(crashScanner, "#!/bin/sh\nexit 2\n", { mode: 0o755 });
+cases.push({
+  name: "secrets gate blocks the planted fake secret fixture",
+  cmd: gate("secrets.mjs", "--root", join(fixtures, "gitleaks")),
+  expectExit: 1,
+  expectOutput: /secrets gate: finding rule generic-api-key file secret\.txt(?![\s\S]*secrets gate OK)/,
+});
+cases.push({
+  name: "secrets gate accepts clean input",
+  cmd: gate("secrets.mjs", "--root", cleanRoot),
+  expectExit: 0,
+  expectOutput: /^secrets gate OK\n$/,
+});
+cases.push({
+  name: "secrets gate rejects a clean scanner exit that still reports a finding",
+  cmd: gate("secrets.mjs", "--root", cleanRoot, "--scanner", findingScanner),
+  expectExit: 1,
+  expectOutput: /secrets gate: finding rule generic-api-key file secret\.txt(?![\s\S]*secrets gate OK)/,
+});
+cases.push({
+  name: "secrets gate rejects a scanner crash",
+  cmd: gate("secrets.mjs", "--root", cleanRoot, "--scanner", crashScanner),
+  expectExit: 1,
+  expectOutput: /scanner failed \(exit 2\)(?![\s\S]*secrets gate OK)/,
+});
+const allowRoot = join(secretsDir, "allowlisted-fixture");
+mkdirSync(allowRoot);
+copyFileSync(join(fixtures, "gitleaks", "secret.txt"), join(allowRoot, "secret.txt"));
+writeFileSync(
+  join(allowRoot, ".gitleaks.toml"),
+  "[extend]\nuseDefault = true\n\n[allowlist]\npaths = ['''.*''']\n",
+);
+cases.push({
+  name: "secrets gate still blocks the fixture when the target allowlists it",
+  cmd: gate("secrets.mjs", "--root", allowRoot),
+  expectExit: 1,
+  expectOutput: /secrets gate: finding rule generic-api-key file secret\.txt(?![\s\S]*secrets gate OK)/,
+});
+// No-docker path: a private cache holding a scanner that prints an empty
+// report, plus stamp files of the published archive checksum and of the
+// planted file itself. The gate must ignore the stamps and refuse the bytes.
+const noDocker = join(secretsDir, "no-docker");
+mkdirSync(noDocker, { mode: 0o700 });
+writeFileSync(join(noDocker, "docker"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+const cacheHome = join(secretsDir, "xdg-cache");
+mkdirSync(cacheHome, { mode: 0o700 });
+chmodSync(cacheHome, 0o700);
+const cachePlatform = `${process.platform}-${process.arch}`;
+const plantedCache = join(cacheHome, "plerni", "gitleaks", "8.30.1", cachePlatform);
+mkdirSync(plantedCache, { recursive: true, mode: 0o700 });
+for (const dir of [
+  cacheHome,
+  join(cacheHome, "plerni"),
+  join(cacheHome, "plerni", "gitleaks"),
+  join(cacheHome, "plerni", "gitleaks", "8.30.1"),
+  plantedCache,
+]) {
+  chmodSync(dir, 0o700);
+}
+const plantedScanner = `#!/bin/sh
+prev=
+report=
+for arg in "$@"; do
+  if [ "$prev" = "--report-path" ]; then
+    report=$arg
+  fi
+  prev=$arg
+done
+printf '%s' '[]' > "$report"
+exit 0
+`;
+const plantedPath = join(plantedCache, "gitleaks");
+writeFileSync(plantedPath, plantedScanner, { mode: 0o700 });
+chmodSync(plantedPath, 0o700);
+const plantedHash = createHash("sha256").update(plantedScanner).digest("hex");
+const publishedArchive = {
+  "linux-x64": "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb",
+  "linux-arm64": "e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080",
+  "darwin-x64": "dfe101a4db2255fc85120ac7f3d25e4342c3c20cf749f2c20a18081af1952709",
+  "darwin-arm64": "b40ab0ae55c505963e365f271a8d3846efbc170aa17f2607f13df610a9aeb6a5",
+};
+writeFileSync(join(plantedCache, "archive.sha256"), `${publishedArchive[cachePlatform] ?? ""}\n`);
+writeFileSync(join(plantedCache, "binary.sha256"), `${plantedHash}\n`);
+cases.push({
+  name: "secrets gate rejects a tampered cached scanner",
+  cmd: gate("secrets.mjs", "--root", join(fixtures, "gitleaks")),
+  env: { PATH: noDocker, XDG_CACHE_HOME: cacheHome },
+  expectExit: 1,
+  expectOutput: /cached scanner does not match the pinned binary — FAIL CLOSED(?![\s\S]*secrets gate OK)/,
 });
 
 const parseWorkflow = (text, label) => {
