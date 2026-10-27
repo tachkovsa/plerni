@@ -11,7 +11,7 @@
  */
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -858,6 +858,19 @@ cases.push({
   cmd: gate("secrets.mjs", "--root", cleanRoot, "--scanner", crashScanner),
   expectExit: 1,
   expectOutput: /scanner failed \(exit 2\)(?![\s\S]*secrets gate OK)/,
+});
+const allowRoot = join(secretsDir, "allowlisted-fixture");
+mkdirSync(allowRoot);
+copyFileSync(join(fixtures, "gitleaks", "secret.txt"), join(allowRoot, "secret.txt"));
+writeFileSync(
+  join(allowRoot, ".gitleaks.toml"),
+  "[extend]\nuseDefault = true\n\n[allowlist]\npaths = ['''.*''']\n",
+);
+cases.push({
+  name: "secrets gate still blocks the fixture when the target allowlists it",
+  cmd: gate("secrets.mjs", "--root", allowRoot),
+  expectExit: 1,
+  expectOutput: /secrets gate: finding rule generic-api-key file secret\.txt(?![\s\S]*secrets gate OK)/,
 });
 
 const parseWorkflow = (text, label) => {

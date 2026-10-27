@@ -5,9 +5,15 @@
  * 0 or 1 fails closed. Exit 0 with an empty finding list passes.
  *
  * The repo allowlist in .gitleaks.toml applies only to the history scan.
- * This gate does not load that file. Gate-health points it at
- * scripts/gates/fixtures/gitleaks (the planted synthetic fixture, which
- * must fail) and at a clean directory (which must pass).
+ * This gate does not load that file, or any .gitleaks.toml in the target.
+ * gitleaks v8.30.1 otherwise uses (target)/.gitleaks.toml, which
+ * re-enables the history allowlist at the repo root and lets another
+ * target hide findings. Both the docker and archive paths pass a
+ * generated config that extends the built-in defaults and has no
+ * allowlist. Gate-health points the gate at scripts/gates/fixtures/gitleaks
+ * (the planted synthetic fixture, which must fail), at a clean directory
+ * (which must pass), and at a target whose own config allowlists the fixture
+ * (which must still fail).
  *
  * Scanner output is discarded. The diagnostic prints only an allowlisted
  * rule id and file basename, never the report body.
@@ -120,7 +126,11 @@ const scannerEnv = () => {
   return env;
 };
 
-const scanArgs = (reportPath, ignoreDir, source) => [
+// Built-in default rules, no allowlist. Written outside the target and
+// passed as --config so gitleaks does not read the target's toml.
+const DEFAULT_RULES = "title = \"plerni-secrets-gate\"\n\n[extend]\nuseDefault = true\n";
+
+const scanArgs = (reportPath, ignoreDir, configPath, source) => [
   "dir",
   "--no-banner",
   "--no-color",
@@ -129,6 +139,8 @@ const scanArgs = (reportPath, ignoreDir, source) => [
   "error",
   "--timeout",
   "60",
+  "--config",
+  configPath,
   "--report-format",
   "json",
   "--report-path",
@@ -153,6 +165,8 @@ const binary = explicitScanner ?? (hasDocker() ? null : pinnedBinary());
 
 const outDir = mkdtempSync(join(tmpdir(), "plerni-secrets-gate-"));
 const reportOnHost = join(outDir, "report.json");
+const configOnHost = join(outDir, "rules.toml");
+writeFileSync(configOnHost, DEFAULT_RULES);
 let failure = null;
 let findingLines = null;
 try {
@@ -160,7 +174,7 @@ try {
   let code = 0;
   try {
     if (binary) {
-      execFileSync(binary, scanArgs(reportOnHost, outDir, root), {
+      execFileSync(binary, scanArgs(reportOnHost, outDir, configOnHost, root), {
         cwd: outDir,
         env,
         stdio: "ignore",
@@ -177,7 +191,7 @@ try {
           "-v",
           `${outDir}:/out`,
           IMAGE,
-          ...scanArgs("/out/report.json", "/out", "/scan"),
+          ...scanArgs("/out/report.json", "/out", "/out/rules.toml", "/scan"),
         ],
         { env, stdio: "ignore", timeout: 180000 },
       );
