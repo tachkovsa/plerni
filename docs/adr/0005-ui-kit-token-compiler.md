@@ -1,13 +1,11 @@
 # ADR-0005 — UI kit + token compiler
 
-- **Status:** Proposed · **Date:** 2026-10-26
+- **Status:** Accepted · **Date:** 2026-10-26
 - **Issue:** [#19](https://github.com/tachkovsa/plerni/issues/19)
 - **Spec:** [`../specs/2026-10-12-plerni-design.md`](../specs/2026-10-12-plerni-design.md) §1 invariants 5–8 and 10, §9 (shell, kit, tokens, declarative screens, accessibility), §12 (token lint, fixture gallery), §14 (dependency freshness)
 - **Register:** [`../decision-register.html`](../decision-register.html) — **D13** (kit), **D14** (token compiler and admin theming). **D12** and **D24** bound the plugin surface this kit renders.
 - **Plan:** [`../plans/2026-10-13-p0-implementation-plan.md`](../plans/2026-10-13-p0-implementation-plan.md) §8 task 11, §9 (reviewer for this record is other than β), §12 (default-theme discovery). [`../plans/2026-10-13-p0-detailed-implementation-plan.md`](../plans/2026-10-13-p0-detailed-implementation-plan.md) T11. [`../ROADMAP.md`](../ROADMAP.md) — declarative plugin screens until P5; WCAG 2.2 AA is a property of the kit, shown on real workflows.
 - **Number:** Plan §8 assigns 0005 to this record. Listing this directory at writing shows 0001, 0003, 0004, 0006, and 0007. 0002 remains the name that section assigns to the ORM record.
-
-This record is Proposed. It carries no review receipt. Issue #19 and plan T11 route acceptance to a reviewer other than family β, because family β authored the theme discovery in plan §12. A receipt on the accepting commit moves the status to Accepted.
 
 Versions below were read from the npm registry `time` field and from the vendors' docs on 2026-10-26. The shell is still unscaffolded, so these are pins for that scaffold, not a lockfile edit.
 
@@ -127,6 +125,22 @@ White on `#6E3F73`, `#0F766E`, or `#A44727` has the same ratio as that color on 
 - **D13.** A procurement-critical accessibility scenario fails on the pinned kit, or a deployment needs pixel-level brand control that token edits inside the schema cannot express. Response: replace the adapter, Mantine first, and keep the token names. Screens stay tokens, declarative data, and the re-export surface. A failed scenario is gallery evidence recorded against the pinned version.
 - **D14.** No flip. The compiler, the `--plerni-*` contract, and the rule that the kit sits behind the adapter stay. A better emitter inside `compileTheme` is an implementation change, as long as preview and publish still call one function, tenant JSON still hits the closed grammar in decision 4, and plugins still see only `--plerni-*`.
 - **Palette.** The maintainer selects a candidate, or the ranking pass rejects plum. That selection updates the default document's seed. It does not reopen the kit or the compiler. A dark primary that fails decision 6 cannot ship to keep one hex across both themes.
+
+## Review
+
+The drafting model families for this record are unknown. Maintainer decision 2026-10-26 ([`../ai/model-routing.md`](../ai/model-routing.md)) accepts an ADR in that case on a review by the project's maintainer-designated assistant reviewer plus a clean Codex review of the exact head. A human review is not required on that path.
+
+Pull request [#70](https://github.com/tachkovsa/plerni/pull/70) merged this record after that pair of reviews. The decision text they reviewed is head `b5548eb74970760ca5330968ff2cf675b76521e1`. The squash merge is `3cdb8efebec6e02c6190c4c2cca7873e977b6796`. The evidence reference is the public assistant receipt comment [6421279167](https://github.com/tachkovsa/plerni/pull/70#issuecomment-6421279167), bound to that head, plus the Codex clean review comment [6418421097](https://github.com/tachkovsa/plerni/pull/70#issuecomment-6418421097) on the same head. The assistant receipt names that head, records the clean Codex review, and states that the reviewer was the project assistant under the maintainer's 2026-10-26 decision because the drafting family is unknown. Required checks on the pull request were green, and the review threads were resolved.
+
+This section is the acceptance record for that review. It is not a new review of a later commit.
+
+- **Reviewed head:** `b5548eb74970760ca5330968ff2cf675b76521e1`
+- **Reviewer role:** `agent` (maintainer-designated assistant reviewer), with a clean Codex review of that same head
+- **Accountable sponsor:** the maintainer
+- **Verification summary:** The assistant receipt checked the decision against D13 and D14, and against invariants 5, 7, 8, and 10 and spec §9, §12, and §14. The kit is Ant Design plus lucide-react, with Mantine as the fallback and Material UI out on the Pro-license grid. The compiler is kit-agnostic, plugins read `--plerni-*` only, the kit sits behind the adapter, and preview and publish call one function. Pins follow the seven-day ageing rule. The contrast table is consistent, and the adapter does not ship `#1677ff`. The default palette and the dark primary stay open for the maintainer. Codex completed its review of the reviewed head with no findings.
+- **Outcome:** Accepted
+- **Rule:** reviewed under the maintainer rule of 2026-10-26. This receipt names that exact head. It carries no human-review claim and no family-separation claim.
+- **Evidence reference:** public assistant receipt comment [6421279167](https://github.com/tachkovsa/plerni/pull/70#issuecomment-6421279167) on pull request #70, bound to head `b5548eb74970760ca5330968ff2cf675b76521e1`, and Codex clean review comment [6418421097](https://github.com/tachkovsa/plerni/pull/70#issuecomment-6418421097) on that same head. This receipt carries no human-review claim and no family-separation claim.
 
 ## Sources
 
