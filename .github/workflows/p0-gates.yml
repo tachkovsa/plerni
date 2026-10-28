@@ -83,3 +83,14 @@ jobs:
       # must not receive that secret, because it checks out and runs the
       # merge commit.
       - run: node scripts/gates/gate-health.test.mjs
+      # SCA negative proof (plan T14). One process generates a temp
+      # package-lock.json for lodash 4.17.20, scans it, requires
+      # CVE-2021-23337 on package lodash, and deletes the directory.
+      # The lockfile is never committed. The reusable sca job is unchanged
+      # and does not see this file. A scanner crash is not a finding.
+      # Exit 0 with the advisory present is not proof. --advisory with a
+      # different id fails with this step's own diagnostic. The scanner is
+      # osv-scanner v2.7.0: digest-pinned when docker is used, sha256-pinned
+      # otherwise. A target osv-scanner.toml is not applied.
+      - name: negative proof — lodash 4.17.20 must report CVE-2021-23337
+        run: node scripts/gates/fixtures/sca/sca-negative-proof.mjs

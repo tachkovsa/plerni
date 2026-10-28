@@ -8,6 +8,10 @@
  * scanner whose bytes do not match the pinned binary digest fails closed.
  * Its negative proof asserts the planted gitleaks finding
  * (see .github/workflows/p0-gates.yml).
+ * The SCA gate blocks a lockfile generated at run time (lodash 4.17.20,
+ * CVE-2021-23337) and accepts clean input (scripts/gates/sca.mjs). That
+ * lockfile is not committed. A cached osv-scanner whose bytes do not match
+ * the pinned digest fails closed. The negative proof asserts the advisory.
  * The approval verifier's four fail-closed cases are artifact missing, digest
  * mismatch, bad signature, and head-key substitution.
  */
@@ -927,6 +931,270 @@ cases.push({
   expectOutput: /cached scanner does not match the pinned binary — FAIL CLOSED(?![\s\S]*secrets gate OK)/,
 });
 
+const scaDir = mkdtempSync(join(tmpdir(), "plerni-sca-gate-"));
+const vulnRoot = join(scaDir, "vuln");
+const scaCleanRoot = join(scaDir, "clean");
+const ignoredRoot = join(scaDir, "ignored");
+const anyRoot = join(scaDir, "any");
+for (const dir of [vulnRoot, scaCleanRoot, ignoredRoot, anyRoot]) mkdirSync(dir);
+writeFileSync(
+  join(ignoredRoot, "osv-scanner.toml"),
+  [
+    "[[IgnoredVulns]]",
+    'id = "CVE-2021-23337"',
+    'reason = "must not hide the fixture"',
+    "",
+    "[[IgnoredVulns]]",
+    'id = "GHSA-35jh-r3h4-6jhm"',
+    'reason = "must not hide the fixture"',
+    "",
+    "[[PackageOverrides]]",
+    'name = "lodash"',
+    "vulnerability.ignore = true",
+    'reason = "must not hide the fixture"',
+    "",
+  ].join("\n"),
+);
+const scaPlantedReport = {
+  results: [
+    {
+      source: { path: "package-lock.json", type: "lockfile" },
+      packages: [
+        {
+          package: { name: "lodash", version: "4.17.20", ecosystem: "npm" },
+          vulnerabilities: [{ id: "GHSA-35jh-r3h4-6jhm", aliases: ["CVE-2021-23337"] }],
+          groups: [{ ids: ["GHSA-35jh-r3h4-6jhm"], aliases: ["CVE-2021-23337", "GHSA-35jh-r3h4-6jhm"] }],
+        },
+      ],
+    },
+  ],
+};
+const scaPlantedPath = join(scaDir, "planted.json");
+const wrongPackagePath = join(scaDir, "wrong-package.json");
+const emptyPath = join(scaDir, "empty.json");
+writeFileSync(scaPlantedPath, JSON.stringify(scaPlantedReport));
+writeFileSync(
+  wrongPackagePath,
+  JSON.stringify({
+    results: [
+      {
+        packages: [
+          {
+            package: { name: "left-pad", version: "1.0.0" },
+            vulnerabilities: [{ id: "CVE-2021-23337", aliases: [] }],
+          },
+        ],
+      },
+    ],
+  }),
+);
+writeFileSync(emptyPath, "{\"results\":[]}\n");
+const scaProof = "fixtures/sca/sca-negative-proof.mjs";
+const scaGenerator = "fixtures/sca/gen-vuln-lockfile.mjs";
+cases.push({
+  name: "sca fixture generator refuses a directory inside the repository",
+  cmd: gate(scaGenerator, "--dir", join(here, "fixtures", "sca")),
+  expectExit: 1,
+  expectOutput: /refusing to write the fixture inside the repository(?![\s\S]*wrote package-lock.json)/,
+});
+cases.push({
+  name: "sca fixture generator writes lodash 4.17.20",
+  cmd: gate(scaGenerator, "--dir", vulnRoot),
+  expectExit: 0,
+  expectOutput: /^gen-vuln-lockfile: wrote package-lock.json lodash 4\.17\.20\n$/,
+});
+cases.push({
+  name: "sca fixture generator writes the clean positive control",
+  cmd: gate(scaGenerator, "--dir", scaCleanRoot, "--clean"),
+  expectExit: 0,
+  expectOutput: /^gen-vuln-lockfile: wrote package-lock.json plerni-sca-clean-fixture 1\.0\.0\n$/,
+});
+cases.push({
+  name: "sca fixture generator writes the lockfile the ignore override must not hide",
+  cmd: gate(scaGenerator, "--dir", ignoredRoot),
+  expectExit: 0,
+  expectOutput: /^gen-vuln-lockfile: wrote package-lock.json lodash 4\.17\.20\n$/,
+});
+cases.push({
+  name: "sca negative proof accepts the planted CVE-2021-23337 advisory",
+  cmd: gate(scaProof, "--report", scaPlantedPath, "--scanner-exit", "1"),
+  expectExit: 0,
+  expectOutput: /^sca negative proof OK \(advisory CVE-2021-23337, package lodash\)\n$/,
+});
+cases.push({
+  name: "sca negative proof rejects exit 0 when the planted advisory is present",
+  cmd: gate(scaProof, "--report", scaPlantedPath, "--scanner-exit", "0"),
+  expectExit: 1,
+  expectOutput: /scanner exit 0 contradicts a planted advisory — a vulnerability must exit 1(?![\s\S]*negative proof OK)/,
+});
+cases.push({
+  name: "sca negative proof rejects a wrong advisory id on the planted fixture",
+  cmd: gate(scaProof, "--report", scaPlantedPath, "--scanner-exit", "1", "--advisory", "CVE-2020-0000"),
+  expectExit: 1,
+  expectOutput: /expected advisory CVE-2020-0000 package lodash is absent(?![\s\S]*negative proof OK)/,
+});
+cases.push({
+  name: "sca negative proof rejects the planted advisory on a different package",
+  cmd: gate(scaProof, "--report", wrongPackagePath, "--scanner-exit", "1"),
+  expectExit: 1,
+  expectOutput: /expected advisory CVE-2021-23337 package lodash is absent(?![\s\S]*negative proof OK)/,
+});
+cases.push({
+  name: "sca negative proof rejects a scanner crash even when the advisory is present",
+  cmd: gate(scaProof, "--report", scaPlantedPath, "--scanner-exit", "127"),
+  expectExit: 1,
+  expectOutput: /scanner failed \(exit 127\) — a crash is not a finding(?![\s\S]*negative proof OK)/,
+});
+cases.push({
+  name: "sca negative proof rejects a vulnerability exit that produced no report",
+  cmd: gate(scaProof, "--report", join(scaDir, "missing.json"), "--scanner-exit", "1"),
+  expectExit: 1,
+  expectOutput: /report is missing or not an osv-scanner result(?![\s\S]*negative proof OK)/,
+});
+cases.push({
+  name: "sca negative proof rejects a clean scan with an empty report",
+  cmd: gate(scaProof, "--report", emptyPath, "--scanner-exit", "0"),
+  expectExit: 1,
+  expectOutput: /expected advisory CVE-2021-23337 package lodash is absent(?![\s\S]*negative proof OK)/,
+});
+cases.push({
+  name: "sca negative proof rejects report mode without a scanner exit",
+  cmd: gate(scaProof, "--report", scaPlantedPath),
+  expectExit: 1,
+  expectOutput: /report mode requires both --report and --scanner-exit(?![\s\S]*negative proof OK)/,
+});
+cases.push({
+  name: "sca negative proof rejects an advisory id that cannot be printed",
+  cmd: gate(scaProof, "--advisory", "not an id"),
+  expectExit: 1,
+  expectOutput: /advisory id is not allowed(?![\s\S]*negative proof OK)/,
+});
+const scaFindingScanner = join(scaDir, "finding-scanner");
+writeFileSync(
+  scaFindingScanner,
+  `#!/bin/sh
+prev=
+report=
+for arg in "$@"; do
+  if [ "$prev" = "--output-file" ]; then
+    report=$arg
+  fi
+  prev=$arg
+done
+printf '%s' '${JSON.stringify(scaPlantedReport)}' > "$report"
+exit 0
+`,
+  { mode: 0o755 },
+);
+chmodSync(scaFindingScanner, 0o755);
+const scaEmptyScanner = join(scaDir, "empty-scanner");
+writeFileSync(
+  scaEmptyScanner,
+  `#!/bin/sh
+prev=
+report=
+for arg in "$@"; do
+  if [ "$prev" = "--output-file" ]; then
+    report=$arg
+  fi
+  prev=$arg
+done
+printf '%s' '{"results":[]}' > "$report"
+exit 0
+`,
+  { mode: 0o755 },
+);
+chmodSync(scaEmptyScanner, 0o755);
+const scaCrashScanner = join(scaDir, "crash-scanner");
+writeFileSync(scaCrashScanner, "#!/bin/sh\nexit 2\n", { mode: 0o755 });
+chmodSync(scaCrashScanner, 0o755);
+const scaKillScanner = join(scaDir, "kill-scanner");
+writeFileSync(scaKillScanner, "#!/bin/sh\nkill -KILL $$\n", { mode: 0o755 });
+chmodSync(scaKillScanner, 0o755);
+cases.push({
+  name: "sca gate rejects a clean scanner exit that still reports an advisory",
+  cmd: gate("sca.mjs", "--root", anyRoot, "--scanner", scaFindingScanner),
+  expectExit: 1,
+  expectOutput: /sca gate: finding id CVE-2021-23337 package lodash(?![\s\S]*sca gate OK)/,
+});
+cases.push({
+  name: "sca gate rejects an empty package list",
+  cmd: gate("sca.mjs", "--root", anyRoot, "--scanner", scaEmptyScanner),
+  expectExit: 1,
+  expectOutput: /report listed no packages(?![\s\S]*sca gate OK)/,
+});
+cases.push({
+  name: "sca gate rejects a scanner crash",
+  cmd: gate("sca.mjs", "--root", anyRoot, "--scanner", scaCrashScanner),
+  expectExit: 1,
+  expectOutput: /scanner failed \(exit 2\)(?![\s\S]*sca gate OK)/,
+});
+cases.push({
+  name: "sca gate rejects a scanner killed with no exit code",
+  cmd: gate("sca.mjs", "--root", anyRoot, "--scanner", scaKillScanner),
+  expectExit: 1,
+  expectOutput: /scanner failed \(no exit code\)(?![\s\S]*sca gate OK)/,
+});
+const scaNoDocker = join(scaDir, "no-docker");
+mkdirSync(scaNoDocker, { mode: 0o700 });
+writeFileSync(join(scaNoDocker, "docker"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+chmodSync(join(scaNoDocker, "docker"), 0o755);
+const scaCacheHome = join(scaDir, "xdg-cache");
+mkdirSync(scaCacheHome, { mode: 0o700 });
+chmodSync(scaCacheHome, 0o700);
+const scaCache = join(scaCacheHome, "plerni", "osv-scanner", "2.7.0", `${process.platform}-${process.arch}`);
+mkdirSync(scaCache, { recursive: true, mode: 0o700 });
+for (const dir of [
+  scaCacheHome,
+  join(scaCacheHome, "plerni"),
+  join(scaCacheHome, "plerni", "osv-scanner"),
+  join(scaCacheHome, "plerni", "osv-scanner", "2.7.0"),
+  scaCache,
+]) {
+  chmodSync(dir, 0o700);
+}
+const scaPlanted = join(scaCache, "osv-scanner");
+writeFileSync(scaPlanted, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+chmodSync(scaPlanted, 0o700);
+writeFileSync(join(scaCache, "binary.sha256"), "160c6253e2922e9e0a6a9771c5c4c40a4b3c6090b34a3cdd5e80c96cc2e4218b\n");
+cases.push({
+  name: "sca gate rejects a tampered cached scanner",
+  cmd: gate("sca.mjs", "--root", anyRoot),
+  env: { PATH: scaNoDocker, XDG_CACHE_HOME: scaCacheHome },
+  expectExit: 1,
+  expectOutput: /cached scanner does not match the pinned binary — FAIL CLOSED(?![\s\S]*sca gate OK)/,
+});
+cases.push({
+  name: "sca gate blocks the generated lodash fixture",
+  cmd: gate("sca.mjs", "--root", vulnRoot),
+  expectExit: 1,
+  expectOutput: /sca gate: finding id CVE-2021-23337 package lodash(?![\s\S]*sca gate OK)/,
+});
+cases.push({
+  name: "sca gate accepts clean input",
+  cmd: gate("sca.mjs", "--root", scaCleanRoot),
+  expectExit: 0,
+  expectOutput: /^sca gate OK\n$/,
+});
+cases.push({
+  name: "sca gate still blocks the fixture when the target ignores it",
+  cmd: gate("sca.mjs", "--root", ignoredRoot),
+  expectExit: 1,
+  expectOutput: /sca gate: finding id CVE-2021-23337 package lodash(?![\s\S]*sca gate OK)/,
+});
+cases.push({
+  name: "sca negative proof reports CVE-2021-23337 from the generated fixture",
+  cmd: gate(scaProof),
+  expectExit: 0,
+  expectOutput: /^sca negative proof OK \(advisory CVE-2021-23337, package lodash\)\n$/,
+});
+cases.push({
+  name: "sca negative proof rejects a wrong advisory id from the live fixture",
+  cmd: gate(scaProof, "--advisory", "CVE-2020-0000"),
+  expectExit: 1,
+  expectOutput: /expected advisory CVE-2020-0000 package lodash is absent — the scan completed without that advisory(?![\s\S]*negative proof OK)/,
+});
+
 const parseWorkflow = (text, label) => {
   const doc = parseYaml(text);
   if (!doc || typeof doc !== "object" || Array.isArray(doc)) {
@@ -1031,6 +1299,47 @@ cases.push({
   expectOutput: /workflow wiring OK/,
 });
 
+const scaWiringProblems = () => {
+  const gates = parseWorkflow(
+    readFileSync(join(here, "../../.github/workflows/p0-gates.yml"), "utf8"),
+    "p0-gates.yml",
+  );
+  const problems = [];
+  const sca = gates.jobs?.sca;
+  const uses = "google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@v2.7.0";
+  if (!sca || sca.uses !== uses) problems.push("reusable sca job must stay on osv-scanner-action v2.7.0");
+  if (sca && sca.steps != null) problems.push("reusable sca job must not gain steps");
+  const scanArgs = sca?.with?.["scan-args"];
+  if (typeof scanArgs !== "string" || !scanArgs.includes("--recursive") || !scanArgs.includes("./")) {
+    problems.push("reusable sca scan-args must stay recursive on ./");
+  }
+  const proof = stepList(gates.jobs?.gates).filter(
+    (step) => typeof step?.run === "string" && step.run.trim() === "node scripts/gates/fixtures/sca/sca-negative-proof.mjs",
+  );
+  if (proof.length !== 1) problems.push("gates job must run sca-negative-proof.mjs exactly once");
+  return problems.join("; ");
+};
+let scaWiringReport = "";
+try {
+  scaWiringReport = scaWiringProblems();
+} catch (err) {
+  scaWiringReport = err instanceof Error ? err.message : String(err);
+}
+cases.push({
+  name: "sca negative proof runs in the gates job and the reusable sca job is unchanged",
+  cmd: [
+    process.execPath,
+    [
+      "-e",
+      scaWiringReport
+        ? `console.error(${JSON.stringify(`sca wiring: ${scaWiringReport}`)}); process.exit(1)`
+        : "console.log('sca wiring OK')",
+    ],
+  ],
+  expectExit: 0,
+  expectOutput: /sca wiring OK/,
+});
+
 let failed = 0;
 try {
   for (const c of cases) {
@@ -1063,6 +1372,7 @@ try {
   rmSync(approvalRoot, { recursive: true, force: true });
   rmSync(approvalKeys, { recursive: true, force: true });
   rmSync(secretsDir, { recursive: true, force: true });
+  rmSync(scaDir, { recursive: true, force: true });
 }
 
 if (failed) {
