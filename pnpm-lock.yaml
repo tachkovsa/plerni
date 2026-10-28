@@ -11,6 +11,9 @@ importers:
 
   .:
     devDependencies:
+      bezier-boolean:
+        specifier: 1.0.6
+        version: 1.0.6
       turbo:
         specifier: ^2.5.8
         version: 2.11.7
@@ -117,6 +120,9 @@ packages:
 
   argparse@2.0.1:
     resolution: {integrity: sha512-8+9WqebbFzpX9OR+Wa6O29asIogeRMzcGtAINdpMHHyAg10f05aSFVBbcEqGf/PXw1EjAZ+q2/bEBg3DvurK3Q==}
+
+  bezier-boolean@1.0.6:
+    resolution: {integrity: sha512-WEDRPnvdArpyjSG/L3zBVnReFb2ar7qXzT32YzvVH2Bfutm5avOYDnpL66qIoYQj5cF5AWI66DlNo4a4nRv1AA==}
 
   callsites@3.1.0:
     resolution: {integrity: sha512-P8BjAsXvZS+VIDUI11hHCQEv74YT67YUi5JJFNWIqL235sBmjX4+qx9Muvls5ivyNENctx46xQLQ3aTuE7ssaQ==}
@@ -385,6 +391,8 @@ snapshots:
       color-convert: 2.0.1
 
   argparse@2.0.1: {}
+
+  bezier-boolean@1.0.6: {}
 
   callsites@3.1.0: {}
 

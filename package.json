@@ -15,6 +15,7 @@
     "gate:health": "node scripts/gates/gate-health.test.mjs"
   },
   "devDependencies": {
+    "bezier-boolean": "1.0.6",
     "turbo": "^2.5.8",
     "typescript": "^5.9.3",
     "yaml": "^2.9.1"
