@@ -16,7 +16,7 @@ Plerni is a self-hostable LXP (Learning Experience Platform): competency/skill m
 
 ## License
 
-Apache-2.0 (see LICENSE). Plerni was founded by **Sergei Tachkov** (see NOTICE). Redistributions must preserve applicable notices as required by Apache-2.0 §4.
+Apache-2.0 (see LICENSE). Plerni was founded by **Sergei Tachkov** (see NOTICE). Redistributions must preserve applicable notices as required by Apache-2.0 §4. The name and logo are not part of that license (see [TRADEMARKS.md](TRADEMARKS.md)).
 
 ## Principles (short form)
 
