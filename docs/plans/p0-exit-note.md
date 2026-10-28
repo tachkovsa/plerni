@@ -132,7 +132,7 @@ Source: [`../specs/2026-10-12-plerni-design.md`](../specs/2026-10-12-plerni-desi
 | DCO | [`../../CONTRIBUTING.md`](../../CONTRIBUTING.md) (Legal). A `Signed-off-by` line is not required at the current stage, and commit-policy does not check for one. |
 | CONTRIBUTING | [`../../CONTRIBUTING.md`](../../CONTRIBUTING.md) |
 | SECURITY | [`../../SECURITY.md`](../../SECURITY.md) |
-| Trademark | [`../../NOTICE`](../../NOTICE) records the wordmark and the founder copyright. [`../../README.md`](../../README.md) requires preserving notices under Apache-2.0 §4. A separate trademark-policy document is not in the tree. |
+| Trademark | [Pull request #82](https://github.com/tachkovsa/plerni/pull/82) adds `TRADEMARKS.md` and links it from NOTICE and README. Merge is still pending. |
 | Dependency policy | Spec §14 (bounded freshness). Mechanical checks: `scripts/gates/license-audit.mjs` and the `sca / osv-scan` job in [`.github/workflows/p0-gates.yml`](../../.github/workflows/p0-gates.yml). |
 | Contract conventions | [`../specs/contract-conventions.md`](../specs/contract-conventions.md), accepted at P0. Issue [#20](https://github.com/tachkovsa/plerni/issues/20). |
 | ADR-0001 | [`../adr/0001-kernel-and-equal-citizen-plugins.md`](../adr/0001-kernel-and-equal-citizen-plugins.md), Accepted |
