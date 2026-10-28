@@ -29,7 +29,7 @@ Each fixture followed the plan §7 safety rule: closed pull requests keep `refs/
 
 ### 1. secrets — required check `secrets`
 
-[Pull request #75](https://github.com/tachkovsa/plerni/pull/75), head `7021eeec4f9983c76b3ccc733805ed1d95d0dea8`. Closed, not merged. Branch `cursor/t15-secrets-fixture-4af7` deleted immediately after close.
+[Pull request #75](https://github.com/tachkovsa/plerni/pull/75), head `7021eeec4f9983c76b3ccc733805ed1d95d0dea8`. Closed, not merged. Its branch was deleted immediately after close.
 
 Failing step: `gitleaks history scan (pinned v8.30.1)` in [job 122593540329](https://github.com/tachkovsa/plerni/actions/runs/40620638992/job/122593540329). The earlier step `Run actions/checkout@v4` succeeded. The negative-proof step was skipped.
 
