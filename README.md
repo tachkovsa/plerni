@@ -6,13 +6,14 @@ Plerni is a self-hostable LXP (Learning Experience Platform): competency/skill m
 
 ## Status
 
-**P0 — Foundations.** There is nothing to run yet. The current state of the design lives in:
+**P0 — Foundations is still open.** The six P0 gates (secrets, private-markers, license-audit, kernel-purity, commit-policy, sca) are done. They block their bad fixtures and are required checks on `dev`. P0 stays open until the B3 replacement is validated ([issue #84](https://github.com/tachkovsa/plerni/issues/84)). The exit note is [`docs/plans/p0-exit-note.md`](docs/plans/p0-exit-note.md). The trademark policy is [`TRADEMARKS.md`](TRADEMARKS.md). There is still nothing to run yet. The current state of the design lives in:
 
 - [`docs/ROADMAP.md`](docs/ROADMAP.md) — what Plerni is, the phases, and where to help (plain language; start here)
 - [`docs/specs/2026-10-12-plerni-design.md`](docs/specs/2026-10-12-plerni-design.md) — the full product & architecture specification (adversarially reviewed across four independent model families, pseudonymized per AGENTS.md §0)
 - [`docs/decision-register.html`](docs/decision-register.html) — 32 architectural decisions with rationale, evidence, and flip conditions (open in a browser)
 - [`docs/adr/`](docs/adr/) — architectural decision records
 - [`docs/reviews/`](docs/reviews/) — integrity manifest of the adversarial review transcripts the design survived (transcripts retained privately per AGENTS.md §0)
+- [`docs/plans/p0-exit-note.md`](docs/plans/p0-exit-note.md) — the P0 exit note
 
 ## License
 
