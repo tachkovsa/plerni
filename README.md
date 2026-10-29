@@ -6,9 +6,7 @@ Plerni is a self-hostable LXP (Learning Experience Platform): competency/skill m
 
 ## Status
 
-**P0 — Foundations is complete.** All six P0 gates (secrets, private-markers, license-audit, kernel-purity, commit-policy, sca) block their bad fixtures and are required checks on `dev`. The exit note is [`docs/plans/p0-exit-note.md`](docs/plans/p0-exit-note.md). The trademark policy is [`TRADEMARKS.md`](TRADEMARKS.md).
-
-**Next is P1 — Kernel.** Sign-in, companies as tenants, roles, an audit trail, file storage, a secret store, notification plumbing, a job and event bus, a small admin screen, and a read-only assistant API. Creating a tenant and an administrator works through the API alone. Courses, tests, and competencies stay in plugins. The kernel source stays free of those words. There is still nothing to run yet. The current state of the design lives in:
+**P0 — Foundations is still open.** The six P0 gates (secrets, private-markers, license-audit, kernel-purity, commit-policy, sca) are done. They block their bad fixtures and are required checks on `dev`. P0 stays open until the B3 replacement is validated ([issue #84](https://github.com/tachkovsa/plerni/issues/84)). The exit note is [`docs/plans/p0-exit-note.md`](docs/plans/p0-exit-note.md). The trademark policy is [`TRADEMARKS.md`](TRADEMARKS.md). There is still nothing to run yet. The current state of the design lives in:
 
 - [`docs/ROADMAP.md`](docs/ROADMAP.md) — what Plerni is, the phases, and where to help (plain language; start here)
 - [`docs/specs/2026-10-12-plerni-design.md`](docs/specs/2026-10-12-plerni-design.md) — the full product & architecture specification (adversarially reviewed across four independent model families, pseudonymized per AGENTS.md §0)
