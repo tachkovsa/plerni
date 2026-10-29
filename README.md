@@ -6,13 +6,16 @@ Plerni is a self-hostable LXP (Learning Experience Platform): competency/skill m
 
 ## Status
 
-**P0 — Foundations.** There is nothing to run yet. The current state of the design lives in:
+**P0 — Foundations is complete.** All six P0 gates (secrets, private-markers, license-audit, kernel-purity, commit-policy, sca) block their bad fixtures and are required checks on `dev`. The exit note is [`docs/plans/p0-exit-note.md`](docs/plans/p0-exit-note.md). The trademark policy is [`TRADEMARKS.md`](TRADEMARKS.md).
+
+**Next is P1 — Kernel.** Sign-in, companies as tenants, roles, an audit trail, file storage, a secret store, notification plumbing, a job and event bus, a small admin screen, and a read-only assistant API. Creating a tenant and an administrator works through the API alone. Courses, tests, and competencies stay in plugins. The kernel source stays free of those words. There is still nothing to run yet. The current state of the design lives in:
 
 - [`docs/ROADMAP.md`](docs/ROADMAP.md) — what Plerni is, the phases, and where to help (plain language; start here)
 - [`docs/specs/2026-10-12-plerni-design.md`](docs/specs/2026-10-12-plerni-design.md) — the full product & architecture specification (adversarially reviewed across four independent model families, pseudonymized per AGENTS.md §0)
 - [`docs/decision-register.html`](docs/decision-register.html) — 32 architectural decisions with rationale, evidence, and flip conditions (open in a browser)
 - [`docs/adr/`](docs/adr/) — architectural decision records
 - [`docs/reviews/`](docs/reviews/) — integrity manifest of the adversarial review transcripts the design survived (transcripts retained privately per AGENTS.md §0)
+- [`docs/plans/p0-exit-note.md`](docs/plans/p0-exit-note.md) — the P0 exit note
 
 ## License
 
