@@ -1,6 +1,6 @@
 # Spike B report
 
-Verdicts for plan §4 B1–B6 and the T5c race battery. The B3 verdict is the replacement validation on 2026-10-29: three `spike:b3` invocations on Node v24.22.2, the major in `.nvmrc`, under the frozen contract. Both buffer caps hold. The 2026-10-18 section is the failed substrate (partial high-water 69632; accounted totals 106496, 57344, and 155648) on the tree of that commit (parent `281f9d3a6e29fd57f6ece14fd255abd4667b41be`). B1, B4, and B6 were rerun on this substrate and passed. B2, B5, and the race battery stay the earlier PASS. This validation had no harness database, so those authority cases were not re-executed. The invalid pooled login from 2026-10-18 is recorded in the Spike A report and is not a B verdict.
+Verdicts for plan §4 B1–B6 and the T5c race battery. The B3 verdict is the replacement validation on 2026-10-29: three `spike:b3` invocations on Node v24.22.2, the major in `.nvmrc`, under the frozen contract. Both buffer caps hold. The 2026-10-18 section is the failed substrate (partial high-water 69632; accounted totals 106496, 57344, and 155648) on the tree of that commit (parent `281f9d3a6e29fd57f6ece14fd255abd4667b41be`). B1, B4, and B6 were rerun on this substrate and passed. B2, B5, and the race battery last passed before #51 changed the supervisor, so they are not green on this substrate. Issue #86 re-runs them. This validation does not. The invalid pooled login from 2026-10-18 is recorded in the Spike A report and is not a B verdict.
 
 Evidence label, verbatim: "transport + minimal-real-authority; full broker proof remains P2 acceptance".
 
@@ -56,13 +56,13 @@ The 2026-10-18 harness was PostgreSQL 18.6, PgBouncer 1.26.0, `pool_mode=transac
 | ID | Verdict | Measured result |
 |---|---|---|
 | B1 | PASS | Replacement rerun. Per-rep rate 7999.98, 8000, 7998.12 /s. Per-rep p99 4.048, 4.392, 4.990 ms. Corrupt 0, errors 0. Target ≥5000 /s and p99 ≤10 ms. |
-| B2 sequential | PASS | Earlier run, not re-executed here. Lost cancel stays `COMMITTED` and is reported `lost`. Live cancel is `cancelled` / `CANCELLED`. Commit after cancel is fenced. Ignore-cancel returns `ignore` and the cancel times out. |
-| B2 concurrent | PASS | Earlier run, not re-executed here. `test:races` case `commit-vs-revoke`, 28.79 ms. The executor holds the row first, the revoker waits on `Lock` / `transactionid`, the commit wins, the cancel loses, and the row stays `COMMITTED`. |
+| B2 sequential | not on this substrate | Last passed before #51. Issue #86 re-runs it. That earlier run: lost cancel stays `COMMITTED` and is reported `lost`. Live cancel is `cancelled` / `CANCELLED`. Commit after cancel is fenced. Ignore-cancel returns `ignore` and the cancel times out. |
+| B2 concurrent | not on this substrate | Last passed before #51. Issue #86 re-runs it. That earlier `test:races` case `commit-vs-revoke` was 28.79 ms. The executor holds the row first, the revoker waits on `Lock` / `transactionid`, the commit wins, the cancel loses, and the row stays `COMMITTED`. |
 | B3 | PASS | Enforced partial high-waters 23488, 25728, and 23488, each ≤ 32768, code `partial-cap`. Enforced accounted totals 32480, 34336, and 33184, each ≤ 49152. `stdoutUnread` 384 ≤ `K_in` 6848. The same-host unenforced control fails both clauses. RSS growth ≤ 67108864 (largest 14475264). |
 | B4 | PASS | Replacement rerun. Malformed child `NdjsonFramingError`, sibling alive. Never-terminated frame `NdjsonOversizeError`, pending bytes 1048590, `pastFramer` true. Mux `MuxOversizeError`. |
-| B5 | PASS | Earlier run, not re-executed here. Mid-call exit is `child-exited` (code 1). The retired token is refused. The respawn token is distinct and fenced. Status stays `ACTIVE`. |
+| B5 | not on this substrate | Last passed before #51. Issue #86 re-runs it. That earlier run: mid-call exit is `child-exited` (code 1). The retired token is refused. The respawn token is distinct and fenced. Status stays `ACTIVE`. |
 | B6 | PASS | Replacement rerun. Hostile checks all true. Flood cancel p99 44.54, 1.56, 1.74 ms, each ≤ 500 ms. |
-| Races | PASS | Earlier run, not re-executed here. Every battery case passed. The designed-failure oracles (stalled shutdown, commit-vs-revoke vacuity, vacuity-authority) and the B6 identity-stamping vacuity fail in the way each oracle requires. |
+| Races | not on this substrate | Last passed before #51. Issue #86 re-runs the battery. That earlier run: every battery case passed. The designed-failure oracles (stalled shutdown, commit-vs-revoke vacuity, vacuity-authority) and the B6 identity-stamping vacuity fail in the way each oracle requires. |
 
 ## B1
 
@@ -169,6 +169,6 @@ Each invocation's three holds warmed 4999–5001 ms, then offered 300 slots (iss
 
 `getsockopt(SO_SNDBUF)` on both writer ends was 4608. `K_in` and `K_out` were 6848, which is `4608 + (4608 >> 1) - 64`. `C` was 4096. `K_mux_in` was 4096 and `K_mux_out` was 4608, the read-back before connect. `B_p` was 21824 and `B_t` was 31360, both ≥ 0. At `totalGlobal` 1048576, `S` is 1035776. One runner, so `R` is 1. The per-process bound is `min(N × T + S + K_mux_in + K_mux_out + C, totalGlobal)`, which is 1048576 for both the default caps and the trip caps.
 
-B1 on the frozen shape passed (about 8000/s, p99 under 5 ms). That is not the flip. B4's never-terminated frame was `NdjsonOversizeError`, not `partial-cap`. B6 sibling cancel p99 stayed under 500 ms. B2, B5, and the race battery were not re-executed. A4b stays issue #34.
+B1 on the frozen shape passed (about 8000/s, p99 under 5 ms). That is not the flip. B4's never-terminated frame was `NdjsonOversizeError`, not `partial-cap`. B6 sibling cancel p99 stayed under 500 ms. B2, B5, and the race battery were not re-executed. A4b PASS (#58, #34 closed).
 
 The recorded snapshots still fail the bound: partial 69632 at cap 32768, and totals 106496, 57344, and 155648 at cap 49152. The enforced runs above are what hold.
