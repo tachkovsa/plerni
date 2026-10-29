@@ -3828,7 +3828,10 @@ function waitForRuntime(pid) {
   const deadline = Date.now() + 1_000;
   while (Date.now() < deadline) {
     try {
-      if (readFileSync(`/proc/${pid}/comm`, 'utf8').startsWith('node')) return true;
+      // Node 24 names the main thread, so comm becomes MainThread after startup.
+      // Until that call it is still node. Either name is this runtime.
+      const name = readFileSync(`/proc/${pid}/comm`, 'utf8');
+      if (name.startsWith('node') || name.startsWith('MainThread')) return true;
     } catch {
       return false;
     }

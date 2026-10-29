@@ -4,6 +4,8 @@
 
 This note records the required-check proof, the six closed fixture pull requests, the spec §15 P0 checklist, and the issues for T1–T14. Fixture branches are deleted. None of the fixture pull requests were merged. The milestone stays open until every checklist row below has evidence.
 
+**Amendment (2026-10-29, issue #84):** the B3 row below is the replacement validation. Both buffer caps pass. README does not claim P0 complete. A4b stays open.
+
 ## Required checks
 
 `GET /repos/tachkovsa/plerni/branches/dev/protection` returned 403 (`Resource not accessible by integration`). The same contexts are on the public branch resource, read with:
@@ -141,7 +143,7 @@ Source: [`../specs/2026-10-12-plerni-design.md`](../specs/2026-10-12-plerni-desi
 | ADR-0004 | [`../adr/0004-plugin-isolation-topology.md`](../adr/0004-plugin-isolation-topology.md), Accepted. Issue [#18](https://github.com/tachkovsa/plerni/issues/18). |
 | ADR-0005 | [`../adr/0005-ui-kit-token-compiler.md`](../adr/0005-ui-kit-token-compiler.md), Accepted. Issue [#19](https://github.com/tachkovsa/plerni/issues/19). |
 | Spike A (DB invariant, typecheck) | [`2026-10-18-spike-a-report.md`](2026-10-18-spike-a-report.md). A1 direct PASS, A1 pooled PASS, A2 PASS, A3 PASS, A4 PASS on unnamed discipline (A4b stays open, issue [#34](https://github.com/tachkovsa/plerni/issues/34)), A5 PASS at the acceptance point, battery PASS. |
-| Spike B (IPC harness) | [`2026-10-18-spike-b-report.md`](2026-10-18-spike-b-report.md). B1 PASS, B2 sequential PASS, B2 concurrent PASS, B3 FAIL (partial cap and total buffer), B4 PASS, B5 PASS, B6 PASS, races PASS. The B3 FAIL leaves the replacement-validation track open. |
+| Spike B (IPC harness) | [`2026-10-18-spike-b-report.md`](2026-10-18-spike-b-report.md). B1 PASS, B3 PASS (partial high-water and total buffer inside the trip caps), B4 PASS, B6 PASS, on the ADR-0006 substrate. B2, B5, and races stay the earlier PASS and were not re-executed in that validation. [ADR-0006](../adr/0006-ipc-flow-control.md) is Accepted. |
 | Contributor roadmap | [`../ROADMAP.md`](../ROADMAP.md). Issue [#15](https://github.com/tachkovsa/plerni/issues/15). |
 
 ### Exit criteria
@@ -149,7 +151,7 @@ Source: [`../specs/2026-10-12-plerni-design.md`](../specs/2026-10-12-plerni-desi
 | Criterion | Evidence | Row |
 |---|---|---|
 | Each P0 gate blocks its deliberately bad fixture pull request | Secrets, private-markers, license-audit, kernel-purity, and SCA failed a required check, at the steps quoted above. The commit-policy check failed at `commit policy` and is not in the required-check list, so that failure does not block merge. | Five required gates have blocking evidence. commit-policy has a red check and no required-check evidence. |
-| Spike reports filed with pass/fail verdicts | The two reports linked above. | Filed, including the B3 FAIL and the open A4b item. |
+| Spike reports filed with pass/fail verdicts | The two reports linked above. | Filed. B3 is PASS on the replacement. A4b stays open. |
 | Contributor roadmap published | [`../ROADMAP.md`](../ROADMAP.md) | Published. No dates. |
 | Protected set stays intact (contract layer, tenancy floor, blocking CI core) | Contract conventions are accepted at P0. Spike A A2 is PASS for tenant isolation on the direct and pooled datasources. The blocking CI core is the required-check list in this note. | Present as recorded. Product tenancy is still P1; `apps/kernel/src` is absent on `dev`. |
 | No nine-month arithmetic bar | Issue [#15](https://github.com/tachkovsa/plerni/issues/15) withdrew the capacity annex. [`../ROADMAP.md`](../ROADMAP.md) states there is no delivery deadline. The amendment at the top of the detailed plan records the same withdrawal. | Withdrawn. The bar is not in force. |
