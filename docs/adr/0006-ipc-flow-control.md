@@ -1,6 +1,6 @@
 # ADR-0006 — IPC flow control: caps that include the kernel buffer
 
-- **Status:** Accepted · **Date:** 2026-10-19 · **Accepted:** 2026-10-29
+- **Status:** Proposed · **Date:** 2026-10-19
 - **Spec:** [`../specs/2026-10-12-plerni-design.md`](../specs/2026-10-12-plerni-design.md) §4.4 (framed NDJSON over stdio, stream backpressure)
 - **Register:** [`../decision-register.html`](../decision-register.html) — **D11** names the isolation topology; ADR-0004 remains that record. This record is only the flow-control mechanism under that spike. It does not decide malicious-plugin isolation.
 - **Plan:** [`../plans/2026-10-13-p0-implementation-plan.md`](../plans/2026-10-13-p0-implementation-plan.md) §3.0, §4 B3, §8 (replacement-validation branch)
@@ -222,13 +222,15 @@ The spike B report gains §3.0 diagnosis records for any FAIL along the way. P0 
 
 ## Acceptance
 
-Proposed 2026-10-19. Accepted 2026-10-29 on the replacement validation in the spike B report. Three `spike:b3` invocations on Linux, Node v24.22.2, frozen warmup 5000 ms, window 60000 ms, 3 reps. Every preflight was valid. Enforced partial high-waters were 23488, 25728, and 23488, each ≤ 32768, code `partial-cap`. Enforced accounted totals were 32480, 34336, and 33184, each ≤ 49152. `stdoutUnread` was 384 against `K_in` 6848. RSS growth stayed ≤ 67108864. The largest hold was 14475264. On the same host, with enforcement removed, both clauses missed: partial high-waters 180224, 114688, and 180224; accounted totals 110592, 143360, and 167936; socket capacity 131072. That control is a scored FAIL. It is not `invalid` and not `unsatisfiable`.
+Proposed 2026-10-19. The B3 replacement evidence is PASS. Acceptance waits for the B2, B5, and `test:races` reruns in issue #86. Re-spike item 2 requires those suites because the substrate moved. This record stays Proposed, pending #86.
+
+Three `spike:b3` invocations on Linux, Node v24.22.2, frozen warmup 5000 ms, window 60000 ms, 3 reps. Every preflight was valid. Enforced partial high-waters were 23488, 25728, and 23488, each ≤ 32768, code `partial-cap`. Enforced accounted totals were 32480, 34336, and 33184, each ≤ 49152. `stdoutUnread` was 384 against `K_in` 6848. RSS growth stayed ≤ 67108864. The largest hold was 14475264. On the same host, with enforcement removed, both clauses missed: partial high-waters 180224, 114688, and 180224; accounted totals 110592, 143360, and 167936; socket capacity 131072. That control is a scored FAIL. It is not `invalid` and not `unsatisfiable`.
 
 `getsockopt(SO_SNDBUF)` was 4608 on both writer ends. `K_in` and `K_out` were 6848. `C` was 4096. `K_mux_in` was 4096 and `K_mux_out` was 4608. At `totalGlobal` 1048576, `S` is 1035776. One runner, so the per-process bound is 1048576.
 
 B1 on the frozen shape passed, about 8000 round-trips/s with p99 under 5 ms. That is not the B1 flip. B4's never-terminated frame was `NdjsonOversizeError`. B6 sibling cancel p99 stayed under 500 ms. B2, B5, and `test:races` were not re-executed: this validation had no harness database. Their earlier PASS is not a new measurement of this substrate.
 
-The review receipt is not in this file. It binds the head that reviews this acceptance.
+The review receipt is not in this file. It binds the head that reviews acceptance, after those reruns.
 
 ## Out of scope / verified in re-spike
 

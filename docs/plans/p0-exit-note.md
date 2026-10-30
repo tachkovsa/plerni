@@ -4,7 +4,7 @@
 
 This note records the required-check proof, the six closed fixture pull requests, the spec §15 P0 checklist, and the issues for T1–T14. Fixture branches are deleted. None of the fixture pull requests were merged. The milestone stays open until every checklist row below has evidence.
 
-**Amendment (2026-10-29, issue #84):** the B3 row below is the replacement validation. Both buffer caps pass. README does not claim P0 complete. A4b PASS (#58, #34 closed). B2, B5, and the race battery last passed before #51 changed the supervisor, so they are not green on the shipped substrate. P0 stays open until issue #86 re-runs them on current dev.
+**Amendment (2026-10-29, issue #84):** the B3 row below is the replacement validation. Both buffer caps pass. ADR-0006 stays Proposed, pending #86. README does not claim P0 complete. A4b PASS (#58, #34 closed). B2, B5, and the race battery last passed before #51 changed the supervisor, so they are not green on the shipped substrate. P0 stays open until issue #86 re-runs them on current dev.
 
 ## Required checks
 
@@ -143,7 +143,7 @@ Source: [`../specs/2026-10-12-plerni-design.md`](../specs/2026-10-12-plerni-desi
 | ADR-0004 | [`../adr/0004-plugin-isolation-topology.md`](../adr/0004-plugin-isolation-topology.md), Accepted. Issue [#18](https://github.com/tachkovsa/plerni/issues/18). |
 | ADR-0005 | [`../adr/0005-ui-kit-token-compiler.md`](../adr/0005-ui-kit-token-compiler.md), Accepted. Issue [#19](https://github.com/tachkovsa/plerni/issues/19). |
 | Spike A (DB invariant, typecheck) | [`2026-10-18-spike-a-report.md`](2026-10-18-spike-a-report.md). A1 direct PASS, A1 pooled PASS, A2 PASS, A3 PASS, A4 PASS on unnamed discipline (A4b PASS (#58, #34 closed)), A5 PASS at the acceptance point, battery PASS. |
-| Spike B (IPC harness) | [`2026-10-18-spike-b-report.md`](2026-10-18-spike-b-report.md). B1 PASS, B3 PASS (partial high-water and total buffer inside the trip caps), B4 PASS, B6 PASS, on the ADR-0006 substrate. B2, B5, and the race battery last passed before #51 changed the supervisor. P0 stays open until issue #86 re-runs them on current dev. [ADR-0006](../adr/0006-ipc-flow-control.md) is Accepted. |
+| Spike B (IPC harness) | [`2026-10-18-spike-b-report.md`](2026-10-18-spike-b-report.md). B1 PASS, B3 PASS (partial high-water and total buffer inside the trip caps), B4 PASS, B6 PASS, on the ADR-0006 substrate. B2, B5, and the race battery last passed before #51 changed the supervisor. P0 stays open until issue #86 re-runs them on current dev. [ADR-0006](../adr/0006-ipc-flow-control.md) is Proposed, pending #86. |
 | Contributor roadmap | [`../ROADMAP.md`](../ROADMAP.md). Issue [#15](https://github.com/tachkovsa/plerni/issues/15). |
 
 ### Exit criteria

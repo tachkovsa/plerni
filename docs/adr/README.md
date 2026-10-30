@@ -15,5 +15,5 @@ The pre-implementation decision record (32 decisions with evidence and flip cond
 - [0003 — Unified outbox + pg-boss](0003-outbox-pgboss.md)
 - [0004 — Plugin isolation topology](0004-plugin-isolation-topology.md)
 - [0005 — UI kit + token compiler](0005-ui-kit-token-compiler.md)
-- [0006 — IPC flow control](0006-ipc-flow-control.md)
+- [0006 — IPC flow control (Proposed, pending #86)](0006-ipc-flow-control.md)
 - [0007 — Pooled contamination recovery](0007-pooled-contamination-recovery.md)
