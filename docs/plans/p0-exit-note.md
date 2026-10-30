@@ -6,7 +6,7 @@ This note records the required-check proof, the six closed fixture pull requests
 
 **Amendment (2026-10-29, issue #84):** the B3 row below is the replacement validation. Both buffer caps pass. ADR-0006 stays Proposed, pending #86. README does not claim P0 complete. A4b PASS (#58, #34 closed). B2, B5, and the race battery last passed before #51 changed the supervisor, so they are not green on the shipped substrate. P0 stays open until issue #86 re-runs them on current dev. The next amendment supersedes that open status.
 
-**Amendment (2026-10-30, issue #86):** those three reruns passed on revision `38949baebd8e28690d90c5c3d2fb56e706e80e8a` (pull request #85). `spike:b2` and `spike:b5` each exited 0. `test:races` exited 0: 26 pass, 0 fail, 0 skipped, duration_ms 92037.198245, then the B6 vacuity control 1 pass, duration_ms 1832.037559. The commands and the environment are in the spike B report. B1–B6 and the race battery are PASS on the shipped substrate. [ADR-0006](../adr/0006-ipc-flow-control.md) is Accepted, on the B3 replacement from pull request #85 plus these reruns. P0 is complete. The commit-policy check still fails its fixture and is still absent from the required-check list, as recorded below. That fact is not an open milestone item.
+**Amendment (2026-10-30, issue #86):** those three reruns passed on revision `38949baebd8e28690d90c5c3d2fb56e706e80e8a` (pull request #85). `spike:b2` and `spike:b5` each exited 0. `test:races` exited 0: 26 pass, 0 fail, 0 skipped, duration_ms 92037.198245, then the B6 vacuity control 1 pass, duration_ms 1832.037559. The commands and the environment are in the spike B report. B1–B6 and the race battery are PASS on the shipped substrate. [ADR-0006](../adr/0006-ipc-flow-control.md) is Accepted, on the B3 replacement from pull request #85 plus these reruns. The same day, the required-check list on `dev` includes `commit-policy`, and [pull request #88](https://github.com/tachkovsa/plerni/pull/88) is blocked from merging because that required check failed. P0 is complete on that evidence. No exit criterion is waived.
 
 ## Required checks
 
@@ -25,7 +25,21 @@ osv-scanner
 approval-artifact
 ```
 
-`commit-policy` runs on pull requests. It is absent from this list. License audit and kernel purity are steps inside the required `gates` job. Branch protection was not changed.
+That read did not include `commit-policy`. License audit and kernel purity are steps inside the required `gates` job. This pull request does not change branch protection.
+
+The same command on 2026-10-30 returned `commit-policy` as well:
+
+```
+secrets
+private-markers
+gates
+sca / osv-scan
+osv-scanner
+approval-artifact
+commit-policy
+```
+
+The fixture in section 5 is measured against this later list.
 
 ## Fixture pull requests
 
@@ -90,7 +104,7 @@ kernel-purity: domain logic in kernel — forbidden (spec §3):
 
 Green on that head: `secrets`, `private-markers`, `sca / osv-scan`, `osv-scanner`, `approval-artifact`, `commit-policy`.
 
-### 5. commit-policy — check runs, and it is not required
+### 5. commit-policy — required check `commit-policy`
 
 [Pull request #79](https://github.com/tachkovsa/plerni/pull/79), head `07454379887a11f33fefbdfcfa8c35855b1eae2f`. Closed, not merged. Branch deleted.
 
@@ -104,7 +118,23 @@ commit-policy: FAIL
 ##[error]Process completed with exit code 1.
 ```
 
-The six required checks on that head stayed green. This check going red does not, by the list above, block a merge.
+The required-check list read on 2026-10-28 did not include `commit-policy`. On that list, the red check did not block a merge. That pull request is not the blocking evidence.
+
+[Pull request #88](https://github.com/tachkovsa/plerni/pull/88), head `2c6eef77f30a7e3be431f14dd57d35c4cf19e0db`. Open, not merged. It is a do-not-merge fixture.
+
+The commit subject is `non conventional subject for the required commit policy fixture`. It has no type prefix. The message ends with `AI-assisted: yes`.
+
+Failing step: `commit policy` in [job 124066159519](https://github.com/tachkovsa/plerni/actions/runs/41056768939/job/124066159519). `check out the base revision` and `fetch pull request commits` succeeded.
+
+```
+commit-policy: FAIL
+  2c6eef7: non-conventional subject "non conventional subject for the required commit policy fixt"
+##[error]Process completed with exit code 1.
+```
+
+The gate prints 60 characters of the subject. The full subject is the one named above. The check completed with conclusion failure.
+
+On that head the status-check rollup state is `FAILURE`. `mergeStateStatus` is `BLOCKED` and `mergeable` is `MERGEABLE`, so the block is not a conflict. `commit-policy` is in the 2026-10-30 required-check list above. It is the only required check whose conclusion is failure. The others concluded success: `secrets` in [job 124066159369](https://github.com/tachkovsa/plerni/actions/runs/41056769365/job/124066159369), `gates` in [job 124066159617](https://github.com/tachkovsa/plerni/actions/runs/41056769365/job/124066159617), `sca / osv-scan` in [job 124066159571](https://github.com/tachkovsa/plerni/actions/runs/41056769365/job/124066159571), `osv-scanner` in [run 124066283218](https://github.com/tachkovsa/plerni/runs/124066283218), and `approval-artifact` in [job 124066159242](https://github.com/tachkovsa/plerni/actions/runs/41056768913/job/124066159242). `private-markers` in [job 124066159037](https://github.com/tachkovsa/plerni/actions/runs/41056769365/job/124066159037) concluded success, and workflow run [41056769365](https://github.com/tachkovsa/plerni/actions/runs/41056769365) completed with conclusion success. That job's check-run status field still read `in_progress` when this note was written. A rerun of the job was not permitted. The rollup state is `FAILURE`, not pending.
 
 ### 6. sca — required check `sca / osv-scan`
 
@@ -152,7 +182,7 @@ Source: [`../specs/2026-10-12-plerni-design.md`](../specs/2026-10-12-plerni-desi
 
 | Criterion | Evidence | Row |
 |---|---|---|
-| Each P0 gate blocks its deliberately bad fixture pull request | Secrets, private-markers, license-audit, kernel-purity, and SCA failed a required check, at the steps quoted above. The commit-policy check failed at `commit policy` and is not in the required-check list, so that failure does not block merge. | Five required gates have blocking evidence. commit-policy has a red check and no required-check evidence. |
+| Each P0 gate blocks its deliberately bad fixture pull request | Secrets, private-markers, license-audit, kernel-purity, and SCA failed a required check, at the steps quoted above. `commit-policy` failed at `commit policy` on [pull request #88](https://github.com/tachkovsa/plerni/pull/88), and that pull request is `BLOCKED` while the check is required. | All six gates have blocking evidence. |
 | Spike reports filed with pass/fail verdicts | The two reports linked above. | Filed. B1–B6 and the race battery are PASS on the shipped substrate. A4b PASS (#58, #34 closed). ADR-0006 is Accepted. P0 is complete. |
 | Contributor roadmap published | [`../ROADMAP.md`](../ROADMAP.md) | Published. No dates. |
 | Protected set stays intact (contract layer, tenancy floor, blocking CI core) | Contract conventions are accepted at P0. Spike A A2 is PASS for tenant isolation on the direct and pooled datasources. The blocking CI core is the required-check list in this note. | Present as recorded. Product tenancy is still P1; `apps/kernel/src` is absent on `dev`. |
