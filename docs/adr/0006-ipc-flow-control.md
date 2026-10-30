@@ -215,10 +215,22 @@ Plan §3.0 ③ and the §4 measurement contract, on the redesigned substrate. Th
 8. **Multi-writer.** `fork` is rejected. Two threads then write fd 1 at once. The case passes when `fork` fails and the supervisor emits `thread-writer` within 100 ms of `stdoutUnread` exceeding the reserved `K_in`, timed the way item 4 times the enlarger. The temporary overshoot in that window is at most `thread count × ((sndbuf >> 1) - 64)`. `K` is not raised. That pass does not fail the B3 cap verdict. A scorer that records `thread-writer` as a B3 cap failure, or that lifts `K` and reports `bound: true`, fails the case.
 9. **Mux open-loop.** The broker and the supervisor flood the mux socket. Before `connect`, `SO_RCVBUF` and `SO_SNDBUF` were set and read back, and those values are the `K_mux_in` and `K_mux_out` in `B_g`. The case passes when `muxUnread ≤ K_mux_in`, `muxSendQueued ≤ K_mux_out`, every mux read is at most `C`, and the process sum stays ≤ `totalGlobal`. A queue above its reservation, or a later `getsockopt` above that read-back, is the flip. It does not raise `K_mux_in` or `K_mux_out`.
 10. **Revised buffer estimate** (the old T7 annex line; the schedule annex was withdrawn by issue #15, so the numbers land on the re-spike report): the inequalities in Consequences, filled with the measured `K_in`, `K_out`, `K_mux_in`, `K_mux_out`, `C`, and the configured `S`. No numeric buffer term is published from the failed substrate.
-11. **Cross-family rerun:** a reviewer from a different model family than every generator checks out the pinned revision, reruns the suites from scratch, and posts a revision-bound receipt (reviewed head SHA, reviewer role, accountable sponsor, verification summary, outcome, opaque evidence ID). This Proposed record is not that receipt. The receipt binds the re-spike head. It is not a sentence in this file: committing it would change the head it names.
+11. **Acceptance review.** When the drafting family is unknown, acceptance follows the maintainer decision of 2026-10-26: an assistant review plus a clean automated review of the exact head. The receipt names that head and states that the review was done under this maintainer rule. It carries no human-review claim and no family-separation claim. This record is not that receipt. The receipt binds the reviewed head. It is not a sentence in this file: committing it would change the head it names.
 12. **Stderr flood.** The child writes fd 2. The case passes when fd 2 is `/dev/null`, the write adds nothing to the process sum, and there is no stderr pipe to probe. A pipe or socket on fd 2 fails the case. That pass does not fail the B3 cap verdict.
 
 The spike B report gains §3.0 diagnosis records for any FAIL along the way. P0 still closes only on green on the shipped substrate.
+
+## Acceptance
+
+Proposed 2026-10-19. The B3 replacement evidence is PASS. Acceptance waits for the B2, B5, and `test:races` reruns in issue #86. Re-spike item 2 requires those suites because the substrate moved. This record stays Proposed, pending #86.
+
+Three `spike:b3` invocations on Linux, Node v24.22.2, frozen warmup 5000 ms, window 60000 ms, 3 reps. Every preflight was valid. Enforced partial high-waters were 23488, 25728, and 23488, each ≤ 32768, code `partial-cap`. Enforced accounted totals were 32480, 34336, and 33184, each ≤ 49152. `stdoutUnread` was 384 against `K_in` 6848. RSS growth stayed ≤ 67108864. The largest hold was 14475264. On the same host, with enforcement removed, both clauses missed: partial high-waters 180224, 114688, and 180224; accounted totals 110592, 143360, and 167936; socket capacity 131072. That control is a scored FAIL. It is not `invalid` and not `unsatisfiable`.
+
+`getsockopt(SO_SNDBUF)` was 4608 on both writer ends. `K_in` and `K_out` were 6848. `C` was 4096. `K_mux_in` was 4096 and `K_mux_out` was 4608. At `totalGlobal` 1048576, `S` is 1035776. One runner, so the per-process bound is 1048576.
+
+B1 on the frozen shape passed, about 8000 round-trips/s with p99 under 5 ms. That is not the B1 flip. B4's never-terminated frame was `NdjsonOversizeError`. B6 sibling cancel p99 stayed under 500 ms. B2, B5, and `test:races` were not re-executed: this validation had no harness database. Their earlier PASS is not a new measurement of this substrate.
+
+The review receipt is not in this file. It binds the head that reviews acceptance, after those reruns.
 
 ## Out of scope / verified in re-spike
 

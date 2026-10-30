@@ -6,7 +6,7 @@ import { constants, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { connectPair, stdinControlReserve } from './supervisor.mjs';
-import { assessFlow, classifyWriterOverrun, FLOW_READ_BYTES, PROBE_INTERVAL_MS, OVERRUN_DEADLINE_MS } from './flow_budget.mjs';
+import { assessFlow, classifyWriterOverrun, FLOW_READ_BYTES, OVERRUN_DEADLINE_MS, partialCapHolds, PROBE_INTERVAL_MS, totalCapHolds } from './flow_budget.mjs';
 import { fionread, measureFlowReserve, rcvbuf, siocoutq, sndbuf } from './flow_socket.mjs';
 import { b3, holdAfterSibling, partialSnapshotInvalid, scoreUnenforced, t7Estimate, tripCaps } from './cases/b3-backpressure.mjs';
 import { b4 } from './cases/b4-bounds.mjs';
@@ -81,6 +81,65 @@ test('same-host vacuity pair: enforcement off fails and enforced passes', { time
   assert.equal(on.detail.mux.kMuxOut, on.detail.mux.muxSndbuf);
   assert.ok(on.detail.mux.kMuxIn > 0);
   assert.equal(on.detail.mux.muxReserve, on.detail.mux.kMuxIn + on.detail.mux.kMuxOut + FLOW_READ_BYTES);
+});
+
+// The two recorded misses are the partial high-water (36864 + 32768 = 69632)
+// and the three accounted totals (106496, 57344, 155648). The unenforced trip
+// still misses both clauses. The enforced trip holds both.
+test('both buffer-cap failures reproduce without enforcement and hold with it', { timeout: 40_000 }, async () => {
+  const partialCap = 32 * 1024;
+  const totalCap = 48 * 1024;
+  const recordedPartial = 36864 + 32768;
+  const recordedTotals = [106496, 57344, 155648];
+  assert.equal(recordedPartial, 69632);
+  assert.equal(partialCapHolds(recordedPartial, partialCap), false);
+  assert.equal(partialCapHolds(partialCap + 4096, partialCap), false);
+  for (const accounted of recordedTotals) {
+    assert.equal(totalCapHolds(accounted, totalCap), false);
+    assert.ok(accounted > totalCap + 4096, String(accounted));
+  }
+
+  const off = await tripCaps({ enforceFlow: false });
+  assert.notEqual(off.outcome, 'invalid', JSON.stringify(off.detail));
+  assert.notEqual(off.outcome, 'unsatisfiable', JSON.stringify(off.detail));
+  const scored = scoreUnenforced(off);
+  assert.equal(scored.outcome, 'scored', JSON.stringify(scored));
+  assert.equal(scored.pass, false, JSON.stringify(scored));
+  assert.deepEqual(scored.failed, ['partial', 'total']);
+  assert.equal(off.detail.partial.code, 'partial-cap');
+  assert.equal(off.detail.partial.bound, false);
+  assert.ok(off.detail.partial.inFlightTailBytes > 0, JSON.stringify(off.detail.partial));
+  assert.equal(
+    off.detail.partial.highWater,
+    off.detail.partial.pendingBytes + off.detail.partial.inFlightTailBytes + off.detail.partial.stdoutUnread,
+  );
+  assert.ok(scored.partial.highWater > partialCap, JSON.stringify(scored.partial));
+  assert.ok(scored.partial.capacity > partialCap, JSON.stringify(scored.partial));
+  assert.equal(off.detail.total.bound, false);
+  assert.equal(off.detail.total.vacuity, true);
+  assert.ok(scored.total.accounted > totalCap, JSON.stringify(scored.total));
+  assert.ok(scored.total.capacity > totalCap, JSON.stringify(scored.total));
+
+  const on = await tripCaps({ enforceFlow: true });
+  assert.equal(on.outcome, 'scored', JSON.stringify(on.detail));
+  assert.equal(on.pass, true, JSON.stringify(on.detail));
+  assert.equal(on.detail.partial.code, 'partial-cap');
+  assert.equal(on.detail.partial.bound, true);
+  assert.equal(partialCapHolds(on.detail.partial.highWater, partialCap), true, JSON.stringify(on.detail.partial));
+  assert.equal(partialCapHolds(recordedPartial, partialCap), false);
+  assert.ok(on.detail.partial.stdoutUnread <= on.detail.partial.kIn, JSON.stringify(on.detail.partial));
+  assert.equal(on.detail.total.tripped, true);
+  assert.equal(on.detail.total.bound, true);
+  assert.equal(on.detail.total.vacuity, true);
+  assert.equal(totalCapHolds(on.detail.total.accounted, totalCap, {
+    stdoutUnread: on.detail.total.pipeUnread,
+    stdinQueued: on.detail.total.stdinQueued,
+    kIn: on.detail.reserve.kIn,
+    kOut: on.detail.reserve.kOut,
+  }), true, JSON.stringify(on.detail.total));
+  for (const accounted of recordedTotals) {
+    assert.equal(totalCapHolds(accounted, totalCap), false);
+  }
 });
 
 test('the unenforced control fails when enforcement makes no difference', async () => {
