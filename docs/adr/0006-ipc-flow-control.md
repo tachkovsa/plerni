@@ -1,10 +1,10 @@
 # ADR-0006 — IPC flow control: caps that include the kernel buffer
 
-- **Status:** Proposed · **Date:** 2026-10-19
+- **Status:** Accepted · **Date:** 2026-10-30
 - **Spec:** [`../specs/2026-10-12-plerni-design.md`](../specs/2026-10-12-plerni-design.md) §4.4 (framed NDJSON over stdio, stream backpressure)
 - **Register:** [`../decision-register.html`](../decision-register.html) — **D11** names the isolation topology; ADR-0004 remains that record. This record is only the flow-control mechanism under that spike. It does not decide malicious-plugin isolation.
 - **Plan:** [`../plans/2026-10-13-p0-implementation-plan.md`](../plans/2026-10-13-p0-implementation-plan.md) §3.0, §4 B3, §8 (replacement-validation branch)
-- **Evidence:** [`../plans/2026-10-18-spike-b-report.md`](../plans/2026-10-18-spike-b-report.md) §B3 items 11–15; issue #49
+- **Evidence:** [`../plans/2026-10-18-spike-b-report.md`](../plans/2026-10-18-spike-b-report.md) (failed substrate §B3 items 11–15; replacement validation from pull request #85; 2026-10-30 B2, B5, and race rerun on `38949baebd8e28690d90c5c3d2fb56e706e80e8a`); issue #49
 - **Number:** 0002, 0004, and 0005 are the names plan §8 already assigns to the ORM, isolation-topology, and UI-kit records. 0003 is the outbox record. This record is the next integer that is neither a file in this directory nor one of those names.
 
 ## Scope
@@ -222,15 +222,30 @@ The spike B report gains §3.0 diagnosis records for any FAIL along the way. P0 
 
 ## Acceptance
 
-Proposed 2026-10-19. The B3 replacement evidence is PASS. Acceptance waits for the B2, B5, and `test:races` reruns in issue #86. Re-spike item 2 requires those suites because the substrate moved. This record stays Proposed, pending #86.
+Accepted 2026-10-30. Proposed 2026-10-19. The B3 replacement evidence is PASS (pull request #85, merged as `38949baebd8e28690d90c5c3d2fb56e706e80e8a`). Re-spike item 2 also required B2, B5, and `test:races` because the substrate moved. Those three were rerun on that revision and passed. The spike B report records the commands and the output.
 
 Three `spike:b3` invocations on Linux, Node v24.22.2, frozen warmup 5000 ms, window 60000 ms, 3 reps. Every preflight was valid. Enforced partial high-waters were 23488, 25728, and 23488, each ≤ 32768, code `partial-cap`. Enforced accounted totals were 32480, 34336, and 33184, each ≤ 49152. `stdoutUnread` was 384 against `K_in` 6848. RSS growth stayed ≤ 67108864. The largest hold was 14475264. On the same host, with enforcement removed, both clauses missed: partial high-waters 180224, 114688, and 180224; accounted totals 110592, 143360, and 167936; socket capacity 131072. That control is a scored FAIL. It is not `invalid` and not `unsatisfiable`.
 
 `getsockopt(SO_SNDBUF)` was 4608 on both writer ends. `K_in` and `K_out` were 6848. `C` was 4096. `K_mux_in` was 4096 and `K_mux_out` was 4608. At `totalGlobal` 1048576, `S` is 1035776. One runner, so the per-process bound is 1048576.
 
-B1 on the frozen shape passed, about 8000 round-trips/s with p99 under 5 ms. That is not the B1 flip. B4's never-terminated frame was `NdjsonOversizeError`. B6 sibling cancel p99 stayed under 500 ms. B2, B5, and `test:races` were not re-executed: this validation had no harness database. Their earlier PASS is not a new measurement of this substrate.
+B1 on the frozen shape passed, about 8000 round-trips/s with p99 under 5 ms. That is not the B1 flip. B4's never-terminated frame was `NdjsonOversizeError`. B6 sibling cancel p99 stayed under 500 ms.
 
-The review receipt is not in this file. It binds the head that reviews acceptance, after those reruns.
+On `38949baebd8e28690d90c5c3d2fb56e706e80e8a`, Node v24.22.2, PostgreSQL 18.6, PgBouncer 1.26.0, `pool_mode=transaction`, `max_prepared_statements=200`, `default_pool_size=10`:
+
+- `pnpm --filter @plerni-spike/ipc-harness spike:b2` exited 0. Lost cancel `COMMITTED` / `lost`. Live cancel `CANCELLED` / `cancelled`. The later commit was fenced. Ignore-cancel returned `ignore` and the cancel timed out.
+- `pnpm --filter @plerni-spike/ipc-harness spike:b5` exited 0. Crash code `child-exited`, exit code 1. The retired token was refused. The respawn token was distinct and fenced. Status stayed `ACTIVE`.
+- `pnpm --filter @plerni-spike/ipc-harness test:races` exited 0. 26 pass, 0 fail, 0 skipped, duration_ms 92037.198245, then the B6 vacuity control 1 pass, duration_ms 1832.037559. `commit-vs-revoke` passed in 22.75 ms.
+
+The drafting model families for this record are unknown. Maintainer decision 2026-10-26 ([`../ai/model-routing.md`](../ai/model-routing.md)) accepts an ADR in that case on a review by the project's maintainer-designated assistant reviewer plus a clean Codex review of the exact head. A human review is not required on that path. Re-spike item 11 is that rule: the receipt names that exact head, states that the review was done under this maintainer rule, and carries no human-review claim and no family-separation claim. Its evidence reference is the public assistant receipt comment on the pull request plus the Codex clean review comment, both bound to that head. This section is not that receipt. Committing the head the receipt names would change the head.
+
+- **Measured revision:** `38949baebd8e28690d90c5c3d2fb56e706e80e8a` for the B2, B5, and race reruns. The B3 figures above are the replacement validation recorded from pull request #85, merged as that same revision.
+- **Reviewed head:** named by the two receipt comments. Not copied into this file.
+- **Reviewer role:** `agent` (maintainer-designated assistant reviewer), with the Codex review of that same head required by the 2026-10-26 rule
+- **Accountable sponsor:** the maintainer
+- **Verification summary:** B3 enforced caps hold and the same-host unenforced control fails. B1, B4, and B6 on that replacement validation do not open their flips. B2, B5, and `test:races` on the measured revision exited 0, with 0 skipped race cases.
+- **Outcome:** Accepted
+- **Rule:** acceptance follows the maintainer rule of 2026-10-26. The receipt comments name the exact head. This section does not. It carries no human-review claim and no family-separation claim.
+- **Evidence reference:** the public assistant receipt comment and the Codex clean review comment on the pull request that accepts this record, both bound to its head. Those comments are not copied into this file.
 
 ## Out of scope / verified in re-spike
 

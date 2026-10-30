@@ -21,7 +21,7 @@ The full statement is [design spec](specs/2026-10-12-plerni-design.md) §1. The 
 
 The design spec §15 is the detailed list. This is the plain version. No phase has a date.
 
-**P0 — Foundations.** The repository, the contributor rules, the decision records, and two technical proofs: tenant separation holds on a normal database pool, and a plugin can talk to the kernel under cancellation and overload. This roadmap is part of P0. Still open: the remaining decision records, and the checks that prove each safety gate can fail.
+**P0 — Foundations.** The repository, the contributor rules, the decision records, and two technical proofs: tenant separation holds on a normal database pool, and a plugin can talk to the kernel under cancellation and overload. This roadmap is part of P0. The [exit note](plans/p0-exit-note.md) records this phase complete.
 
 An earlier draft of this phase included a schedule exercise: a capacity annex with a team size, a calendar formula, and a nine-month bar. The maintainer withdrew that exercise on 2026-10-25 ([issue #15](https://github.com/tachkovsa/plerni/issues/15)). This page replaces it. The [design spec](specs/2026-10-12-plerni-design.md) §15, decision D23, and the [P0 plan](plans/2026-10-13-p0-implementation-plan.md) record the withdrawal.
 

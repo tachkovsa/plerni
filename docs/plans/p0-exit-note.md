@@ -2,9 +2,11 @@
 
 **Date:** 2026-10-28 · **Issue:** [#23](https://github.com/tachkovsa/plerni/issues/23) · **Task:** T15 in [`2026-10-13-p0-detailed-implementation-plan.md`](2026-10-13-p0-detailed-implementation-plan.md)
 
-This note records the required-check proof, the six closed fixture pull requests, the spec §15 P0 checklist, and the issues for T1–T14. Fixture branches are deleted. None of the fixture pull requests were merged. The milestone stays open until every checklist row below has evidence.
+This note records the required-check proof, the six closed fixture pull requests, the spec §15 P0 checklist, and the issues for T1–T14. Fixture branches are deleted. None of the fixture pull requests were merged. The 2026-10-30 amendment records the checklist complete.
 
-**Amendment (2026-10-29, issue #84):** the B3 row below is the replacement validation. Both buffer caps pass. ADR-0006 stays Proposed, pending #86. README does not claim P0 complete. A4b PASS (#58, #34 closed). B2, B5, and the race battery last passed before #51 changed the supervisor, so they are not green on the shipped substrate. P0 stays open until issue #86 re-runs them on current dev.
+**Amendment (2026-10-29, issue #84):** the B3 row below is the replacement validation. Both buffer caps pass. ADR-0006 stays Proposed, pending #86. README does not claim P0 complete. A4b PASS (#58, #34 closed). B2, B5, and the race battery last passed before #51 changed the supervisor, so they are not green on the shipped substrate. P0 stays open until issue #86 re-runs them on current dev. The next amendment supersedes that open status.
+
+**Amendment (2026-10-30, issue #86):** those three reruns passed on revision `38949baebd8e28690d90c5c3d2fb56e706e80e8a` (pull request #85). `spike:b2` and `spike:b5` each exited 0. `test:races` exited 0: 26 pass, 0 fail, 0 skipped, duration_ms 92037.198245, then the B6 vacuity control 1 pass, duration_ms 1832.037559. The commands and the environment are in the spike B report. B1–B6 and the race battery are PASS on the shipped substrate. [ADR-0006](../adr/0006-ipc-flow-control.md) is Accepted, on the B3 replacement from pull request #85 plus these reruns. P0 is complete. The commit-policy check still fails its fixture and is still absent from the required-check list, as recorded below. That fact is not an open milestone item.
 
 ## Required checks
 
@@ -143,7 +145,7 @@ Source: [`../specs/2026-10-12-plerni-design.md`](../specs/2026-10-12-plerni-desi
 | ADR-0004 | [`../adr/0004-plugin-isolation-topology.md`](../adr/0004-plugin-isolation-topology.md), Accepted. Issue [#18](https://github.com/tachkovsa/plerni/issues/18). |
 | ADR-0005 | [`../adr/0005-ui-kit-token-compiler.md`](../adr/0005-ui-kit-token-compiler.md), Accepted. Issue [#19](https://github.com/tachkovsa/plerni/issues/19). |
 | Spike A (DB invariant, typecheck) | [`2026-10-18-spike-a-report.md`](2026-10-18-spike-a-report.md). A1 direct PASS, A1 pooled PASS, A2 PASS, A3 PASS, A4 PASS on unnamed discipline (A4b PASS (#58, #34 closed)), A5 PASS at the acceptance point, battery PASS. |
-| Spike B (IPC harness) | [`2026-10-18-spike-b-report.md`](2026-10-18-spike-b-report.md). B1 PASS, B3 PASS (partial high-water and total buffer inside the trip caps), B4 PASS, B6 PASS, on the ADR-0006 substrate. B2, B5, and the race battery last passed before #51 changed the supervisor. P0 stays open until issue #86 re-runs them on current dev. [ADR-0006](../adr/0006-ipc-flow-control.md) is Proposed, pending #86. |
+| Spike B (IPC harness) | [`2026-10-18-spike-b-report.md`](2026-10-18-spike-b-report.md). B1 PASS, B2 PASS, B3 PASS (partial high-water and total buffer inside the trip caps), B4 PASS, B5 PASS, B6 PASS, races PASS, on revision `38949baebd8e28690d90c5c3d2fb56e706e80e8a`. [ADR-0006](../adr/0006-ipc-flow-control.md) is Accepted. |
 | Contributor roadmap | [`../ROADMAP.md`](../ROADMAP.md). Issue [#15](https://github.com/tachkovsa/plerni/issues/15). |
 
 ### Exit criteria
@@ -151,7 +153,7 @@ Source: [`../specs/2026-10-12-plerni-design.md`](../specs/2026-10-12-plerni-desi
 | Criterion | Evidence | Row |
 |---|---|---|
 | Each P0 gate blocks its deliberately bad fixture pull request | Secrets, private-markers, license-audit, kernel-purity, and SCA failed a required check, at the steps quoted above. The commit-policy check failed at `commit policy` and is not in the required-check list, so that failure does not block merge. | Five required gates have blocking evidence. commit-policy has a red check and no required-check evidence. |
-| Spike reports filed with pass/fail verdicts | The two reports linked above. | Filed. B3 is PASS on the replacement. A4b PASS (#58, #34 closed). P0 stays open until issue #86 re-runs B2, B5, and the race battery on current dev. |
+| Spike reports filed with pass/fail verdicts | The two reports linked above. | Filed. B1–B6 and the race battery are PASS on the shipped substrate. A4b PASS (#58, #34 closed). ADR-0006 is Accepted. P0 is complete. |
 | Contributor roadmap published | [`../ROADMAP.md`](../ROADMAP.md) | Published. No dates. |
 | Protected set stays intact (contract layer, tenancy floor, blocking CI core) | Contract conventions are accepted at P0. Spike A A2 is PASS for tenant isolation on the direct and pooled datasources. The blocking CI core is the required-check list in this note. | Present as recorded. Product tenancy is still P1; `apps/kernel/src` is absent on `dev`. |
 | No nine-month arithmetic bar | Issue [#15](https://github.com/tachkovsa/plerni/issues/15) withdrew the capacity annex. [`../ROADMAP.md`](../ROADMAP.md) states there is no delivery deadline. The amendment at the top of the detailed plan records the same withdrawal. | Withdrawn. The bar is not in force. |
