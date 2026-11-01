@@ -19,3 +19,7 @@ The pre-implementation decision record (32 decisions with evidence and flip cond
 - [0007 — Pooled contamination recovery](0007-pooled-contamination-recovery.md)
 - [0008 — Per-plugin capability grants and schema role](0008-capability-grants-and-schema-role.md) (Proposed)
 - [0009 — P1 accepts the log on two replicas, with Valkey outside durability](0009-leaderless-replica-log.md) (Proposed)
+- [0010 — The platform operator is a tenant, and runtime roles have no bypass](0010-operator-tenant-no-bypassrls.md) (Proposed)
+- [0011 — Plugins sign digests; the secret store keeps the keys](0011-digest-signing-port.md) (Proposed)
+- [0012 — Adding a plugin leaves the kernel tree unchanged](0012-plugin-addition-leaves-kernel-unchanged.md) (Proposed)
+- [0013 — P1 keeps sensitive and destructive actions on human sessions](0013-p1-human-commit-boundary.md) (Proposed)

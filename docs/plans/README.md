@@ -4,4 +4,4 @@ Implementation plans live here. The schedule model once planned as a capacity an
 
 Current execution plan: `2026-10-13-p0-implementation-plan.md` (+ its detailed execution breakdown and review chain). P0 is complete ([`p0-exit-note.md`](p0-exit-note.md)).
 
-P1 kernel design, draft B (for review, not yet the execution plan): [`p1-kernel-design-b.md`](p1-kernel-design-b.md). Proposed records beside it: [ADR-0008](../adr/0008-capability-grants-and-schema-role.md), [ADR-0009](../adr/0009-leaderless-replica-log.md).
+P1 kernel design, draft B, selected by the maintainer: [`p1-kernel-design-b.md`](p1-kernel-design-b.md). Proposed records beside it: [ADR-0008](../adr/0008-capability-grants-and-schema-role.md) through [ADR-0013](../adr/0013-p1-human-commit-boundary.md). They are not Accepted by that selection.

@@ -30,14 +30,15 @@ The maintainer brief for draft B calls this wall capability sandboxing. In this 
    | `events.subscribe:<type>` | One subscription filter for that type. |
    | `jobs.handle:<name>` | One job handler name in this plugin. |
    | `directory.read` | Directory port, still filtered by the caller's authorization. |
-   | `directory.register_edge_type` | Insert an edge-type row. The type is data. The kernel schema does not change. |
+   | `directory.register_edge_type` | Insert an edge-type row named in the manifest. The type is data. The kernel schema does not change. |
+   | `directory.write_edge:<type>` | Broker inserts or ends one edge of that manifest-listed type, inside the caller's WorkUnit. The plugin role receives no SQL grant on Directory tables. |
    | `storage.prefix` | Objects under the prefix the broker derives from the plugin id. |
    | `notify.send` | Notification plumbing. Copy stays in the plugin. |
    | `secrets.use:<purpose>` | Broker resolves a reference at execution. The value is not returned to the plugin. |
+   | `secrets.sign` / `secrets.verify` | Digest in, signature out. Private keys stay in the store ([ADR-0011](0011-digest-signing-port.md)). |
    | `http.egress:<host>` | Operator allowlist entry, brokered. Absent means no external HTTP. |
    | `config.own` | Read and write this plugin's tenant settings keys. |
    | `audit.append` | Audit row in the same transaction as the mutation. |
-   | `plane.installation` | Installation-operator actions (fan-out across tenant ids). Tenant admins cannot approve this grant. |
 
    `clock` is ambient. `ai.complete` is reserved for the P3 gateway and is not issued in P1.
 
@@ -54,6 +55,8 @@ The maintainer brief for draft B calls this wall capability sandboxing. In this 
 ## Consequences
 
 - Tenant enablement cannot widen grants. Only the operator install step can.
+- `directory.write_edge:<type>` is a kernel effect inside the WorkUnit. The broker writes the Directory row in that same transaction, for a subject and object in the authorized tenant, and only for a type the approved manifest lists. Plugin SQL that names the Directory tables fails admission. Cross-tenant ids fail the tenant guard.
+- There is no installation-plane grant. An actor who works across customer tenants is a session in the operator tenant, and the host fans that work out one transaction per target tenant ([ADR-0010](0010-operator-tenant-no-bypassrls.md)).
 - A plugin that needs a new port adds a grant name by ADR, then a manifest line. It does not add a kernel conditional for that plugin id.
 - Cross-plugin foreign keys stay forbidden. Identity references stay the declared read-only `REFERENCES` on `users(id, tenant_id)` for the migration role.
 - Functions, triggers, and `DO` blocks stay forbidden. They are the indirect `set_config` path D08 closes.

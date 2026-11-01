@@ -1,6 +1,6 @@
 # P1 kernel design — draft B
 
-- **Status:** Draft for review. It does not amend the spec, the decision register, or any Accepted ADR. [ADR-0008](../adr/0008-capability-grants-and-schema-role.md) and [ADR-0009](../adr/0009-leaderless-replica-log.md) are Proposed beside it.
+- **Status:** Selected by the maintainer as the P1 kernel design. It does not amend the spec, the decision register, or any Accepted ADR. The records in §10.3 stay Proposed until their own review.
 - **Date:** 2026-11-01
 - **Spec:** [`../specs/2026-10-12-plerni-design.md`](../specs/2026-10-12-plerni-design.md) §1, §3–§8, §10, §15 (P1 row), §16
 - **Register:** [`../decision-register.html`](../decision-register.html) D01, D05, D07, D08, D10, D11, D16, D22, D26, D27, D32
@@ -9,7 +9,7 @@
 - **P0:** [`p0-exit-note.md`](p0-exit-note.md) records P0 complete. This draft starts at that line.
 - **Roadmap:** [`../ROADMAP.md`](../ROADMAP.md) P1 paragraph
 
-Draft B is the isolation-and-scale reading of the kernel. The capability wall is a closed grant set plus one database role per plugin schema ([ADR-0008](../adr/0008-capability-grants-and-schema-role.md)). The bus is the accepted log, and P1 proves it with two replicas and no leader ([ADR-0009](../adr/0009-leaderless-replica-log.md)). Learning features stay plugins. The kernel stays the host.
+Draft B is the isolation-and-scale reading of the kernel. The capability wall is a closed grant set plus one database role per plugin schema ([ADR-0008](../adr/0008-capability-grants-and-schema-role.md)). The bus is the accepted log, and P1 proves it with two replicas and no leader ([ADR-0009](../adr/0009-leaderless-replica-log.md)). The operator is a real tenant ([ADR-0010](../adr/0010-operator-tenant-no-bypassrls.md)). Plugins sign digests ([ADR-0011](../adr/0011-digest-signing-port.md)). Adding a fixture plugin leaves `apps/kernel` empty ([ADR-0012](../adr/0012-plugin-addition-leaves-kernel-unchanged.md)). Sensitive and destructive routes stay on human sessions ([ADR-0013](../adr/0013-p1-human-commit-boundary.md)). Learning features stay plugins. The kernel stays the host.
 
 Three maintainer calls decide whether this draft proceeds:
 
@@ -43,13 +43,13 @@ Equal citizenship (D01): the kernel never imports a plugin, and a plugin never i
 |---|---|---|
 | Tenant registry, RLS context, application tenant guard | Yes | Every plugin table repeats the same policy shape |
 | Local IdP, sessions, revocation epoch, OIDC module | Yes | SAML/SCIM plugins in P4 call `identity.deprovision` |
-| Directory: users, groups, typed relation edges as rows | Yes | Plugins register edge types; they do not migrate the kernel |
+| Directory: users, groups, typed relation edges as rows | Yes | Plugins register edge types and request `directory.write_edge`. The broker writes the edge. |
 | Generic authorization: resource type, id, action, grants, relationship qualifier, time-boxed delegation | Yes | Plugin manifests add namespaces |
 | Package registry, approved grants, per-tenant enablement | Rows and APIs | P2 attaches tarball activation to those rows |
 | Migration journal for kernel SQL, plus one fixture schema | Yes | P2 points the same journal at installed packages |
 | Outbox log, relays, job handoff | Yes, two processes | Plugins publish through the WorkUnit |
 | Audit (commitment hash, per-tenant chain) | Yes | Plugin mutations append in the same transaction |
-| Secret store (envelope encryption, references) | Yes | Plugins hold references. P3 signing hooks use the same store |
+| Secret store (envelope encryption, references, digest sign and verify) | Yes | Plugins hold references and submit digests. Private keys stay in the store (ADR-0011). |
 | Object storage gateway | Yes | Plugin bytes live under a derived prefix |
 | Notification plumbing: channels, preferences, dedup, delivery | Yes | Templates and copy stay in plugins |
 | Tenant settings: opaque keys | Yes | Targeting and experiments stay in the flags plugin |
@@ -86,7 +86,7 @@ The AI gateway's control tables are P3 (spec §15). P1 does not create them "ear
 
 A new plugin adds a package: manifest, SQL, zod contracts, declarative UI (when P2 slots exist). Admission composes those contracts into the registries (convention R1.2). The kernel source, the kernel `Database` interface, and the kernel migration history stay as they were.
 
-The proof fixture for that sentence is task K17: a package whose schema is `plugin_fixture_alpha`, whose tables are `note` and `label`, whose SQL lives outside `apps/kernel/src`, and whose names do not appear in the kernel type interface.
+K17 proves the schema role and the codegen boundary with `fixture_alpha`. K28–K30 are the tree proof ([ADR-0012](../adr/0012-plugin-addition-leaves-kernel-unchanged.md)): `fixture_publisher`, `fixture_subscriber`, and `fixture_optional` each land in a commit whose `git diff --stat -- apps/kernel` is empty, with kernel-purity and the import check green.
 
 ## 2. Capability wall
 
@@ -96,7 +96,8 @@ The proof fixture for that sentence is task K17: a package whose schema is `plug
 - The supervisor stamps the approved set into the spawn credential (P2). P1 enforces the same set on kernel ports.
 - The broker's app role is a member of each plugin role and uses `SET LOCAL ROLE` only after the hygiene inspect (ADR-0002, ADR-0007).
 - Plugin SQL names its own schema. The migration role, not the request role, may `CREATE` there.
-- `plane.installation` is the only grant that may iterate tenant ids. It still writes each tenant in a separate tenant-scoped transaction. It is not `BYPASSRLS`.
+- No grant iterates tenant ids. The operator is a tenant ([ADR-0010](../adr/0010-operator-tenant-no-bypassrls.md)). Fan-out is one transaction per target tenant. No runtime role has `BYPASSRLS`.
+- `directory.write_edge:<type>` is a broker write inside the WorkUnit, limited to types the manifest lists. The plugin role has no SQL grant on Directory tables.
 
 A plugin process that opens a TCP connection to PostgreSQL is already a failed deployment: production egress is the broker, and the plugin has no database credential (ADR-0001, ADR-0004). The grant wall is the layer that stays in force when a development composition relaxes network placement and says so.
 
@@ -115,7 +116,7 @@ Manifest format v0. The field set is closed. Unknown fields fail admission. Id g
 | `requires` | `{plugin, contract, range}` edges. These order migrations and block enablement. |
 | `optionalRequires` | Same shape. They do not order migrations and do not block enablement. A call to a missing optional port returns `UNAVAILABLE` with reason `dependency_disabled`. |
 | `permissions` | Namespace, resource types, actions, suggested role mappings. Mappings are suggestions. The tenant starts from an empty composition. |
-| `routes` | Method, path, operation id, request and response schemas, permission, action class `routine` \| `sensitive` \| `destructive`, limits. |
+| `routes` | Method, path, operation id, request and response schemas, permission, action class `routine` \| `sensitive` \| `destructive`, `scope` (`tenant` or `platform`), limits. A mutating route with no class fails admission (ADR-0013). |
 | `events` | Publish and subscribe entries: type, payload version, owner. |
 | `jobs` | Handler name, payload version, optional cron, idempotency. |
 | `migrations` | Path of SQL files inside the package. |
@@ -145,7 +146,7 @@ Per-tenant enablement is a second axis, not a state of the artifact. An active p
 
 | Stage | Who | What changes | What stays |
 |---|---|---|---|
-| Install | Installation operator | Artifact digest, manifest, approved grants, registry row | No tenant data. Tenants are not enabled implicitly. |
+| Install | Operator-tenant admin | Artifact digest, manifest, approved grants, registry row | No customer data. Customer tenants are not enabled implicitly. |
 | Migrate | Journal, migration role, unpooled connection | That plugin's schema only | Kernel schema untouched. Other plugin schemas untouched. |
 | Activate | P2 runner, readiness-gated rolling restart | Code version that serves routes | v1 does not hot-swap a process in place (spec §4.5). |
 | Enable | Tenant administrator, for their tenant | Enablement row, route exposure, subscription watermark | Grants unchanged. Other tenants unchanged. |
@@ -157,7 +158,7 @@ Per-tenant enablement is a second axis, not a state of the artifact. An active p
 
 Tenant administrators never upload executable code.
 
-Disable of a single tenant does not park the installation cursor. Installation retire does. Re-enable after retire runs the throttled catch-up in spec §4.5. The backlog quota default stays the spec's: 30 days or a size cap, whichever first. Past the quota the operator is warned and may export-then-force-advance. Silent drop of a parked backlog is a failed task.
+Disable of a single tenant does not park the installation cursor. Installation retire does. Re-enable after retire runs the throttled catch-up in spec §4.5. The backlog quota is 30 days or a provisional 256 MiB, whichever first (§4.4). Past the quota the operator is warned and may export-then-force-advance. Silent drop of a parked backlog is a failed task. Unexpired tenant watermarks stay inside the retention minimum for that whole window.
 
 ### 3.3 Migrations
 
@@ -220,21 +221,32 @@ Append-only table in the kernel schema: `seq` (sequence), `tenant_id`, `aggregat
 ### 4.2 Delivery
 
 - One global cursor per subscription (`last_seq`).
-- Lagging horizon: deliver rows with `seq > last_seq` and `seq <= safe_point`, where `safe_point` is the database clock minus 10 seconds. The app clock is not the horizon.
-- Claim unit is the subscription row, `FOR UPDATE SKIP LOCKED`, so two relays compete without a leader (ADR-0009).
+- `safe_point` is a `bigint` sequence cutoff, defined in ADR-0009 decision 2 and repeated here so the two texts match. `seq` is a `bigint`. Comparing `seq` to a timestamp, or casting the 10 second horizon to an integer and treating that integer as a sequence, is not this rule.
+
+  The horizon is 10 seconds of database time (`clock_timestamp()`). Each allocation writes `kernel.seq_reservation(seq, allocated_at, finished_at)` on the reserved unpooled connection, so the row is visible before the business transaction commits. `allocated_at` is `clock_timestamp()` at `nextval`. The business insert uses that same `seq`. `finished_at` is set when that transaction ends. A sweeper sets it when the allocating backend is gone, matching pid and backend start so a recycled pid does not finish a live reservation, and the log row is either visible or absent.
+
+  ```
+  horizon_seq    = max seq reserved with allocated_at <= clock_timestamp() - horizon
+  inflight_floor = min seq reserved with finished_at null
+  safe_point     = least(horizon_seq, inflight_floor - 1)
+  ```
+
+  With no open reservation, `safe_point = horizon_seq`. With nothing old enough, the relay delivers nothing. The reader takes committed-visible log rows with `seq > last_seq AND seq <= safe_point`. A sequence at or below `safe_point` with no log row is a gap and is skipped. An open reservation holds `safe_point` strictly below its `seq`, including when the reservation is older than the horizon, so a later committed sequence cannot move the cursor past it.
+
+- Claim unit is the subscription row, `FOR UPDATE SKIP LOCKED`, so two relays compete without a leader (ADR-0009). A second relay skips a locked subscription.
 - One event, one delivery transaction: unique `(subscription, seq)` dedup marker, handler effects, cursor advance, fencing check. A duplicate delivery updates zero business rows.
 - Filtered subscriptions skip types they do not list and still advance. A filter cannot stall the log.
-- Unknown payload version for a type the subscription does list: park that subscription with an error. Do not best-effort the payload (spec §4.8, convention R5.3). An operator, or a consumer upgraded to that version, resolves the park. The resolution writes a dead-letter row and advances in one transaction. The log row stays.
+- Unknown payload version for a type the subscription does list: park that subscription with `UNKNOWN_EVENT_VERSION`. The cursor stays. The row stays. Do not best-effort the payload (spec §4.8, convention R5.3). An upgraded consumer unparks. An operator force-advance writes a dead-letter row and advances in one transaction, and only after the export procedure in §4.4.
 - Poison handler failures take the same dead-letter path, with an alarm. They are not deleted from the log.
 - New subscriptions start at the current high-water `seq`, or at a declared start `seq` recorded in the manifest. They do not replay the history of the installation unless the manifest asks.
-- Retention low-water is the minimum `last_seq` among live cursors. Parked installation cursors are exempt inside the §3.2 quota.
+- Retention low-water is the minimum of live subscription cursors, parked installation cursors still inside the quota, and unexpired tenant enablement watermarks (§4.4). A log row at or above that minimum stays.
 - `LISTEN`/`NOTIFY` is a zero-payload wake-up on a dedicated unpooled connection per relay. Polling about once a second is the correctness net. Zero listeners raise an alert. Delivery still happens.
 
 At-least-once is the contract outside PostgreSQL. The handoff from outbox row to a job row is one database transaction (exactly-once inside PostgreSQL). The SDK text says so. Handlers that need order consume the event log. Jobs are unordered.
 
 ### 4.3 Ordering
 
-There is no global order. Per-aggregate order holds because the writer locks the aggregate row before inserting the event, so sequence numbers for that aggregate are allocated in lock order. The horizon bounds the window where a later transaction could commit a lower sequence. The design states that bound. It does not promise a total order across aggregates, tenants, or types.
+There is no global order. Per-aggregate order holds because the writer locks the aggregate row before inserting the event, so sequence numbers for that aggregate are allocated in lock order. `safe_point` is what stops a reader from passing a lower sequence that is still in flight. The design states that bound. It does not promise a total order across aggregates, tenants, or types.
 
 Two replicas can deliver different subscriptions at the same time. They do not deliver the same subscription's same `seq` twice as two committed effects.
 
@@ -243,8 +255,10 @@ Two replicas can deliver different subscriptions at the same time. They do not d
 The installation cursor must keep moving while one tenant has a plugin disabled and another has it enabled.
 
 - Installation disable (retire) parks the subscription cursor. Spec §4.5 applies.
-- Tenant disable writes a per-tenant watermark and stops delivery for that `tenant_id`. Other tenants continue. The installation cursor advances across the skipped rows.
-- Tenant re-enable catch-up starts at that watermark, throttled, inside the same quota. If retention has already passed the watermark, catch-up starts at the low-water, and the gap is an audited skip, not a silent one.
+- Tenant disable writes a per-tenant watermark (the last `seq` that tenant consumed) and stops delivery for that `tenant_id`. Other tenants continue. The installation cursor may move past the watermark. The watermark stays in the retention minimum while it is unexpired, so the disabled tenant's backlog is not deleted.
+- A watermark is unexpired while its age is within 30 days and its backlog is within the provisional size cap of 256 MiB, whichever bound is hit first (spec §4.5). Both numbers are the quota. The size cap is provisional and is copied into the K26 envelope note.
+- Re-enable catch-up starts at the watermark and delivers that retained backlog, throttled. Catch-up inside the quota finds the rows still in the log.
+- Past the quota the operator is warned. The only way to move an expired watermark forward, and to release the rows it holds, is export-then-force-advance. An automatic skip, including an audited one, is not a retention path.
 - Watermark rows are kernel-internal machinery: service identity of the relay, tenant id in the row, no RLS, application-level scope. Their shape does not change when a plugin is added.
 
 ### 4.5 Versioning on the bus
@@ -263,7 +277,7 @@ Deprecation windows follow convention R2.2. Kernel event types do not use learni
 
 pg-boss is the job mechanism behind the log (ADR-0003). The pin is adopted only after task K14 passes through PgBouncer transaction mode under the unnamed-statement default. The kernel envelope on every job: tenant, plugin, handler name, payload version, idempotency key, deadline, attempt budget, trace, service identity. `expiredIn` starts at a conservative cold default of 60 seconds per job class until a measured p99 exists, and then moves to at least three times that p99. Cron is a manifest field with a misfire rule and a uniqueness key. The dead-letter queue has an operator replay action in the admin shell.
 
-Claiming jobs is cross-tenant machinery. Executing a job re-enters `withTenant` for the row's tenant. A job without a tenant id is installation-plane and requires `plane.installation`.
+Claiming jobs is kernel-internal machinery. Executing a job re-enters `withTenant` for the row's tenant. A fan-out job's parent row is kernel-internal bookkeeping written in the operator tenant's transaction. Each child carries one target tenant id and runs in its own transaction (ADR-0010). A job row with no tenant id is not a legal claim.
 
 ## 5. Tenancy, identity, roles
 
@@ -288,17 +302,17 @@ PostgreSQL is the revocation authority (D16).
 - Ordinary requests trust a freshness lease of five minutes. Admin and sensitive routes read the session row on every request. `strict_disable` makes that per-request check installation-wide for the tenant.
 - A successful OIDC login does not clear a local disable.
 - OIDC, in the kernel: authorization code and PKCE, issuer mix-up protections, exact redirect match. Tokens stay server-side. Configure-OIDC is one of the API-only workflows.
-- Bootstrap: the first installation operator and the first tenant administrator are created by the API, using a one-time bootstrap credential supplied in the process environment. The value is never logged, never migrated into a fixture, and never committed. After bootstrap the credential stops working.
-- Service principals: tenant-scoped, hashed, scoped, expiring, rotatable, revocable. An upstream IdP token is not a Plerni token.
+- Bootstrap: the API creates the operator tenant and its first admin, then the first customer tenant and its admin, using a one-time bootstrap credential supplied in the process environment. The value is never logged, never migrated into a fixture, and never committed. After bootstrap the credential stops working. There is exactly one operator tenant (ADR-0010).
+- Service principals: tenant-scoped, hashed, scoped, expiring, rotatable, revocable. An upstream IdP token is not a Plerni token. A service principal that calls a `sensitive` or `destructive` route receives `FORBIDDEN` (ADR-0013). `routine` routes still require the principal's grants.
 - `identity.deprovision` is a kernel command in P1, idempotent on `event_id`, bound to a source incarnation so a stale termination after rehire does not disable the account. A future SCIM plugin translates wire events into that command and does not touch sessions.
 - Break-glass local operators are WebAuthn-bound, rate-limited, and alarmed.
 - Valkey may cache the freshness deadline with a TTL inside the lease. A restored cache cannot authorize (spec §16.15). That case is an acceptance test of K16.
 
-Step-up for P1's own sensitive kernel actions (disable a user, export, rotate a key, erase a tenant) is the spec §6 MFA step-up, at most fifteen minutes, checked per request. Durable AI proposals and the nondelegable proof-of-human ceremony stay P3. The action class is still recorded on P1 routes so the later ceremony has a field to read.
+Step-up for P1's own sensitive kernel actions (disable a user, export, rotate a key, erase a tenant) is the spec §6 MFA step-up, at most fifteen minutes, checked per request. Durable AI proposals and the nondelegable proof-of-human ceremony stay P3. P1 already enforces the commit boundary those proposals will wrap: every mutation is classified, MCP does not mutate, and service principals stop at `routine` (ADR-0013).
 
 ### 5.3 Directory, roles, permissions
 
-Directory rows: users, groups, memberships, and typed edges. Edge types are data. A mentorship plugin registers `mentors` with `directory.register_edge_type`. The kernel table gained that type as a row, not as a migration.
+Directory rows: users, groups, memberships, and typed edges. Edge types are data. A mentorship plugin registers `mentors` with `directory.register_edge_type`. Creating an edge instance is `directory.write_edge:mentors`: the plugin names the type and the two user ids in the WorkUnit, and the broker inserts the Directory row in that same transaction. The plugin role has no `INSERT` on Directory tables. An unlisted type is `FORBIDDEN`. Subject and object must be users in the authorized tenant.
 
 Authorization input is resource type, resource id, action, and grants. Grants may say "holder of edge `reports_to` toward the subject." Evaluation is the same function for a session, a service principal, and an MCP actor. An MCP actor receives the human's grants or a delegated subset. It does not receive a superset (D26, D32).
 
@@ -308,14 +322,16 @@ Plugins declare a permission namespace in the manifest. Tenant administrators co
 
 Object-level scope is applied by the broker before execution, from the query's declared resource binding (spec §4.3). RLS is the tenant wall. The binding is the wall between two users in one tenant. P1's suite covers the kernel resources (users, groups, sessions, audit). Plugin resources join that suite in the phase that adds the plugin. The fixture package in K17 includes two notes in one tenant and shows that a principal without the grant receives none.
 
-### 5.4 Two planes
+### 5.4 Operator tenant
 
-| Plane | Actor | Can |
+The operator is a tenant with `kind = operator` (ADR-0010). Customer tenants have `kind = customer`. Runtime roles have no `SUPERUSER` and no `BYPASSRLS`. The migration role has neither attribute either.
+
+| Actor | Session tenant | Can |
 |---|---|---|
-| Tenant | Tenant user, tenant service principal | Read and write that tenant, inside grants and RLS. |
-| Installation | Operator principal holding `plane.installation` | Iterate tenant ids from the registry. Open a tenant transaction per id. Manage packages, maintenance, and restore. |
+| Customer user or customer service principal | That customer | Read and write that tenant, inside grants and RLS. |
+| Operator admin | The operator tenant | Platform routes: packages, maintenance, restore, list tenant ids from `kernel.tenants`. Fan-out opens one child transaction per target customer. A direct plugin-role query returns no customer rows. |
 
-An announcement to every tenant is an installation-plane job that copies the payload into each tenant's plugin table. It does not select one tenant's plugin rows while serving another. A maintenance switch is installation-plane. A feature flag aimed at one user is tenant-plane.
+An announcement to every tenant is that fan-out. The operator transaction writes claim rows only. Each child sets `plerni.tenant_id` to one customer and writes that customer's announcement row. A maintenance switch is a platform route, one kernel-internal row, audited. A feature flag aimed at one user is a customer-tenant write.
 
 ## 6. Contract versioning
 
@@ -328,7 +344,7 @@ Four axes (convention R2.1). A change names the axis it moves.
 | SDK protocol | SDK semver range in the manifest | A port signature change is an SDK major. Installed packages outside the range do not activate. |
 | Public API | Operation ids, generated OpenAPI, MCP descriptors | Removing or renaming an operation id, tightening a request, loosening a response, or changing an error code's meaning (convention R2.2). |
 
-The first error envelope is frozen in K19, so later additions are not slipped in as "small" response changes. Fields: closed `code`, human message, `next_step`, optional `reason` from a closed set (`maintenance`, `dependency_disabled`, `cache_unavailable`, `parked`, `quota`). Codes include the convention R3.3 set. HTTP status comes from the code (`CONCURRENCY_CONFLICT` is 409). MCP puts the same envelope in a tool result with `isError: true` and does not use a JSON-RPC protocol error for it.
+The first error envelope is frozen in K19, so later additions are not slipped in as "small" response changes. Fields: closed `code`, human message, `next_step`, optional `reason` from a closed set (`maintenance`, `dependency_disabled`, `cache_unavailable`, `parked`, `quota`). Codes are the convention R3.3 set plus `UNKNOWN_EVENT_VERSION`. HTTP status comes from the code (`CONCURRENCY_CONFLICT` is 409). MCP puts the same envelope in a tool result with `isError: true` and does not use a JSON-RPC protocol error for it.
 
 Public versus plugin-private schemas are marked in the registry. Plugin-private schemas are not generated into the installation OpenAPI. Public schemas carry deprecation windows.
 
@@ -342,7 +358,7 @@ P1's curated read inventory is kernel-only:
 
 | Tool | Permission | Notes |
 |---|---|---|
-| `kernel.session.whoami` | Authenticated actor | Plane, tenant, subject, grant summary. No secrets. |
+| `kernel.session.whoami` | Authenticated actor | Tenant kind, tenant, subject, grant summary. No secrets. |
 | `kernel.tenant.get` | Tenant reader | The caller's tenant. |
 | `kernel.directory.user.get` | Directory read on that user | Authorization applied before the query. |
 | `kernel.directory.user.list` | Directory read | Keyset pagination. Bounded. |
@@ -351,7 +367,7 @@ P1's curated read inventory is kernel-only:
 | `kernel.audit.list` | Audit reader | Bounded. Payload hashes, not secret values. |
 | `kernel.package.list` | Tenant admin or operator | Enablement for the caller's tenant. Operators may pass a tenant id. |
 
-Admin mutations, uploads, streaming, and maintenance switches stay REST (D26). MCP write tools wait for the P3 proposal ceremony. A plugin joins this inventory later by declaring `mcp: read` on a route. Declaration is admission data. The kernel generator does not gain a branch for that plugin.
+Admin mutations, uploads, streaming, and maintenance switches stay REST (D26). MCP write tools wait for the P3 proposal ceremony. In P1 a write-shaped MCP call returns `FORBIDDEN` with `next_step` pointing at the human route (ADR-0013). A plugin joins the read inventory later by declaring `mcp: read` on a route. Declaration is admission data. The kernel generator does not gain a branch for that plugin.
 
 The alignment check compares the generated MCP manifest to this inventory for schema and permission identity, then a real MCP client runs the read workflows. The API-parity workflows in §8.1 run over REST without the shell. Equivalence for the overlapping reads: same rows, same permission denials, ignoring generated ids and timestamps (spec §16.11).
 
@@ -399,7 +415,7 @@ While maintenance is on:
 - `GET /health` stays available to the orchestrator and reports maintenance, without tenant data, so a cluster probe can tell maintenance from a dead process.
 - The shell serves a static page from its image and does not call a plugin to render it. The API-only profile has no page; clients use the envelope.
 
-The switch is installation-wide, so two replicas agree. Draining one replica during a rollout is the proxy's job; the application flag is the wrong tool for that. Clearing the flag is an installation-operator action, audited.
+The switch is one kernel-internal row, so two replicas agree. Draining one replica during a rollout is the proxy's job; the application flag is the wrong tool for that. Clearing the flag is an operator-tenant action, audited.
 
 ### 8.5 Backup, restore, upgrade
 
@@ -474,9 +490,10 @@ Registration checks the gathering's audience (a user or a group) through Directo
 | Tables | `engagement`, `note` |
 | Requires | Directory port, `directory.register_edge_type` |
 | Publishes | `mentorship.engagement.opened` |
-| Grants | `db.own_schema`, `directory.read`, `directory.register_edge_type`, publish that type |
+| Grants | `db.own_schema`, `directory.read`, `directory.register_edge_type`, `directory.write_edge:mentors`, publish that type |
+| Class | Opening an engagement is `sensitive` |
 
-On install the package registers the edge type `mentors`. That is an insert into the Directory edge-type table. The kernel schema is unchanged. An engagement creates the edge and the plugin row in one WorkUnit. A grant of the form "holder of `mentors` may read `mentorship.note` of the subject" is tenant configuration over the generic evaluator. The kernel does not learn the word mentor. The purity list already contains `mentor` and `mentorship`; they stay out of `apps/kernel/src`.
+On install the package registers the edge type `mentors`. That is an insert of a type row. The kernel schema is unchanged. An engagement lists the edge upsert as a kernel effect and the engagement insert as plugin SQL. The broker writes both in one WorkUnit: the Directory edge as the broker, the plugin row as `plerni_plugin_mentorship`. The plugin role has no SQL grant on Directory tables. A grant of the form "holder of `mentors` may read `mentorship.note` of the subject" is tenant configuration over the generic evaluator. A service principal and an MCP client receive `FORBIDDEN` on the open route. The kernel does not learn the word mentor. The purity list already contains `mentor` and `mentorship`; they stay out of `apps/kernel/src`.
 
 ### 9.5 Budgets
 
@@ -505,9 +522,10 @@ A posting is a reservation or a release, with an idempotency key. The subscriber
 | Optional | `courses`, `competencies` |
 | Subscribes | `courses.completion.recorded`, `competencies.assessment.submitted` |
 | Publishes | `certificates.certificate.issued` |
-| Grants | `db.own_schema`, those subscriptions, publish, `storage.prefix`, `secrets.use:signing` |
+| Grants | `db.own_schema`, those subscriptions, publish, `storage.prefix`, `secrets.sign` |
+| Class | Issuing is `sensitive` |
 
-The handler verifies the payload version it declared. An unknown version parks the subscription (no best-effort certificate). The document bytes go to storage under the derived prefix. The signing key is a secret reference; the broker resolves it for the sign operation and does not return the key to the plugin. A completion event alone does not satisfy an assessment rule inside this plugin unless the tenant configured that rule. The plugin can refuse to treat completion as competence, which keeps the spec §16 invariant in plugin policy rather than in a kernel special case.
+The handler verifies the payload version it declared. An unknown version parks the subscription (no best-effort certificate). The plugin hashes the document, calls `secrets.sign` with the digest and a key reference, and stores the signature and the digest (ADR-0011). The document bytes go to storage under the derived prefix. The broker does not return the private key. A completion event alone does not satisfy an assessment rule inside this plugin unless the tenant configured that rule. The plugin can refuse to treat completion as competence, which keeps the spec §16 invariant in plugin policy rather than in a kernel special case.
 
 ### 9.7 Announcements
 
@@ -518,15 +536,16 @@ The handler verifies the payload version it declared. An unknown version parks t
 | Tables | `announcement`, `audience_snapshot` |
 | Requires | Directory port, notify plumbing |
 | Publishes | `announcements.announcement.published` |
-| Grants | `db.own_schema`, `directory.read`, `notify.send`, publish. Installation-wide audience also needs `plane.installation`, which a tenant admin cannot grant. |
+| Grants | `db.own_schema`, `directory.read`, `notify.send`, publish |
+| Scope | Group and single-tenant sends are `tenant`. The all-tenant send is `platform` and `sensitive`. |
 
-Three audiences, one code path:
+Three audiences:
 
 | Audience | Who may send | Write shape |
 |---|---|---|
 | One group in one tenant | Tenant administrator | One announcement row, snapshot of member ids, notify each member. |
 | One tenant | Tenant administrator | Snapshot is every Directory user in that tenant. RLS confines the read. |
-| Every tenant | Installation operator | A job lists tenant ids from the registry and, per id, opens a tenant transaction that writes that tenant's row. Bounded batch, admission limit, resumable cursor on the job. |
+| Every customer tenant | Operator-tenant admin | The operator transaction writes kernel-internal claim rows only. Each child transaction sets the target tenant and writes that tenant's row (ADR-0010). Bounded batch, admission limit, resumable cursor on the job. |
 
 The all-tenant job does not read announcement rows across tenants. A group change after the snapshot does not rewrite the snapshot. Notify dedup uses the announcement id plus the user id.
 
@@ -565,10 +584,10 @@ Issue #64's integrations (HRIS, content libraries, calendars, BI) attach the sam
 | # | Risk | What this draft does |
 |---|---|---|
 | 1 | The grant wall gets described as an OS sandbox (spec §17 risk 2). | ADR-0008 forbids that reading. Same-UID residuals stay with ADR-0004. |
-| 2 | The installation plane becomes a standing bypass of RLS. | `plane.installation` iterates tenant ids and then uses a normal tenant transaction. The suite includes a test that an operator job cannot `SELECT` two tenants' plugin rows in one statement. |
+| 2 | The operator tenant becomes a standing bypass of RLS. | ADR-0010: the operator session sees operator rows only. Fan-out is one transaction per customer. The suite shows a plugin role cannot `SELECT` two tenants' rows in one statement, and no runtime role has `BYPASSRLS`. |
 | 3 | `SET LOCAL ROLE` interacts with PgBouncer's `search_path` replay (ADR-0007). | SQL is schema-qualified. K17 measures replay and discards the client session if it happens. |
 | 4 | pg-boss 12.38.0 may need session state the pooler cannot keep. | K14 is a gate, not a guess. No pin is adopted on the registry reading alone. |
-| 5 | A per-tenant watermark holds retention hostage. | Same quota as a parked cursor. Past the quota, the skip is audited. |
+| 5 | A disabled tenant's watermark holds the log until the quota. | That hold is the spec §4.5 catch-up guarantee. Retention includes every unexpired watermark. Past 30 days or 256 MiB, only export-then-force-advance releases the rows. An automatic skip is not available. |
 | 6 | Domain issues #63–#66 arrive with a role or a report that "has to be in the kernel." | The mapping in §9 is the bet. A fact that cannot be a plugin payload, a Directory edge, or a grant is a maintainer decision against D27/D32, not a quiet kernel noun. |
 | 7 | Two processes on one host pass, and a real pause between them does not. | K15 kills a process and pauses one relay. It does not only start two threads. |
 | 8 | First-party packages later import kernel internals. | No first-party package is added in P1. Import parity is a P2 gate, already specified. |
@@ -579,9 +598,9 @@ Issue #64's integrations (HRIS, content libraries, calendars, BI) attach the sam
 
 ### 10.2 Open questions
 
-1. **Quota numbers.** The 30-day / size-cap default is the spec's. The size cap's byte number is unset. K13 records a provisional cap in the envelope note and treats it as revisable, not as a promise.
+1. **Quota numbers.** The 30-day bound is the spec's. The size cap used here is a provisional 256 MiB per watermark or parked subscription. K26 copies it into the envelope note. §12 says when crossing it reopens the quota.
 2. **Bootstrap credential delivery.** The environment is the entry. Whether the appliance prompt accepts it once and then drops it is an operator-doc question for K3. The value stays out of the repository either way.
-3. **Edge-type governance.** Any plugin with `directory.register_edge_type` can add a type. Open: should install-time approval list the type names, not only the grant? Draft B says yes: the manifest lists the type strings, and the grant only allows those strings. K17's fixture registers none.
+3. **Edge-type strings.** Decided: the manifest lists the type names, `directory.register_edge_type` inserts only those names, and `directory.write_edge:<type>` writes instances only for those names. K17's fixture registers none.
 4. **Hash for A/B buckets.** The flags plugin owns the algorithm. Draft B requires it to be stable across processes and to take tenant, flag, and subject as inputs. The exact function is chosen in that plugin's spec, with a test vector. It is not a kernel choice.
 5. **Health authentication.** `GET /health` is unauthenticated and contains no tenant data. Confirming that the orchestrator can scrape it without a credential is part of K23. It must not grow into a status dashboard.
 6. **pg-boss versus a kernel-only job table if K14 fails.** ADR-0009's flip is to stay on the outbox. A replacement dispatcher is a new ADR, not a silent BullMQ import inside K14.
@@ -591,10 +610,14 @@ Issue #64's integrations (HRIS, content libraries, calendars, BI) attach the sam
 
 | Record | Decision | Status |
 |---|---|---|
-| [ADR-0008](../adr/0008-capability-grants-and-schema-role.md) | Closed grant vocabulary, one `NOBYPASSRLS` role per plugin, `SET LOCAL ROLE` after hygiene, schema-qualified SQL. | Proposed |
-| [ADR-0009](../adr/0009-leaderless-replica-log.md) | P1 proves the log with two processes. Valkey is outside durability. pg-boss pin waits on a pooler proof. | Proposed |
+| [ADR-0008](../adr/0008-capability-grants-and-schema-role.md) | Closed grant vocabulary, one `NOBYPASSRLS` role per plugin, `SET LOCAL ROLE` after hygiene, schema-qualified SQL, brokered edge writes. | Proposed |
+| [ADR-0009](../adr/0009-leaderless-replica-log.md) | P1 proves the log with two processes. `safe_point` is a sequence. Valkey is outside durability. pg-boss pin waits on a pooler proof. | Proposed |
+| [ADR-0010](../adr/0010-operator-tenant-no-bypassrls.md) | The operator is a tenant. No runtime `BYPASSRLS`. All-tenant work is one transaction per target tenant. | Proposed |
+| [ADR-0011](../adr/0011-digest-signing-port.md) | Plugins sign digests. Private keys stay in the secret store. | Proposed |
+| [ADR-0012](../adr/0012-plugin-addition-leaves-kernel-unchanged.md) | Three neutral fixture plugins prove an empty `apps/kernel` diff, purity, and the import check. | Proposed |
+| [ADR-0013](../adr/0013-p1-human-commit-boundary.md) | Mutations are classified. MCP does not mutate in P1. Service principals stop at `routine`. | Proposed |
 
-No further ADR is required to start K1. An ADR is required before: a new grant name, a job dispatcher other than the outbox, moving the OS tier forward, or putting a §9 feature in the kernel.
+No further ADR is required to start K1. An ADR is required before: a new grant name, a job dispatcher other than the outbox, moving the OS tier forward, or putting a §9 feature in the kernel. §12 names the measurements that open that ADR.
 
 ### 10.4 What would make this draft wrong
 
@@ -614,32 +637,35 @@ Suggested order is the dependency column, not a calendar. Tracks that can procee
 | ID | Task | Depends | Acceptance | Gates | Risk |
 |---|---|---|---|---|---|
 | K1 | Kernel schema, RLS, hygiene, tenant guard | P0 | Two tenants, overlapping ids, pooled and direct. Missing context returns no rows and the guard raises. Contamination terminates the backend, discards the pooler session, retries at most twice. Vacuity control fails when the guard is skipped. | Tenancy suite on PostgreSQL through PgBouncer. Kernel-purity still green (no domain nouns). | High |
-| K2 | Tenant registry and create-tenant API | K1 | API creates a tenant. Second call with the same idempotency key returns the same tenant. A request with no operator credential is refused. `kernel.tenant.created` is in the log. | API test, no shell. | High |
-| K3 | Local IdP, sessions, epoch, bootstrap admin | K2 | Bootstrap creates one admin, then the bootstrap credential stops working. Disable bumps the epoch and revokes sessions in one transaction. A revoked token fails. Rescue codes are stored hashed. No secret in logs. | Auth suite, including the epoch bump. | High |
+| K2 | Tenant registry and create-tenant API | K1 | API creates a customer tenant. Bootstrap has already created the one operator tenant (ADR-0010). Second call with the same idempotency key returns the same tenant. A customer session is refused. `kernel.tenants` has no tenant policy. A plugin role cannot select it. `kernel.tenant.created` is in the log. | API test, no shell. Catalog check that no runtime role has `BYPASSRLS`. | High |
+| K3 | Local IdP, sessions, epoch, bootstrap admin | K2 | Bootstrap creates the operator admin and one customer admin, then the bootstrap credential stops working. Disable bumps the epoch and revokes sessions in one transaction. A revoked token fails. Rescue codes are stored hashed. No secret in logs. | Auth suite, including the epoch bump. | High |
 | K4 | OIDC authorization code + PKCE | K3 | Configure-OIDC via API. Exact redirect match. A local disable survives a successful IdP login. IdP tokens are not API tokens. | OIDC suite against a local test issuer. | High |
-| K5 | Service principals | K3 | Provision, call, rotate, revoke. The previous credential fails after rotate. Scope does not include undeclared permissions. | Principal suite. | High |
-| K6 | Directory users, groups, edges | K3 | CRUD inside one tenant. Tenant B sees none of tenant A's users. Registering an edge type inserts a row and does not add a kernel migration. | Two-tenant Directory suite. | High |
-| K7 | Authorization, relationship grants, delegation | K6 | A `reports_to` grant allows the holder and denies a peer. An expired delegation denies. MCP-shaped actor (same function, service principal) cannot exceed the delegator. | Authz suite with a same-tenant adversarial query. | High |
+| K5 | Service principals | K3 | Provision, call a `routine` route, rotate, revoke. The previous credential fails after rotate. A call to a route classed `sensitive` or `destructive` returns `FORBIDDEN` (ADR-0013). Scope does not include undeclared permissions. | Principal suite. | High |
+| K6 | Directory users, groups, edges | K3, K17 | CRUD inside one tenant. Tenant B sees none of tenant A's users. Registering an edge type inserts a row and does not add a kernel migration. `directory.write_edge` inserts an edge only for a manifest-listed type, in the same transaction as a fixture plugin row, and rolls both back together. The plugin role's `INSERT` on the Directory table fails a privilege check. | Two-tenant Directory suite. | High |
+| K7 | Authorization, relationship grants, delegation | K6 | A `reports_to` grant allows the holder and denies a peer. An expired delegation denies. A service principal and an MCP actor receive `FORBIDDEN` on a route classed `sensitive`. A mutating route with no class fails admission. | Authz suite with a same-tenant adversarial query. | High |
 | K8 | Audit commitment chain | K3 | Mutating the audited action writes the audit row in the same transaction. A rollback writes neither. The chain is per tenant. Payloads are hashes. | Audit suite, rollback case included. | High |
-| K9 | Secret store | K1 | Put, reference, resolve inside the broker, rotate the data key. A plugin-shaped caller receives the reference and not the value. KEK comes from the environment or a key file. Air-gap profile has no cloud KMS call. | Secret suite. Log scan shows no value. | High |
+| K9 | Secret store and digest sign | K1 | Put, reference, resolve inside the broker, rotate the data key. `secrets.sign` takes a digest and returns a signature and a public key id. The response and the audit row contain no private key bytes. A caller without `secrets.sign` is refused. KEK comes from the environment or a key file. Air-gap profile has no cloud KMS call. | Secret suite. Log scan shows no value and no private key. | High |
 | K10 | Signing-key guide | K9 | The guide requested by issue #62: backup posture, rotation PR, overlap of public keys, compromise. Satisfies §6: the verifier honors a key set; a removed key fails closed after the window the guide names; no private key in the diff. | Docs review plus a verifier fixture that accepts two public keys and rejects an unknown one. The fixture key is synthetic. | High |
 | K11 | Object storage gateway | K1 | Put and get under a derived prefix. Tenant B cannot read tenant A's key. A missing object is `NOT_FOUND` with `next_step`. | Storage suite against an S3-compatible test double. | High |
 | K12 | Notification plumbing | K1 | Deliver, dedup on idempotency key, record preference. A duplicate send does not duplicate delivery. No template lives in the kernel. | Notify suite. | Medium |
-| K13 | Outbox log and one relay | K1 | Append with the business transaction. Horizon skips a rolled-back seq. A filtered subscription advances. Unknown version parks. Polling delivers with `LISTEN` down. | Bus suite, one process. | High |
+| K13 | Outbox log and one relay | K1 | Append with the business transaction. `safe_point` is the sequence cutoff in §4.2: an open reservation older than the horizon holds the cursor below its `seq`, and a rolled-back `seq` is skipped only after `safe_point` passes it. A filtered subscription advances. Version-park fixture: a consumer of `fixture_publisher.note.recorded` at version 1 receives version 1; version 2 parks that subscription with the cursor unchanged and the row retained; a second subscription that does not list the type advances past the same row. Duplicate-delivery fixture: a crash after the effect and before ack redelivers the same idempotency key, and `UNIQUE(subscription, seq)` leaves one business row. Polling delivers with `LISTEN` down. The kernel test uses the fixture type, not a learning noun. | Bus suite, one process. | High |
 | K14 | pg-boss pooler proof, then handoff | K13 | The candidate pin runs through PgBouncer `pool_mode=transaction`, `max_prepared_statements=0`, with no session `SET`, no session advisory lock, and no `LISTEN` on a pooled connection. Claim uses `SKIP LOCKED`. Handoff is one transaction. If the pin fails, the task stops at the written failure and adopts nothing (ADR-0009). | Spike report in `docs/plans/`, commands and exit codes included. | High |
-| K15 | Two-process relay | K13 | ADR-0009 subset: two processes, kill one relay, duplicate delivery, listener-absent polling, retention above the live cursor. No leader row. The survivor drains. | Two-process suite. A one-process run does not count. | High |
+| K15 | Two-process relay | K13 | ADR-0009 subset: two processes, kill one relay, the duplicate-delivery fixture from K13 under two claimers, the version-park fixture with the cursor held on one subscription while the other advances, listener-absent polling. Retention stays at or above the minimum of the live cursor and an unexpired watermark. No leader row. The survivor drains. | Two-process suite. A one-process run does not count. | High |
 | K16 | Valkey cache and loss | K3 | §8.2 loss tests, including a restored snapshot that still holds a revoked session. Rate limit fails closed when Valkey is down. Ordinary reads still authorize from PostgreSQL. | Cache suite. Pin and source recorded in the PR. | High |
 | K17 | Grants, plugin role, fixture schema | K1 | ADR-0008. Fixture package `fixture_alpha` migrates `plugin_fixture_alpha` without a kernel source edit and without entering the kernel `Database` interface. A fixture-file check rejects unqualified table names, another plugin schema, and functions. That check is not the P2 admission parser. `SET LOCAL ROLE` replay is measured. Two notes in one tenant: the principal without the grant reads zero. | Fixture suite plus kernel-purity. Codegen diff empty. | High |
-| K18 | Package registry and per-tenant enablement | K17 | Enable for tenant A, leave B disabled. A's watermark receives a fixture event; B's does not; the installation cursor advances. Re-enable catch-up delivers inside the quota. Grants do not widen on enable. | Enablement suite. | High |
+| K18 | Package registry and per-tenant enablement | K17 | Enable for tenant A, leave B disabled. A's watermark receives a fixture event; B's does not; the installation cursor advances. A retention pass while B is disabled leaves B's unexpired backlog in the log. Re-enable catch-up delivers that backlog. Force-advance is refused while the watermark is inside 30 days and 256 MiB. After either bound, it is accepted only as export-then-force-advance. Grants do not widen on enable. | Enablement suite. | High |
 | K19 | Error envelope and generated OpenAPI | K2 | Envelope matches §6, including `reason`. OpenAPI is generated from the zod registry. A hand-written path fails review. `CONCURRENCY_CONFLICT` maps to 409. | Contract test. Breaking-change check on the kernel routes. | Medium |
-| K20 | MCP read inventory | K7, K19 | The eight tools in §7. Alignment check against the curated list. A real MCP client reads the same tenant the REST client reads, and is denied the same cross-tenant read. No write tool is registered. | MCP alignment suite. | High |
+| K20 | MCP read inventory | K7, K19 | The eight tools in §7. Alignment check against the curated list. A real MCP client reads the same tenant the REST client reads, and is denied the same cross-tenant read. No write tool is registered. A write-shaped call returns `FORBIDDEN` with `isError: true` and a successful transport status. | MCP alignment suite. | High |
 | K21 | Minimal admin shell | K19, K3 | Shell screens for the kernel workflows only: tenant, admin, principal, OIDC, audit list, package enablement. No plugin slot host yet (P2). Tokens only, no domain nouns in kernel client code. | Browser walkthrough of those screens, plus the API-only proof that they are not required. | Medium |
 | K22 | API-only profile | K4, K5, K20 | `surfaces=api` completes the five workflows in §8.1 with the shell absent. MCP read-back matches. | Headless suite. | High |
 | K23 | Maintenance mode | K19 | Flag on: tenant routes and MCP return `UNAVAILABLE` reason `maintenance`; `/health` reports maintenance and no tenant data; shell static page renders with plugins disabled. Flag off: the next request proceeds. Two processes observe one row. | Maintenance suite. | Medium |
 | K24 | Backup, restore, `restore_epoch` | K9, K11 | Restore onto a clean database and object store. Manifest hash, row counts, and the written sample match. A pre-restore session and service credential are denied. | Restore drill log in the PR. | High |
 | K25 | Upgrade preflight | K1, K24 | Preflight refuses a pending migration when the backup step has not run, and allows it when the drill backup exists. N and N+1 kernel SQL are both valid during a mixed read of the expanded schema. | Preflight suite. | High |
-| K26 | Telemetry, limits, envelope note | K13, K16 | Oldest-pending age, pool wait, and rate-limit rejections are metrics. A limit over the draft ceiling returns `RATE_LIMITED` or `UNAVAILABLE` with `next_step`. The provisional numbers live in the PR's doc and are labeled provisional. | Metric smoke plus the limit test. | Medium |
+| K26 | Telemetry, limits, envelope note | K13, K16 | Oldest-pending age, pool wait, and rate-limit rejections are metrics. A limit over the draft ceiling returns `RATE_LIMITED` or `UNAVAILABLE` with `next_step`. The note records the provisional ceilings from §12: watermark cap 256 MiB, per-plugin idle RSS 128 MiB, 20 plugins on one runner, and the D10 lag numbers. Each figure is labeled provisional. | Metric smoke plus the limit test. | Medium |
 | K27 | Contract gate for kernel events | K13, K19 | A fixture diff that removes a payload field without a version bump fails the check. A fixture that bumps the version passes. | Breaking-change gate, with a negative fixture. | Medium |
+| K28 | Fixture publisher | K17, K13 | ADR-0012. `plugins/fixture_publisher/` publishes `fixture_publisher.note.recorded` at version 1. The commit's `git diff --stat -- apps/kernel` is empty. Kernel-purity exits 0. The import check finds no kernel import of `plugins/`. | Empty-diff check, purity, import check. | High |
+| K29 | Fixture subscriber | K28 | `plugins/fixture_subscriber/` requires the publisher contract and imports only that contract module. A duplicate delivery of the publisher's event inserts one subscriber row. The commit's kernel diff is empty. Purity and the import check pass. | Empty-diff check, purity, import check, duplicate-delivery assertion. | High |
+| K30 | Fixture optional dependency | K28 | `plugins/fixture_optional/` names the publisher under `optionalRequires`. With the publisher disabled for the tenant, the call returns `UNAVAILABLE` reason `dependency_disabled` and the caller keeps its declared default. The commit's kernel diff is empty. Purity and the import check pass. | Empty-diff check, purity, import check. | High |
 
 ### 11.1 Trace to the spec §15 P1 exit
 
@@ -649,7 +675,7 @@ Suggested order is the dependency column, not a calendar. Tracks that can procee
 | API-only: create tenant, bootstrap admin, provision service principal, rotate credential, configure OIDC | K2, K3, K4, K5, K22 |
 | MCP verifies the curated read surface | K20, K22 |
 | Backup, restore, `restore_epoch`, manifest equality | K24 |
-| The rest of the P1 contents row (Directory, grants, audit, storage, secrets, notify, bus, telemetry, admin shell, self-upgrade, limits, envelope note) | K6–K12, K14–K16, K21, K23, K25, K26 |
+| The rest of the P1 contents row (Directory, grants, audit, storage, secrets, notify, bus, telemetry, admin shell, self-upgrade, limits, envelope note) | K6–K12, K14–K16, K21, K23, K25–K30 |
 
 §9 is the proof those exits stay enough when the learning features arrive. It is not an extra exit that smuggles P3 into P1.
 
@@ -662,3 +688,16 @@ This document is done when a reviewer can, from the text alone:
 - and confirm that each §9 feature names its schema, its events, and a kernel diff of none.
 
 It is not done by an implementation PR, and it is not an Accepted ADR.
+
+## 12. Kernel review triggers
+
+These are the measurements that reopen the kernel. Crossing one starts the action in the last column. It does not authorize a plugin PR to edit `apps/kernel`. The provisional figures are the ones K26 records, and P4 may replace them with measured ones. D10's capacity C, once measured, supersedes the early event and tenant counts.
+
+| Signal | Threshold | Owner action |
+|---|---|---|
+| A feature plugin needs a kernel change | `git diff --stat -- apps/kernel` is non-empty on the plugin commit, or kernel-purity or the import check fails | Stop the plugin PR. Open a superseding ADR for the missing primitive. |
+| Tenant count or event volume | 1,000 tenants in one database, or 100 sustained events/s for 10 minutes, before C exists. After C exists: forecast peak above 50% of C (p99 publication lag above 1 s, claim p95 above 50 ms, or foreground p99 degradation above 20%). | Run the capacity measurement. Open the D10 migration ADR if the forecast is over 50% of C. |
+| Event-log lag | Healthy relays, and p99 publication lag above 1 s across the ADR-0003 measurement window | Spike the relay and the `safe_point` formula. Open an ADR if the spike cannot hold the lag inside C. |
+| Retention pressure | One unexpired watermark's backlog exceeds 256 MiB, or the 30-day quota is reached and the rows are still held | The operator runs export-then-force-advance (§4.4). If three watermarks in one installation hit a bound, open an ADR on the quota. |
+| A grant cannot express a plugin need | The only implementation is a kernel conditional on a plugin id | Open an ADR that adds one grant name, or refuse the need. |
+| Process-per-plugin overhead | Idle RSS above 128 MiB for one fixture plugin, or 20 plugins exceed the host envelope, or a child crash takes down a sibling or the supervisor | Re-run the ADR-0004 spike. Open an ADR only if that record's flip conditions are met. |
