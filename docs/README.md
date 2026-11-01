@@ -1,6 +1,7 @@
 # Plerni documentation
 
 - [`ROADMAP.md`](ROADMAP.md) — plain-language roadmap for contributors (phases, starter issues, planned plugins)
+- [`plans/`](plans/README.md) — implementation plans; the P1 kernel draft is a proposal until it is accepted
 - [`specs/`](specs/) — product & architecture design (the source of truth)
 - [`adr/`](adr/) — architectural decision records (index in [`adr/README.md`](adr/README.md))
 - [`decision-register.html`](decision-register.html) — 32 decisions (D01–D32) with rationale, evidence, and flip conditions; browser viewer and the founder's review tool

@@ -17,3 +17,7 @@ The pre-implementation decision record (32 decisions with evidence and flip cond
 - [0005 — UI kit + token compiler](0005-ui-kit-token-compiler.md)
 - [0006 — IPC flow control](0006-ipc-flow-control.md)
 - [0007 — Pooled contamination recovery](0007-pooled-contamination-recovery.md)
+- [0008 — P1 loads plugins in-process](0008-p1-modular-monolith.md) (Proposed, draft A)
+- [0009 — P1 dispatches the transactional outbox in-process](0009-p1-in-process-outbox-dispatch.md) (Proposed, draft A)
+- [0010 — The platform operator is a tenant, and runtime roles have no bypass](0010-operator-tenant-no-bypassrls.md) (Proposed, draft A)
+- [0011 — Plugins sign digests; the secret store keeps the keys](0011-digest-signing-port.md) (Proposed, draft A)
