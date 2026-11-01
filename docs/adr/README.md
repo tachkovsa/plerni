@@ -17,3 +17,5 @@ The pre-implementation decision record (32 decisions with evidence and flip cond
 - [0005 — UI kit + token compiler](0005-ui-kit-token-compiler.md)
 - [0006 — IPC flow control](0006-ipc-flow-control.md)
 - [0007 — Pooled contamination recovery](0007-pooled-contamination-recovery.md)
+- [0008 — Per-plugin capability grants and schema role](0008-capability-grants-and-schema-role.md) (Proposed)
+- [0009 — P1 accepts the log on two replicas, with Valkey outside durability](0009-leaderless-replica-log.md) (Proposed)
