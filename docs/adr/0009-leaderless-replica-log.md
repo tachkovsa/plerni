@@ -3,7 +3,7 @@
 - **Status:** Proposed · **Date:** 2026-11-01
 - **Spec:** [`../specs/2026-10-12-plerni-design.md`](../specs/2026-10-12-plerni-design.md) §7 (one machinery, no leader), §15 P1 (outbox/relay/pg-boss), §16.17 (duplicate/loss battery, full suite at P3)
 - **Register:** [`../decision-register.html`](../decision-register.html) — **D10**, **D22**
-- **Depends on:** [ADR-0003](0003-outbox-pgboss.md). This record sequences P1. It does not replace the log shape.
+- **Depends on:** [ADR-0003](0003-outbox-pgboss.md). This record follows ADR-0003 and does not amend it. It sequences P1. It does not replace the log shape.
 - **Design:** [`../plans/p1-kernel-design-b.md`](../plans/p1-kernel-design-b.md) §4 and §8
 - **Number:** 0008 is the capability-grant record drafted with this one. 0009 is the next integer.
 
@@ -19,17 +19,20 @@ Valkey (D22) is the cache, the rate-limit counter, and the cross-replica hint fo
 
 1. **P1's bus acceptance runs two kernel processes and two relays against one PostgreSQL primary.** The relays are two instances of one implementation. Each kernel replica may host a relay, and the same module may run as its own process. There is no leader election, no lease on "the" relay, and no correctness path that requires exactly one of them to be alive.
 
-2. **The claim unit is the subscription row, and `safe_point` is a sequence.** `seq` is a `bigint`. `safe_point` is a `bigint`. A timestamp, or the horizon length cast to an integer, is not a cutoff the reader can compare to `seq`.
+2. **The claim unit is the subscription row, and `safe_point` is the ADR-0003 horizon as a sequence.** This decision follows ADR-0003 decision 2. It does not amend ADR-0003. `seq` is a `bigint` from `nextval`, allocated inside the business transaction with no advisory lock and not held until commit. Spec §7's rule against lock serialization on the write path stays in force. `safe_point` is a `bigint`. A timestamp, or the horizon length cast to an integer, is not a cutoff the reader can compare to `seq`.
 
-   Allocation is inside the business transaction, on that transaction's connection. There is no reservation table and no sweeper. The order is: hygiene and the tenant GUC; `FOR UPDATE` on the aggregate rows in id-sorted order; `pg_advisory_xact_lock` on the constant for `plerni.event_seq`; `nextval`; insert the event row; commit. The advisory lock is transaction-scoped and ends at commit or rollback. It is not a session lock (spec §5).
+   Per-aggregate order is `aggregate_version` on the aggregate row, incremented under `FOR UPDATE` on that row (id-sorted when a unit locks several) and copied onto the event. The row lock lasts until the transaction ends. The next writer on that aggregate waits. A writer on another aggregate locks a different row and does not wait. The global `seq` is the log position. Consumers apply one aggregate in `aggregate_version` order. The subscription cursor stays one global `last_seq`.
 
-   The aggregate lock comes before `nextval`, so one aggregate's sequence numbers follow the lock order (spec §7). The advisory lock stays until commit, so another transaction cannot take a higher `seq` while this one is open. A committed row at `seq = K` means every lower allocation has committed or rolled back. Publishing a reservation on another connection before this transaction would allow a later aggregate lock to commit a higher sequence first.
+   The horizon is 10 seconds of database time (`clock_timestamp()`). `created_at` is that clock at insert.
 
    ```
-   safe_point = max seq among event rows visible to the reader's snapshot
+   safe_point = max(seq) among committed-visible rows
+                whose created_at <= clock_timestamp() - horizon
    ```
 
-   The reader takes committed-visible rows with `seq > last_seq AND seq <= safe_point`. An integer `seq <= safe_point` with no event row is a gap. `nextval` gave it to a transaction that rolled back or whose backend died before commit. The relay skips that integer and does not wait. Nothing can insert an event there later: `nextval` will not return it, and there is no reservation row a late commit could fill. Backend death aborts the business transaction with the allocation, so the sequence cannot be abandoned on one connection and committed on another.
+   If no such row exists, the relay delivers nothing. The reader takes committed-visible rows with `seq > last_seq AND seq <= safe_point`. A row younger than the horizon is not eligible, so a higher `seq` still inside the horizon cannot move the cursor past a lower `seq` that is also still inside it. A transaction that stays open longer than the horizon is the residual ADR-0003 already states. This record does not close it with a global lock.
+
+   An integer `seq <= safe_point` with no event row is a rolled-back `nextval`. The relay skips that gap and does not wait. `nextval` does not return that value again.
 
    A relay, in a short transaction: compute that `safe_point`; `SELECT` one live subscription that is behind it `FOR UPDATE SKIP LOCKED`; read a bounded batch of matching log rows. Delivery of one event is its own transaction: dedup marker `UNIQUE(subscription, seq)`, handler effects, cursor advance, fencing check. A second relay skips a locked subscription. A second attempt at the same seq hits the unique marker and commits no second effect. The log insert path does not take the subscription lock.
 
@@ -47,12 +50,13 @@ Valkey (D22) is the cache, the rate-limit counter, and the cross-replica hint fo
 
 - A P1 green run on one process does not meet this record. The task is red until two processes have run the subset in decision 4.
 - Plugin-level parked cursors and the per-tenant enablement watermark are specified in the design. They ride the same log. They do not introduce a second bus.
+- The event sequence has no advisory lock. Per-aggregate order is the version under the aggregate row lock. That is ADR-0003's writer-side discipline, not a new bus.
 - Read replicas stay incompatible with transaction-pinned `set_config` (spec §5). This record does not add one.
 - Operating-envelope numbers stay provisional at P1 and are revised against P4 measurements (spec §15). This record sets no delivery date (issue #15).
 
 ## Flip conditions
 
-- The two-process subset fails unless a leader is introduced. That falsifies decision 1. Fix the claim or the allocation lock. Do not add an election to make the test pass.
+- The two-process subset fails unless a leader is introduced. That falsifies decision 1. Fix the claim or the horizon. Do not add an election to make the test pass. Do not add a global lock on the event sequence. That would amend ADR-0003.
 - The pg-boss pooler proof fails on the grounds in decision 5. Leave jobs on the outbox until a pin passes or a maintainer-accepted swap is written. Do not point plugins at a second queue.
 - Measured C crosses the D10 threshold. Follow D10. This record does not move that threshold.
 
