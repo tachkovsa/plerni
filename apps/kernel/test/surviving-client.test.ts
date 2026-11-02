@@ -10,6 +10,7 @@ import type pg from 'pg';
 import type { Database } from '../src/db/database.ts';
 import { bindPool } from '../src/db/pool.ts';
 import { MAX_RETRY, PINNED_SEARCH_PATH } from '../src/tenancy/constants.ts';
+import { MissingTenantContextError } from '../src/tenancy/errors.ts';
 import { withTenant, type HygieneEvidence } from '../src/tenancy/hygiene.ts';
 
 const TENANT_A = '11111111-1111-1111-1111-111111111111';
@@ -246,4 +247,27 @@ test('withTenant does not run access on another tenant id or a leaked role', asy
   assert.ok(ev.terminatedBackendPids.length >= 1);
   assert.ok(ev.terminatedBackendPids.length <= MAX_RETRY);
   await db.destroy();
+});
+
+test('withTenant rejects an empty, whitespace, or missing tenant id before access', async () => {
+  const { db, pool } = poolFor({ searchPath: PINNED_SEARCH_PATH, leak: false });
+  const blanks: string[] = ['', ' \t', undefined as unknown as string];
+  try {
+    for (const tenantId of blanks) {
+      const ev = blank();
+      let ran = false;
+      await assert.rejects(
+        () => withTenant(db, tenantId, ev, pool.terminate, async () => {
+          ran = true;
+          return 1;
+        }),
+        (error: unknown) => error instanceof MissingTenantContextError,
+      );
+      assert.equal(ran, false);
+      assert.equal(ev.terminatedBackendPids.length, 0);
+      assert.equal(ev.attempts, 0);
+    }
+  } finally {
+    await db.destroy();
+  }
 });

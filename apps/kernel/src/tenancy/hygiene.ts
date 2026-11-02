@@ -6,7 +6,7 @@ import { sql, type Kysely, type Transaction } from 'kysely';
 import type { Database } from '../db/database.ts';
 import { discardPoolerSessions, unblockPool } from '../db/pool.ts';
 import { MAX_RETRY, PINNED_SEARCH_PATH } from './constants.ts';
-import { ContaminationError, ContextInstallError } from './errors.ts';
+import { ContaminationError, ContextInstallError, MissingTenantContextError } from './errors.ts';
 
 export interface SessionState {
   tenant_guc: string | null;
@@ -29,6 +29,13 @@ export function blankEvidence(): HygieneEvidence {
 }
 
 const absent = (value: string | null): boolean => value === null || value === '';
+
+/** A blank id would install '' and the read-back would accept it. RLS treats that as no context. */
+export function rejectBlankTenantId(tenantId: string): void {
+  if (typeof tenantId !== 'string' || tenantId.trim() === '') {
+    throw new MissingTenantContextError('plerni.tenant_id not installed');
+  }
+}
 
 export function findContamination(state: SessionState): string[] {
   const reasons: string[] = [];
@@ -67,6 +74,7 @@ export async function installTenantContext(
   tenantId: string,
   evidence: HygieneEvidence,
 ): Promise<void> {
+  rejectBlankTenantId(tenantId);
   const before = await readSessionState(trx);
   const contamination = findContamination(before);
   if (contamination.length > 0) {
@@ -98,6 +106,7 @@ export async function withTenant<T>(
   terminateBackend: (pid: number) => Promise<void>,
   fn: (trx: Transaction<Database>) => Promise<T>,
 ): Promise<T> {
+  rejectBlankTenantId(tenantId);
   for (let attempt = 1; ; attempt += 1) {
     evidence.attempts = attempt;
     const terminatedBefore = evidence.terminatedBackendPids.length;

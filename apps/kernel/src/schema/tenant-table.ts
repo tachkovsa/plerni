@@ -135,10 +135,17 @@ export async function inspectTenantTable(
     }
   }
 
+  // role_table_grants hides a grant unless the inspector is the grantor or an
+  // enabled grantee, so a PUBLIC grant from another role is invisible.
+  // table_privileges also drops MAINTAIN. The ACL lists every grant, and
+  // grantee 0 is PUBLIC.
   const grants = await client.query<{ grantee: string; privilege_type: string }>(
-    `SELECT grantee, privilege_type
-     FROM information_schema.role_table_grants
-     WHERE table_schema = $1 AND table_name = $2`,
+    `SELECT CASE WHEN acl.grantee = 0 THEN 'PUBLIC' ELSE pg_get_userbyid(acl.grantee) END AS grantee,
+            acl.privilege_type
+     FROM pg_class c
+     JOIN pg_namespace n ON n.oid = c.relnamespace
+     CROSS JOIN LATERAL aclexplode(COALESCE(c.relacl, acldefault('r'::"char", c.relowner))) AS acl
+     WHERE n.nspname = $1 AND c.relname = $2`,
     [schema, table],
   );
   for (const grant of grants.rows) {

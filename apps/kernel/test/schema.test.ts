@@ -144,3 +144,29 @@ test('a table without row security fails the checker', async () => {
   const codes = await codesFor(fixture('unguarded.sql'), 'fixture_unguarded');
   assert.ok(codes.includes('rls_disabled'), codes.join(','));
 });
+
+test('a PUBLIC truncate grant is rejected when the inspecting role is not the grantor', async () => {
+  await ready();
+  const root = new pg.Client({ connectionString: ROOT });
+  const migrate = new pg.Client({ connectionString: MIGRATE });
+  await root.connect();
+  await migrate.connect();
+  try {
+    await root.query('DROP TABLE IF EXISTS kernel.fixture_public_truncate');
+    await root.query(fixture('public-truncate.sql'));
+    const violations = await inspectTenantTable(migrate, {
+      schema: 'kernel',
+      table: 'fixture_public_truncate',
+    });
+    const privilege = violations.filter((item) => item.code === 'privilege');
+    assert.ok(privilege.length > 0, violations.map((item) => item.code).join(','));
+    assert.ok(
+      privilege.some((item) => item.detail.includes('PUBLIC') && item.detail.includes('TRUNCATE')),
+      privilege.map((item) => item.detail).join(','),
+    );
+  } finally {
+    await root.query('DROP TABLE IF EXISTS kernel.fixture_public_truncate');
+    await migrate.end();
+    await root.end();
+  }
+});
