@@ -7,6 +7,7 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { sql } from 'kysely';
 import pg from 'pg';
+import { MAX_RETRY } from '../src/tenancy/constants.ts';
 import { blankEvidence, withTenant } from '../src/tenancy/hygiene.ts';
 import {
   InvalidIdempotencyKeyError,
@@ -46,6 +47,15 @@ async function withRoot<T>(fn: (client: pg.Client) => Promise<T>): Promise<T> {
   } finally {
     await client.end();
   }
+}
+
+async function drainAppBackends(): Promise<void> {
+  await withRoot(async (client) => {
+    await client.query(
+      `SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+       WHERE usename = 'plerni_app' AND pid <> pg_backend_pid()`,
+    );
+  });
 }
 
 async function resetRegistry(): Promise<void> {
@@ -122,7 +132,8 @@ async function scenario(connection: string): Promise<void> {
     const repeat = await bootstrapOperatorTenant(db, second, terminate);
     assert.equal(repeat.id, operator.id);
     assert.equal(repeat.kind, 'operator');
-    assert.equal(second.attempts, 0);
+    assert.equal(second.attempts, 1);
+    assert.equal(second.terminatedBackendPids.length, 0);
     assert.deepEqual(await snapshot(), afterBoot);
 
     const session = { tenantId: operator.id };
@@ -402,6 +413,31 @@ serial('a failed outbox insert rolls the customer tenant back', async () => {
     assert.equal(created.kind, 'customer');
   } finally {
     await db.destroy();
+  }
+});
+
+serial('pooled: repeat bootstrap recovers a leaked plugin role and writes nothing', async () => {
+  await ready();
+  await resetRegistry();
+  const db = appDb(POOLED, 1);
+  try {
+    const operator = await bootstrapOperatorTenant(db, blankEvidence(), terminate);
+    const before = await snapshot();
+    await sql`SET ROLE plerni_plugin_a`.execute(db);
+    const evidence = blankEvidence();
+    const repeat = await bootstrapOperatorTenant(db, evidence, terminate);
+    assert.equal(repeat.id, operator.id);
+    assert.equal(repeat.kind, 'operator');
+    assert.ok(evidence.attempts >= 2);
+    assert.ok(evidence.attempts <= MAX_RETRY + 1);
+    assert.equal(evidence.terminatedBackendPids.length, 1);
+    assert.ok(
+      evidence.alerts.some((alert) => alert.includes('role leaked') && alert.includes('plerni_plugin_a')),
+    );
+    assert.deepEqual(await snapshot(), before);
+  } finally {
+    await db.destroy();
+    await drainAppBackends();
   }
 });
 

@@ -163,11 +163,14 @@ export async function bootstrapOperatorTenant(
   evidence: HygieneEvidence,
   terminateBackend: (pid: number) => Promise<void>,
 ): Promise<TenantRecord> {
-  const existing = await readOperator(db);
-  if (existing) return existing;
+  // The proposed id is only the hygiene GUC until an insert commits. The
+  // lookup stays inside the transaction so a leaked role, tenant GUC, or
+  // search_path is recovered before the read. A repeat call writes nothing.
   const id = randomUUID();
   return withTenant(db, id, evidence, terminateBackend, async (trx) => {
     await assertTenantContext(trx);
+    const existing = await readOperator(trx);
+    if (existing) return existing;
     const inserted = await sql<{ id: string }>`
       INSERT INTO kernel.tenants (id, kind, aggregate_version)
       VALUES (${id}::uuid, 'operator', 0)
