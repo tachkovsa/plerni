@@ -194,6 +194,7 @@ export async function createTenant(
   input: CreateTenantInput,
   evidence: HygieneEvidence,
   terminateBackend: (pid: number) => Promise<void>,
+  afterKeyMiss?: (trx: Transaction<Database>) => Promise<void>,
 ): Promise<TenantRecord> {
   assertUuid(session.tenantId);
   const key = input.idempotencyKey;
@@ -205,6 +206,9 @@ export async function createTenant(
       if (actor?.kind !== 'operator') throw new PlatformScopeError();
       const replay = await readIdempotentTenant(trx, key);
       if (replay) return replay;
+      // Still inside this transaction, before the insert. A race test waits here
+      // until the other request has also missed the key.
+      if (afterKeyMiss) await afterKeyMiss(trx);
       const id = randomUUID();
       await insertTenant(trx, id, 'customer');
       await appendTenantCreated(trx, session.tenantId, id, 'customer');
@@ -220,7 +224,14 @@ export async function createTenant(
     });
   } catch (error) {
     if (error instanceof IdempotencyConflict || postgresCode(error) === '23505') {
-      const saved = await readIdempotentTenant(db, key);
+      // The losing transaction has rolled back. This checkout may be a different
+      // pooled backend, so the winner is read only after a fresh hygiene pass.
+      const saved = await withTenant(db, session.tenantId, evidence, terminateBackend, async (trx) => {
+        await assertTenantContext(trx);
+        const actor = await readTenant(trx, session.tenantId);
+        if (actor?.kind !== 'operator') throw new PlatformScopeError();
+        return readIdempotentTenant(trx, key);
+      });
       if (saved) return saved;
     }
     throw error;

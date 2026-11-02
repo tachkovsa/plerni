@@ -416,6 +416,75 @@ serial('a failed outbox insert rolls the customer tenant back', async () => {
   }
 });
 
+/** Both callers arrive before either is released. The wait is the barrier, not a sleep. */
+function rendezvous(parties: number): () => Promise<void> {
+  let arrived = 0;
+  let openGate: () => void = () => undefined;
+  const opened = new Promise<void>((resolve) => {
+    openGate = resolve;
+  });
+  return () => {
+    arrived += 1;
+    if (arrived >= parties) openGate();
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('race barrier timed out')), 10_000);
+      void opened.then(() => {
+        clearTimeout(timer);
+        resolve();
+      }, reject);
+    });
+  };
+}
+
+serial('pooled: two creates that both miss the same key leave one tenant', async () => {
+  await ready();
+  await resetRegistry();
+  const left = appDb(POOLED, 1);
+  const right = appDb(POOLED, 1);
+  try {
+    const operator = await bootstrapOperatorTenant(left, blankEvidence(), terminate);
+    const before = await snapshot();
+    const session = { tenantId: operator.id };
+    const arrived = rendezvous(2);
+    const [first, second] = await Promise.all([
+      createTenant(left, session, { idempotencyKey: 'race-customer' }, blankEvidence(), terminate, arrived),
+      createTenant(right, session, { idempotencyKey: 'race-customer' }, blankEvidence(), terminate, arrived),
+    ]);
+    assert.equal(first.kind, 'customer');
+    assert.equal(second.id, first.id);
+    assert.equal(second.kind, 'customer');
+    assert.equal(second.createdAt.getTime(), first.createdAt.getTime());
+    const after = await snapshot();
+    assert.equal(after.operators, 1);
+    assert.equal(after.tenants - before.tenants, 1);
+    assert.equal(after.audits - before.audits, 1);
+    assert.equal(after.events - before.events, 1);
+    assert.equal(after.keys - before.keys, 1);
+    const customers = await sql<{ id: string }>`
+      SELECT id::text AS id FROM kernel.tenants WHERE kind = 'customer'`.execute(left);
+    assert.deepEqual(customers.rows.map((row) => row.id), [first.id]);
+    const events = await sql<{ count: string }>`
+      SELECT count(*)::text AS count FROM kernel.outbox
+      WHERE type = 'kernel.tenant.created' AND aggregate_id = ${first.id}::uuid`.execute(left);
+    const keys = await sql<{ count: string }>`
+      SELECT count(*)::text AS count FROM kernel.tenant_idempotency
+      WHERE idempotency_key = 'race-customer' AND tenant_id = ${first.id}::uuid`.execute(left);
+    const auditCount = await withTenant(left, operator.id, blankEvidence(), terminate, async (trx) => {
+      const result = await sql<{ count: string }>`
+        SELECT count(*)::text AS count FROM kernel.audit_record
+        WHERE action = 'kernel.tenant.created' AND target_tenant_id = ${first.id}::uuid`.execute(trx);
+      return result.rows[0]?.count;
+    });
+    assert.equal(events.rows[0]?.count, '1');
+    assert.equal(auditCount, '1');
+    assert.equal(keys.rows[0]?.count, '1');
+  } finally {
+    await left.destroy();
+    await right.destroy();
+    await drainAppBackends();
+  }
+});
+
 serial('pooled: repeat bootstrap recovers a leaked plugin role and writes nothing', async () => {
   await ready();
   await resetRegistry();
