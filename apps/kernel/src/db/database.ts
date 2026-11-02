@@ -13,4 +13,33 @@ export interface Database {
     row_id: string;
     marker: string;
   };
+  tenants: {
+    id: string;
+    kind: 'operator' | 'customer';
+    aggregate_version: string;
+    created_at: Date;
+  };
+  tenant_idempotency: {
+    idempotency_key: string;
+    tenant_id: string;
+    created_at: Date;
+  };
+  outbox: {
+    seq: string;
+    tenant_id: string;
+    aggregate_type: string;
+    aggregate_id: string;
+    aggregate_version: string;
+    type: string;
+    version: number;
+    payload: unknown;
+    created_at: Date;
+  };
+  audit_record: {
+    tenant_id: string;
+    id: string;
+    action: string;
+    target_tenant_id: string;
+    created_at: Date;
+  };
 }
