@@ -5,7 +5,7 @@
   "engines": { "node": ">=22" },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node --test --test-concurrency=1 --test-reporter spec test/hygiene.test.ts test/surviving-client.test.ts test/schema.test.ts test/tenancy.test.ts"
+    "test": "node --test --test-concurrency=1 --test-reporter spec test/hygiene.test.ts test/surviving-client.test.ts test/schema.test.ts test/tenancy.test.ts test/tenant-registry.test.ts"
   },
   "dependencies": {
     "kysely": "0.29.6",

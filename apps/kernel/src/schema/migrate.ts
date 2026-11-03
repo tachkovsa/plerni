@@ -5,6 +5,7 @@ import { readdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
+import { inspectKernelInternal } from './kernel-internal.ts';
 import { inspectTenantTable } from './tenant-table.ts';
 
 const SQL_NAME = /^[0-9]{4}_[a-z0-9_]+\.sql$/;
@@ -38,10 +39,20 @@ export async function applyKernelMigrations(connectionString: string): Promise<r
     const violations = [
       ...(await inspectTenantTable(client, { schema: 'kernel', table: 'scoped_row' })),
       ...(await inspectTenantTable(client, { schema: 'kernel', table: 'scoped_link', foreignKey: SCOPED_LINK_FK })),
+      ...(await inspectTenantTable(client, { schema: 'kernel', table: 'audit_record' })),
     ];
     if (violations.length > 0) {
       const summary = violations.map((item) => `${item.table}:${item.code}`).join(', ');
       throw new Error(`kernel tenant tables failed the shape check: ${summary}`);
+    }
+    const internal = [
+      ...(await inspectKernelInternal(client, 'tenants')),
+      ...(await inspectKernelInternal(client, 'tenant_idempotency')),
+      ...(await inspectKernelInternal(client, 'outbox')),
+      ...(await inspectKernelInternal(client, 'outbox_seq')),
+    ];
+    if (internal.length > 0) {
+      throw new Error(`kernel-internal relations failed the shape check: ${internal.join(', ')}`);
     }
     await client.query('COMMIT');
     return applied;
