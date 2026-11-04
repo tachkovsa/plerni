@@ -31,6 +31,8 @@ export interface TenantTableSpec {
   schema: string;
   table: string;
   foreignKey?: string;
+  /** DML grantee. Kernel tables leave this as plerni_app. A plugin table names its schema role. */
+  runtimeRole?: string;
 }
 
 export interface Queryable {
@@ -148,9 +150,10 @@ export async function inspectTenantTable(
      WHERE n.nspname = $1 AND c.relname = $2`,
     [schema, table],
   );
+  const runtimeRole = spec.runtimeRole ?? 'plerni_app';
   for (const grant of grants.rows) {
     if (grant.grantee === row.owner) continue;
-    if (grant.grantee === 'plerni_app' && DML.has(grant.privilege_type)) continue;
+    if (grant.grantee === runtimeRole && DML.has(grant.privilege_type)) continue;
     violations.push({ table: label, code: 'privilege', detail: `${grant.grantee} ${grant.privilege_type}` });
   }
 

@@ -40,6 +40,7 @@ export async function applyKernelMigrations(connectionString: string): Promise<r
       ...(await inspectTenantTable(client, { schema: 'kernel', table: 'scoped_row' })),
       ...(await inspectTenantTable(client, { schema: 'kernel', table: 'scoped_link', foreignKey: SCOPED_LINK_FK })),
       ...(await inspectTenantTable(client, { schema: 'kernel', table: 'audit_record' })),
+      ...(await inspectTenantTable(client, { schema: 'kernel', table: 'principal_grant' })),
     ];
     if (violations.length > 0) {
       const summary = violations.map((item) => `${item.table}:${item.code}`).join(', ');
@@ -50,6 +51,8 @@ export async function applyKernelMigrations(connectionString: string): Promise<r
       ...(await inspectKernelInternal(client, 'tenant_idempotency')),
       ...(await inspectKernelInternal(client, 'outbox')),
       ...(await inspectKernelInternal(client, 'outbox_seq')),
+      ...(await inspectKernelInternal(client, 'plugin_grant')),
+      ...(await inspectKernelInternal(client, 'plugin_migration')),
     ];
     if (internal.length > 0) {
       throw new Error(`kernel-internal relations failed the shape check: ${internal.join(', ')}`);

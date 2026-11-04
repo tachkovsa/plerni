@@ -42,4 +42,21 @@ export interface Database {
     target_tenant_id: string;
     created_at: Date;
   };
+  plugin_grant: {
+    plugin_id: string;
+    grant_name: string;
+  };
+  plugin_migration: {
+    plugin_id: string;
+    version: string;
+    applied_at: Date;
+  };
+  principal_grant: {
+    tenant_id: string;
+    id: string;
+    principal_id: string;
+    plugin_id: string;
+    resource: string;
+    action: string;
+  };
 }
