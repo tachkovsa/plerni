@@ -134,8 +134,10 @@ export function checkFixtureSql(pluginId: string, sqlText: string): FixtureSqlVi
       continue;
     }
     // Quoted identifiers and modifiers such as UNLOGGED hide names from the
-    // patterns below. Reject them instead of treating the statement as clean.
-    if (statement.includes('"') || !recognized(statement)) {
+    // patterns below. A comma-separated DROP or TRUNCATE list only yields the
+    // first name to those patterns, so that form fails closed too.
+    const multiTable = /^(?:drop\s+table|truncate)\b/i.test(statement) && statement.includes(',');
+    if (statement.includes('"') || !recognized(statement) || multiTable) {
       violations.push({ code: 'unsupported', detail: statement.slice(0, 80) });
       continue;
     }

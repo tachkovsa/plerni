@@ -61,6 +61,22 @@ test('an unlogged table in another plugin schema is rejected', () => {
   assert.deepEqual(codes, ['unsupported']);
 });
 
+test('a multi-table drop that includes another schema is rejected', () => {
+  const codes = checkFixtureSql(
+    'fixture_alpha',
+    'DROP TABLE plugin_fixture_alpha.note, plugin_beta.note;',
+  ).map((item) => item.code);
+  assert.deepEqual(codes, ['unsupported']);
+});
+
+test('a multi-table truncate that includes another schema is rejected', () => {
+  const codes = checkFixtureSql(
+    'fixture_alpha',
+    'TRUNCATE plugin_fixture_alpha.note, plugin_beta.note;',
+  ).map((item) => item.code);
+  assert.deepEqual(codes, ['unsupported']);
+});
+
 test('functions, triggers, and DO blocks are rejected', () => {
   const samples = [
     'CREATE FUNCTION plugin_fixture_alpha.touch() RETURNS void LANGUAGE sql AS $$ SELECT 1 $$;',
