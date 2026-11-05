@@ -51,6 +51,16 @@ test('another plugin schema is rejected', () => {
   assert.ok(codes.includes('foreign_schema'), codes.join(','));
 });
 
+test('a quoted unqualified table name is rejected', () => {
+  const codes = checkFixtureSql('fixture_alpha', 'CREATE TABLE "note" (id uuid);').map((item) => item.code);
+  assert.deepEqual(codes, ['unsupported']);
+});
+
+test('an unlogged table in another plugin schema is rejected', () => {
+  const codes = checkFixtureSql('fixture_alpha', 'CREATE UNLOGGED TABLE plugin_beta.note (id uuid);').map((item) => item.code);
+  assert.deepEqual(codes, ['unsupported']);
+});
+
 test('functions, triggers, and DO blocks are rejected', () => {
   const samples = [
     'CREATE FUNCTION plugin_fixture_alpha.touch() RETURNS void LANGUAGE sql AS $$ SELECT 1 $$;',

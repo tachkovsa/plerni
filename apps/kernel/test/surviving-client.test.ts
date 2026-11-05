@@ -11,6 +11,8 @@ import type { Database } from '../src/db/database.ts';
 import { bindPool } from '../src/db/pool.ts';
 import { MAX_RETRY, PINNED_SEARCH_PATH } from '../src/tenancy/constants.ts';
 import { MissingTenantContextError } from '../src/tenancy/errors.ts';
+import { allowPrincipal, readPluginRows } from '../src/plugin/read.ts';
+import { roleReplay, withPluginRole } from '../src/plugin/session.ts';
 import { withTenant, type HygieneEvidence } from '../src/tenancy/hygiene.ts';
 
 const TENANT_A = '11111111-1111-1111-1111-111111111111';
@@ -49,11 +51,16 @@ interface Session {
   leakArmed: boolean;
   backend: Backend | null;
   localTenant: string | null;
+  localRole: string | null;
+  localSearchPath: string | null;
   checkedOut: boolean;
 }
 
 class SurvivingClientPool {
   readonly _clients: FakeClient[] = [];
+  pluginGrantReads = 0;
+  principalGrantReads = 0;
+  principalInserts = 0;
   private readonly sessions: Session[] = [];
   private nextPid = 1;
 
@@ -93,6 +100,8 @@ class SurvivingClientPool {
       leakArmed: leak,
       backend: null,
       localTenant: null,
+      localRole: null,
+      localSearchPath: null,
       checkedOut: false,
     };
     const client: FakeClient = {
@@ -133,14 +142,30 @@ class SurvivingClientPool {
     if (statement === 'begin') {
       if (!session.backend || session.backend.dead) session.backend = this.link(session);
       session.localTenant = null;
+      session.localRole = null;
+      session.localSearchPath = null;
       return { rows: [], rowCount: 0 };
     }
     if (!session.backend || session.backend.dead) throw death();
     if (statement === 'commit' || statement === 'rollback') {
       session.localTenant = null;
+      session.localRole = null;
+      session.localSearchPath = null;
       return { rows: [], rowCount: 0 };
     }
     if (statement === 'select 1') return { rows: [{ '?column?': 1 }], rowCount: 1 };
+    if (statement.startsWith('set local role ')) {
+      session.localRole = statement.slice('set local role '.length).replace(/"/g, '').trim();
+      return { rows: [], rowCount: 0 };
+    }
+    if (statement.includes('set_config') && statement.includes('search_path')) {
+      const path = values?.[0];
+      if (typeof path !== 'string' || !statement.includes(', true)')) {
+        throw new Error(`unexpected search_path set_config: ${text}`);
+      }
+      session.localSearchPath = path;
+      return { rows: [{ set_config: path }], rowCount: 1 };
+    }
     if (statement.includes('set_config')) {
       const tenant = values?.[0];
       if (typeof tenant !== 'string' || !statement.includes(', true)')) {
@@ -148,6 +173,30 @@ class SurvivingClientPool {
       }
       session.localTenant = tenant;
       return { rows: [{ set_config: tenant }], rowCount: 1 };
+    }
+    if (statement.includes('kernel.plugin_grant')) {
+      this.pluginGrantReads += 1;
+      return { rows: [{ ok: 1 }], rowCount: 1 };
+    }
+    if (statement.includes('insert into kernel.principal_grant')) {
+      this.principalInserts += 1;
+      return { rows: [], rowCount: 1 };
+    }
+    if (statement.includes('kernel.principal_grant')) {
+      this.principalGrantReads += 1;
+      return { rows: [], rowCount: 0 };
+    }
+    if (statement.includes("current_setting('search_path')") && !statement.includes('plerni.tenant_id')) {
+      const backend = session.backend;
+      if (!backend) throw death();
+      return {
+        rows: [{
+          search_path: session.localSearchPath ?? session.varcache.search_path,
+          current_user: session.localRole ?? backend.current_user,
+          session_user: backend.session_user,
+        }],
+        rowCount: 1,
+      };
     }
     if (statement.includes('tenant-access') || statement.includes("current_setting('plerni.tenant_id'")) {
       return { rows: [this.snapshot(session, statement.includes('tenant-access'))], rowCount: 1 };
@@ -160,9 +209,9 @@ class SurvivingClientPool {
     if (!backend) throw death();
     const row: Record<string, unknown> = {
       tenant_guc: session.localTenant ?? backend.tenant_guc,
-      current_user: backend.current_user,
+      current_user: session.localRole ?? backend.current_user,
       session_user: backend.session_user,
-      search_path: session.varcache.search_path,
+      search_path: session.localSearchPath ?? session.varcache.search_path,
       pid: backend.pid,
     };
     if (access) {
@@ -247,6 +296,77 @@ test('withTenant does not run access on another tenant id or a leaked role', asy
   assert.ok(ev.terminatedBackendPids.length >= 1);
   assert.ok(ev.terminatedBackendPids.length <= MAX_RETRY);
   await db.destroy();
+});
+
+const PLUGIN = 'fixture_alpha';
+const PRINCIPAL = '00000000-0000-4000-8000-0000000000c2';
+const READ = 'SELECT id::text AS id, body FROM plugin_fixture_alpha.note';
+
+function assertFreshRecovery(pool: SurvivingClientPool, ev: HygieneEvidence): void {
+  assert.equal(pool._clients.length, 2);
+  assert.equal(pool._clients[0]?.connection.stream.destroyed, true);
+  assert.equal(pool._clients[1]?.connection.stream.destroyed, false);
+  assert.equal(ev.attempts, 2);
+  assert.equal(ev.terminatedBackendPids.length, 1);
+  assert.ok(ev.discardedPoolerSessions >= 1);
+  assert.ok(ev.attempts <= MAX_RETRY + 1);
+  const replay = roleReplay(ev);
+  assert.equal(replay?.replayed, false);
+  assert.equal(replay?.afterSearchPath, PINNED_SEARCH_PATH);
+  assert.equal(replay?.afterUser, SESSION_USER);
+  assert.equal(replay?.afterSessionUser, SESSION_USER);
+}
+
+test('plugin calls reacquire a connection after contamination and still probe replay', async () => {
+  const role = poolFor({ searchPath: 'pg_catalog', leak: true });
+  const roleEvidence = blank();
+  const seen: AccessRow[] = [];
+  const access = await withPluginRole(role.db, TENANT_B, PLUGIN, roleEvidence, role.pool.terminate, async (trx) => {
+    const result = await ACCESS.execute(trx);
+    const row = result.rows[0];
+    if (row) seen.push(row);
+    return row;
+  });
+  assert.equal(seen.length, 1);
+  assert.equal(access?.tenant_guc, TENANT_B);
+  assert.equal(access?.session_tenant, null);
+  assert.equal(access?.current_user, 'plerni_plugin_fixture_alpha');
+  assert.equal(access?.session_user, SESSION_USER);
+  assert.equal(access?.search_path, 'plugin_fixture_alpha, pg_catalog');
+  assert.notEqual(access?.pid, roleEvidence.terminatedBackendPids[0]);
+  assertFreshRecovery(role.pool, roleEvidence);
+  await role.db.destroy();
+
+  const read = poolFor({ searchPath: 'pg_catalog', leak: true });
+  const readEvidence = blank();
+  const rows = await readPluginRows(read.db, {
+    tenantId: TENANT_B,
+    principalId: PRINCIPAL,
+    pluginId: PLUGIN,
+    resource: 'note',
+    action: 'read',
+    statement: READ,
+  }, readEvidence, read.pool.terminate);
+  assert.deepEqual(rows, []);
+  assert.equal(read.pool.pluginGrantReads, 1);
+  assert.equal(read.pool.principalGrantReads, 1);
+  assert.equal(read.pool.principalInserts, 0);
+  assertFreshRecovery(read.pool, readEvidence);
+  await read.db.destroy();
+
+  const grant = poolFor({ searchPath: 'pg_catalog', leak: true });
+  const grantEvidence = blank();
+  await allowPrincipal(grant.db, {
+    tenantId: TENANT_B,
+    principalId: PRINCIPAL,
+    pluginId: PLUGIN,
+    resource: 'note',
+    action: 'read',
+  }, grantEvidence, grant.pool.terminate);
+  assert.equal(grant.pool.pluginGrantReads, 1);
+  assert.equal(grant.pool.principalInserts, 1);
+  assertFreshRecovery(grant.pool, grantEvidence);
+  await grant.db.destroy();
 });
 
 test('withTenant rejects an empty, whitespace, or missing tenant id before access', async () => {

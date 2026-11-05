@@ -34,9 +34,14 @@ function packageFile(packageDir: string, rel: string): string {
   return full;
 }
 
+/** Plan §3.3: SQL files run in alphanumeric order, not manifest order. ASCII paths sort bytewise. */
+export function migrationOrder(paths: readonly string[]): string[] {
+  return [...paths].sort((left, right) => (left < right ? -1 : left > right ? 1 : 0));
+}
+
 export async function migratePluginPackage(options: MigratePluginOptions): Promise<readonly string[]> {
   const manifest = readManifest(options.packageDir);
-  const files = manifest.migrations.map((rel) => {
+  const files = migrationOrder(manifest.migrations).map((rel) => {
     const full = packageFile(options.packageDir, rel);
     const sqlText = readFileSync(full, 'utf8');
     const violations = checkFixtureSql(manifest.id, sqlText);

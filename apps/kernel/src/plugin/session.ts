@@ -8,7 +8,13 @@ import type { Database } from '../db/database.ts';
 import { discardPoolerSessions, sharePool } from '../db/pool.ts';
 import { PINNED_SEARCH_PATH } from '../tenancy/constants.ts';
 import { assertTenantContext } from '../tenancy/guard.ts';
-import { readSessionState, withTenant, type HygieneEvidence } from '../tenancy/hygiene.ts';
+import {
+  executeTenantTransaction,
+  readSessionState,
+  rejectBlankTenantId,
+  retryContaminated,
+  type HygieneEvidence,
+} from '../tenancy/hygiene.ts';
 import { PluginPackageError } from './errors.ts';
 import { pluginRoleName, pluginSchemaName, quoteIdent } from './ident.ts';
 
@@ -76,12 +82,15 @@ async function inPinnedTransaction<T>(
   terminateBackend: (pid: number) => Promise<void>,
   fn: (trx: Transaction<Database>) => Promise<T>,
 ): Promise<T> {
-  return db.connection().execute(async (pinned) => {
+  rejectBlankTenantId(tenantId);
+  // The retry must check out again. A loop inside one connection().execute
+  // would rerun the transaction on the backend that hygiene just terminated.
+  return retryContaminated(evidence, () => db.connection().execute(async (pinned) => {
     sharePool(pinned, db);
-    const value = await withTenant(pinned, tenantId, evidence, terminateBackend, fn);
+    const value = await executeTenantTransaction(pinned, tenantId, evidence, terminateBackend, fn);
     await observeReplay(pinned, evidence, db);
     return value;
-  });
+  }));
 }
 
 /** Switch role and pin search_path. Caller SQL runs only after both succeed. */

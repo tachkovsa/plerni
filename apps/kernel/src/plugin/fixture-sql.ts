@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Fixture-file check for in-repo package SQL (plan K17, ADR-0008 decision 4).
 // Rejects unqualified table names, another schema, and functions (plus triggers
-// and DO blocks, the indirect set_config path). This is not the P2 admission
+// and DO blocks, the indirect set_config path). A statement or identifier form
+// this checker does not recognize fails closed. This is not the P2 admission
 // parser and does not classify arbitrary author SQL.
 import { PluginPackageError } from './errors.ts';
 import { pluginSchemaName } from './ident.ts';
 
-export type FixtureSqlCode = 'unqualified_table' | 'foreign_schema' | 'function';
+export type FixtureSqlCode = 'unqualified_table' | 'foreign_schema' | 'function' | 'unsupported';
 
 export interface FixtureSqlViolation {
   code: FixtureSqlCode;
@@ -66,6 +67,27 @@ function isRoutine(statement: string): boolean {
   return /^(create\s+(or\s+replace\s+)?(function|procedure|trigger)|do)\b/i.test(statement);
 }
 
+/** Forms whose table names this checker actually validates. Anything else fails closed. */
+const RECOGNIZED = [
+  /^create\s+schema\b/i,
+  /^create\s+table\b/i,
+  /^alter\s+table\b/i,
+  /^drop\s+table\b/i,
+  /^truncate\b/i,
+  /^insert\s+into\b/i,
+  /^update\b/i,
+  /^delete\s+from\b/i,
+  /^create\s+policy\b/i,
+  /^drop\s+policy\b/i,
+  /^grant\b/i,
+  /^revoke\b/i,
+  /^select\b/i,
+];
+
+function recognized(statement: string): boolean {
+  return RECOGNIZED.some((pattern) => pattern.test(statement));
+}
+
 function tableRefs(statement: string): string[] {
   const refs: string[] = [];
   const take = (pattern: RegExp): void => {
@@ -109,6 +131,12 @@ export function checkFixtureSql(pluginId: string, sqlText: string): FixtureSqlVi
     if (statement === '') continue;
     if (isRoutine(statement)) {
       violations.push({ code: 'function', detail: statement.slice(0, 80) });
+      continue;
+    }
+    // Quoted identifiers and modifiers such as UNLOGGED hide names from the
+    // patterns below. Reject them instead of treating the statement as clean.
+    if (statement.includes('"') || !recognized(statement)) {
+      violations.push({ code: 'unsupported', detail: statement.slice(0, 80) });
       continue;
     }
     const schema = /^create\s+schema\s+(?:if\s+not\s+exists\s+)?([a-z_][a-z0-9_]*)/i.exec(statement);

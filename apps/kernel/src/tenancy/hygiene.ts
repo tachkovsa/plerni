@@ -99,50 +99,58 @@ function isConnectionDeath(error: unknown): boolean {
     || message === 'Client was closed and is not queryable';
 }
 
-export async function withTenant<T>(
+/** One hygiene transaction. The caller chooses the connection and whether to retry. */
+export async function executeTenantTransaction<T>(
   db: Kysely<Database>,
   tenantId: string,
   evidence: HygieneEvidence,
   terminateBackend: (pid: number) => Promise<void>,
   fn: (trx: Transaction<Database>) => Promise<T>,
 ): Promise<T> {
-  rejectBlankTenantId(tenantId);
+  return db.transaction().execute(async (trx) => {
+    try {
+      await installTenantContext(trx, tenantId, evidence);
+    } catch (error) {
+      if (error instanceof ContaminationError) {
+        const pid = Number(JSON.parse(error.message).pid);
+        let confirmed = false;
+        try {
+          await terminateBackend(pid);
+          confirmed = true;
+        } catch (termError) {
+          unblockPool(db);
+          throw new Error(`contaminated backend ${pid} was not confirmed dead`, { cause: termError });
+        }
+        let alive = true;
+        try {
+          await sql`SELECT 1`.execute(trx);
+          alive = true;
+        } catch {
+          alive = false;
+        }
+        if (!confirmed || alive) {
+          unblockPool(db);
+          throw new Error(`contaminated backend ${pid} accepted a query after terminate`);
+        }
+        evidence.terminatedBackendPids.push(pid);
+        evidence.discardedPoolerSessions += discardPoolerSessions(db);
+      }
+      throw error;
+    }
+    return fn(trx);
+  });
+}
+
+/** Retry after a terminated contaminated backend. Each `run` must take a fresh connection. */
+export async function retryContaminated<T>(
+  evidence: HygieneEvidence,
+  run: () => Promise<T>,
+): Promise<T> {
   for (let attempt = 1; ; attempt += 1) {
     evidence.attempts = attempt;
     const terminatedBefore = evidence.terminatedBackendPids.length;
     try {
-      return await db.transaction().execute(async (trx) => {
-        try {
-          await installTenantContext(trx, tenantId, evidence);
-        } catch (error) {
-          if (error instanceof ContaminationError) {
-            const pid = Number(JSON.parse(error.message).pid);
-            let confirmed = false;
-            try {
-              await terminateBackend(pid);
-              confirmed = true;
-            } catch (termError) {
-              unblockPool(db);
-              throw new Error(`contaminated backend ${pid} was not confirmed dead`, { cause: termError });
-            }
-            let alive = true;
-            try {
-              await sql`SELECT 1`.execute(trx);
-              alive = true;
-            } catch {
-              alive = false;
-            }
-            if (!confirmed || alive) {
-              unblockPool(db);
-              throw new Error(`contaminated backend ${pid} accepted a query after terminate`);
-            }
-            evidence.terminatedBackendPids.push(pid);
-            evidence.discardedPoolerSessions += discardPoolerSessions(db);
-          }
-          throw error;
-        }
-        return fn(trx);
-      });
+      return await run();
     } catch (error) {
       const killedThisAttempt = evidence.terminatedBackendPids.length > terminatedBefore;
       if (killedThisAttempt && (error instanceof ContaminationError || isConnectionDeath(error))) {
@@ -155,4 +163,16 @@ export async function withTenant<T>(
       throw error;
     }
   }
+}
+
+export async function withTenant<T>(
+  db: Kysely<Database>,
+  tenantId: string,
+  evidence: HygieneEvidence,
+  terminateBackend: (pid: number) => Promise<void>,
+  fn: (trx: Transaction<Database>) => Promise<T>,
+): Promise<T> {
+  rejectBlankTenantId(tenantId);
+  return retryContaminated(evidence, () =>
+    executeTenantTransaction(db, tenantId, evidence, terminateBackend, fn));
 }
