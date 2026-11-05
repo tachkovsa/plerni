@@ -593,6 +593,89 @@ ${child}`);
   }
 });
 
+serial('a partitioned parent without row security is rolled back', async () => {
+  await ready();
+  const id = 'part_leak';
+  const schema = 'plugin_part_leak';
+  const role = 'plerni_plugin_part_leak';
+  const noteA = '00000000-0000-4000-8000-0000000000d1';
+  const noteB = '00000000-0000-4000-8000-0000000000d2';
+  const dir = mkdtempSync(join(tmpdir(), 'plerni-part-'));
+  const manifest = JSON.parse(readFileSync(join(packageDir, 'manifest.json'), 'utf8')) as Record<string, unknown>;
+  mkdirSync(join(dir, 'sql'));
+  writeFileSync(join(dir, 'sql/0001_note.sql'), `CREATE SCHEMA IF NOT EXISTS ${schema};
+REVOKE ALL ON SCHEMA ${schema} FROM PUBLIC;
+GRANT USAGE ON SCHEMA ${schema} TO ${role};
+${tenantTable(schema, role, 'note', 'body text NOT NULL,')}`);
+  writeFileSync(join(dir, 'manifest.json'), JSON.stringify({
+    ...manifest,
+    id,
+    permissions: [],
+    migrations: ['sql/0001_note.sql'],
+  }));
+  const admin = new pg.Client({ connectionString: ROOT });
+  const migrate = new pg.Client({ connectionString: MIGRATE });
+  admin.on('error', () => undefined);
+  migrate.on('error', () => undefined);
+  await admin.connect();
+  await migrate.connect();
+  const db = appDb(POOLED, 1);
+  try {
+    const first = await migratePluginPackage({ admin, migrate, packageDir: dir });
+    assert.deepEqual(first, ['0001_note.sql']);
+    await withPluginRole(db, TENANT_A, id, blankEvidence(), terminate, async (trx) => {
+      await sql`
+        INSERT INTO plugin_part_leak.note (tenant_id, id, body)
+        VALUES (${TENANT_A}::uuid, ${noteA}::uuid, 'alpha')`.execute(trx);
+    });
+    await withPluginRole(db, TENANT_B, id, blankEvidence(), terminate, async (trx) => {
+      await sql`
+        INSERT INTO plugin_part_leak.note (tenant_id, id, body)
+        VALUES (${TENANT_B}::uuid, ${noteB}::uuid, 'beta')`.execute(trx);
+    });
+    writeFileSync(join(dir, 'sql/0002_parent.sql'), `CREATE TABLE ${schema}.all_notes (LIKE ${schema}.note INCLUDING ALL)
+  PARTITION BY LIST (tenant_id);
+ALTER TABLE ${schema}.all_notes ATTACH PARTITION ${schema}.note DEFAULT;
+GRANT SELECT ON TABLE ${schema}.all_notes TO ${role};
+`);
+    writeFileSync(join(dir, 'manifest.json'), JSON.stringify({
+      ...manifest,
+      id,
+      permissions: [],
+      migrations: ['sql/0001_note.sql', 'sql/0002_parent.sql'],
+    }));
+    await assert.rejects(
+      () => migratePluginPackage({ admin, migrate, packageDir: dir }),
+      (error: unknown) => error instanceof PluginPackageError && error.message.includes('rls_disabled'),
+    );
+    const parent = await admin.query<{ rel: string | null }>(
+      'SELECT to_regclass($1)::text AS rel',
+      [`${schema}.all_notes`],
+    );
+    assert.equal(parent.rows[0]?.rel ?? null, null);
+    const visible = await withPluginRole(db, TENANT_A, id, blankEvidence(), terminate, async (trx) => {
+      const result = await sql<{ count: string; body: string }>`
+        SELECT count(*)::text AS count, min(body) AS body
+        FROM plugin_part_leak.note`.execute(trx);
+      return result.rows[0];
+    });
+    assert.equal(visible?.count, '1');
+    assert.equal(visible?.body, 'alpha');
+    const other = await withPluginRole(db, TENANT_B, id, blankEvidence(), terminate, async (trx) => {
+      const result = await sql<{ body: string }>`
+        SELECT body FROM plugin_part_leak.note`.execute(trx);
+      return result.rows.map((row) => row.body);
+    });
+    assert.deepEqual(other, ['beta']);
+  } finally {
+    await db.destroy();
+    await dropPackage(admin, id, schema, role);
+    await admin.end();
+    await migrate.end();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 function redact(text: string): string {
   return text.replace(/postgres:\/\/[^@\s]+@/g, 'postgres://[redacted]@');
 }
