@@ -23,10 +23,23 @@ function isEscapeString(sql: string, quote: number): boolean {
   return !/[A-Za-z0-9_]/.test(sql[quote - 2] ?? '');
 }
 
-function strip(sql: string): { text: string; escapeString: boolean } {
+/** A dollar quote starts a new token. `$` inside an identifier does not. */
+function isDollarBoundary(prev: string): boolean {
+  if (prev === '' || prev.charCodeAt(0) <= 32) return true;
+  return '([,.;:=+-*/<>!%^|&~@?\'"`])'.includes(prev);
+}
+
+function dollarQuoteAt(sql: string, index: number): string | null {
+  if (sql[index] !== '$' || !isDollarBoundary(sql[index - 1] ?? '')) return null;
+  const tag = /^\$\$|^\$[A-Za-z_][A-Za-z0-9_]*\$/.exec(sql.slice(index));
+  return tag?.[0] ?? null;
+}
+
+function strip(sql: string): { text: string; escapeString: boolean; dollarIdent: boolean } {
   let out = '';
   let i = 0;
   let escapeString = false;
+  let dollarIdent = false;
   while (i < sql.length) {
     if (sql.startsWith('--', i)) {
       const end = sql.indexOf('\n', i);
@@ -58,18 +71,19 @@ function strip(sql: string): { text: string; escapeString: boolean } {
       continue;
     }
     if (sql[i] === '$') {
-      const tag = /^\$[A-Za-z0-9_]*\$/.exec(sql.slice(i));
+      const tag = dollarQuoteAt(sql, i);
       if (tag) {
-        const close = sql.indexOf(tag[0], i + tag[0].length);
-        i = close === -1 ? sql.length : close + tag[0].length;
+        const close = sql.indexOf(tag, i + tag.length);
+        i = close === -1 ? sql.length : close + tag.length;
         out += "''";
         continue;
       }
+      dollarIdent = true;
     }
     out += sql[i];
     i += 1;
   }
-  return { text: out, escapeString };
+  return { text: out, escapeString, dollarIdent };
 }
 
 function isRoutine(statement: string): boolean {
@@ -341,6 +355,8 @@ export function checkFixtureSql(pluginId: string, sqlText: string): FixtureSqlVi
   const stripped = strip(sqlText);
   // E'...' follows backslash rules this scan does not tokenize. Reject it.
   if (stripped.escapeString) return [{ code: 'unsupported', detail: 'escape string' }];
+  // `$` that did not open a dollar quote is part of an identifier or a placeholder.
+  if (stripped.dollarIdent) return [{ code: 'unsupported', detail: 'dollar' }];
   const parts = stripped.text.split(';');
   for (const part of parts) {
     const statement = part.trim();

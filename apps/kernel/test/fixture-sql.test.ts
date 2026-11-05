@@ -141,6 +141,16 @@ test('an escape string cannot hide a following statement', () => {
   assert.deepEqual(plain, []);
 });
 
+test('a dollar sign in an identifier cannot hide a following statement', () => {
+  const sqlText = 'SELECT 1 AS marker$$; DELETE FROM plugin_fixture_alpha.note; COMMIT; -- $$';
+  const found = checkFixtureSql('fixture_alpha', sqlText);
+  assert.ok(found.some((item) => item.code === 'unsupported' && item.detail === 'dollar'), sqlText);
+  assert.throws(
+    () => assertFixtureRead('fixture_alpha', sqlText),
+    (error: unknown) => error instanceof PluginPackageError,
+  );
+});
+
 test('attaching a partition from another schema is rejected', () => {
   const found = checkFixtureSql(
     'fixture_alpha',
