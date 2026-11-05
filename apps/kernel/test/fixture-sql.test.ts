@@ -116,6 +116,24 @@ test('a read that changes the tenant context is rejected', () => {
   }
 });
 
+test('an indirect sql execution that forges the tenant is rejected', () => {
+  const sqlText = "SELECT query_to_xml($$SELECT set_config('plerni.tenant_id', '22222222-2222-2222-2222-222222222222', true); SELECT * FROM plugin_fixture_alpha.note$$, false, false, '')";
+  const found = checkFixtureSql('fixture_alpha', sqlText);
+  assert.ok(found.some((item) => item.code === 'context' && item.detail === 'query_to_xml'), sqlText);
+  assert.throws(
+    () => assertFixtureRead('fixture_alpha', sqlText),
+    (error: unknown) => error instanceof PluginPackageError,
+  );
+});
+
+test('inheriting another plugin table is rejected', () => {
+  const found = checkFixtureSql(
+    'fixture_alpha',
+    'ALTER TABLE plugin_fixture_alpha.note INHERIT plugin_beta.note;',
+  );
+  assert.ok(found.some((item) => item.code === 'unsupported'), found.map((item) => item.code).join(','));
+});
+
 test('alter table set schema to another plugin is rejected', () => {
   const found = checkFixtureSql(
     'fixture_alpha',

@@ -484,6 +484,121 @@ serial('a read cannot replace the authorized tenant context', async () => {
   }
 });
 
+serial('an indirect read cannot forge the tenant and return the other note', async () => {
+  await ready();
+  await migrateFixture();
+  await withRoot(async (client) => {
+    await client.query('DELETE FROM plugin_fixture_alpha.note');
+    await client.query('DELETE FROM kernel.principal_grant');
+  });
+  const db = appDb(POOLED, 1);
+  try {
+    await withPluginRole(db, TENANT_A, PLUGIN, blankEvidence(), terminate, async (trx) => {
+      await sql`
+        INSERT INTO plugin_fixture_alpha.note (tenant_id, id, body)
+        VALUES (${TENANT_A}::uuid, '00000000-0000-4000-8000-0000000000f1'::uuid, 'alpha')`.execute(trx);
+    });
+    await withPluginRole(db, TENANT_B, PLUGIN, blankEvidence(), terminate, async (trx) => {
+      await sql`
+        INSERT INTO plugin_fixture_alpha.note (tenant_id, id, body)
+        VALUES (${TENANT_B}::uuid, '00000000-0000-4000-8000-0000000000f2'::uuid, 'beta')`.execute(trx);
+    });
+    await allowPrincipal(db, {
+      tenantId: TENANT_A,
+      principalId: HOLDER,
+      pluginId: PLUGIN,
+      resource: 'note',
+      action: 'read',
+    }, blankEvidence(), terminate);
+    const forged = `SELECT query_to_xml($$SELECT set_config('plerni.tenant_id', '${TENANT_B}', true); SELECT * FROM plugin_fixture_alpha.note$$, false, false, '')`;
+    await assert.rejects(
+      () => readPluginRows(db, {
+        tenantId: TENANT_A,
+        principalId: HOLDER,
+        pluginId: PLUGIN,
+        resource: 'note',
+        action: 'read',
+        statement: forged,
+      }, blankEvidence(), terminate),
+      (error: unknown) => error instanceof PluginPackageError && error.message.includes('context'),
+    );
+    const honest = await readPluginRows(db, {
+      tenantId: TENANT_A,
+      principalId: HOLDER,
+      pluginId: PLUGIN,
+      resource: 'note',
+      action: 'read',
+      statement: READ_SQL,
+    }, blankEvidence(), terminate);
+    assert.deepEqual(honest.map((row) => row.body), ['alpha']);
+  } finally {
+    await db.destroy();
+  }
+});
+
+serial('inheriting another plugin table does not link the child', async () => {
+  await ready();
+  const id = 'inherit_x';
+  const schema = 'plugin_inherit_x';
+  const role = 'plerni_plugin_inherit_x';
+  const dir = mkdtempSync(join(tmpdir(), 'plerni-inherit-'));
+  const manifest = JSON.parse(readFileSync(join(packageDir, 'manifest.json'), 'utf8')) as Record<string, unknown>;
+  mkdirSync(join(dir, 'sql'));
+  writeFileSync(join(dir, 'sql/0001_note.sql'), `CREATE SCHEMA IF NOT EXISTS ${schema};
+REVOKE ALL ON SCHEMA ${schema} FROM PUBLIC;
+GRANT USAGE ON SCHEMA ${schema} TO ${role};
+${tenantTable(schema, role, 'note', 'body text NOT NULL,')}`);
+  writeFileSync(join(dir, 'manifest.json'), JSON.stringify({
+    ...manifest,
+    id,
+    permissions: [],
+    migrations: ['sql/0001_note.sql'],
+  }));
+  const admin = new pg.Client({ connectionString: ROOT });
+  const migrate = new pg.Client({ connectionString: MIGRATE });
+  admin.on('error', () => undefined);
+  migrate.on('error', () => undefined);
+  await admin.connect();
+  await migrate.connect();
+  try {
+    const first = await migratePluginPackage({ admin, migrate, packageDir: dir });
+    assert.deepEqual(first, ['0001_note.sql']);
+    writeFileSync(
+      join(dir, 'sql/0002_inherit.sql'),
+      `ALTER TABLE ${schema}.note INHERIT plugin_beta.note;\n`,
+    );
+    writeFileSync(join(dir, 'manifest.json'), JSON.stringify({
+      ...manifest,
+      id,
+      permissions: [],
+      migrations: ['sql/0001_note.sql', 'sql/0002_inherit.sql'],
+    }));
+    await assert.rejects(
+      () => migratePluginPackage({ admin, migrate, packageDir: dir }),
+      (error: unknown) => error instanceof PluginPackageError && error.message.includes('unsupported'),
+    );
+    const links = await admin.query<{ count: string }>(
+      `SELECT count(*)::text AS count
+       FROM pg_inherits i
+       JOIN pg_class c ON c.oid = i.inhrelid
+       JOIN pg_namespace n ON n.oid = c.relnamespace
+       WHERE n.nspname = $1`,
+      [schema],
+    );
+    assert.equal(links.rows[0]?.count, '0');
+    const stayed = await admin.query<{ rel: string | null }>(
+      'SELECT to_regclass($1)::text AS rel',
+      [`${schema}.note`],
+    );
+    assert.equal(stayed.rows[0]?.rel, `${schema}.note`);
+  } finally {
+    await dropPackage(admin, id, schema, role);
+    await admin.end();
+    await migrate.end();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 serial('alter table set schema does not move the table', async () => {
   await ready();
   const id = 'schema_move';

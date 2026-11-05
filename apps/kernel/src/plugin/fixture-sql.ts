@@ -240,6 +240,58 @@ function setSchemaDestination(statement: string): string | 'unsupported' | null 
   return match[1].toLowerCase();
 }
 
+/** Calls a fixture statement may make. Anything else can execute hidden SQL. */
+const ALLOWED_CALLS = new Set(['current_setting', 'nullif']);
+/** Parentheses that introduce syntax, not a function call. */
+const SYNTAX_CALLS = new Set(['key', 'check', 'using', 'unique', 'list', 'range', 'hash', 'in', 'values', 'exists', 'array', 'row']);
+
+function nameBeforeParen(statement: string, paren: number): { name: string; start: number } | null {
+  let i = paren - 1;
+  while (i >= 0 && /\s/.test(statement[i] ?? '')) i -= 1;
+  const end = i + 1;
+  while (i >= 0 && /[A-Za-z0-9_]/.test(statement[i] ?? '')) i -= 1;
+  if (end <= i + 1) return null;
+  let start = i + 1;
+  let name = statement.slice(start, end);
+  if ((statement[i] ?? '') === '.') {
+    let j = i - 1;
+    const qualEnd = j + 1;
+    while (j >= 0 && /[A-Za-z0-9_]/.test(statement[j] ?? '')) j -= 1;
+    if (qualEnd > j + 1) {
+      start = j + 1;
+      name = `${statement.slice(start, qualEnd)}.${name}`;
+    }
+  }
+  return { name: name.toLowerCase(), start };
+}
+
+function isColumnList(statement: string, nameStart: number): boolean {
+  return /\b(?:create|alter|drop)\s+table(?:\s+if\s+(?:not\s+)?exists)?\s+$/i.test(statement.slice(0, nameStart));
+}
+
+function isReferenceList(statement: string, nameStart: number): boolean {
+  return /\breferences\s+$/i.test(statement.slice(0, nameStart));
+}
+
+/** Function calls outside the allowlist. Schema-qualified calls are rejected too. */
+function disallowedCalls(statement: string): string[] {
+  const bad: string[] = [];
+  for (let i = 0; i < statement.length; i += 1) {
+    if (statement[i] !== '(') continue;
+    const found = nameBeforeParen(statement, i);
+    if (!found) continue;
+    if (isColumnList(statement, found.start) || isReferenceList(statement, found.start)) continue;
+    const dot = found.name.lastIndexOf('.');
+    const schema = dot === -1 ? '' : found.name.slice(0, dot);
+    const simple = dot === -1 ? found.name : found.name.slice(dot + 1);
+    const allowedSchema = schema === '' || schema === 'pg_catalog';
+    const allowedName = ALLOWED_CALLS.has(simple) || (schema === '' && SYNTAX_CALLS.has(simple));
+    if (allowedSchema && allowedName) continue;
+    bad.push(found.name);
+  }
+  return bad;
+}
+
 /** set_config and SET of a plerni GUC replace the tenant context RLS trusts. */
 function changesTenantContext(statement: string): boolean {
   return /\bset_config\s*\(/i.test(statement) || /\bset\s+(?:local\s+|session\s+)?plerni\./i.test(statement);
@@ -275,6 +327,15 @@ export function checkFixtureSql(pluginId: string, sqlText: string): FixtureSqlVi
     // first name to those patterns, so that form fails closed too.
     const multiTable = /^(?:drop\s+table|truncate)\b/i.test(statement) && statement.includes(',');
     if (statement.includes('"') || !recognized(statement) || multiTable) {
+      violations.push({ code: 'unsupported', detail: statement.slice(0, 80) });
+      continue;
+    }
+    const calls = disallowedCalls(statement);
+    if (calls.length > 0) {
+      violations.push({ code: 'context', detail: calls[0] ?? statement.slice(0, 80) });
+      continue;
+    }
+    if (/\binherits?\b/i.test(statement)) {
       violations.push({ code: 'unsupported', detail: statement.slice(0, 80) });
       continue;
     }
