@@ -112,7 +112,7 @@ Do this only when you still have the current private key, and you have no reason
 6. From the repository root, sign that file with the current private key (the key that matches the public key on the base). Set `SIGNING_KEY` in this shell to that private key file outside the clone. Do not write the assignment into a file in the repository. A relative `-f plerni-maintainer-signing-key` from the repository root would look inside the worktree.
 
    ```sh
-   ssh-keygen -Y sign -f "$SIGNING_KEY" -n plerni-gate-approval -s scripts/gates/approvals/YYYY-MM-DD-maintainer-key-rotation.json.sig scripts/gates/approvals/YYYY-MM-DD-maintainer-key-rotation.json
+   ssh-keygen -Y sign -f "$SIGNING_KEY" -n plerni-gate-approval scripts/gates/approvals/YYYY-MM-DD-maintainer-key-rotation.json
    ```
 
 7. Commit the `.json` and `.json.sig` files on their own:
@@ -189,4 +189,4 @@ Merging to `dev` also takes permission on the repository. Key rotation does not 
 
 Behavior of the gate: [`scripts/gates/verify-approval.mjs`](../../scripts/gates/verify-approval.mjs), [`.github/workflows/approval-artifact.yml`](../../.github/workflows/approval-artifact.yml), and the P0 plan §8 in [`docs/plans/2026-10-13-p0-implementation-plan.md`](../plans/2026-10-13-p0-implementation-plan.md). The waiver sentence is the owner decision of 2026-10-15 in [`docs/ai/model-routing.md`](../ai/model-routing.md). The overlap requirement is §10.2 question 7 and task K10 of [`docs/plans/p1-kernel-design-b.md`](../plans/p1-kernel-design-b.md). Task K10's acceptance line cites §6. Section 6 of that design is contract versioning and does not state this key's rules. The window length is the one named above.
 
-OpenSSH commands follow `ssh-keygen(1)` ([man.openbsd.org/ssh-keygen](https://man.openbsd.org/ssh-keygen.1), read 2026-11-05): `-t ed25519` and `-t ed25519-sk`, `-y`, `-Y sign` with `-f` and `-n`, and the allowed-signers file used by `-Y verify`. The `-s` path on `-Y sign` is the form the repository's approval tests use; the manual's default is to write `file.sig` beside the file. FIDO notes in that manual: the device key is not exportable, signing needs the on-disk key handle and the same authenticator, and resident keys store the handle on the device.
+OpenSSH commands follow `ssh-keygen(1)` ([man.openbsd.org/ssh-keygen](https://man.openbsd.org/ssh-keygen.1), read 2026-11-05): `-t ed25519` and `-t ed25519-sk`, `-y`, `-Y sign` with `-f` and `-n`, and the allowed-signers file used by `-Y verify`. `-Y sign` writes `file.sig` beside the file. `-s` is only for `-Y verify`. FIDO notes in that manual: the device key is not exportable, signing needs the on-disk key handle and the same authenticator, and resident keys store the handle on the device.
