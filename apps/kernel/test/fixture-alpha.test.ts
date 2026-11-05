@@ -432,6 +432,117 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE ${schema}.note TO ${role};
   }
 });
 
+serial('a read cannot replace the authorized tenant context', async () => {
+  await ready();
+  await migrateFixture();
+  await withRoot(async (client) => {
+    await client.query('DELETE FROM plugin_fixture_alpha.note');
+    await client.query('DELETE FROM kernel.principal_grant');
+  });
+  const db = appDb(POOLED, 1);
+  try {
+    await withPluginRole(db, TENANT_A, PLUGIN, blankEvidence(), terminate, async (trx) => {
+      await sql`
+        INSERT INTO plugin_fixture_alpha.note (tenant_id, id, body)
+        VALUES (${TENANT_A}::uuid, '00000000-0000-4000-8000-0000000000e1'::uuid, 'alpha')`.execute(trx);
+    });
+    await withPluginRole(db, TENANT_B, PLUGIN, blankEvidence(), terminate, async (trx) => {
+      await sql`
+        INSERT INTO plugin_fixture_alpha.note (tenant_id, id, body)
+        VALUES (${TENANT_B}::uuid, '00000000-0000-4000-8000-0000000000e2'::uuid, 'beta')`.execute(trx);
+    });
+    await allowPrincipal(db, {
+      tenantId: TENANT_A,
+      principalId: HOLDER,
+      pluginId: PLUGIN,
+      resource: 'note',
+      action: 'read',
+    }, blankEvidence(), terminate);
+    const forged = `SELECT set_config('plerni.tenant_id', '${TENANT_B}', true)`;
+    await assert.rejects(
+      () => readPluginRows(db, {
+        tenantId: TENANT_A,
+        principalId: HOLDER,
+        pluginId: PLUGIN,
+        resource: 'note',
+        action: 'read',
+        statement: forged,
+      }, blankEvidence(), terminate),
+      (error: unknown) => error instanceof PluginPackageError && error.message.includes('context'),
+    );
+    const honest = await readPluginRows(db, {
+      tenantId: TENANT_A,
+      principalId: HOLDER,
+      pluginId: PLUGIN,
+      resource: 'note',
+      action: 'read',
+      statement: READ_SQL,
+    }, blankEvidence(), terminate);
+    assert.deepEqual(honest.map((row) => row.body), ['alpha']);
+  } finally {
+    await db.destroy();
+  }
+});
+
+serial('alter table set schema does not move the table', async () => {
+  await ready();
+  const id = 'schema_move';
+  const schema = 'plugin_schema_move';
+  const role = 'plerni_plugin_schema_move';
+  const dir = mkdtempSync(join(tmpdir(), 'plerni-move-'));
+  const manifest = JSON.parse(readFileSync(join(packageDir, 'manifest.json'), 'utf8')) as Record<string, unknown>;
+  mkdirSync(join(dir, 'sql'));
+  writeFileSync(join(dir, 'sql/0001_note.sql'), `CREATE SCHEMA IF NOT EXISTS ${schema};
+REVOKE ALL ON SCHEMA ${schema} FROM PUBLIC;
+GRANT USAGE ON SCHEMA ${schema} TO ${role};
+${tenantTable(schema, role, 'note', 'body text NOT NULL,')}`);
+  writeFileSync(join(dir, 'manifest.json'), JSON.stringify({
+    ...manifest,
+    id,
+    permissions: [],
+    migrations: ['sql/0001_note.sql'],
+  }));
+  const admin = new pg.Client({ connectionString: ROOT });
+  const migrate = new pg.Client({ connectionString: MIGRATE });
+  admin.on('error', () => undefined);
+  migrate.on('error', () => undefined);
+  await admin.connect();
+  await migrate.connect();
+  try {
+    const first = await migratePluginPackage({ admin, migrate, packageDir: dir });
+    assert.deepEqual(first, ['0001_note.sql']);
+    writeFileSync(
+      join(dir, 'sql/0002_move.sql'),
+      `ALTER TABLE ${schema}.note SET SCHEMA plugin_beta;\n`,
+    );
+    writeFileSync(join(dir, 'manifest.json'), JSON.stringify({
+      ...manifest,
+      id,
+      permissions: [],
+      migrations: ['sql/0001_note.sql', 'sql/0002_move.sql'],
+    }));
+    await assert.rejects(
+      () => migratePluginPackage({ admin, migrate, packageDir: dir }),
+      (error: unknown) => error instanceof PluginPackageError && error.message.includes('foreign_schema'),
+    );
+    const stayed = await admin.query<{ rel: string | null }>(
+      'SELECT to_regclass($1)::text AS rel',
+      [`${schema}.note`],
+    );
+    assert.equal(stayed.rows[0]?.rel, `${schema}.note`);
+    const journal = await admin.query<{ version: string }>(
+      'SELECT version FROM kernel.plugin_migration WHERE plugin_id = $1 ORDER BY version',
+      [id],
+    );
+    assert.deepEqual(journal.rows.map((row) => row.version), ['0001_note.sql']);
+  } finally {
+    await dropPackage(admin, id, schema, role);
+    await admin.end();
+    await migrate.end();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 function tenantTable(schema: string, role: string, table: string, body: string): string {
   return `CREATE TABLE ${schema}.${table} (
   tenant_id uuid NOT NULL,

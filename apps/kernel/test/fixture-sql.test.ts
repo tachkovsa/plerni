@@ -5,7 +5,8 @@ import { dirname, join } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import type { Database } from '../src/db/database.ts';
-import { checkFixtureSql } from '../src/plugin/fixture-sql.ts';
+import { PluginPackageError } from '../src/plugin/errors.ts';
+import { assertFixtureRead, checkFixtureSql } from '../src/plugin/fixture-sql.ts';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repo = join(here, '../../..');
@@ -98,6 +99,29 @@ test('every relation in a from list is checked', () => {
     'SELECT id FROM plugin_fixture_alpha.note a, plugin_fixture_alpha.note b;',
   );
   assert.deepEqual(own, []);
+});
+
+test('a read that changes the tenant context is rejected', () => {
+  const direct = "SELECT set_config('plerni.tenant_id', '22222222-2222-2222-2222-222222222222', true)";
+  const nested = `SELECT id FROM plugin_fixture_alpha.note WHERE (
+    SELECT set_config('plerni.tenant_id', '22222222-2222-2222-2222-222222222222', true)
+  ) IS NOT NULL`;
+  for (const sqlText of [direct, nested]) {
+    const found = checkFixtureSql('fixture_alpha', sqlText);
+    assert.ok(found.some((item) => item.code === 'context'), sqlText);
+    assert.throws(
+      () => assertFixtureRead('fixture_alpha', sqlText),
+      (error: unknown) => error instanceof PluginPackageError,
+    );
+  }
+});
+
+test('alter table set schema to another plugin is rejected', () => {
+  const found = checkFixtureSql(
+    'fixture_alpha',
+    'ALTER TABLE plugin_fixture_alpha.note SET SCHEMA plugin_beta;',
+  );
+  assert.ok(found.some((item) => item.code === 'foreign_schema' && item.detail === 'plugin_beta'));
 });
 
 test('a table query expression from another schema is rejected', () => {

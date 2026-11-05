@@ -7,7 +7,7 @@
 import { PluginPackageError } from './errors.ts';
 import { pluginRoleName, pluginSchemaName } from './ident.ts';
 
-export type FixtureSqlCode = 'unqualified_table' | 'foreign_schema' | 'function' | 'unsupported' | 'privilege';
+export type FixtureSqlCode = 'unqualified_table' | 'foreign_schema' | 'function' | 'unsupported' | 'privilege' | 'context';
 
 export interface FixtureSqlViolation {
   code: FixtureSqlCode;
@@ -232,6 +232,19 @@ function grantTargets(statement: string): { kind: 'schema' | 'table'; names: str
   return { kind: 'table', names };
 }
 
+/** `ALTER TABLE ... SET SCHEMA`. The destination must be this plugin's schema. */
+function setSchemaDestination(statement: string): string | 'unsupported' | null {
+  if (!/^alter\s+table\b/i.test(statement) || !/\bset\s+schema\b/i.test(statement)) return null;
+  const match = /\bset\s+schema\s+([a-z_][a-z0-9_]*)\s*$/i.exec(statement.trim());
+  if (!match?.[1]) return 'unsupported';
+  return match[1].toLowerCase();
+}
+
+/** set_config and SET of a plerni GUC replace the tenant context RLS trusts. */
+function changesTenantContext(statement: string): boolean {
+  return /\bset_config\s*\(/i.test(statement) || /\bset\s+(?:local\s+|session\s+)?plerni\./i.test(statement);
+}
+
 function classify(ref: string, expected: string, violations: FixtureSqlViolation[]): void {
   const dot = ref.indexOf('.');
   if (dot === -1) {
@@ -249,6 +262,10 @@ export function checkFixtureSql(pluginId: string, sqlText: string): FixtureSqlVi
   for (const part of parts) {
     const statement = part.trim();
     if (statement === '') continue;
+    if (changesTenantContext(statement)) {
+      violations.push({ code: 'context', detail: statement.slice(0, 80) });
+      continue;
+    }
     if (isRoutine(statement)) {
       violations.push({ code: 'function', detail: statement.slice(0, 80) });
       continue;
@@ -292,6 +309,12 @@ export function checkFixtureSql(pluginId: string, sqlText: string): FixtureSqlVi
       violations.push({ code: 'unsupported', detail: statement.slice(0, 80) });
     } else if (updated) {
       classify(updated, expected, violations);
+    }
+    const moved = setSchemaDestination(statement);
+    if (moved === 'unsupported') {
+      violations.push({ code: 'unsupported', detail: statement.slice(0, 80) });
+    } else if (moved && moved !== expected) {
+      violations.push({ code: 'foreign_schema', detail: moved });
     }
     for (const ref of tableRefs(statement)) classify(ref, expected, violations);
     const tableSources = tableQuerySources(statement);
