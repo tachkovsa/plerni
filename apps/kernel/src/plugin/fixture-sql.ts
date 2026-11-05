@@ -104,12 +104,31 @@ function tableRefs(statement: string): string[] {
   take(new RegExp(String.raw`\bdelete\s+from\s+(?:only\s+)?(${IDENT})`, 'gi'));
   take(new RegExp(String.raw`\bupdate\s+(?:only\s+)?(${IDENT})\s+set\b`, 'gi'));
   take(new RegExp(String.raw`\breferences\s+(${IDENT})`, 'gi'));
-  take(new RegExp(String.raw`\bon\s+table\s+(${IDENT})`, 'gi'));
   take(new RegExp(String.raw`\bpolicy\s+(?:if\s+(?:not\s+)?exists\s+)?[a-z_][a-z0-9_]*\s+on\s+(${IDENT})`, 'gi'));
   if (!/^(grant|revoke)\b/i.test(statement)) {
     take(new RegExp(String.raw`\b(?:from|join)\s+(${IDENT})`, 'gi'));
   }
   return refs;
+}
+
+/**
+ * GRANT/REVOKE targets. `ON name` and `ON TABLE name` are tables. Every name
+ * in a comma list is checked. A target this pattern cannot read fails closed.
+ */
+function grantTargets(statement: string): { kind: 'schema' | 'table'; names: string[] } | 'unsupported' {
+  const match = /\bon\s+(?:(schema|table)\s+)?([a-z_][a-z0-9_.]*(?:\s*,\s*[a-z_][a-z0-9_.]*)*)\s+(?:to|from)\b/i.exec(
+    statement,
+  );
+  if (!match?.[2]) return 'unsupported';
+  const names = match[2].split(',').map((part) => part.trim().toLowerCase());
+  const ident = /^[a-z_][a-z0-9_]*(?:\.[a-z_][a-z0-9_]*)?$/;
+  if (names.length === 0 || names.some((name) => !ident.test(name))) return 'unsupported';
+  const keyword = match[1]?.toLowerCase();
+  if (keyword === 'schema') {
+    if (names.some((name) => name.includes('.'))) return 'unsupported';
+    return { kind: 'schema', names };
+  }
+  return { kind: 'table', names };
 }
 
 function classify(ref: string, expected: string, violations: FixtureSqlViolation[]): void {
@@ -144,6 +163,21 @@ export function checkFixtureSql(pluginId: string, sqlText: string): FixtureSqlVi
     const schema = /^create\s+schema\s+(?:if\s+not\s+exists\s+)?([a-z_][a-z0-9_]*)/i.exec(statement);
     if (schema) {
       if (schema[1] !== expected) violations.push({ code: 'foreign_schema', detail: schema[1] ?? 'schema' });
+      continue;
+    }
+    if (/^(grant|revoke)\b/i.test(statement)) {
+      const targets = grantTargets(statement);
+      if (targets === 'unsupported') {
+        violations.push({ code: 'unsupported', detail: statement.slice(0, 80) });
+        continue;
+      }
+      if (targets.kind === 'schema') {
+        for (const name of targets.names) {
+          if (name !== expected) violations.push({ code: 'foreign_schema', detail: name });
+        }
+        continue;
+      }
+      for (const name of targets.names) classify(name, expected, violations);
       continue;
     }
     for (const ref of tableRefs(statement)) classify(ref, expected, violations);

@@ -5,7 +5,10 @@ import { PluginPackageError } from './errors.ts';
 
 const NAME = /^[a-z][a-z0-9_]{0,40}$/;
 const EVENT = /^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$/;
-const HOST = /^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$/;
+const HOST = /^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$/;
+/** Same bound as kernel.plugin_grant.grant_name in sql/0003_plugin_grant.sql. */
+export const GRANT_NAME_MAX = 201;
+const GRANT_CHARS = /^[a-z][a-z0-9_.:-]+$/;
 
 const EXACT = new Set([
   'db.own_schema',
@@ -29,7 +32,9 @@ const PREFIXES: readonly { prefix: string; rest: RegExp }[] = [
 ];
 
 export function assertGrantName(grant: string): void {
-  if (typeof grant !== 'string') throw new PluginPackageError('grant name is missing');
+  if (typeof grant !== 'string' || grant.length < 2 || grant.length > GRANT_NAME_MAX || !GRANT_CHARS.test(grant)) {
+    throw new PluginPackageError('grant is outside the vocabulary');
+  }
   if (EXACT.has(grant)) return;
   for (const item of PREFIXES) {
     if (!grant.startsWith(item.prefix)) continue;

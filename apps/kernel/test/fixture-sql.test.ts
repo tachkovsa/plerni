@@ -69,6 +69,24 @@ test('a multi-table drop that includes another schema is rejected', () => {
   assert.deepEqual(codes, ['unsupported']);
 });
 
+test('grant on a table without the table keyword checks every target', () => {
+  const foreign = checkFixtureSql(
+    'fixture_alpha',
+    'GRANT SELECT ON plugin_beta.note TO plerni_plugin_fixture_alpha;',
+  );
+  assert.ok(foreign.some((item) => item.code === 'foreign_schema' && item.detail === 'plugin_beta.note'));
+  const own = checkFixtureSql(
+    'fixture_alpha',
+    'GRANT SELECT ON plugin_fixture_alpha.note TO plerni_plugin_fixture_alpha;',
+  );
+  assert.deepEqual(own, []);
+  const listed = checkFixtureSql(
+    'fixture_alpha',
+    'GRANT SELECT ON plugin_fixture_alpha.note, plugin_beta.note TO plerni_plugin_fixture_alpha;',
+  );
+  assert.ok(listed.some((item) => item.code === 'foreign_schema' && item.detail === 'plugin_beta.note'));
+});
+
 test('a multi-table truncate that includes another schema is rejected', () => {
   const codes = checkFixtureSql(
     'fixture_alpha',

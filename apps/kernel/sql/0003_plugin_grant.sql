@@ -24,7 +24,11 @@ CREATE TABLE IF NOT EXISTS kernel.plugin_grant (
   grant_name text NOT NULL,
   PRIMARY KEY (plugin_id, grant_name),
   CONSTRAINT plugin_grant_id CHECK (plugin_id ~ '^[a-z][a-z0-9_]{0,40}$'),
-  CONSTRAINT plugin_grant_name CHECK (grant_name ~ '^[a-z][a-z0-9_.:-]{1,200}$')
+  -- 2..201 matches GRANT_NAME_MAX in the grant vocabulary checker.
+  CONSTRAINT plugin_grant_name CHECK (
+    char_length(grant_name) BETWEEN 2 AND 201
+    AND grant_name ~ '^[a-z][a-z0-9_.:-]+$'
+  )
 );
 
 REVOKE ALL ON TABLE kernel.plugin_grant FROM PUBLIC;
