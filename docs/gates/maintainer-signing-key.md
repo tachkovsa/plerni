@@ -6,32 +6,23 @@ This guide is how the maintainer backs up that private key, rotates the public k
 
 The key is only for this gate. Tenant document signing uses different keys, kept in the secret store ([ADR-0011](../adr/0011-digest-signing-port.md)). Rotating one does not rotate the other.
 
-Issue [#62](https://github.com/tachkovsa/plerni/issues/62) is the checklist for this guide. Task K10 in [`docs/plans/p1-kernel-design-b.md`](../plans/p1-kernel-design-b.md) asks for it.
+Issue [#62](https://github.com/tachkovsa/plerni/issues/62) is the checklist for this guide. Task K10 in [`docs/plans/p1-kernel-design-b.md`](../plans/p1-kernel-design-b.md) asks for the guide. Task K10b is the follow-up that changes the verifier. This document is K10 only. It does not satisfy the old K10 fixture gate.
 
 ## Back up the private key
 
 Make the backup before you need it. The copy in git is the public key only.
 
-Keep the private key in a store the maintainer controls, outside this repository:
+Keep the private key in a password manager that can hold the OpenSSH private-key file and its passphrase, outside this repository. Keep a second copy in a different store the maintainer controls, so one lost device does not become a lost key.
 
-- A password manager that can hold the OpenSSH private-key file and its passphrase. Keep a second copy in a different store the maintainer controls, so one lost device does not become a lost key.
-- A hardware security key. The command below, with `-t ed25519-sk`, creates a key the verifier accepts. Accepted types are `ssh-ed25519`, `ssh-rsa`, `ssh-ecdsa`, `ssh-ecdsa-sk`, and `ssh-ed25519-sk`. The device holds a private key that cannot be exported. The file ssh-keygen writes beside it is a key handle, and signing needs both the file and the same device. Put that key-handle file in the password manager. Losing the device means the key is lost. A second device produces a new key pair. It is a new public key, and it follows the rotation steps. This guide keeps the key handle off the device (OpenSSH's `-O resident` stores the handle on the device as well).
+Hardware security keys are not a backup this guide supports. OpenSSH publishes those public keys as `sk-ssh-ed25519@openssh.com` or `sk-ecdsa-sha2-nistp256@openssh.com`. The verifier accepts a single line of type `ssh-ed25519`, `ssh-rsa`, `ssh-ecdsa`, `ssh-ecdsa-sk`, or `ssh-ed25519-sk`, so a real hardware public key fails closed after rotation. Support waits until the verifier and its tests cover the real `sk-*` encodings. That work is out of scope here.
 
-Generate the key from a directory that is not the clone, so the private key file never lands in the worktree. Pass `-f`. Without it, ssh-keygen offers a default filename in the SSH directory and can overwrite an existing login key. Set a passphrase when asked, and store it with the private key.
-
-Software key:
+Generate a software Ed25519 key from a directory that is not the clone, so the private key file never lands in the worktree. Pass `-f`. Without it, ssh-keygen offers a default filename in the SSH directory and can overwrite an existing login key. Set a passphrase when asked, and store it with the private key.
 
 ```sh
 ssh-keygen -t ed25519 -f plerni-maintainer-signing-key -C plerni-gate-approval
 ```
 
-Hardware key, with the authenticator attached (touch it when asked):
-
-```sh
-ssh-keygen -t ed25519-sk -f plerni-maintainer-signing-key -C plerni-gate-approval
-```
-
-The file `plerni-maintainer-signing-key` is the private key (or the key handle). `plerni-maintainer-signing-key.pub` is the public line. If `git status` inside the clone lists either name, you ran this in the worktree. Remove both files from the clone and generate them again outside it.
+The file `plerni-maintainer-signing-key` is the private key. `plerni-maintainer-signing-key.pub` is the public line. The public line must be `ssh-ed25519`. If `git status` inside the clone lists either name, you ran this in the worktree. Remove both files from the clone and generate them again outside it.
 
 Confirm the backup before you trust it. On a machine that does not already have the working copy, restore `plerni-maintainer-signing-key` into a directory outside the clone and run:
 
@@ -130,7 +121,7 @@ Do this only when you still have the current private key, and you have no reason
    ```
 
    Success prints `verify-approval: OK` and the scope hex. Then open the pull request. Review the diff as a press release: the public key line changes, and the two artifact files are added. No private-key file, no passphrase, no second public key.
-9. After it merges, sign later artifacts with the new private key. Before you delete the old private key, confirm `ssh-keygen -y -f "$SIGNING_KEY"` on the new private key matches the merged `maintainer.pub`, and that the backup check's verify command succeeds for the new key. On a planned rotation you may keep the old private key until the next real artifact signed with the new key has passed the verifier. On a compromise, delete the old private key as soon as that backup check succeeds and the new public key is on `dev`. Retire a hardware device that held the old key.
+9. After it merges, sign later artifacts with the new private key. Before you delete the old private key, confirm `ssh-keygen -y -f "$SIGNING_KEY"` on the new private key matches the merged `maintainer.pub`, and that the backup check's verify command succeeds for the new key. On a planned rotation you may keep the old private key until the next real artifact signed with the new key has passed the verifier. On a compromise, delete the old private key as soon as that backup check succeeds and the new public key is on `dev`.
 
 If you amend the public key or any other scoped file, the digest changes. Re-run from step 4 before you push.
 
@@ -138,14 +129,11 @@ If you amend the public key or any other scoped file, the digest changes. Re-run
 
 Loss means you cannot produce a signature and you have no reason to think anyone else has the key. You cannot finish the steps above. Signing with the new key does not help: the verifier ignores the public key on the head. Adding the waiver sentence on the head does not help: the waiver is read from the base, and it does not cover a key change. Editing the workflow on the head does not help: the job runs the workflow from the base.
 
-Recovery is a maintainer action on the repository, the same shape as key genesis in the P0 plan §8. Genesis was the one public-key change with no incumbent signature; it carried a human review receipt instead. A lost key is that shape again.
+There is no authorized unsigned rotation today. P0 plan §8 requires an incumbent signature and a human review receipt for every rotation, with no exceptions. Genesis, the first `maintainer.pub` committed when no incumbent key existed, is the only unsigned case. A lost key is not genesis.
 
-1. Open a pull request whose only change is the new `scripts/gates/approvals/maintainer.pub`. The `approval-artifact` check fails closed. That failure is expected. Leave it red.
-2. Put a human review receipt on the pull request. Name the head SHA. State that the private key is lost, that there is no incumbent signature, and that the diff is only the new public key.
-3. With no other pull request open that touches `.github/workflows/`, `scripts/gates/`, `tools/harness/sql/`, or `tools/spikes/*/bench/.artifacts/`, lift the required `approval-artifact` check on `dev`, merge this pull request only, and restore the required check before any other merge. While the check is not required, a different change in those paths could merge with no valid signature. The push of that merge to `dev` runs the same verifier and fails closed, because the public key changed and there is no incumbent signature. That red run is the record of this recovery. It does not remove the commit. The next pull request reads the new public key from the base.
-4. Store the new private key with the backup steps. The next gate-config change is signed with it, against the new public key on the base.
+Open an ADR, or an explicit amendment of that P0 §8 rule, before any replacement of `maintainer.pub`. Get maintainer review of that policy change, then follow whatever the accepted record says. This guide does not lift the required `approval-artifact` check, and an unsigned replacement is not an authorized path.
 
-This is not the path for a key that may have been copied. Use the compromise steps, which add a review of open pull requests and of recent merges.
+If the key may have been copied, also follow [If the key is compromised](#if-the-key-is-compromised). That review does not authorize an unsigned rotation either.
 
 ## Approvals signed with the old key
 
@@ -159,7 +147,7 @@ An open pull request is different. Its merge-base still points at the old public
 
 ### Overlap the design requires later
 
-Task K10 and §10.2 question 7 of the P1 kernel design require a later verifier to accept a set of public keys during a named window, and to fail closed for a key removed after that window. This guide names the window. The verifier in the repository does not implement it. Landing that set is a later change to the gate, signed like any other change to `maintainer.pub`, and it is outside this document.
+This guide names the window under task K10 and §10.2 question 7 of the P1 kernel design. Task K10b is the follow-up that changes `verify-approval.mjs` so the verifier accepts a set of public keys during that window and fails closed for a key removed after it, with a synthetic fixture that accepts two public keys and rejects an unknown one. This guide does not satisfy that fixture gate, and it does not claim the old K10 acceptance line that bundled the fixture with the guide. The verifier in the repository today does not implement the set.
 
 **Overlap window for a planned rotation of a key that is not compromised: 14 days**, counted from the committer timestamp of the merge commit on `dev` that publishes the new public key.
 
@@ -178,15 +166,15 @@ The overlap window does not apply. The old public key is removed in the rotation
 
 1. Close open pull requests you did not sign that touch `.github/workflows/`, `scripts/gates/`, `tools/harness/sql/`, `tools/spikes/*/bench/.artifacts/`, or `scripts/gates/approvals/`. A stolen key can sign a matching artifact for a hostile diff.
 2. If you still have the private key, rotate with the steps in [Rotate the key](#rotate-the-key). The rotation diff is only the new public key and the artifact pair signed by the current key. Review it yourself. Overlap is zero.
-3. If you no longer have the private key, use [If the private key is lost](#if-the-private-key-is-lost) to publish the new public key, and still do the review in the next step. Assume the old key can sign until the new public key is on `dev` and `approval-artifact` is required again.
-4. Review merges to `dev` since the earliest time the key could have left your control, on those same paths. The verifier will not re-check them. Revert a merged change you do not trust in a follow-up pull request, signed with the new key after the rotation has merged. Keep that revert out of the rotation pull request so the rotation signature covers only the new public key.
-5. After the new key is on `dev` and a signature from it has passed the verifier, delete every copy of the old private key: password-manager items, key-handle files, and any export. A backup of a compromised key is still the compromised key. Retire a hardware device that held it.
+3. If you no longer have the private key, you are in the lost-key case. Follow [If the private key is lost](#if-the-private-key-is-lost): there is no authorized unsigned rotation until an accepted ADR or an accepted amendment of P0 plan §8 says otherwise. Still review open pull requests and recent merges, as the next step describes. Assume the old key can sign until a replacement that the accepted record allows is on `dev`.
+4. Review merges to `dev` since the earliest time the key could have left your control, on those same paths. The verifier will not re-check them. Revert a merged change you do not trust in a follow-up pull request. When you still have the private key, sign that revert with the new key after the rotation has merged, and keep the revert out of the rotation pull request so the rotation signature covers only the new public key. When the private key is lost, that revert waits on the ADR path above.
+5. After the new key is on `dev` and a signature from it has passed the verifier, delete every copy of the old private key, including password-manager items and any export. A backup of a compromised key is still the compromised key.
 6. If the private key itself reached a commit, follow AGENTS.md §0 as well: rotate first, then rewrite history. This guide does not replace that rule.
 
 Merging to `dev` also takes permission on the repository. Key rotation does not recover a stolen account that can merge on its own. That is a separate maintainer response; close or revert the merges, then rotate this key.
 
 ## Sources
 
-Behavior of the gate: [`scripts/gates/verify-approval.mjs`](../../scripts/gates/verify-approval.mjs), [`.github/workflows/approval-artifact.yml`](../../.github/workflows/approval-artifact.yml), and the P0 plan §8 in [`docs/plans/2026-10-13-p0-implementation-plan.md`](../plans/2026-10-13-p0-implementation-plan.md). The waiver sentence is the owner decision of 2026-10-15 in [`docs/ai/model-routing.md`](../ai/model-routing.md). The overlap requirement is §10.2 question 7 and task K10 of [`docs/plans/p1-kernel-design-b.md`](../plans/p1-kernel-design-b.md). Task K10's acceptance line cites §6. Section 6 of that design is contract versioning and does not state this key's rules. The window length is the one named above.
+Behavior of the gate: [`scripts/gates/verify-approval.mjs`](../../scripts/gates/verify-approval.mjs), [`.github/workflows/approval-artifact.yml`](../../.github/workflows/approval-artifact.yml), and the P0 plan §8 in [`docs/plans/2026-10-13-p0-implementation-plan.md`](../plans/2026-10-13-p0-implementation-plan.md). The waiver sentence is the owner decision of 2026-10-15 in [`docs/ai/model-routing.md`](../ai/model-routing.md). The overlap window is named above under task K10 and §10.2 question 7 of [`docs/plans/p1-kernel-design-b.md`](../plans/p1-kernel-design-b.md). Task K10b is the verifier change. Section 6 of that design is contract versioning and does not state this key's rules. The old K10 line that cited §6 and a two-key fixture is replaced by K10 for the guide and K10b for the fixture.
 
-OpenSSH commands follow `ssh-keygen(1)` ([man.openbsd.org/ssh-keygen](https://man.openbsd.org/ssh-keygen.1), read 2026-11-05): `-t ed25519` and `-t ed25519-sk`, `-y`, `-Y sign` with `-f` and `-n`, and the allowed-signers file used by `-Y verify`. `-Y sign` writes `file.sig` beside the file. `-s` is only for `-Y verify`. FIDO notes in that manual: the device key is not exportable, signing needs the on-disk key handle and the same authenticator, and resident keys store the handle on the device.
+OpenSSH commands follow `ssh-keygen(1)` ([man.openbsd.org/ssh-keygen](https://man.openbsd.org/ssh-keygen.1), read 2026-11-05): `-t ed25519`, `-y`, and `-Y sign` with `-f` and `-n`. `-Y sign` writes `file.sig` beside the file. `-s` is only for `-Y verify`, which also takes the allowed-signers file.
