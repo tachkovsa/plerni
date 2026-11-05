@@ -346,6 +346,92 @@ serial('a package file that names an unqualified table is not applied', async ()
   }
 });
 
+serial('an upgrade that disables row security is rolled back', async () => {
+  await ready();
+  const id = 'rls_drop';
+  const schema = 'plugin_rls_drop';
+  const role = 'plerni_plugin_rls_drop';
+  const dir = mkdtempSync(join(tmpdir(), 'plerni-rls-'));
+  const manifest = JSON.parse(readFileSync(join(packageDir, 'manifest.json'), 'utf8')) as Record<string, unknown>;
+  const noteSql = `CREATE SCHEMA IF NOT EXISTS ${schema};
+REVOKE ALL ON SCHEMA ${schema} FROM PUBLIC;
+GRANT USAGE ON SCHEMA ${schema} TO ${role};
+CREATE TABLE IF NOT EXISTS ${schema}.note (
+  tenant_id uuid NOT NULL,
+  id uuid NOT NULL,
+  body text NOT NULL,
+  PRIMARY KEY (tenant_id, id)
+);
+ALTER TABLE ${schema}.note ENABLE ROW LEVEL SECURITY;
+ALTER TABLE ${schema}.note FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON ${schema}.note;
+CREATE POLICY tenant_isolation ON ${schema}.note
+  USING (tenant_id = NULLIF(current_setting('plerni.tenant_id', true), '')::uuid)
+  WITH CHECK (tenant_id = NULLIF(current_setting('plerni.tenant_id', true), '')::uuid);
+REVOKE ALL ON TABLE ${schema}.note FROM PUBLIC;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE ${schema}.note TO ${role};
+`;
+  mkdirSync(join(dir, 'sql'));
+  writeFileSync(join(dir, 'sql/0001_note.sql'), noteSql);
+  writeFileSync(join(dir, 'manifest.json'), JSON.stringify({
+    ...manifest,
+    id,
+    permissions: [],
+    migrations: ['sql/0001_note.sql'],
+  }));
+  const admin = new pg.Client({ connectionString: ROOT });
+  const migrate = new pg.Client({ connectionString: MIGRATE });
+  admin.on('error', () => undefined);
+  migrate.on('error', () => undefined);
+  await admin.connect();
+  await migrate.connect();
+  try {
+    const first = await migratePluginPackage({ admin, migrate, packageDir: dir });
+    assert.deepEqual(first, ['0001_note.sql']);
+    writeFileSync(
+      join(dir, 'sql/0002_disable.sql'),
+      `ALTER TABLE ${schema}.note DISABLE ROW LEVEL SECURITY;\n`,
+    );
+    writeFileSync(join(dir, 'manifest.json'), JSON.stringify({
+      ...manifest,
+      id,
+      permissions: [],
+      migrations: ['sql/0001_note.sql', 'sql/0002_disable.sql'],
+    }));
+    await assert.rejects(
+      () => migratePluginPackage({ admin, migrate, packageDir: dir }),
+      (error: unknown) => error instanceof PluginPackageError && error.message.includes('rls_disabled'),
+    );
+    const shape = await admin.query<{ relrowsecurity: boolean; relforcerowsecurity: boolean }>(
+      `SELECT c.relrowsecurity, c.relforcerowsecurity
+       FROM pg_class c
+       JOIN pg_namespace n ON n.oid = c.relnamespace
+       WHERE n.nspname = $1 AND c.relname = 'note'`,
+      [schema],
+    );
+    assert.equal(shape.rows[0]?.relrowsecurity, true);
+    assert.equal(shape.rows[0]?.relforcerowsecurity, true);
+    const journal = await admin.query<{ version: string }>(
+      'SELECT version FROM kernel.plugin_migration WHERE plugin_id = $1 ORDER BY version',
+      [id],
+    );
+    assert.deepEqual(journal.rows.map((row) => row.version), ['0001_note.sql']);
+  } finally {
+    await admin.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+    await admin.query('DELETE FROM kernel.plugin_migration WHERE plugin_id = $1', [id]);
+    await admin.query('DELETE FROM kernel.plugin_grant WHERE plugin_id = $1', [id]);
+    const exists = await admin.query('SELECT 1 FROM pg_roles WHERE rolname = $1', [role]);
+    if ((exists.rowCount ?? 0) > 0) {
+      await admin.query(`REVOKE ${role} FROM plerni_app`);
+      await admin.query(`DROP OWNED BY ${role}`);
+      await admin.query(`DROP ROLE ${role}`);
+    }
+    await admin.end();
+    await migrate.end();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 function redact(text: string): string {
   return text.replace(/postgres:\/\/[^@\s]+@/g, 'postgres://[redacted]@');
 }

@@ -4,8 +4,10 @@
 import { readFileSync } from 'node:fs';
 import { isAbsolute, relative, resolve, sep } from 'node:path';
 import type pg from 'pg';
+import { inspectTenantTable } from '../schema/tenant-table.ts';
 import { PluginPackageError } from './errors.ts';
 import { checkFixtureSql } from './fixture-sql.ts';
+import { pluginRoleName, pluginSchemaName } from './ident.ts';
 import { readManifest } from './manifest.ts';
 import { ensurePluginRole } from './role.ts';
 
@@ -32,6 +34,32 @@ function packageFile(packageDir: string, rel: string): string {
     throw new PluginPackageError('migration path leaves the package');
   }
   return full;
+}
+
+/** Every plugin table must still match the canonical tenant shape before commit. */
+async function assertPluginTables(migrate: Queryable, pluginId: string): Promise<void> {
+  const schema = pluginSchemaName(pluginId);
+  const role = pluginRoleName(pluginId);
+  const tables = await migrate.query<{ relname: string }>(
+    `SELECT c.relname
+     FROM pg_class c
+     JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = $1 AND c.relkind = 'r'
+     ORDER BY c.relname`,
+    [schema],
+  );
+  const problems: string[] = [];
+  for (const table of tables.rows) {
+    const violations = await inspectTenantTable(migrate, {
+      schema,
+      table: table.relname,
+      runtimeRole: role,
+    });
+    for (const item of violations) problems.push(`${item.table}:${item.code}`);
+  }
+  if (problems.length > 0) {
+    throw new PluginPackageError(`plugin tables failed the shape check: ${problems.join(', ')}`);
+  }
 }
 
 /** Plan §3.3: SQL files run in alphanumeric order, not manifest order. ASCII paths sort bytewise. */
@@ -76,6 +104,7 @@ export async function migratePluginPackage(options: MigratePluginOptions): Promi
         [manifest.id, grant],
       );
     }
+    await assertPluginTables(options.migrate, manifest.id);
     await options.migrate.query('COMMIT');
     return applied;
   } catch (error) {

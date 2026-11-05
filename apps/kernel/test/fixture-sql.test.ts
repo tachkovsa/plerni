@@ -100,6 +100,44 @@ test('every relation in a from list is checked', () => {
   assert.deepEqual(own, []);
 });
 
+test('an aliased update of another schema is rejected', () => {
+  const found = checkFixtureSql(
+    'fixture_alpha',
+    "UPDATE plugin_beta.note AS b SET body = 'changed';",
+  );
+  assert.ok(found.some((item) => item.code === 'foreign_schema' && item.detail.toLowerCase() === 'plugin_beta.note'));
+});
+
+test('source relations after union and in a where subquery are checked', () => {
+  const union = checkFixtureSql(
+    'fixture_alpha',
+    'CREATE TABLE plugin_fixture_alpha.copy AS SELECT * FROM plugin_fixture_alpha.note UNION ALL SELECT * FROM plugin_beta.note;',
+  );
+  assert.ok(union.some((item) => item.code === 'foreign_schema' && item.detail.toLowerCase() === 'plugin_beta.note'));
+  const nested = checkFixtureSql(
+    'fixture_alpha',
+    'SELECT id FROM plugin_fixture_alpha.note WHERE id IN (SELECT id FROM plugin_beta.note);',
+  );
+  assert.ok(nested.some((item) => item.code === 'foreign_schema' && item.detail.toLowerCase() === 'plugin_beta.note'));
+});
+
+test('grant recipients are only the owning plugin role', () => {
+  const samples = [
+    'GRANT USAGE ON SCHEMA plugin_fixture_alpha TO PUBLIC;',
+    'GRANT SELECT ON TABLE plugin_fixture_alpha.note TO PUBLIC;',
+    'GRANT SELECT ON TABLE plugin_fixture_alpha.note TO plerni_plugin_beta;',
+  ];
+  for (const sqlText of samples) {
+    const found = checkFixtureSql('fixture_alpha', sqlText);
+    assert.ok(found.some((item) => item.code === 'privilege'), sqlText);
+  }
+  const own = checkFixtureSql(
+    'fixture_alpha',
+    'GRANT SELECT ON TABLE plugin_fixture_alpha.note TO plerni_plugin_fixture_alpha;',
+  );
+  assert.deepEqual(own, []);
+});
+
 test('grant all and other non-dml privileges are rejected', () => {
   const samples = [
     'GRANT ALL ON TABLE plugin_fixture_alpha.note TO plerni_plugin_fixture_alpha;',

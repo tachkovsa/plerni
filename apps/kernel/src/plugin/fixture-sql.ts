@@ -5,7 +5,7 @@
 // this checker does not recognize fails closed. This is not the P2 admission
 // parser and does not classify arbitrary author SQL.
 import { PluginPackageError } from './errors.ts';
-import { pluginSchemaName } from './ident.ts';
+import { pluginRoleName, pluginSchemaName } from './ident.ts';
 
 export type FixtureSqlCode = 'unqualified_table' | 'foreign_schema' | 'function' | 'unsupported' | 'privilege';
 
@@ -102,7 +102,6 @@ function tableRefs(statement: string): string[] {
   take(new RegExp(String.raw`\btruncate\s+(?:table\s+)?(?:only\s+)?(${IDENT})`, 'gi'));
   take(new RegExp(String.raw`\binsert\s+into\s+(${IDENT})`, 'gi'));
   take(new RegExp(String.raw`\bdelete\s+from\s+(?:only\s+)?(${IDENT})`, 'gi'));
-  take(new RegExp(String.raw`\bupdate\s+(?:only\s+)?(${IDENT})\s+set\b`, 'gi'));
   take(new RegExp(String.raw`\breferences\s+(${IDENT})`, 'gi'));
   take(new RegExp(String.raw`\bpolicy\s+(?:if\s+(?:not\s+)?exists\s+)?[a-z_][a-z0-9_]*\s+on\s+(${IDENT})`, 'gi'));
   return refs;
@@ -123,21 +122,47 @@ function grantPrivileges(statement: string, kind: 'schema' | 'table'): 'ok' | 'p
   return 'ok';
 }
 
+/** `UPDATE name [AS alias] SET`. An alias is part of the target. Other shapes fail closed. */
+function updateTarget(statement: string): string | 'unsupported' | null {
+  if (!/^update\b/i.test(statement)) return null;
+  const match = /^update\s+(?:only\s+)?([a-z_][a-z0-9_]*(?:\.[a-z_][a-z0-9_]*)?)(?:\s+(?:as\s+)?[a-z_][a-z0-9_]*)?\s+set\b/i.exec(
+    statement,
+  );
+  if (!match?.[1]) return 'unsupported';
+  return match[1];
+}
+
 /**
- * Relations in a FROM list, including comma-separated items and aliases.
- * A join, subquery, or other shape this pattern cannot read fails closed.
+ * Every FROM list in the statement, including lists after UNION and inside
+ * subqueries. A join or other shape this pattern cannot read fails closed.
  */
 function sourceRelations(statement: string): string[] | 'unsupported' | null {
-  const from = /\bfrom\b/i.exec(statement);
-  if (!from || from.index === undefined) return null;
-  const start = from.index + from[0].length;
+  const names: string[] = [];
+  const fromRe = /\bfrom\b/gi;
+  let saw = false;
+  let match: RegExpExecArray | null;
+  while ((match = fromRe.exec(statement)) !== null) {
+    saw = true;
+    const parsed = relationsAfter(statement, match.index + match[0].length);
+    if (parsed === 'unsupported') return 'unsupported';
+    names.push(...parsed);
+  }
+  return saw ? names : null;
+}
+
+function relationsAfter(statement: string, start: number): string[] | 'unsupported' {
   let depth = 0;
   let end = statement.length;
   for (let i = start; i < statement.length; i += 1) {
     const ch = statement[i] ?? '';
     if (ch === '(') depth += 1;
-    else if (ch === ')') depth -= 1;
-    else if (depth === 0 && /\s/.test(ch)
+    else if (ch === ')') {
+      if (depth === 0) {
+        end = i;
+        break;
+      }
+      depth -= 1;
+    } else if (depth === 0 && /\s/.test(ch)
       && /^\s+(where|group|order|limit|offset|having|window|union|except|intersect|fetch|for)\b/i.test(statement.slice(i))) {
       end = i;
       break;
@@ -153,6 +178,16 @@ function sourceRelations(statement: string): string[] | 'unsupported' | null {
     names.push(found[1]);
   }
   return names;
+}
+
+/** GRANT recipients. Only the owning plugin role may receive a grant. */
+function grantRecipients(statement: string, pluginId: string): 'ok' | 'privilege' | 'unsupported' {
+  const role = pluginRoleName(pluginId).toLowerCase();
+  const match = /\bto\s+([a-z_][a-z0-9_]*(?:\s*,\s*[a-z_][a-z0-9_]*)*)\s*$/i.exec(statement.trim());
+  if (!match?.[1]) return 'unsupported';
+  const names = match[1].split(',').map((part) => part.trim().toLowerCase());
+  if (names.length === 0 || names.some((name) => name !== role)) return 'privilege';
+  return 'ok';
 }
 
 /**
@@ -218,6 +253,8 @@ export function checkFixtureSql(pluginId: string, sqlText: string): FixtureSqlVi
       if (/^grant\b/i.test(statement)) {
         const privileges = grantPrivileges(statement, targets.kind);
         if (privileges !== 'ok') violations.push({ code: privileges, detail: statement.slice(0, 80) });
+        const recipients = grantRecipients(statement, pluginId);
+        if (recipients !== 'ok') violations.push({ code: recipients, detail: statement.slice(0, 80) });
       }
       if (targets.kind === 'schema') {
         for (const name of targets.names) {
@@ -227,6 +264,12 @@ export function checkFixtureSql(pluginId: string, sqlText: string): FixtureSqlVi
       }
       for (const name of targets.names) classify(name, expected, violations);
       continue;
+    }
+    const updated = updateTarget(statement);
+    if (updated === 'unsupported') {
+      violations.push({ code: 'unsupported', detail: statement.slice(0, 80) });
+    } else if (updated) {
+      classify(updated, expected, violations);
     }
     for (const ref of tableRefs(statement)) classify(ref, expected, violations);
     const sources = sourceRelations(statement);
