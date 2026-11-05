@@ -16,9 +16,17 @@ export interface FixtureSqlViolation {
 
 const IDENT = String.raw`[a-z_][a-z0-9_]*(?:\.[a-z_][a-z0-9_]*)?`;
 
-function strip(sql: string): string {
+function isEscapeString(sql: string, quote: number): boolean {
+  const mark = sql[quote - 1] ?? '';
+  if (mark !== 'E' && mark !== 'e') return false;
+  // The letter E is a prefix only when it is not the tail of an identifier.
+  return !/[A-Za-z0-9_]/.test(sql[quote - 2] ?? '');
+}
+
+function strip(sql: string): { text: string; escapeString: boolean } {
   let out = '';
   let i = 0;
+  let escapeString = false;
   while (i < sql.length) {
     if (sql.startsWith('--', i)) {
       const end = sql.indexOf('\n', i);
@@ -33,6 +41,7 @@ function strip(sql: string): string {
       continue;
     }
     if (sql[i] === "'") {
+      if (isEscapeString(sql, i)) escapeString = true;
       i += 1;
       while (i < sql.length) {
         if (sql[i] === "'" && sql[i + 1] === "'") {
@@ -60,7 +69,7 @@ function strip(sql: string): string {
     out += sql[i];
     i += 1;
   }
-  return out;
+  return { text: out, escapeString };
 }
 
 function isRoutine(statement: string): boolean {
@@ -232,6 +241,25 @@ function grantTargets(statement: string): { kind: 'schema' | 'table'; names: str
   return { kind: 'table', names };
 }
 
+/**
+ * Partition parent and child names. A form this pattern cannot read fails closed.
+ * Same-schema names stay; another schema is rejected by the caller.
+ */
+function partitionRefs(statement: string): string[] | 'unsupported' | null {
+  const re = /\b(?:attach\s+partition|detach\s+partition|partition\s+of)\s+/gi;
+  const names: string[] = [];
+  let saw = false;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(statement)) !== null) {
+    saw = true;
+    const rest = statement.slice(match.index + match[0].length);
+    const named = /^(?:only\s+)?([a-z_][a-z0-9_]*(?:\.[a-z_][a-z0-9_]*)?)\b/i.exec(rest);
+    if (!named?.[1]) return 'unsupported';
+    names.push(named[1]);
+  }
+  return saw ? names : null;
+}
+
 /** `ALTER TABLE ... SET SCHEMA`. The destination must be this plugin's schema. */
 function setSchemaDestination(statement: string): string | 'unsupported' | null {
   if (!/^alter\s+table\b/i.test(statement) || !/\bset\s+schema\b/i.test(statement)) return null;
@@ -310,7 +338,10 @@ function classify(ref: string, expected: string, violations: FixtureSqlViolation
 export function checkFixtureSql(pluginId: string, sqlText: string): FixtureSqlViolation[] {
   const expected = pluginSchemaName(pluginId);
   const violations: FixtureSqlViolation[] = [];
-  const parts = strip(sqlText).split(';');
+  const stripped = strip(sqlText);
+  // E'...' follows backslash rules this scan does not tokenize. Reject it.
+  if (stripped.escapeString) return [{ code: 'unsupported', detail: 'escape string' }];
+  const parts = stripped.text.split(';');
   for (const part of parts) {
     const statement = part.trim();
     if (statement === '') continue;
@@ -338,6 +369,14 @@ export function checkFixtureSql(pluginId: string, sqlText: string): FixtureSqlVi
     if (/\binherits?\b/i.test(statement)) {
       violations.push({ code: 'unsupported', detail: statement.slice(0, 80) });
       continue;
+    }
+    const partitions = partitionRefs(statement);
+    if (partitions === 'unsupported') {
+      violations.push({ code: 'unsupported', detail: statement.slice(0, 80) });
+      continue;
+    }
+    if (partitions) {
+      for (const name of partitions) classify(name, expected, violations);
     }
     const schema = /^create\s+schema\s+(?:if\s+not\s+exists\s+)?([a-z_][a-z0-9_]*)/i.exec(statement);
     if (schema) {
@@ -401,7 +440,7 @@ export function assertFixtureRead(pluginId: string, statement: string): void {
     const summary = violations.map((item) => `${item.code}:${item.detail}`).join(', ');
     throw new PluginPackageError(`fixture sql rejected: ${summary}`);
   }
-  const statements = strip(statement).split(';').map((item) => item.trim()).filter((item) => item !== '');
+  const statements = strip(statement).text.split(';').map((item) => item.trim()).filter((item) => item !== '');
   if (statements.length !== 1 || !/^select\b/i.test(statements[0] ?? '')) {
     throw new PluginPackageError('plugin read must be one select');
   }

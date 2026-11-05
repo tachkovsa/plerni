@@ -126,6 +126,37 @@ test('an indirect sql execution that forges the tenant is rejected', () => {
   );
 });
 
+test('an escape string cannot hide a following statement', () => {
+  const sqlText = "SELECT E" + String.fromCharCode(0x27, 0x5c, 0x27, 0x27) + "; DELETE FROM plugin_fixture_alpha.note; COMMIT; -- '";
+  const found = checkFixtureSql('fixture_alpha', sqlText);
+  assert.ok(found.some((item) => item.code === 'unsupported' && item.detail === 'escape string'), sqlText);
+  assert.throws(
+    () => assertFixtureRead('fixture_alpha', sqlText),
+    (error: unknown) => error instanceof PluginPackageError,
+  );
+  const plain = checkFixtureSql(
+    'fixture_alpha',
+    "SELECT id FROM plugin_fixture_alpha.note WHERE body = 'it''s fine';",
+  );
+  assert.deepEqual(plain, []);
+});
+
+test('attaching a partition from another schema is rejected', () => {
+  const found = checkFixtureSql(
+    'fixture_alpha',
+    'ALTER TABLE plugin_fixture_alpha.all_notes ATTACH PARTITION plugin_beta.note DEFAULT;',
+  );
+  assert.ok(
+    found.some((item) => item.code === 'foreign_schema' && item.detail.toLowerCase() === 'plugin_beta.note'),
+    found.map((item) => `${item.code}:${item.detail}`).join(','),
+  );
+  const own = checkFixtureSql(
+    'fixture_alpha',
+    'ALTER TABLE plugin_fixture_alpha.all_notes ATTACH PARTITION plugin_fixture_alpha.note DEFAULT;',
+  );
+  assert.deepEqual(own, []);
+});
+
 test('inheriting another plugin table is rejected', () => {
   const found = checkFixtureSql(
     'fixture_alpha',
