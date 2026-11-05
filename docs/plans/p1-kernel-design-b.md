@@ -23,7 +23,7 @@ P0 is done. `apps/kernel/src` is still absent. P1 builds kernel services. P2 adm
 
 Issues [#63](https://github.com/tachkovsa/plerni/issues/63), [#64](https://github.com/tachkovsa/plerni/issues/64), [#65](https://github.com/tachkovsa/plerni/issues/65), and [#66](https://github.com/tachkovsa/plerni/issues/66) are open domain-input tasks. As of this draft they have no comments and no files under `docs/domain/`. The walkthrough in §9 shows that those future notes have somewhere to land. It does not record them as product decisions. Default role mappings ship empty. Tenant administrators compose roles from plugin-declared building blocks (D27).
 
-Issue [#62](https://github.com/tachkovsa/plerni/issues/62) is the signing-key backup and rotation guide. §6 states the verifier invariant. The guide itself is task K10, and its checklist is the issue.
+Issue [#62](https://github.com/tachkovsa/plerni/issues/62) is the signing-key backup and rotation guide: [`../gates/maintainer-signing-key.md`](../gates/maintainer-signing-key.md). The guide is task K10, and its checklist is the issue. The overlap window is §10.2 question 7; the guide names its length.
 
 **Out of this draft's tasks, on purpose:**
 
@@ -171,7 +171,7 @@ SQL files, alphanumeric within a package. The journal's order:
 
 `optionalRequires` is not an ordering edge. Event subscriptions are not ordering edges (ADR-0002 decision 8). A statement that names another plugin's schema fails the checker. A statement that is a function, a trigger, or a `DO` block fails the checker. `CREATE EXTENSION` fails. The kernel bootstrap owns the extension allowlist (`vector`, `pg_trgm`).
 
-Each migration carries the signed approval artifact (spec §4.6). The public key set and rotation rules are §6 and issue #62. P2 wires verification into admission. P1's kernel migrations follow the same artifact shape so the verifier has one code path.
+Each migration carries the signed approval artifact (spec §4.6). The public key set and rotation rules are [the maintainer signing-key guide](../gates/maintainer-signing-key.md) (issue #62). P2 wires verification into admission. P1's kernel migrations follow the same artifact shape so the verifier has one code path.
 
 Tenant-domain tables, kernel or plugin: `tenant_id NOT NULL`, `ENABLE` and `FORCE ROW LEVEL SECURITY`, exactly one canonical permissive policy, composite foreign keys that include `tenant_id`, runtime grants limited to DML. `GRANT ALL` fails the linter. Kernel-internal machinery (outbox, cursors, job store, relay state) has no tenant RLS and is reachable only by the named service identities in spec §5.
 
@@ -611,7 +611,7 @@ Issue #64's integrations (HRIS, content libraries, calendars, BI) attach the sam
 4. **Hash for A/B buckets.** The flags plugin owns the algorithm. Draft B requires it to be stable across processes and to take tenant, flag, and subject as inputs. The exact function is chosen in that plugin's spec, with a test vector. It is not a kernel choice.
 5. **Health authentication.** `GET /health` is unauthenticated and contains no tenant data. Confirming that the orchestrator can scrape it without a credential is part of K23. It must not grow into a status dashboard.
 6. **pg-boss versus a kernel-only job table if K14 fails.** ADR-0009's flip is to stay on the outbox. A replacement dispatcher is a new ADR, not a silent BullMQ import inside K14.
-7. **Issue #62 transition overlap.** This draft requires the verifier to accept a set of public keys during a named window. The length of the window is written in the guide's PR, not here.
+7. **Issue #62 transition overlap.** This draft requires the verifier to accept a set of public keys during a named window. The length of the window is written in [the maintainer signing-key guide](../gates/maintainer-signing-key.md), not here.
 
 ### 10.3 Proposed ADRs
 

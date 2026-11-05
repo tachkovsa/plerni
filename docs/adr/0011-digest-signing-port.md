@@ -11,7 +11,7 @@
 
 A certificate plugin has to produce a signature a verifier can check later. The key belongs in the kernel secret store: envelope-encrypted, per-tenant data keys under a kernel key-encryption key, with that key coming from the environment or a key file. The Secrets port resolves references at the broker and does not hand values to plugins. Signing is the operation that uses the private key without changing that rule.
 
-Issue #62 tracks backup and rotation of the maintainer signing key used for migration-approval artifacts. That key is a different purpose. This record does not decide its backup procedure.
+Issue #62 tracks backup and rotation of the maintainer signing key used for migration-approval artifacts. That key is a different purpose. This record does not decide its backup procedure. The operator steps are in [the maintainer signing-key guide](../gates/maintainer-signing-key.md).
 
 ## Decision
 
