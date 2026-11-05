@@ -87,6 +87,30 @@ test('grant on a table without the table keyword checks every target', () => {
   assert.ok(listed.some((item) => item.code === 'foreign_schema' && item.detail === 'plugin_beta.note'));
 });
 
+test('every relation in a from list is checked', () => {
+  const copied = checkFixtureSql(
+    'fixture_alpha',
+    'CREATE TABLE plugin_fixture_alpha.copy AS SELECT b.* FROM plugin_fixture_alpha.note a, plugin_beta.note b;',
+  );
+  assert.ok(copied.some((item) => item.code === 'foreign_schema' && item.detail.toLowerCase() === 'plugin_beta.note'));
+  const own = checkFixtureSql(
+    'fixture_alpha',
+    'SELECT id FROM plugin_fixture_alpha.note a, plugin_fixture_alpha.note b;',
+  );
+  assert.deepEqual(own, []);
+});
+
+test('grant all and other non-dml privileges are rejected', () => {
+  const samples = [
+    'GRANT ALL ON TABLE plugin_fixture_alpha.note TO plerni_plugin_fixture_alpha;',
+    'GRANT TRUNCATE ON TABLE plugin_fixture_alpha.note TO plerni_plugin_fixture_alpha;',
+  ];
+  for (const sqlText of samples) {
+    const found = checkFixtureSql('fixture_alpha', sqlText);
+    assert.ok(found.some((item) => item.code === 'privilege'), sqlText);
+  }
+});
+
 test('a multi-table truncate that includes another schema is rejected', () => {
   const codes = checkFixtureSql(
     'fixture_alpha',

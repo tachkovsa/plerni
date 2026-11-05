@@ -7,7 +7,7 @@
 import { PluginPackageError } from './errors.ts';
 import { pluginSchemaName } from './ident.ts';
 
-export type FixtureSqlCode = 'unqualified_table' | 'foreign_schema' | 'function' | 'unsupported';
+export type FixtureSqlCode = 'unqualified_table' | 'foreign_schema' | 'function' | 'unsupported' | 'privilege';
 
 export interface FixtureSqlViolation {
   code: FixtureSqlCode;
@@ -105,10 +105,54 @@ function tableRefs(statement: string): string[] {
   take(new RegExp(String.raw`\bupdate\s+(?:only\s+)?(${IDENT})\s+set\b`, 'gi'));
   take(new RegExp(String.raw`\breferences\s+(${IDENT})`, 'gi'));
   take(new RegExp(String.raw`\bpolicy\s+(?:if\s+(?:not\s+)?exists\s+)?[a-z_][a-z0-9_]*\s+on\s+(${IDENT})`, 'gi'));
-  if (!/^(grant|revoke)\b/i.test(statement)) {
-    take(new RegExp(String.raw`\b(?:from|join)\s+(${IDENT})`, 'gi'));
-  }
   return refs;
+}
+
+const TABLE_DML = new Set(['select', 'insert', 'update', 'delete']);
+const SCHEMA_GRANT = new Set(['usage']);
+
+/** Privileges named before ON. ALL and anything outside DML (or USAGE on a schema) are rejected. */
+function grantPrivileges(statement: string, kind: 'schema' | 'table'): 'ok' | 'privilege' | 'unsupported' {
+  const match = /^grant\s+([\s\S]+?)\s+on\b/i.exec(statement);
+  const list = match?.[1]?.trim() ?? '';
+  if (list === '' || list.includes('(')) return 'unsupported';
+  if (/\ball\b/i.test(list)) return 'privilege';
+  const names = list.split(',').map((part) => part.trim().toLowerCase());
+  const allowed = kind === 'schema' ? SCHEMA_GRANT : TABLE_DML;
+  if (names.some((name) => !allowed.has(name))) return 'privilege';
+  return 'ok';
+}
+
+/**
+ * Relations in a FROM list, including comma-separated items and aliases.
+ * A join, subquery, or other shape this pattern cannot read fails closed.
+ */
+function sourceRelations(statement: string): string[] | 'unsupported' | null {
+  const from = /\bfrom\b/i.exec(statement);
+  if (!from || from.index === undefined) return null;
+  const start = from.index + from[0].length;
+  let depth = 0;
+  let end = statement.length;
+  for (let i = start; i < statement.length; i += 1) {
+    const ch = statement[i] ?? '';
+    if (ch === '(') depth += 1;
+    else if (ch === ')') depth -= 1;
+    else if (depth === 0 && /\s/.test(ch)
+      && /^\s+(where|group|order|limit|offset|having|window|union|except|intersect|fetch|for)\b/i.test(statement.slice(i))) {
+      end = i;
+      break;
+    }
+  }
+  const clause = statement.slice(start, end).trim();
+  if (clause === '' || clause.includes('(') || clause.includes(')')) return 'unsupported';
+  const names: string[] = [];
+  const item = /^(?:only\s+)?([a-z_][a-z0-9_]*(?:\.[a-z_][a-z0-9_]*)?)(?:\s+(?:as\s+)?[a-z_][a-z0-9_]*)?$/i;
+  for (const part of clause.split(',')) {
+    const found = item.exec(part.trim());
+    if (!found?.[1]) return 'unsupported';
+    names.push(found[1]);
+  }
+  return names;
 }
 
 /**
@@ -171,6 +215,10 @@ export function checkFixtureSql(pluginId: string, sqlText: string): FixtureSqlVi
         violations.push({ code: 'unsupported', detail: statement.slice(0, 80) });
         continue;
       }
+      if (/^grant\b/i.test(statement)) {
+        const privileges = grantPrivileges(statement, targets.kind);
+        if (privileges !== 'ok') violations.push({ code: privileges, detail: statement.slice(0, 80) });
+      }
       if (targets.kind === 'schema') {
         for (const name of targets.names) {
           if (name !== expected) violations.push({ code: 'foreign_schema', detail: name });
@@ -181,6 +229,12 @@ export function checkFixtureSql(pluginId: string, sqlText: string): FixtureSqlVi
       continue;
     }
     for (const ref of tableRefs(statement)) classify(ref, expected, violations);
+    const sources = sourceRelations(statement);
+    if (sources === 'unsupported') {
+      violations.push({ code: 'unsupported', detail: statement.slice(0, 80) });
+    } else if (sources) {
+      for (const name of sources) classify(name, expected, violations);
+    }
   }
   return violations;
 }
