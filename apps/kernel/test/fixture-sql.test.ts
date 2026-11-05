@@ -100,6 +100,14 @@ test('every relation in a from list is checked', () => {
   assert.deepEqual(own, []);
 });
 
+test('a table query expression from another schema is rejected', () => {
+  const found = checkFixtureSql(
+    'fixture_alpha',
+    'INSERT INTO plugin_fixture_alpha.note TABLE plugin_beta.note;',
+  );
+  assert.ok(found.some((item) => item.code === 'foreign_schema' && item.detail.toLowerCase() === 'plugin_beta.note'));
+});
+
 test('an aliased update of another schema is rejected', () => {
   const found = checkFixtureSql(
     'fixture_alpha',

@@ -432,6 +432,167 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE ${schema}.note TO ${role};
   }
 });
 
+function tenantTable(schema: string, role: string, table: string, body: string): string {
+  return `CREATE TABLE ${schema}.${table} (
+  tenant_id uuid NOT NULL,
+  id uuid NOT NULL,
+  ${body}
+  PRIMARY KEY (tenant_id, id)
+);
+ALTER TABLE ${schema}.${table} ENABLE ROW LEVEL SECURITY;
+ALTER TABLE ${schema}.${table} FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON ${schema}.${table};
+CREATE POLICY tenant_isolation ON ${schema}.${table}
+  USING (tenant_id = NULLIF(current_setting('plerni.tenant_id', true), '')::uuid)
+  WITH CHECK (tenant_id = NULLIF(current_setting('plerni.tenant_id', true), '')::uuid);
+REVOKE ALL ON TABLE ${schema}.${table} FROM PUBLIC;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE ${schema}.${table} TO ${role};
+`;
+}
+
+async function dropPackage(client: pg.Client, id: string, schema: string, role: string): Promise<void> {
+  await client.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+  await client.query('DELETE FROM kernel.plugin_migration WHERE plugin_id = $1', [id]);
+  await client.query('DELETE FROM kernel.plugin_grant WHERE plugin_id = $1', [id]);
+  const exists = await client.query('SELECT 1 FROM pg_roles WHERE rolname = $1', [role]);
+  if ((exists.rowCount ?? 0) > 0) {
+    await client.query(`REVOKE ${role} FROM plerni_app`);
+    await client.query(`DROP OWNED BY ${role}`);
+    await client.query(`DROP ROLE ${role}`);
+  }
+}
+
+serial('a maximum-length plugin id migrates its schema', async () => {
+  await ready();
+  const id = 'a'.repeat(41);
+  const schema = `plugin_${id}`;
+  const role = `plerni_plugin_${id}`;
+  const dir = mkdtempSync(join(tmpdir(), 'plerni-long-'));
+  const manifest = JSON.parse(readFileSync(join(packageDir, 'manifest.json'), 'utf8')) as Record<string, unknown>;
+  mkdirSync(join(dir, 'sql'));
+  writeFileSync(join(dir, 'manifest.json'), JSON.stringify({
+    ...manifest,
+    id,
+    permissions: [],
+    migrations: ['sql/0001_note.sql'],
+  }));
+  writeFileSync(join(dir, 'sql/0001_note.sql'), `CREATE SCHEMA IF NOT EXISTS ${schema};
+REVOKE ALL ON SCHEMA ${schema} FROM PUBLIC;
+GRANT USAGE ON SCHEMA ${schema} TO ${role};
+${tenantTable(schema, role, 'note', '')}`);
+  const admin = new pg.Client({ connectionString: ROOT });
+  const migrate = new pg.Client({ connectionString: MIGRATE });
+  admin.on('error', () => undefined);
+  migrate.on('error', () => undefined);
+  await admin.connect();
+  await migrate.connect();
+  try {
+    const applied = await migratePluginPackage({ admin, migrate, packageDir: dir });
+    assert.deepEqual(applied, ['0001_note.sql']);
+    const present = await admin.query<{ rel: string | null }>(
+      'SELECT to_regclass($1)::text AS rel',
+      [`${schema}.note`],
+    );
+    assert.equal(present.rows[0]?.rel, `${schema}.note`);
+  } finally {
+    await dropPackage(admin, id, schema, role);
+    await admin.end();
+    await migrate.end();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+serial('a cross-tenant cascade foreign key is rolled back', async () => {
+  await ready();
+  const id = 'fk_cascade';
+  const schema = 'plugin_fk_cascade';
+  const role = 'plerni_plugin_fk_cascade';
+  const dir = mkdtempSync(join(tmpdir(), 'plerni-fk-'));
+  const manifest = JSON.parse(readFileSync(join(packageDir, 'manifest.json'), 'utf8')) as Record<string, unknown>;
+  const parent = `CREATE TABLE ${schema}.parent (
+  tenant_id uuid NOT NULL,
+  id uuid NOT NULL,
+  PRIMARY KEY (tenant_id, id),
+  UNIQUE (id)
+);
+ALTER TABLE ${schema}.parent ENABLE ROW LEVEL SECURITY;
+ALTER TABLE ${schema}.parent FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation ON ${schema}.parent;
+CREATE POLICY tenant_isolation ON ${schema}.parent
+  USING (tenant_id = NULLIF(current_setting('plerni.tenant_id', true), '')::uuid)
+  WITH CHECK (tenant_id = NULLIF(current_setting('plerni.tenant_id', true), '')::uuid);
+REVOKE ALL ON TABLE ${schema}.parent FROM PUBLIC;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE ${schema}.parent TO ${role};
+`;
+  const child = tenantTable(
+    schema,
+    role,
+    'child',
+    `parent_id uuid NOT NULL,
+  FOREIGN KEY (tenant_id, parent_id) REFERENCES ${schema}.parent (tenant_id, id),`,
+  );
+  const bad = `${tenantTable(
+    schema,
+    role,
+    'bad_child',
+    `parent_id uuid NOT NULL,
+  FOREIGN KEY (parent_id) REFERENCES ${schema}.parent (id) ON DELETE CASCADE,`,
+  )}`;
+  mkdirSync(join(dir, 'sql'));
+  writeFileSync(join(dir, 'sql/0001_parent.sql'), `CREATE SCHEMA IF NOT EXISTS ${schema};
+REVOKE ALL ON SCHEMA ${schema} FROM PUBLIC;
+GRANT USAGE ON SCHEMA ${schema} TO ${role};
+${parent}
+${child}`);
+  writeFileSync(join(dir, 'manifest.json'), JSON.stringify({
+    ...manifest,
+    id,
+    permissions: [],
+    migrations: ['sql/0001_parent.sql'],
+  }));
+  const admin = new pg.Client({ connectionString: ROOT });
+  const migrate = new pg.Client({ connectionString: MIGRATE });
+  admin.on('error', () => undefined);
+  migrate.on('error', () => undefined);
+  await admin.connect();
+  await migrate.connect();
+  try {
+    const first = await migratePluginPackage({ admin, migrate, packageDir: dir });
+    assert.deepEqual(first, ['0001_parent.sql']);
+    writeFileSync(join(dir, 'sql/0002_cascade.sql'), bad);
+    writeFileSync(join(dir, 'manifest.json'), JSON.stringify({
+      ...manifest,
+      id,
+      permissions: [],
+      migrations: ['sql/0001_parent.sql', 'sql/0002_cascade.sql'],
+    }));
+    await assert.rejects(
+      () => migratePluginPackage({ admin, migrate, packageDir: dir }),
+      (error: unknown) => error instanceof PluginPackageError && error.message.includes('foreign_key'),
+    );
+    const childPresent = await admin.query<{ rel: string | null }>(
+      'SELECT to_regclass($1)::text AS rel',
+      [`${schema}.bad_child`],
+    );
+    assert.equal(childPresent.rows[0]?.rel ?? null, null);
+    const parentPresent = await admin.query<{ rel: string | null }>(
+      'SELECT to_regclass($1)::text AS rel',
+      [`${schema}.parent`],
+    );
+    assert.equal(parentPresent.rows[0]?.rel, `${schema}.parent`);
+    const journal = await admin.query<{ version: string }>(
+      'SELECT version FROM kernel.plugin_migration WHERE plugin_id = $1 ORDER BY version',
+      [id],
+    );
+    assert.deepEqual(journal.rows.map((row) => row.version), ['0001_parent.sql']);
+  } finally {
+    await dropPackage(admin, id, schema, role);
+    await admin.end();
+    await migrate.end();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 function redact(text: string): string {
   return text.replace(/postgres:\/\/[^@\s]+@/g, 'postgres://[redacted]@');
 }

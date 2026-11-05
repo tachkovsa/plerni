@@ -54,6 +54,7 @@ async function assertPluginTables(migrate: Queryable, pluginId: string): Promise
       schema,
       table: table.relname,
       runtimeRole: role,
+      tenantForeignKeys: true,
     });
     for (const item of violations) problems.push(`${item.table}:${item.code}`);
   }

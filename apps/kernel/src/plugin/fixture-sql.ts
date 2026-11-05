@@ -122,6 +122,28 @@ function grantPrivileges(statement: string, kind: 'schema' | 'table'): 'ok' | 'p
   return 'ok';
 }
 
+/**
+ * `TABLE name` used as a query source, as in `INSERT INTO t TABLE other`.
+ * DDL and `ON TABLE` uses of the keyword are not sources.
+ */
+function tableQuerySources(statement: string): string[] | 'unsupported' {
+  const sources: string[] = [];
+  const re = /\btable\b/gi;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(statement)) !== null) {
+    const before = statement.slice(0, match.index).trimEnd();
+    const prior = /([a-z_]+)$/i.exec(before)?.[1]?.toLowerCase();
+    if (prior === 'create' || prior === 'alter' || prior === 'drop' || prior === 'truncate' || prior === 'on' || prior === 'into') {
+      continue;
+    }
+    const rest = statement.slice(match.index + match[0].length);
+    const named = /^\s+(?:only\s+)?([a-z_][a-z0-9_]*(?:\.[a-z_][a-z0-9_]*)?)/i.exec(rest);
+    if (!named?.[1]) return 'unsupported';
+    sources.push(named[1]);
+  }
+  return sources;
+}
+
 /** `UPDATE name [AS alias] SET`. An alias is part of the target. Other shapes fail closed. */
 function updateTarget(statement: string): string | 'unsupported' | null {
   if (!/^update\b/i.test(statement)) return null;
@@ -272,6 +294,12 @@ export function checkFixtureSql(pluginId: string, sqlText: string): FixtureSqlVi
       classify(updated, expected, violations);
     }
     for (const ref of tableRefs(statement)) classify(ref, expected, violations);
+    const tableSources = tableQuerySources(statement);
+    if (tableSources === 'unsupported') {
+      violations.push({ code: 'unsupported', detail: statement.slice(0, 80) });
+    } else {
+      for (const name of tableSources) classify(name, expected, violations);
+    }
     const sources = sourceRelations(statement);
     if (sources === 'unsupported') {
       violations.push({ code: 'unsupported', detail: statement.slice(0, 80) });
