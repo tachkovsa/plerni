@@ -153,6 +153,24 @@ function tableRefs(statement: string): string[] {
   return refs;
 }
 
+/** `LIKE source` copies a table definition. A string pattern is not a source. */
+function likeSources(statement: string): string[] | 'unsupported' | null {
+  const re = /\blike\b/gi;
+  const names: string[] = [];
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(statement)) !== null) {
+    const rest = statement.slice(match.index + match[0].length);
+    const named = /^\s+(?:only\s+)?([a-z_][a-z0-9_]*(?:\.[a-z_][a-z0-9_]*)?)\b/i.exec(rest);
+    if (named?.[1]) {
+      names.push(named[1]);
+      continue;
+    }
+    if (/^\s+''/.test(rest)) continue;
+    return 'unsupported';
+  }
+  return names.length > 0 ? names : null;
+}
+
 const TABLE_DML = new Set(['select', 'insert', 'update', 'delete']);
 const SCHEMA_GRANT = new Set(['usage']);
 
@@ -461,6 +479,12 @@ export function checkFixtureSql(pluginId: string, sqlText: string): FixtureSqlVi
       violations.push({ code: 'foreign_schema', detail: moved });
     }
     for (const ref of tableRefs(statement)) classify(ref, expected, violations);
+    const likes = likeSources(statement);
+    if (likes === 'unsupported') {
+      violations.push({ code: 'unsupported', detail: statement.slice(0, 80) });
+    } else if (likes) {
+      for (const name of likes) classify(name, expected, violations);
+    }
     const tableSources = tableQuerySources(statement);
     if (tableSources === 'unsupported') {
       violations.push({ code: 'unsupported', detail: statement.slice(0, 80) });

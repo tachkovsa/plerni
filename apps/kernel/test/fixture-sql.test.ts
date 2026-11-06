@@ -186,6 +186,30 @@ test('create schema subcommands are rejected', () => {
   assert.deepEqual(plain, []);
 });
 
+test('a like source must be in the owning schema', () => {
+  const foreign = checkFixtureSql(
+    'fixture_alpha',
+    'CREATE TABLE plugin_fixture_alpha.copy (LIKE plugin_beta.note INCLUDING ALL);',
+  );
+  assert.ok(
+    foreign.some((item) => item.code === 'foreign_schema' && item.detail.toLowerCase() === 'plugin_beta.note'),
+    foreign.map((item) => `${item.code}:${item.detail}`).join(','),
+  );
+  const bare = checkFixtureSql(
+    'fixture_alpha',
+    'CREATE TABLE plugin_fixture_alpha.copy (LIKE note INCLUDING ALL);',
+  );
+  assert.ok(
+    bare.some((item) => item.code === 'unqualified_table' && item.detail.toLowerCase() === 'note'),
+    bare.map((item) => `${item.code}:${item.detail}`).join(','),
+  );
+  const own = checkFixtureSql(
+    'fixture_alpha',
+    'CREATE TABLE plugin_fixture_alpha.copy (LIKE plugin_fixture_alpha.note INCLUDING ALL);',
+  );
+  assert.deepEqual(own, []);
+});
+
 test('attaching a partition from another schema is rejected', () => {
   const found = checkFixtureSql(
     'fixture_alpha',

@@ -771,6 +771,51 @@ serial('a create schema view subcommand is not applied', async () => {
   }
 });
 
+serial('copying another plugin table with like is not applied', async () => {
+  await ready();
+  const id = 'like_src';
+  const schema = 'plugin_like_src';
+  const role = 'plerni_plugin_like_src';
+  const dir = mkdtempSync(join(tmpdir(), 'plerni-like-'));
+  const manifest = JSON.parse(readFileSync(join(packageDir, 'manifest.json'), 'utf8')) as Record<string, unknown>;
+  mkdirSync(join(dir, 'sql'));
+  writeFileSync(
+    join(dir, 'sql/0001_copy.sql'),
+    `CREATE SCHEMA IF NOT EXISTS ${schema};
+CREATE TABLE ${schema}.copy (LIKE plugin_beta.note INCLUDING ALL);
+GRANT SELECT ON TABLE ${schema}.copy TO ${role};
+`,
+  );
+  writeFileSync(join(dir, 'manifest.json'), JSON.stringify({
+    ...manifest,
+    id,
+    permissions: [],
+    migrations: ['sql/0001_copy.sql'],
+  }));
+  const admin = new pg.Client({ connectionString: ROOT });
+  const migrate = new pg.Client({ connectionString: MIGRATE });
+  admin.on('error', () => undefined);
+  migrate.on('error', () => undefined);
+  await admin.connect();
+  await migrate.connect();
+  try {
+    await assert.rejects(
+      () => migratePluginPackage({ admin, migrate, packageDir: dir }),
+      (error: unknown) => error instanceof PluginPackageError && error.message.includes('foreign_schema'),
+    );
+    const copied = await admin.query<{ rel: string | null }>(
+      'SELECT to_regclass($1)::text AS rel',
+      [`${schema}.copy`],
+    );
+    assert.equal(copied.rows[0]?.rel ?? null, null);
+  } finally {
+    await dropPackage(admin, id, schema, role);
+    await admin.end();
+    await migrate.end();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 serial('attaching another plugin partition does not link the child', async () => {
   await ready();
   const id = 'attach_x';
