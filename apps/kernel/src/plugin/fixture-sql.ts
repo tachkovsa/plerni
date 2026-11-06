@@ -63,8 +63,9 @@ function strip(sql: string): { text: string; escapeString: boolean; dollarIdent:
   let openComment = false;
   while (i < sql.length) {
     if (sql.startsWith('--', i)) {
-      const end = sql.indexOf('\n', i);
-      i = end === -1 ? sql.length : end + 1;
+      let end = i + 2;
+      while (end < sql.length && sql[end] !== '\n' && sql[end] !== '\r') end += 1;
+      i = end < sql.length ? end + 1 : sql.length;
       out += ' ';
       continue;
     }

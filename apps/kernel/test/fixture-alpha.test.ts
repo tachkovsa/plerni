@@ -677,6 +677,53 @@ serial('a nested block comment cannot delete through a read', async () => {
   }
 });
 
+serial('a carriage return cannot hide a delete after a line comment', async () => {
+  await ready();
+  await migrateFixture();
+  await withRoot(async (client) => {
+    await client.query('DELETE FROM plugin_fixture_alpha.note');
+    await client.query('DELETE FROM kernel.principal_grant');
+  });
+  const db = appDb(POOLED, 1);
+  try {
+    await withPluginRole(db, TENANT_A, PLUGIN, blankEvidence(), terminate, async (trx) => {
+      await sql`
+        INSERT INTO plugin_fixture_alpha.note (tenant_id, id, body)
+        VALUES (${TENANT_A}::uuid, '00000000-0000-4000-8000-0000000000f6'::uuid, 'alpha')`.execute(trx);
+    });
+    await allowPrincipal(db, {
+      tenantId: TENANT_A,
+      principalId: HOLDER,
+      pluginId: PLUGIN,
+      resource: 'note',
+      action: 'read',
+    }, blankEvidence(), terminate);
+    const forged = 'SELECT 1 -- comment\r; DELETE FROM plugin_fixture_alpha.note; COMMIT;';
+    await assert.rejects(
+      () => readPluginRows(db, {
+        tenantId: TENANT_A,
+        principalId: HOLDER,
+        pluginId: PLUGIN,
+        resource: 'note',
+        action: 'read',
+        statement: forged,
+      }, blankEvidence(), terminate),
+      (error: unknown) => error instanceof PluginPackageError && error.message.includes('unsupported'),
+    );
+    const honest = await readPluginRows(db, {
+      tenantId: TENANT_A,
+      principalId: HOLDER,
+      pluginId: PLUGIN,
+      resource: 'note',
+      action: 'read',
+      statement: READ_SQL,
+    }, blankEvidence(), terminate);
+    assert.deepEqual(honest.map((row) => row.body), ['alpha']);
+  } finally {
+    await db.destroy();
+  }
+});
+
 serial('attaching another plugin partition does not link the child', async () => {
   await ready();
   const id = 'attach_x';

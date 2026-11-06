@@ -166,6 +166,18 @@ test('a nested block comment cannot hide a following statement', () => {
   assert.deepEqual(kept, []);
 });
 
+test('a carriage return ends a line comment', () => {
+  const sqlText = 'SELECT 1 -- comment\r; DELETE FROM plugin_fixture_alpha.note; COMMIT;';
+  const found = checkFixtureSql('fixture_alpha', sqlText);
+  assert.ok(found.some((item) => item.code === 'unsupported'), found.map((item) => `${item.code}:${item.detail}`).join(','));
+  assert.throws(
+    () => assertFixtureRead('fixture_alpha', sqlText),
+    (error: unknown) => error instanceof PluginPackageError,
+  );
+  const kept = checkFixtureSql('fixture_alpha', 'SELECT id FROM plugin_fixture_alpha.note -- kept\r;');
+  assert.deepEqual(kept, []);
+});
+
 test('attaching a partition from another schema is rejected', () => {
   const found = checkFixtureSql(
     'fixture_alpha',
