@@ -178,6 +178,14 @@ test('a carriage return ends a line comment', () => {
   assert.deepEqual(kept, []);
 });
 
+test('create schema subcommands are rejected', () => {
+  const sqlText = 'CREATE SCHEMA plugin_fixture_alpha CREATE VIEW exposed AS SELECT * FROM plugin_beta.note GRANT USAGE ON SCHEMA plugin_fixture_alpha TO plerni_plugin_fixture_alpha GRANT SELECT ON TABLE plugin_fixture_alpha.exposed TO plerni_plugin_fixture_alpha;';
+  const found = checkFixtureSql('fixture_alpha', sqlText);
+  assert.ok(found.some((item) => item.code === 'unsupported'), found.map((item) => `${item.code}:${item.detail}`).join(','));
+  const plain = checkFixtureSql('fixture_alpha', 'CREATE SCHEMA IF NOT EXISTS plugin_fixture_alpha;');
+  assert.deepEqual(plain, []);
+});
+
 test('attaching a partition from another schema is rejected', () => {
   const found = checkFixtureSql(
     'fixture_alpha',

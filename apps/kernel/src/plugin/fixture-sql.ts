@@ -418,8 +418,12 @@ export function checkFixtureSql(pluginId: string, sqlText: string): FixtureSqlVi
     if (partitions) {
       for (const name of partitions) classify(name, expected, violations);
     }
-    const schema = /^create\s+schema\s+(?:if\s+not\s+exists\s+)?([a-z_][a-z0-9_]*)/i.exec(statement);
-    if (schema) {
+    if (/^create\s+schema\b/i.test(statement)) {
+      const schema = /^create\s+schema\s+(?:if\s+not\s+exists\s+)?([a-z_][a-z0-9_]*)\s*$/i.exec(statement);
+      if (!schema) {
+        violations.push({ code: 'unsupported', detail: statement.slice(0, 80) });
+        continue;
+      }
       if (schema[1] !== expected) violations.push({ code: 'foreign_schema', detail: schema[1] ?? 'schema' });
       continue;
     }

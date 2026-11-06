@@ -724,6 +724,53 @@ serial('a carriage return cannot hide a delete after a line comment', async () =
   }
 });
 
+serial('a create schema view subcommand is not applied', async () => {
+  await ready();
+  const id = 'schema_view';
+  const schema = 'plugin_schema_view';
+  const role = 'plerni_plugin_schema_view';
+  const dir = mkdtempSync(join(tmpdir(), 'plerni-schema-view-'));
+  const manifest = JSON.parse(readFileSync(join(packageDir, 'manifest.json'), 'utf8')) as Record<string, unknown>;
+  mkdirSync(join(dir, 'sql'));
+  writeFileSync(
+    join(dir, 'sql/0001_view.sql'),
+    `CREATE SCHEMA ${schema} CREATE VIEW exposed AS SELECT * FROM plugin_beta.note GRANT USAGE ON SCHEMA ${schema} TO ${role} GRANT SELECT ON TABLE ${schema}.exposed TO ${role};\n`,
+  );
+  writeFileSync(join(dir, 'manifest.json'), JSON.stringify({
+    ...manifest,
+    id,
+    permissions: [],
+    migrations: ['sql/0001_view.sql'],
+  }));
+  const admin = new pg.Client({ connectionString: ROOT });
+  const migrate = new pg.Client({ connectionString: MIGRATE });
+  admin.on('error', () => undefined);
+  migrate.on('error', () => undefined);
+  await admin.connect();
+  await migrate.connect();
+  try {
+    await assert.rejects(
+      () => migratePluginPackage({ admin, migrate, packageDir: dir }),
+      (error: unknown) => error instanceof PluginPackageError && error.message.includes('unsupported'),
+    );
+    const view = await admin.query<{ rel: string | null }>(
+      'SELECT to_regclass($1)::text AS rel',
+      [`${schema}.exposed`],
+    );
+    assert.equal(view.rows[0]?.rel ?? null, null);
+    const present = await admin.query<{ name: string | null }>(
+      'SELECT nspname AS name FROM pg_namespace WHERE nspname = $1',
+      [schema],
+    );
+    assert.equal(present.rows[0]?.name ?? null, null);
+  } finally {
+    await dropPackage(admin, id, schema, role);
+    await admin.end();
+    await migrate.end();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 serial('attaching another plugin partition does not link the child', async () => {
   await ready();
   const id = 'attach_x';
