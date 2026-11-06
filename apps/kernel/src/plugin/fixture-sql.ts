@@ -35,11 +35,32 @@ function dollarQuoteAt(sql: string, index: number): string | null {
   return tag?.[0] ?? null;
 }
 
-function strip(sql: string): { text: string; escapeString: boolean; dollarIdent: boolean } {
+/** PostgreSQL block comments nest, so an inner closer leaves the outer comment open. */
+function skipBlockComment(sql: string, start: number): { next: number; closed: boolean } {
+  let i = start + 2;
+  let depth = 1;
+  while (i < sql.length && depth > 0) {
+    if (sql.startsWith('/*', i)) {
+      depth += 1;
+      i += 2;
+      continue;
+    }
+    if (sql.startsWith('*/', i)) {
+      depth -= 1;
+      i += 2;
+      continue;
+    }
+    i += 1;
+  }
+  return { next: i, closed: depth === 0 };
+}
+
+function strip(sql: string): { text: string; escapeString: boolean; dollarIdent: boolean; openComment: boolean } {
   let out = '';
   let i = 0;
   let escapeString = false;
   let dollarIdent = false;
+  let openComment = false;
   while (i < sql.length) {
     if (sql.startsWith('--', i)) {
       const end = sql.indexOf('\n', i);
@@ -48,8 +69,9 @@ function strip(sql: string): { text: string; escapeString: boolean; dollarIdent:
       continue;
     }
     if (sql.startsWith('/*', i)) {
-      const end = sql.indexOf('*/', i + 2);
-      i = end === -1 ? sql.length : end + 2;
+      const comment = skipBlockComment(sql, i);
+      if (!comment.closed) openComment = true;
+      i = comment.next;
       out += ' ';
       continue;
     }
@@ -83,7 +105,7 @@ function strip(sql: string): { text: string; escapeString: boolean; dollarIdent:
     out += sql[i];
     i += 1;
   }
-  return { text: out, escapeString, dollarIdent };
+  return { text: out, escapeString, dollarIdent, openComment };
 }
 
 function isRoutine(statement: string): boolean {
@@ -357,6 +379,7 @@ export function checkFixtureSql(pluginId: string, sqlText: string): FixtureSqlVi
   if (stripped.escapeString) return [{ code: 'unsupported', detail: 'escape string' }];
   // `$` that did not open a dollar quote is part of an identifier or a placeholder.
   if (stripped.dollarIdent) return [{ code: 'unsupported', detail: 'dollar' }];
+  if (stripped.openComment) return [{ code: 'unsupported', detail: 'comment' }];
   const parts = stripped.text.split(';');
   for (const part of parts) {
     const statement = part.trim();
