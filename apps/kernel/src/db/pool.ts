@@ -49,3 +49,8 @@ export function discardPoolerSessions(db: Kysely<Database>): number {
 export function unblockPool(db: Kysely<Database>): void {
   discardPoolerSessions(db);
 }
+
+/** A connection-scoped Kysely shares the pool so hygiene can discard its sockets. */
+export function sharePool(target: Kysely<Database>, source: Kysely<Database>): void {
+  pools.set(target, poolOf(source));
+}

@@ -1,0 +1,24 @@
+{
+  "id": "fixture_alpha",
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  "sdk": ">=0.0.0",
+  "provides": [],
+  "requires": [],
+  "optionalRequires": [],
+  "permissions": [
+    {
+      "namespace": "fixture_alpha",
+      "resource": "note",
+      "action": "read",
+      "suggestedRoleMappings": []
+    }
+  ],
+  "routes": [],
+  "events": [],
+  "jobs": [],
+  "migrations": ["sql/0001_note.sql"],
+  "ui": [],
+  "grants": ["db.own_schema"],
+  "classification": []
+}

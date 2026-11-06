@@ -331,19 +331,24 @@ serial('catalog: tenants have no policy, plugin role cannot select, runtime role
        WHERE n.nspname = 'kernel' AND c.relname = 'tenants'`,
     );
     assert.equal(grants.rows.some((grant) => grant.grantee === 'PUBLIC'), false);
-    assert.equal(grants.rows.some((grant) => grant.grantee === 'plerni_plugin_a'), false);
+    assert.equal(grants.rows.some((grant) => grant.grantee.startsWith('plerni_plugin_')), false);
     const roles = await client.query<{ rolname: string; rolsuper: boolean; rolbypassrls: boolean }>(
       `SELECT rolname, rolsuper, rolbypassrls
        FROM pg_roles
        WHERE rolname LIKE 'plerni\\_%' ESCAPE '\\'
        ORDER BY rolname`,
     );
-    assert.deepEqual(roles.rows.map((role) => role.rolname), [
-      'plerni_admin_ro',
-      'plerni_app',
-      'plerni_migrate',
-      'plerni_plugin_a',
-    ]);
+    const names = roles.rows.map((role) => role.rolname);
+    for (const required of ['plerni_admin_ro', 'plerni_app', 'plerni_migrate', 'plerni_plugin_a']) {
+      assert.ok(names.includes(required), required);
+    }
+    // A package role (K17) may exist beside the harness fixture. It is still
+    // NOBYPASSRLS, and the grant check above rejects every plerni_plugin_* grantee.
+    const harness = new Set(['plerni_admin_ro', 'plerni_app', 'plerni_migrate', 'plerni_plugin_a']);
+    for (const name of names) {
+      if (harness.has(name)) continue;
+      assert.match(name, /^plerni_plugin_[a-z][a-z0-9_]{0,40}$/);
+    }
     assert.equal(roles.rows.every((role) => role.rolsuper === false && role.rolbypassrls === false), true);
     const routines = await client.query<{ count: string }>(
       `SELECT count(*)::text AS count

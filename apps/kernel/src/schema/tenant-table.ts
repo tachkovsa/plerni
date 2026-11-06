@@ -2,7 +2,9 @@
 // Live-database shape check for one tenant-domain table (spec §4.6).
 import type pg from 'pg';
 
-const IDENT = /^[a-z][a-z0-9_]{0,40}$/;
+const TABLE_IDENT = /^[a-z][a-z0-9_]{0,40}$/;
+/** Plugin schemas are `plugin_` plus a manifest id, which can be 41 characters. */
+const SCHEMA_IDENT = /^[a-z][a-z0-9_]{0,62}$/;
 const DML = new Set(['SELECT', 'INSERT', 'UPDATE', 'DELETE']);
 
 /** Deparsed form of the canonical predicate, observed on PostgreSQL 18. */
@@ -31,6 +33,10 @@ export interface TenantTableSpec {
   schema: string;
   table: string;
   foreignKey?: string;
+  /** DML grantee. Kernel tables leave this as plerni_app. A plugin table names its schema role. */
+  runtimeRole?: string;
+  /** Every foreign key must pair tenant_id with the referenced tenant_id. */
+  tenantForeignKeys?: boolean;
 }
 
 export interface Queryable {
@@ -40,8 +46,13 @@ export interface Queryable {
   ): Promise<pg.QueryResult<T>>;
 }
 
-function ident(value: string): string {
-  if (!IDENT.test(value)) throw new Error(`refusing unexpected identifier: ${value}`);
+function schemaIdent(value: string): string {
+  if (!SCHEMA_IDENT.test(value)) throw new Error(`refusing unexpected identifier: ${value}`);
+  return value;
+}
+
+function tableIdent(value: string): string {
+  if (!TABLE_IDENT.test(value)) throw new Error(`refusing unexpected identifier: ${value}`);
   return value;
 }
 
@@ -49,8 +60,8 @@ export async function inspectTenantTable(
   client: Queryable,
   spec: TenantTableSpec,
 ): Promise<TenantTableViolation[]> {
-  const schema = ident(spec.schema);
-  const table = ident(spec.table);
+  const schema = schemaIdent(spec.schema);
+  const table = tableIdent(spec.table);
   const label = `${schema}.${table}`;
   const violations: TenantTableViolation[] = [];
   const regclass = `${schema}.${table}`;
@@ -148,10 +159,50 @@ export async function inspectTenantTable(
      WHERE n.nspname = $1 AND c.relname = $2`,
     [schema, table],
   );
+  const runtimeRole = spec.runtimeRole ?? 'plerni_app';
   for (const grant of grants.rows) {
     if (grant.grantee === row.owner) continue;
-    if (grant.grantee === 'plerni_app' && DML.has(grant.privilege_type)) continue;
+    if (grant.grantee === runtimeRole && DML.has(grant.privilege_type)) continue;
     violations.push({ table: label, code: 'privilege', detail: `${grant.grantee} ${grant.privilege_type}` });
+  }
+
+  if (spec.tenantForeignKeys) {
+    const foreignKeys = await client.query<{
+      oid: string;
+      def: string;
+      src_col: string;
+      dst_col: string;
+      ref_schema: string;
+    }>(
+      `SELECT c.oid::text AS oid,
+              pg_get_constraintdef(c.oid) AS def,
+              src.attname AS src_col,
+              dst.attname AS dst_col,
+              rn.nspname AS ref_schema
+       FROM pg_constraint c
+       JOIN pg_class rc ON rc.oid = c.confrelid
+       JOIN pg_namespace rn ON rn.oid = rc.relnamespace
+       JOIN LATERAL generate_subscripts(c.conkey, 1) AS s(i) ON true
+       JOIN pg_attribute src
+         ON src.attrelid = c.conrelid AND src.attnum = c.conkey[s.i] AND NOT src.attisdropped
+       JOIN pg_attribute dst
+         ON dst.attrelid = c.confrelid AND dst.attnum = c.confkey[s.i] AND NOT dst.attisdropped
+       WHERE c.conrelid = $1::regclass AND c.contype = 'f'
+       ORDER BY c.oid, s.i`,
+      [regclass],
+    );
+    const grouped = new Map<string, { def: string; refSchema: string; pairs: { src: string; dst: string }[] }>();
+    for (const fk of foreignKeys.rows) {
+      const group = grouped.get(fk.oid) ?? { def: fk.def, refSchema: fk.ref_schema, pairs: [] };
+      group.pairs.push({ src: fk.src_col, dst: fk.dst_col });
+      grouped.set(fk.oid, group);
+    }
+    for (const fk of grouped.values()) {
+      const paired = fk.pairs.some((pair) => pair.src === 'tenant_id' && pair.dst === 'tenant_id');
+      if (fk.refSchema !== schema || !paired) {
+        violations.push({ table: label, code: 'foreign_key', detail: fk.def });
+      }
+    }
   }
 
   if (spec.foreignKey !== undefined) {
