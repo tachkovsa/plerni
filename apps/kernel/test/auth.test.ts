@@ -16,6 +16,7 @@ import {
   BootstrapRejectedError,
   FreshnessExpiredError,
   IdentityForbiddenError,
+  IdentityValidationError,
   LoginRejectedError,
   SessionRejectedError,
   ThrottledError,
@@ -883,6 +884,214 @@ serial('a disabled account stays disabled for rescue and login', async () => {
       }, installed.operator.userId, context(new Sink()).ctx),
       (error: unknown) => error instanceof IdentityForbiddenError,
     );
+  } finally {
+    await db.destroy();
+  }
+});
+
+function rendezvous(parties: number): () => Promise<void> {
+  let arrived = 0;
+  let openGate: () => void = () => undefined;
+  const opened = new Promise<void>((resolve) => {
+    openGate = resolve;
+  });
+  return () => {
+    arrived += 1;
+    if (arrived >= parties) openGate();
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('race barrier timed out')), 10_000);
+      void opened.then(() => {
+        clearTimeout(timer);
+        resolve();
+      }, reject);
+    });
+  };
+}
+
+serial('two admins cannot disable each other out of the last enabled admin', async () => {
+  await ready();
+  await resetIdentity();
+  const credential = secret();
+  const password = secret();
+  const secondPassword = secret();
+  const left = appDb(POOLED, 1);
+  const right = appDb(POOLED, 1);
+  try {
+    const installed = await withCredential(credential, () => bootstrapInstallation(left, {
+      credential,
+      operatorEmail: email('operator'),
+      operatorPassword: password,
+      customerEmail: email('customer'),
+      customerPassword: password,
+    }, context(new Sink()).ctx));
+    const customerEmail = await withRoot(async (client) => {
+      const result = await client.query<{ email: string }>(
+        'SELECT email FROM kernel.user_account WHERE id = $1',
+        [installed.customer.userId],
+      );
+      return result.rows[0]?.email ?? '';
+    });
+    const first = await login(left, {
+      tenantId: installed.customer.tenantId,
+      email: customerEmail,
+      password,
+    }, context(new Sink()).ctx);
+    const secondEmail = email('admin');
+    const second = await createUser(left, {
+      tenantId: installed.customer.tenantId,
+      token: first.token,
+    }, { email: secondEmail, password: secondPassword, kind: 'admin' }, context(new Sink()).ctx);
+    const secondSession = await login(right, {
+      tenantId: installed.customer.tenantId,
+      email: secondEmail,
+      password: secondPassword,
+    }, context(new Sink()).ctx);
+    const arrived = rendezvous(2);
+    const actor = { tenantId: installed.customer.tenantId };
+    const results = await Promise.allSettled([
+      disableUser(left, { ...actor, token: first.token }, first.userId, context(new Sink()).ctx, {
+        beforeAdminLock: async () => arrived(),
+      }),
+      disableUser(right, { ...actor, token: secondSession.token }, second.userId, context(new Sink()).ctx, {
+        beforeAdminLock: async () => arrived(),
+      }),
+    ]);
+    const fulfilled = results.filter((item) => item.status === 'fulfilled');
+    const rejected = results.filter((item) => item.status === 'rejected');
+    assert.equal(fulfilled.length, 1);
+    assert.equal(rejected.length, 1);
+    assert.equal(
+      rejected[0]?.status === 'rejected' && rejected[0].reason instanceof IdentityForbiddenError,
+      true,
+    );
+    const enabled = await withRoot(async (client) => client.query<{ count: string }>(
+      `SELECT count(*)::text AS count
+       FROM kernel.user_account u
+       JOIN kernel.user_auth_state s ON s.tenant_id = u.tenant_id AND s.id = u.id
+       WHERE u.tenant_id = $1 AND u.kind = 'admin' AND s.disabled_at IS NULL`,
+      [installed.customer.tenantId],
+    ));
+    assert.equal(enabled.rows[0]?.count, '1');
+  } finally {
+    await left.destroy();
+    await right.destroy();
+  }
+});
+
+serial('recovery throttles before hashing and a used reset token dies with the password', async () => {
+  await ready();
+  await resetIdentity();
+  const credential = secret();
+  const password = secret();
+  const nextPassword = secret();
+  const db = appDb(POOLED, 1);
+  try {
+    const installed = await withCredential(credential, () => bootstrapInstallation(db, {
+      credential,
+      operatorEmail: email('operator'),
+      operatorPassword: password,
+      customerEmail: email('customer'),
+      customerPassword: password,
+    }, context(new Sink()).ctx));
+    const customerEmail = await withRoot(async (client) => {
+      const result = await client.query<{ email: string }>(
+        'SELECT email FROM kernel.user_account WHERE id = $1',
+        [installed.customer.userId],
+      );
+      return result.rows[0]?.email ?? '';
+    });
+    await assert.rejects(
+      () => recoverWithRescueCode(db, {
+        tenantId: installed.customer.tenantId,
+        email: customerEmail,
+        code: 'not-a-code',
+        password: 'x',
+      }, context(new Sink()).ctx),
+      (error: unknown) => error instanceof LoginRejectedError && !(error instanceof IdentityValidationError),
+    );
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      await assert.rejects(
+        () => recoverWithRescueCode(db, {
+          tenantId: installed.customer.tenantId,
+          email: customerEmail,
+          code: 'AAAA-AAAA-AAAA-AAAA',
+          password: 'x',
+        }, context(new Sink()).ctx),
+        (error: unknown) => error instanceof LoginRejectedError,
+      );
+    }
+    await assert.rejects(
+      () => recoverWithRescueCode(db, {
+        tenantId: installed.customer.tenantId,
+        email: customerEmail,
+        code: 'AAAA-AAAA-AAAA-AAAA',
+        password: 'x',
+      }, context(new Sink()).ctx),
+      (error: unknown) => error instanceof ThrottledError,
+    );
+    const firstReset = await requestPasswordReset(db, {
+      tenantId: installed.operator.tenantId,
+      email: (await withRoot(async (client) => {
+        const result = await client.query<{ email: string }>(
+          'SELECT email FROM kernel.user_account WHERE id = $1',
+          [installed.operator.userId],
+        );
+        return result.rows[0]?.email ?? '';
+      })),
+    }, context(new Sink()).ctx);
+    const operatorEmail = await withRoot(async (client) => {
+      const result = await client.query<{ email: string }>(
+        'SELECT email FROM kernel.user_account WHERE id = $1',
+        [installed.operator.userId],
+      );
+      return result.rows[0]?.email ?? '';
+    });
+    const secondReset = await requestPasswordReset(db, {
+      tenantId: installed.operator.tenantId,
+      email: operatorEmail,
+    }, context(new Sink()).ctx);
+    if (!firstReset.token || !secondReset.token) throw new Error('reset token missing');
+    await confirmPasswordReset(db, {
+      tenantId: installed.operator.tenantId,
+      token: firstReset.token,
+      password: nextPassword,
+    }, context(new Sink()).ctx);
+    await assert.rejects(
+      () => confirmPasswordReset(db, {
+        tenantId: installed.operator.tenantId,
+        token: secondReset.token ?? '',
+        password: secret(),
+      }, context(new Sink()).ctx),
+      (error: unknown) => error instanceof LoginRejectedError,
+    );
+    const code = installed.operator.rescueCodes[0];
+    if (!code) throw new Error('rescue code missing');
+    const leftover = await requestPasswordReset(db, {
+      tenantId: installed.operator.tenantId,
+      email: operatorEmail,
+    }, context(new Sink()).ctx);
+    if (!leftover.token) throw new Error('reset token missing');
+    const leftoverToken = leftover.token;
+    const rescuePassword = secret();
+    await recoverWithRescueCode(db, {
+      tenantId: installed.operator.tenantId,
+      email: operatorEmail,
+      code,
+      password: rescuePassword,
+    }, context(new Sink()).ctx);
+    await assert.rejects(
+      () => confirmPasswordReset(db, {
+        tenantId: installed.operator.tenantId,
+        token: leftoverToken,
+        password: secret(),
+      }, context(new Sink()).ctx),
+      (error: unknown) => error instanceof LoginRejectedError,
+    );
+    await login(db, {
+      tenantId: installed.operator.tenantId,
+      email: operatorEmail,
+      password: rescuePassword,
+    }, context(new Sink()).ctx);
   } finally {
     await db.destroy();
   }

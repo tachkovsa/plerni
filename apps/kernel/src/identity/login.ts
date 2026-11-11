@@ -1,19 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
-import { randomUUID } from 'node:crypto';
-import { sql, type Kysely, type Transaction } from 'kysely';
+import { sql, type Kysely } from 'kysely';
 import type { Database } from '../db/database.ts';
 import { assertTenantContext } from '../tenancy/guard.ts';
 import { withTenant } from '../tenancy/hygiene.ts';
-import {
-  THROTTLE_LIMIT,
-  THROTTLE_WINDOW_MINUTES,
-  canonicalEmail,
-  canonicalUuid,
-  type IdentityContext,
-} from './context.ts';
+import { canonicalEmail, canonicalUuid, type IdentityContext } from './context.ts';
 import { AccountDisabledError, LoginRejectedError, ThrottledError } from './errors.ts';
 import { hashArgon2id, verifyPassword } from './password.ts';
 import { insertSession, lifetimeFor, asEpoch, writeAuthAudit } from './store.ts';
+import { clearFailures, loginSubject, recordFailure, throttled } from './throttle.ts';
 import { newSecretToken, sha256Hex } from './token.ts';
 
 let dummyHash: Promise<string> | undefined;
@@ -21,42 +15,6 @@ let dummyHash: Promise<string> | undefined;
 function missingAccountHash(): Promise<string> {
   dummyHash ??= hashArgon2id(new TextEncoder().encode('missing-account-dummy'));
   return dummyHash;
-}
-
-async function throttled(trx: Transaction<Database>, tenantId: string, subject: string): Promise<boolean> {
-  const result = await sql<{ failures: number; expired: boolean }>`
-    SELECT failures,
-           (window_started_at + make_interval(mins => ${THROTTLE_WINDOW_MINUTES}::int) <= clock_timestamp()) AS expired
-    FROM kernel.login_throttle
-    WHERE tenant_id = ${tenantId}::uuid AND subject_hash = ${subject}`.execute(trx);
-  const row = result.rows[0];
-  return Boolean(row && !row.expired && row.failures >= THROTTLE_LIMIT);
-}
-
-async function recordFailure(trx: Transaction<Database>, tenantId: string, subject: string): Promise<void> {
-  await sql`
-    INSERT INTO kernel.login_throttle (tenant_id, id, subject_hash, failures, window_started_at)
-    VALUES (${tenantId}::uuid, ${randomUUID()}::uuid, ${subject}, 1, clock_timestamp())
-    ON CONFLICT (tenant_id, subject_hash) DO UPDATE
-    SET failures = CASE
-          WHEN kernel.login_throttle.window_started_at
-               + make_interval(mins => ${THROTTLE_WINDOW_MINUTES}::int) <= clock_timestamp()
-          THEN 1
-          ELSE kernel.login_throttle.failures + 1
-        END,
-        window_started_at = CASE
-          WHEN kernel.login_throttle.window_started_at
-               + make_interval(mins => ${THROTTLE_WINDOW_MINUTES}::int) <= clock_timestamp()
-          THEN clock_timestamp()
-          ELSE kernel.login_throttle.window_started_at
-        END`.execute(trx);
-}
-
-async function clearFailures(trx: Transaction<Database>, tenantId: string, subject: string): Promise<void> {
-  await sql`
-    UPDATE kernel.login_throttle
-    SET failures = 0, window_started_at = clock_timestamp()
-    WHERE tenant_id = ${tenantId}::uuid AND subject_hash = ${subject}`.execute(trx);
 }
 
 export interface LoginResult {
@@ -72,7 +30,7 @@ export async function login(
 ): Promise<LoginResult> {
   const tenantId = canonicalUuid(input.tenantId);
   const email = canonicalEmail(input.email);
-  const subject = sha256Hex(email);
+  const subject = loginSubject(email);
   const result = await withTenant(db, tenantId, ctx.evidence, ctx.terminate, async (trx) => {
     await assertTenantContext(trx);
     if (await throttled(trx, tenantId, subject)) {

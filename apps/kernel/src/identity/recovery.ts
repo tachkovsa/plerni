@@ -8,10 +8,11 @@ import type { Database } from '../db/database.ts';
 import { assertTenantContext } from '../tenancy/guard.ts';
 import { withTenant } from '../tenancy/hygiene.ts';
 import { RESET_MINUTES, canonicalEmail, canonicalUuid, type IdentityContext } from './context.ts';
-import { AccountDisabledError, LoginRejectedError } from './errors.ts';
+import { AccountDisabledError, LoginRejectedError, ThrottledError } from './errors.ts';
 import { hashPassword } from './password.ts';
 import { rescueCodeMatches } from './rescue.ts';
 import { bumpEpoch, notifyIdentity, revokeSessions, writeAuthAudit } from './store.ts';
+import { clearFailures, recordFailure, recoverySubject, throttled } from './throttle.ts';
 import { newSecretToken, sha256Hex } from './token.ts';
 
 async function rejectDisabled(trx: Transaction<Database>, tenantId: string, userId: string): Promise<void> {
@@ -36,6 +37,12 @@ async function replacePassword(
     WHERE tenant_id = ${tenantId}::uuid AND id = ${userId}::uuid`.execute(trx);
   const epoch = await bumpEpoch(trx, tenantId, userId);
   await revokeSessions(trx, tenantId, userId);
+  await sql`
+    UPDATE kernel.password_reset
+    SET consumed_at = clock_timestamp()
+    WHERE tenant_id = ${tenantId}::uuid
+      AND user_id = ${userId}::uuid
+      AND consumed_at IS NULL`.execute(trx);
   await writeAuthAudit(trx, {
     tenantId,
     action,
@@ -89,26 +96,36 @@ export async function confirmPasswordReset(
 ): Promise<void> {
   const tenantId = canonicalUuid(input.tenantId);
   const tokenHash = sha256Hex(input.token);
-  const passwordHash = await hashPassword(input.password);
-  await withTenant(db, tenantId, ctx.evidence, ctx.terminate, async (trx) => {
+  const found = await withTenant(db, tenantId, ctx.evidence, ctx.terminate, async (trx) => {
     await assertTenantContext(trx);
-    const found = await sql<{ id: string; user_id: string; expired: boolean; consumed: boolean }>`
+    const rows = await sql<{ id: string; user_id: string; expired: boolean; consumed: boolean }>`
       SELECT id::text AS id, user_id::text AS user_id,
              (expires_at <= clock_timestamp()) AS expired,
              (consumed_at IS NOT NULL) AS consumed
       FROM kernel.password_reset
-      WHERE tenant_id = ${tenantId}::uuid AND token_hash = ${tokenHash}
-      FOR UPDATE`.execute(trx);
-    const row = found.rows[0];
-    if (!row || row.expired || row.consumed) throw new LoginRejectedError();
-    await rejectDisabled(trx, tenantId, row.user_id);
+      WHERE tenant_id = ${tenantId}::uuid AND token_hash = ${tokenHash}`.execute(trx);
+    const row = rows.rows[0];
+    if (!row || row.expired || row.consumed) return null;
+    const disabled = await sql<{ disabled: boolean }>`
+      SELECT (disabled_at IS NOT NULL) AS disabled
+      FROM kernel.user_auth_state
+      WHERE tenant_id = ${tenantId}::uuid AND id = ${row.user_id}::uuid`.execute(trx);
+    if (disabled.rows[0]?.disabled) return 'disabled' as const;
+    return { id: row.id, userId: row.user_id };
+  });
+  if (found === 'disabled') throw new AccountDisabledError();
+  if (!found) throw new LoginRejectedError();
+  const passwordHash = await hashPassword(input.password);
+  await withTenant(db, tenantId, ctx.evidence, ctx.terminate, async (trx) => {
+    await assertTenantContext(trx);
+    await rejectDisabled(trx, tenantId, found.userId);
     const consumed = await sql<{ id: string }>`
       UPDATE kernel.password_reset
       SET consumed_at = clock_timestamp()
-      WHERE tenant_id = ${tenantId}::uuid AND id = ${row.id}::uuid AND consumed_at IS NULL
+      WHERE tenant_id = ${tenantId}::uuid AND id = ${found.id}::uuid AND consumed_at IS NULL
       RETURNING id::text AS id`.execute(trx);
     if (!consumed.rows[0]) throw new LoginRejectedError();
-    await replacePassword(trx, tenantId, row.user_id, passwordHash, 'reset');
+    await replacePassword(trx, tenantId, found.userId, passwordHash, 'reset');
   });
   ctx.log.event('password.reset', { tenantId, action: 'reset', outcome: 'accepted' });
 }
@@ -120,38 +137,95 @@ export async function recoverWithRescueCode(
 ): Promise<void> {
   const tenantId = canonicalUuid(input.tenantId);
   const email = canonicalEmail(input.email);
-  const passwordHash = await hashPassword(input.password);
-  await withTenant(db, tenantId, ctx.evidence, ctx.terminate, async (trx) => {
+  const subject = recoverySubject(email);
+  const listed = await withTenant(db, tenantId, ctx.evidence, ctx.terminate, async (trx) => {
     await assertTenantContext(trx);
+    if (await throttled(trx, tenantId, subject)) return { ok: false as const, reason: 'throttled' as const };
     const found = await sql<{ id: string; disabled: boolean }>`
       SELECT u.id::text AS id, (s.disabled_at IS NOT NULL) AS disabled
       FROM kernel.user_account u
       JOIN kernel.user_auth_state s ON s.tenant_id = u.tenant_id AND s.id = u.id
-      WHERE u.tenant_id = ${tenantId}::uuid AND u.email = ${email}
-      FOR UPDATE OF s`.execute(trx);
+      WHERE u.tenant_id = ${tenantId}::uuid AND u.email = ${email}`.execute(trx);
     const account = found.rows[0];
-    if (!account) throw new LoginRejectedError();
-    if (account.disabled) throw new AccountDisabledError();
+    if (!account) {
+      await recordFailure(trx, tenantId, subject);
+      await writeAuthAudit(trx, {
+        tenantId,
+        action: 'rescue',
+        actorUserId: null,
+        targetUserId: null,
+        sessionHash: null,
+        epochBefore: null,
+        epochAfter: null,
+        reason: 'password',
+      });
+      return { ok: false as const, reason: 'rejected' as const };
+    }
+    if (account.disabled) return { ok: false as const, reason: 'disabled' as const };
     const codes = await sql<{ id: string; code_hash: string }>`
       SELECT id::text AS id, code_hash
       FROM kernel.rescue_code
-      WHERE tenant_id = ${tenantId}::uuid AND user_id = ${account.id}::uuid AND consumed_at IS NULL
-      FOR UPDATE`.execute(trx);
-    let matched: string | null = null;
-    for (const row of codes.rows) {
-      if (await rescueCodeMatches(row.code_hash, input.code)) {
-        matched = row.id;
-        break;
-      }
+      WHERE tenant_id = ${tenantId}::uuid AND user_id = ${account.id}::uuid AND consumed_at IS NULL`.execute(trx);
+    return { ok: true as const, userId: account.id, codes: codes.rows };
+  });
+  if (!listed.ok) {
+    ctx.log.event('account.rescue', {
+      tenantId,
+      action: 'rescue',
+      outcome: listed.reason === 'throttled' ? 'throttled' : listed.reason === 'disabled' ? 'disabled' : 'rejected',
+    });
+    if (listed.reason === 'throttled') throw new ThrottledError();
+    if (listed.reason === 'disabled') throw new AccountDisabledError();
+    throw new LoginRejectedError();
+  }
+  let matched: string | null = null;
+  for (const row of listed.codes) {
+    if (await rescueCodeMatches(row.code_hash, input.code)) {
+      matched = row.id;
+      break;
     }
-    if (!matched) throw new LoginRejectedError();
+  }
+  if (!matched) {
+    await withTenant(db, tenantId, ctx.evidence, ctx.terminate, async (trx) => {
+      await assertTenantContext(trx);
+      await recordFailure(trx, tenantId, subject);
+      await writeAuthAudit(trx, {
+        tenantId,
+        action: 'rescue',
+        actorUserId: null,
+        targetUserId: listed.userId,
+        sessionHash: null,
+        epochBefore: null,
+        epochAfter: null,
+        reason: 'password',
+      });
+    });
+    ctx.log.event('account.rescue', { tenantId, action: 'rescue', outcome: 'rejected' });
+    throw new LoginRejectedError();
+  }
+  const codeId = matched;
+  const passwordHash = await hashPassword(input.password);
+  const saved = await withTenant(db, tenantId, ctx.evidence, ctx.terminate, async (trx) => {
+    await assertTenantContext(trx);
+    if (await throttled(trx, tenantId, subject)) return 'throttled' as const;
+    const disabled = await sql<{ disabled: boolean }>`
+      SELECT (disabled_at IS NOT NULL) AS disabled
+      FROM kernel.user_auth_state
+      WHERE tenant_id = ${tenantId}::uuid AND id = ${listed.userId}::uuid
+      FOR UPDATE`.execute(trx);
+    if (disabled.rows[0]?.disabled) return 'disabled' as const;
     const consumed = await sql<{ id: string }>`
       UPDATE kernel.rescue_code
       SET consumed_at = clock_timestamp()
-      WHERE tenant_id = ${tenantId}::uuid AND id = ${matched}::uuid AND consumed_at IS NULL
+      WHERE tenant_id = ${tenantId}::uuid AND id = ${codeId}::uuid AND consumed_at IS NULL
       RETURNING id::text AS id`.execute(trx);
-    if (!consumed.rows[0]) throw new LoginRejectedError();
-    await replacePassword(trx, tenantId, account.id, passwordHash, 'rescue');
+    if (!consumed.rows[0]) return 'rejected' as const;
+    await clearFailures(trx, tenantId, subject);
+    await replacePassword(trx, tenantId, listed.userId, passwordHash, 'rescue');
+    return 'ok' as const;
   });
+  if (saved === 'throttled') throw new ThrottledError();
+  if (saved === 'disabled') throw new AccountDisabledError();
+  if (saved === 'rejected') throw new LoginRejectedError();
   ctx.log.event('account.rescue', { tenantId, action: 'rescue', outcome: 'accepted' });
 }

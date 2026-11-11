@@ -17,6 +17,8 @@ export interface DisableResult {
 }
 
 export interface DisableHooks {
+  /** Runs before the shared admin-row lock, so a race can arrive first. */
+  beforeAdminLock?(trx: Transaction<Database>): Promise<void>;
   afterWrite?(trx: Transaction<Database>): Promise<void>;
 }
 
@@ -33,6 +35,22 @@ export async function disableUser(
     await assertTenantContext(trx);
     const admin = await requireSession(trx, tenantId, actor.token, 'sensitive', leaseOf(ctx));
     if (admin.sessionKind !== 'admin') throw new IdentityForbiddenError();
+    const kind = await sql<{ kind: string }>`
+      SELECT kind FROM kernel.user_account
+      WHERE tenant_id = ${tenantId}::uuid AND id = ${target}::uuid`.execute(trx);
+    const accountKind = kind.rows[0]?.kind;
+    if (!accountKind) throw new IdentityNotFoundError();
+    if (accountKind === 'admin') {
+      // Both self-disables must take the same rows, in id order, before either counts.
+      if (hooks.beforeAdminLock) await hooks.beforeAdminLock(trx);
+      await sql`
+        SELECT s.id
+        FROM kernel.user_auth_state s
+        JOIN kernel.user_account u ON u.tenant_id = s.tenant_id AND u.id = s.id
+        WHERE s.tenant_id = ${tenantId}::uuid AND u.kind = 'admin'
+        ORDER BY s.id
+        FOR UPDATE OF s`.execute(trx);
+    }
     const locked = await sql<{ epoch: string; disabled: boolean }>`
       SELECT revocation_epoch::text AS epoch, (disabled_at IS NOT NULL) AS disabled
       FROM kernel.user_auth_state
@@ -40,10 +58,7 @@ export async function disableUser(
       FOR UPDATE`.execute(trx);
     const state = locked.rows[0];
     if (!state) throw new IdentityNotFoundError();
-    const kind = await sql<{ kind: string }>`
-      SELECT kind FROM kernel.user_account
-      WHERE tenant_id = ${tenantId}::uuid AND id = ${target}::uuid`.execute(trx);
-    if (kind.rows[0]?.kind === 'admin') {
+    if (accountKind === 'admin') {
       const others = await sql<{ count: string }>`
         SELECT count(*)::text AS count
         FROM kernel.user_account u
