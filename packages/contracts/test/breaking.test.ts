@@ -152,6 +152,36 @@ test('adding a request format tightens the request', () => {
   assert.ok(breaks.some((item) => item.kind === 'request_tightened' && item.detail === 'format added'));
 });
 
+test('dropping the message type loosens the response', () => {
+  const before = clone();
+  const next = clone();
+  const message = next.components.schemas.ErrorEnvelope?.properties?.message;
+  assert.equal(message?.type, 'string');
+  delete message.type;
+  const breaks = unversionedRouteBreaks(before, next);
+  assert.ok(breaks.some((item) => item.kind === 'response_loosened' && item.detail === 'type removed'));
+});
+
+test('removing a request type is not a tightening', () => {
+  const before = clone();
+  const next = clone();
+  const key = requestSchema(next).properties?.idempotencyKey;
+  assert.equal(key?.type, 'string');
+  delete key.type;
+  const breaks = unversionedRouteBreaks(before, next);
+  assert.equal(breaks.some((item) => item.kind === 'request_tightened'), false);
+});
+
+test('adding a request type tightens the request', () => {
+  const before = clone();
+  const next = clone();
+  const beforeKey = requestSchema(before).properties?.idempotencyKey;
+  assert.ok(beforeKey);
+  delete beforeKey.type;
+  const breaks = unversionedRouteBreaks(before, next);
+  assert.ok(breaks.some((item) => item.kind === 'request_tightened' && item.detail === 'type added'));
+});
+
 test('removing a request format is not a tightening', () => {
   const before = clone();
   const next = clone();

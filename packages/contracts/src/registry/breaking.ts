@@ -41,10 +41,30 @@ function resolve(document: OpenApiDocument, schema: SchemaObject | undefined, se
   return resolve(document, target, seen);
 }
 
-function typesOf(schema: SchemaObject): string[] {
+/** A missing type accepts every value. An empty type list accepts none. */
+function typesOf(schema: SchemaObject): string[] | null {
+  if (schema.type === undefined) return null;
   if (Array.isArray(schema.type)) return schema.type;
   if (typeof schema.type === 'string') return [schema.type];
-  return [];
+  return null;
+}
+
+function typeTightened(before: SchemaObject, after: SchemaObject): 'type added' | 'type narrowed' | null {
+  const beforeTypes = typesOf(before);
+  const afterTypes = typesOf(after);
+  if (beforeTypes === null && afterTypes === null) return null;
+  if (beforeTypes === null && afterTypes !== null) return 'type added';
+  if (beforeTypes === null || afterTypes === null) return null;
+  return beforeTypes.some((type) => !afterTypes.includes(type)) ? 'type narrowed' : null;
+}
+
+function typeLoosened(before: SchemaObject, after: SchemaObject): 'type removed' | 'type widened' | null {
+  const beforeTypes = typesOf(before);
+  const afterTypes = typesOf(after);
+  if (beforeTypes === null && afterTypes === null) return null;
+  if (beforeTypes !== null && afterTypes === null) return 'type removed';
+  if (beforeTypes === null || afterTypes === null) return null;
+  return afterTypes.some((type) => !beforeTypes.includes(type)) ? 'type widened' : null;
 }
 
 function allowsExtras(schema: SchemaObject): boolean {
@@ -87,11 +107,8 @@ function formatLoosened(before: SchemaObject, after: SchemaObject): 'format remo
 
 function requestBreaks(before: SchemaObject, after: SchemaObject, at: string): RouteBreak[] {
   const breaks: RouteBreak[] = [];
-  const beforeTypes = typesOf(before);
-  const afterTypes = typesOf(after);
-  if (beforeTypes.length > 0 && beforeTypes.some((type) => !afterTypes.includes(type))) {
-    breaks.push({ kind: 'request_tightened', path: at, detail: 'type narrowed' });
-  }
+  const tighterType = typeTightened(before, after);
+  if (tighterType) breaks.push({ kind: 'request_tightened', path: at, detail: tighterType });
   if (enumAdded(before, after)) {
     breaks.push({ kind: 'request_tightened', path: at, detail: 'enum added' });
   } else if (enumNarrowed(before, after)) {
@@ -134,10 +151,8 @@ function requestBreaks(before: SchemaObject, after: SchemaObject, at: string): R
 
 function responseBreaks(before: SchemaObject, after: SchemaObject, at: string): RouteBreak[] {
   const breaks: RouteBreak[] = [];
-  const beforeTypes = typesOf(before);
-  if (beforeTypes.length > 0 && typesOf(after).some((type) => !beforeTypes.includes(type))) {
-    breaks.push({ kind: 'response_loosened', path: at, detail: 'type widened' });
-  }
+  const looserType = typeLoosened(before, after);
+  if (looserType) breaks.push({ kind: 'response_loosened', path: at, detail: looserType });
   if (enumRemoved(before, after)) {
     breaks.push({ kind: 'response_loosened', path: at, detail: 'enum removed' });
   } else if (enumWidened(before, after)) {
