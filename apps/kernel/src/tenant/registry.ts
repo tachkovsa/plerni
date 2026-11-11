@@ -6,12 +6,14 @@
 //
 // The log row's seq comes from nextval inside that transaction. Per-aggregate
 // order is aggregate_version, incremented under FOR UPDATE on the tenant row
-// (plan §4.2, ADR-0009). No advisory lock is taken. The relay is not started.
+// (plan §4.2, ADR-0009). No advisory lock is taken. A zero-payload NOTIFY
+// shares this transaction. This module does not start the relay.
 import { randomUUID } from 'node:crypto';
 import { sql, type Kysely, type Transaction } from 'kysely';
 import type { Database } from '../db/database.ts';
 import { assertTenantContext } from '../tenancy/guard.ts';
 import { withTenant, type HygieneEvidence } from '../tenancy/hygiene.ts';
+import { OUTBOX_CHANNEL } from '../bus/constants.ts';
 import {
   IdempotencyConflict,
   InvalidIdempotencyKeyError,
@@ -148,6 +150,7 @@ async function appendTenantCreated(
       1,
       ${payload}::jsonb
     )`.execute(trx);
+  await sql`SELECT pg_notify(${OUTBOX_CHANNEL}, '')`.execute(trx);
   await sql`
     INSERT INTO kernel.audit_record (tenant_id, id, action, target_tenant_id)
     VALUES (
