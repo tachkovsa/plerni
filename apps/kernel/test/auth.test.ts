@@ -1279,3 +1279,46 @@ serial('an expired reset token is refused at consumption', async () => {
     await db.destroy();
   }
 });
+
+serial('concurrent login attempts reserve at most the throttle limit', async () => {
+  await ready();
+  await resetIdentity();
+  const credential = secret();
+  const password = secret();
+  const db = appDb(POOLED, 8);
+  try {
+    const installed = await withCredential(credential, () => bootstrapInstallation(db, {
+      credential,
+      operatorEmail: email('operator'),
+      operatorPassword: password,
+      customerEmail: email('customer'),
+      customerPassword: password,
+    }, context(new Sink()).ctx));
+    const customerEmail = await withRoot(async (client) => {
+      const result = await client.query<{ email: string }>(
+        'SELECT email FROM kernel.user_account WHERE id = $1',
+        [installed.customer.userId],
+      );
+      return result.rows[0]?.email ?? '';
+    });
+    const arrived = rendezvous(8);
+    const results = await Promise.allSettled(Array.from({ length: 8 }, () => login(db, {
+      tenantId: installed.customer.tenantId,
+      email: customerEmail,
+      password: 'x',
+    }, context(new Sink()).ctx, {
+      beforeReserve: async () => arrived(),
+    })));
+    const rejected = results.filter((item) => item.status === 'rejected' && item.reason instanceof LoginRejectedError);
+    const throttled = results.filter((item) => item.status === 'rejected' && item.reason instanceof ThrottledError);
+    assert.equal(rejected.length, 5);
+    assert.equal(throttled.length, 3);
+    const stored = await withRoot(async (client) => client.query<{ failures: number }>(
+      'SELECT failures FROM kernel.login_throttle WHERE tenant_id = $1',
+      [installed.customer.tenantId],
+    ));
+    assert.equal(stored.rows[0]?.failures, 5);
+  } finally {
+    await db.destroy();
+  }
+});
