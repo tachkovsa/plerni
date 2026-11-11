@@ -18,3 +18,6 @@ export const PARK_UNKNOWN_VERSION = 'UNKNOWN_EVENT_VERSION';
 export const HANDLER_FAILED = 'HANDLER_FAILED';
 
 export const NO_LISTENER_ALERT = 'no relay listener';
+
+/** LISTEN setup failed. Polling still runs. */
+export const LISTENER_FAILED = 'relay listener failed';

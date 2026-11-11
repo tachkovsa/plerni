@@ -8,7 +8,7 @@
 // and is skipped. No advisory lock.
 import { sql, type Kysely, type Transaction } from 'kysely';
 import type { Database } from '../db/database.ts';
-import { blankEvidence, withTenant } from '../tenancy/hygiene.ts';
+import { blankEvidence, withTenant, type HygieneEvidence } from '../tenancy/hygiene.ts';
 import { DRAIN_LIMIT, HANDLER_FAILED, NO_LISTENER_ALERT, PARK_UNKNOWN_VERSION } from './constants.ts';
 import { countRelayListeners } from './listen.ts';
 import { decide, parseFilter } from './validate.ts';
@@ -55,6 +55,22 @@ export interface DeliverReport {
   parked: number;
   duplicates: number;
   alerts: string[];
+}
+
+export interface DeliverStep {
+  outcome: DeliverOutcome;
+  alerts: readonly string[];
+}
+
+/** A delivery pass failed after hygiene recorded alerts that must not be dropped. */
+export class RelayDeliveryError extends Error {
+  readonly alerts: readonly string[];
+
+  constructor(cause: unknown, alerts: readonly string[]) {
+    super('relay delivery failed', { cause });
+    this.name = 'RelayDeliveryError';
+    this.alerts = alerts;
+  }
 }
 
 interface OutboxEvent {
@@ -151,7 +167,7 @@ async function nextOutboxEvent(
   };
 }
 
-async function claimNext(db: Kysely<Database>): Promise<Claim | null> {
+async function claimNext(db: Kysely<Database>, exclude: readonly string[]): Promise<Claim | null> {
   return db.transaction().execute(async (trx) => {
     const safePoint = await readSafePoint(trx);
     if (!safePoint) return null;
@@ -160,6 +176,7 @@ async function claimNext(db: Kysely<Database>): Promise<Claim | null> {
       FROM kernel.subscription
       WHERE status = 'live'
         AND last_seq < ${safePoint}::bigint
+        AND NOT (id::text = ANY(${exclude}::text[]))
       ORDER BY last_seq, id
       FOR UPDATE SKIP LOCKED
       LIMIT 1`.execute(trx);
@@ -268,8 +285,8 @@ async function applyClaim(
   claim: Claim,
   handler: DeliveryHandler,
   terminateBackend: (pid: number) => Promise<void>,
+  evidence: HygieneEvidence,
 ): Promise<DeliverOutcome> {
-  const evidence = blankEvidence();
   return withTenant(db, claim.event.tenantId, evidence, terminateBackend, async (trx) => {
     const current = await lockSubscription(trx, claim.subscriptionId);
     if (!current || current.fence !== claim.fence || current.status !== 'live') {
@@ -317,20 +334,26 @@ export async function deliverOne(
   handler: DeliveryHandler,
   terminateBackend: (pid: number) => Promise<void>,
   afterClaim?: (claim: Claim) => Promise<void>,
-): Promise<DeliverOutcome> {
-  const claim = await claimNext(db);
-  if (!claim) return { kind: 'idle' };
+  exclude: readonly string[] = [],
+): Promise<DeliverStep> {
+  const claim = await claimNext(db, exclude);
+  if (!claim) return { outcome: { kind: 'idle' }, alerts: [] };
   if (afterClaim) await afterClaim(claim);
+  const evidence = blankEvidence();
   try {
-    return await applyClaim(db, claim, handler, terminateBackend);
+    const outcome = await applyClaim(db, claim, handler, terminateBackend, evidence);
+    return { outcome, alerts: evidence.alerts };
   } catch (error) {
-    if (!isHandlerFailed(error)) throw error;
+    if (!isHandlerFailed(error)) throw new RelayDeliveryError(error, evidence.alerts);
     await recordDeadLetter(db, claim.subscriptionId, claim.event.seq);
     return {
-      kind: 'failed',
-      subscriptionId: claim.subscriptionId,
-      seq: claim.event.seq,
-      alarm: 'handler failed',
+      outcome: {
+        kind: 'failed',
+        subscriptionId: claim.subscriptionId,
+        seq: claim.event.seq,
+        alarm: 'handler failed',
+      },
+      alerts: ['handler failed', ...evidence.alerts],
     };
   }
 }
@@ -347,17 +370,22 @@ export async function deliverAvailable(
     duplicates: 0,
     alerts: [],
   };
-  for (let step = 0; step < DRAIN_LIMIT; step += 1) {
-    const outcome = await deliverOne(db, handler, terminateBackend);
-    if (outcome.kind === 'idle') break;
-    if (outcome.kind === 'delivered') report.delivered += 1;
-    else if (outcome.kind === 'skipped') report.skipped += 1;
-    else if (outcome.kind === 'parked') report.parked += 1;
-    else if (outcome.kind === 'duplicate') report.duplicates += 1;
-    else if (outcome.kind === 'failed') {
-      report.alerts.push(outcome.alarm);
-      break;
+  const failed = new Set<string>();
+  try {
+    for (let step = 0; step < DRAIN_LIMIT; step += 1) {
+      const current = await deliverOne(db, handler, terminateBackend, undefined, [...failed]);
+      report.alerts.push(...current.alerts);
+      const outcome = current.outcome;
+      if (outcome.kind === 'idle') break;
+      if (outcome.kind === 'delivered') report.delivered += 1;
+      else if (outcome.kind === 'skipped') report.skipped += 1;
+      else if (outcome.kind === 'parked') report.parked += 1;
+      else if (outcome.kind === 'duplicate') report.duplicates += 1;
+      else if (outcome.kind === 'failed') failed.add(outcome.subscriptionId);
     }
+  } catch (error) {
+    if (error instanceof RelayDeliveryError) report.alerts.push(...error.alerts);
+    throw new RelayDeliveryError(error, report.alerts);
   }
   const listeners = await countRelayListeners(db);
   if (listeners === 0) report.alerts.push(NO_LISTENER_ALERT);

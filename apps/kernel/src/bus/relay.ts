@@ -1,11 +1,53 @@
 // SPDX-License-Identifier: Apache-2.0
 // One relay process: a direct LISTEN connection plus a poll (plan §4.2).
-// Two processes are K15. pg-boss is K14. This module starts neither.
+// Polling starts even when LISTEN cannot. Wake-ups coalesce into the active
+// pass plus one rerun. Two processes are K15. pg-boss is K14.
 import type { Kysely } from 'kysely';
 import type { Database } from '../db/database.ts';
-import { POLL_MS } from './constants.ts';
-import { deliverAvailable, type DeliveryHandler } from './deliver.ts';
+import { LISTENER_FAILED, POLL_MS } from './constants.ts';
+import { deliverAvailable, RelayDeliveryError, type DeliveryHandler } from './deliver.ts';
 import { listenForOutbox } from './listen.ts';
+
+export function createPassScheduler(run: () => Promise<void>): {
+  kick: () => void;
+  idle: () => Promise<void>;
+  stop: () => void;
+} {
+  let stopped = false;
+  let running = false;
+  let pending = false;
+  let tail: Promise<void> = Promise.resolve();
+  const kick = (): void => {
+    if (stopped) return;
+    if (running) {
+      pending = true;
+      return;
+    }
+    running = true;
+    tail = tail.then(async () => {
+      try {
+        do {
+          pending = false;
+          if (stopped) return;
+          await run();
+        } while (pending && !stopped);
+      } finally {
+        running = false;
+        if (pending && !stopped) {
+          pending = false;
+          kick();
+        }
+      }
+    });
+  };
+  return {
+    kick,
+    idle: () => tail,
+    stop: () => {
+      stopped = true;
+    },
+  };
+}
 
 export async function startRelay(input: {
   db: Kysely<Database>;
@@ -15,41 +57,41 @@ export async function startRelay(input: {
   terminateBackend: (pid: number) => Promise<void>;
 }): Promise<{ stop: () => Promise<void>; alerts: () => readonly string[] }> {
   const alerts: string[] = [];
-  let stopped = false;
-  let chain: Promise<void> = Promise.resolve();
-  const pump = (): Promise<void> => {
-    const run = chain.then(async () => {
-      if (stopped) return;
-      try {
-        const report = await deliverAvailable(input.db, input.handler, input.terminateBackend);
-        alerts.push(...report.alerts);
-      } catch (error) {
-        const name = error instanceof Error ? error.name : 'Error';
-        alerts.push(`relay failed: ${name}`);
-      }
-    });
-    chain = run.then(() => undefined, () => undefined);
-    return run;
-  };
-  const listener = await listenForOutbox(
-    input.directConnectionString,
-    input.pooledConnectionString,
-    () => {
-      void pump();
-    },
-  );
+  const scheduler = createPassScheduler(async () => {
+    try {
+      const report = await deliverAvailable(input.db, input.handler, input.terminateBackend);
+      alerts.push(...report.alerts);
+    } catch (error) {
+      const cause = error instanceof RelayDeliveryError ? error.cause : error;
+      if (error instanceof RelayDeliveryError) alerts.push(...error.alerts);
+      const name = cause instanceof Error ? cause.name : 'Error';
+      alerts.push(`relay failed: ${name}`);
+    }
+  });
   const timer = setInterval(() => {
-    void pump();
+    scheduler.kick();
   }, POLL_MS);
   timer.unref();
-  await pump();
+  let listener: { close: () => Promise<void> } | null = null;
+  try {
+    listener = await listenForOutbox(
+      input.directConnectionString,
+      input.pooledConnectionString,
+      () => {
+        scheduler.kick();
+      },
+    );
+  } catch {
+    alerts.push(LISTENER_FAILED);
+  }
+  scheduler.kick();
   return {
     alerts: () => alerts,
     stop: async () => {
-      stopped = true;
+      scheduler.stop();
       clearInterval(timer);
-      await chain;
-      await listener.close();
+      await scheduler.idle();
+      if (listener) await listener.close();
     },
   };
 }

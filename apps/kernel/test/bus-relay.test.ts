@@ -7,7 +7,7 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { sql, type Kysely } from 'kysely';
 import { appendEvent, type AppendedEvent } from '../src/bus/append.ts';
-import { NO_LISTENER_ALERT } from '../src/bus/constants.ts';
+import { LISTENER_FAILED, NO_LISTENER_ALERT } from '../src/bus/constants.ts';
 import {
   deliverAvailable,
   deliverOne,
@@ -15,7 +15,7 @@ import {
   type DeliveredEvent,
 } from '../src/bus/deliver.ts';
 import { assertDirectListen, countRelayListeners, listenForOutbox } from '../src/bus/listen.ts';
-import { startRelay } from '../src/bus/relay.ts';
+import { createPassScheduler, startRelay } from '../src/bus/relay.ts';
 import { retainLog } from '../src/bus/retain.ts';
 import { registerSubscription } from '../src/bus/subscription.ts';
 import type { Database } from '../src/db/database.ts';
@@ -353,10 +353,10 @@ test('a stale fencing token commits no effect', async () => {
         SET fence = fence + 1
         WHERE id = ${claim.subscriptionId}::uuid`.execute(db);
     });
-    assert.equal(stale.kind, 'stale');
+    assert.equal(stale.outcome.kind, 'stale');
     assert.equal(calls, 0);
     const delivered = await deliverOne(db, handler, terminate);
-    assert.equal(delivered.kind, 'delivered');
+    assert.equal(delivered.outcome.kind, 'delivered');
     assert.equal(calls, 1);
   } finally {
     await db.destroy();
@@ -532,4 +532,143 @@ test('the relay poll delivers a row that becomes eligible while LISTEN is only a
     await relay.stop();
     await db.destroy();
   }
+});
+
+test('a failing subscription does not stop a later healthy subscription in the same pass', async () => {
+  await resetBus();
+  await createEffectTable();
+  const tenantId = randomUUID();
+  await insertCustomer(tenantId);
+  const db = appDb(POOLED, 2);
+  const poisonId = '00000000-0000-4000-8000-0000000000a1';
+  const healthyId = 'ffffffff-ffff-4fff-8fff-ffffffffffff';
+  try {
+    const appended = await publish(db, tenantId, FIXTURE_TYPE, 1);
+    await ageSeqs([appended.seq]);
+    await registerSubscription(db, {
+      id: poisonId,
+      filter: [{ type: FIXTURE_TYPE, versions: [1] }],
+      start: '0',
+    });
+    await registerSubscription(db, {
+      id: healthyId,
+      filter: [{ type: FIXTURE_TYPE, versions: [1] }],
+      start: '0',
+    });
+    const report = await deliverAvailable(db, async (trx, event) => {
+      if (event.subscriptionId === poisonId) throw new Error('poison handler');
+      await sql`
+        INSERT INTO kernel.bus_effect (subscription_id, seq, idempotency_key)
+        VALUES (
+          ${event.subscriptionId}::uuid,
+          ${event.seq}::bigint,
+          ${event.idempotencyKey}
+        )`.execute(trx);
+    }, terminate);
+    assert.equal(report.delivered, 1);
+    assert.ok(report.alerts.includes('handler failed'));
+    assert.equal((await cursor(db, poisonId)).lastSeq, '0');
+    assert.equal((await cursor(db, poisonId)).status, 'live');
+    assert.equal((await cursor(db, healthyId)).lastSeq, appended.seq);
+    const effects = await withRoot(async (client) => {
+      const result = await client.query<{ count: string }>(
+        'SELECT count(*)::text AS count FROM kernel.bus_effect',
+      );
+      return Number(result.rows[0]?.count ?? '0');
+    });
+    assert.equal(effects, 1);
+    assert.ok((await outboxSeqs()).includes(appended.seq));
+  } finally {
+    await db.destroy();
+  }
+});
+
+test('a recovered contaminated connection still reports the security alert', async () => {
+  await resetBus();
+  const tenantId = randomUUID();
+  await insertCustomer(tenantId);
+  const db = appDb(POOLED, 1);
+  try {
+    const appended = await publish(db, tenantId, FIXTURE_TYPE, 1);
+    await ageSeqs([appended.seq]);
+    await registerSubscription(db, {
+      id: randomUUID(),
+      filter: [{ type: FIXTURE_TYPE, versions: [1] }],
+      start: '0',
+    });
+    await sql`SELECT set_config('plerni.tenant_id', ${tenantId}, false)`.execute(db);
+    const seen: string[] = [];
+    const report = await deliverAvailable(db, async (_trx, event) => {
+      seen.push(event.seq);
+    }, terminate);
+    assert.deepEqual(seen, [appended.seq]);
+    assert.equal(report.delivered, 1);
+    assert.ok(report.alerts.some((alert) => alert.includes('SECURITY contamination')));
+  } finally {
+    await db.destroy();
+    await withRoot(async (client) => {
+      await client.query(
+        `SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+         WHERE usename = 'plerni_app' AND pid <> pg_backend_pid()`,
+      );
+    });
+  }
+});
+
+test('polling starts when the direct listener cannot connect', async () => {
+  await resetBus();
+  const tenantId = randomUUID();
+  await insertCustomer(tenantId);
+  const db = appDb(POOLED, 2);
+  const refused = new URL(DIRECT);
+  refused.port = '54329';
+  const seen: string[] = [];
+  const relay = await startRelay({
+    db,
+    directConnectionString: refused.toString(),
+    pooledConnectionString: POOLED,
+    handler: async (_trx, event) => {
+      seen.push(event.seq);
+    },
+    terminateBackend: terminate,
+  });
+  try {
+    const appended = await publish(db, tenantId, FIXTURE_TYPE, 1);
+    await ageSeqs([appended.seq]);
+    await registerSubscription(db, {
+      id: randomUUID(),
+      filter: [{ type: FIXTURE_TYPE, versions: [1] }],
+      start: '0',
+    });
+    await waitFor('poll without a listener', async () => seen.includes(appended.seq));
+    assert.ok(relay.alerts().includes(LISTENER_FAILED));
+  } finally {
+    await relay.stop();
+    await db.destroy();
+  }
+});
+
+test('wake-ups during a pass collapse into one rerun', async () => {
+  let entered = 0;
+  let release!: () => void;
+  const hold = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let mark!: () => void;
+  const started = new Promise<void>((resolve) => {
+    mark = resolve;
+  });
+  const scheduler = createPassScheduler(async () => {
+    entered += 1;
+    if (entered === 1) {
+      mark();
+      await hold;
+    }
+  });
+  scheduler.kick();
+  await started;
+  for (let i = 0; i < 10_000; i += 1) scheduler.kick();
+  release();
+  await scheduler.idle();
+  assert.equal(entered, 2);
 });
