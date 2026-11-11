@@ -110,6 +110,37 @@ test('dropping a response enum loosens the response', () => {
   assert.ok(breaks.some((item) => item.kind === 'response_loosened' && item.detail === 'enum removed'));
 });
 
+test('an anyOf request rejects previously valid keys', () => {
+  const before = clone();
+  const next = clone();
+  const request = requestSchema(next);
+  request.properties = {
+    ...request.properties,
+    idempotencyKey: {
+      anyOf: [
+        { type: 'string', enum: ['UPPER'] },
+        { type: 'string', enum: ['OTHER'] },
+      ],
+    },
+  };
+  const breaks = unversionedRouteBreaks(before, next);
+  assert.ok(breaks.some((item) => item.kind === 'request_tightened' && item.detail === 'composition changed'));
+});
+
+test('a recursive object is compared once when both contracts have the cycle', () => {
+  const before = clone();
+  const next = clone();
+  for (const document of [before, next]) {
+    const schema = document.components.schemas.CreateTenantRequest;
+    assert.ok(schema);
+    schema.properties = {
+      ...schema.properties,
+      child: { $ref: '#/components/schemas/CreateTenantRequest' },
+    };
+  }
+  assert.deepEqual(unversionedRouteBreaks(before, next), []);
+});
+
 test('a referenced request pattern tightens the request', () => {
   const before = clone();
   const next = clone();

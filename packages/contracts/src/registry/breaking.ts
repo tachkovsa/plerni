@@ -105,16 +105,80 @@ function formatLoosened(before: SchemaObject, after: SchemaObject): 'format remo
   return after.format === undefined ? 'format removed' : 'format changed';
 }
 
+type ComposeKey = 'allOf' | 'anyOf' | 'oneOf';
+type SeenPairs = WeakMap<SchemaObject, WeakSet<SchemaObject>>;
+
+function compositionKey(schema: SchemaObject): ComposeKey | null {
+  if (schema.allOf) return 'allOf';
+  if (schema.anyOf) return 'anyOf';
+  if (schema.oneOf) return 'oneOf';
+  return null;
+}
+
+function visited(seen: SeenPairs, left: SchemaObject, right: SchemaObject): boolean {
+  const rights = seen.get(left);
+  if (rights?.has(right)) return true;
+  if (rights) rights.add(right);
+  else {
+    const created = new WeakSet<SchemaObject>();
+    created.add(right);
+    seen.set(left, created);
+  }
+  return false;
+}
+
+function compositionBreaks(
+  beforeDoc: OpenApiDocument,
+  afterDoc: OpenApiDocument,
+  before: SchemaObject,
+  after: SchemaObject,
+  at: string,
+  seen: SeenPairs,
+  walk: (
+    beforeDoc: OpenApiDocument,
+    afterDoc: OpenApiDocument,
+    beforeSchema: SchemaObject,
+    afterSchema: SchemaObject,
+    at: string,
+    seen: SeenPairs,
+  ) => RouteBreak[],
+  kind: 'request_tightened' | 'response_loosened',
+): RouteBreak[] | null {
+  const beforeKey = compositionKey(before);
+  const afterKey = compositionKey(after);
+  if (!beforeKey && !afterKey) return null;
+  const changed = (): RouteBreak => ({ kind, path: at, detail: 'composition changed' });
+  if (!beforeKey || beforeKey !== afterKey) return [changed()];
+  const left = before[beforeKey] ?? [];
+  const right = after[beforeKey] ?? [];
+  if (left.length !== right.length) return [changed()];
+  const breaks: RouteBreak[] = [];
+  for (let index = 0; index < left.length; index += 1) {
+    const leftBranch = left[index];
+    const rightBranch = right[index];
+    if (!leftBranch || !rightBranch) {
+      breaks.push(changed());
+      continue;
+    }
+    breaks.push(...walk(beforeDoc, afterDoc, leftBranch, rightBranch, `${at} ${beforeKey} ${index}`, seen));
+  }
+  return breaks;
+}
+
 function requestBreaks(
   beforeDoc: OpenApiDocument,
   afterDoc: OpenApiDocument,
   beforeSchema: SchemaObject,
   afterSchema: SchemaObject,
   at: string,
+  seen: SeenPairs,
 ): RouteBreak[] {
   const before = resolve(beforeDoc, beforeSchema) ?? beforeSchema;
   const after = resolve(afterDoc, afterSchema) ?? afterSchema;
+  if (visited(seen, before, after)) return [];
   const breaks: RouteBreak[] = [];
+  const composed = compositionBreaks(beforeDoc, afterDoc, before, after, at, seen, requestBreaks, 'request_tightened');
+  if (composed) breaks.push(...composed);
   const tighterType = typeTightened(before, after);
   if (tighterType) breaks.push({ kind: 'request_tightened', path: at, detail: tighterType });
   if (enumAdded(before, after)) {
@@ -146,14 +210,14 @@ function requestBreaks(
       if (!allowsExtras(after)) breaks.push({ kind: 'request_tightened', path: `${at}.${key}`, detail: 'property removed' });
       continue;
     }
-    breaks.push(...requestBreaks(beforeDoc, afterDoc, beforeProps[key] as SchemaObject, afterProp, `${at}.${key}`));
+    breaks.push(...requestBreaks(beforeDoc, afterDoc, beforeProps[key] as SchemaObject, afterProp, `${at}.${key}`, seen));
   }
   for (const key of afterRequired) {
     if (!beforeRequired.has(key)) {
       breaks.push({ kind: 'request_tightened', path: `${at}.${key}`, detail: 'property became required' });
     }
   }
-  if (before.items && after.items) breaks.push(...requestBreaks(beforeDoc, afterDoc, before.items, after.items, `${at}[]`));
+  if (before.items && after.items) breaks.push(...requestBreaks(beforeDoc, afterDoc, before.items, after.items, `${at}[]`, seen));
   return breaks;
 }
 
@@ -163,10 +227,14 @@ function responseBreaks(
   beforeSchema: SchemaObject,
   afterSchema: SchemaObject,
   at: string,
+  seen: SeenPairs,
 ): RouteBreak[] {
   const before = resolve(beforeDoc, beforeSchema) ?? beforeSchema;
   const after = resolve(afterDoc, afterSchema) ?? afterSchema;
+  if (visited(seen, before, after)) return [];
   const breaks: RouteBreak[] = [];
+  const composed = compositionBreaks(beforeDoc, afterDoc, before, after, at, seen, responseBreaks, 'response_loosened');
+  if (composed) breaks.push(...composed);
   const looserType = typeLoosened(before, after);
   if (looserType) breaks.push({ kind: 'response_loosened', path: at, detail: looserType });
   if (enumRemoved(before, after)) {
@@ -200,14 +268,14 @@ function responseBreaks(
       breaks.push({ kind: 'response_loosened', path: `${at}.${key}`, detail: 'property removed' });
       continue;
     }
-    breaks.push(...responseBreaks(beforeDoc, afterDoc, beforeProps[key] as SchemaObject, afterProp, `${at}.${key}`));
+    breaks.push(...responseBreaks(beforeDoc, afterDoc, beforeProps[key] as SchemaObject, afterProp, `${at}.${key}`, seen));
   }
   for (const key of Object.keys(afterProps)) {
     if (!(key in beforeProps) && !allowsExtras(before)) {
       breaks.push({ kind: 'response_loosened', path: `${at}.${key}`, detail: 'property added' });
     }
   }
-  if (before.items && after.items) breaks.push(...responseBreaks(beforeDoc, afterDoc, before.items, after.items, `${at}[]`));
+  if (before.items && after.items) breaks.push(...responseBreaks(beforeDoc, afterDoc, before.items, after.items, `${at}[]`, seen));
   return breaks;
 }
 
@@ -244,14 +312,14 @@ export function findRouteBreaks(before: OpenApiDocument, after: OpenApiDocument)
     }
     const oldRequest = resolve(before, jsonSchema(old.operation, 'request', ''));
     const newRequest = resolve(after, jsonSchema(found.operation, 'request', ''));
-    if (oldRequest && newRequest) breaks.push(...requestBreaks(before, after, oldRequest, newRequest, operationId));
+    if (oldRequest && newRequest) breaks.push(...requestBreaks(before, after, oldRequest, newRequest, operationId, new WeakMap()));
     else if (oldRequest && !newRequest) {
       breaks.push({ kind: 'request_tightened', path: operationId, detail: 'request body removed' });
     }
     for (const status of Object.keys(old.operation.responses ?? {})) {
       const oldResponse = resolve(before, jsonSchema(old.operation, 'response', status));
       const newResponse = resolve(after, jsonSchema(found.operation, 'response', status));
-      if (oldResponse && newResponse) breaks.push(...responseBreaks(before, after, oldResponse, newResponse, `${operationId} ${status}`));
+      if (oldResponse && newResponse) breaks.push(...responseBreaks(before, after, oldResponse, newResponse, `${operationId} ${status}`, new WeakMap()));
       else if (oldResponse && !newResponse) {
         breaks.push({ kind: 'response_loosened', path: `${operationId} ${status}`, detail: 'response removed' });
       }

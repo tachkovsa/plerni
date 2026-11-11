@@ -38,6 +38,9 @@ export interface SchemaObject {
   required?: string[];
   additionalProperties?: boolean | SchemaObject;
   enum?: string[];
+  allOf?: SchemaObject[];
+  anyOf?: SchemaObject[];
+  oneOf?: SchemaObject[];
   items?: SchemaObject;
   minLength?: number;
   maxLength?: number;
