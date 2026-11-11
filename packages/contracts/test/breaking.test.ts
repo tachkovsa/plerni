@@ -63,6 +63,27 @@ test('a changed existing operation fails', () => {
   assert.deepEqual(breaks, [{ method: 'post', path: '/kernel/tenants', change: 'changed' }]);
 });
 
+test('renaming an operation id fails', () => {
+  const baseline = clone();
+  const next = clone();
+  const operation = next.paths['/kernel/tenants']?.post;
+  assert.ok(operation);
+  operation.operationId = 'kernel.tenant.create.v2';
+  assert.deepEqual(operationBreaks(baseline, next), [{ method: 'post', path: '/kernel/tenants', change: 'changed' }]);
+});
+
+test('changing an error status fails', () => {
+  const baseline = clone();
+  const next = clone();
+  next['x-plerni-error-statuses'] = { ...next['x-plerni-error-statuses'], NOT_FOUND: 410 };
+  const allow: OperationAllow[] = [{ method: 'post', path: '/kernel/tenants', reason: 'does not waive the status map' }];
+  assert.deepEqual(operationBreaks(baseline, next, allow), [{
+    method: 'document',
+    path: 'x-plerni-error-statuses',
+    change: 'changed',
+  }]);
+});
+
 test('a removed operation fails', () => {
   const baseline = clone();
   const next = clone();

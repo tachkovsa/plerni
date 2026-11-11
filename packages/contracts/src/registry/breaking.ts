@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Any change to an existing operation is treated as breaking; no semantic diff.
 // An operation already in the baseline is identified by method and path. Its
-// hash covers parameters, the request body, and responses, with every $ref
-// inlined and object keys sorted. A new operation is allowed. A removed
-// operation, or a hash change, fails unless the API major changes or the
-// operation is listed in the allow file with a reason.
+// hash covers the operation id, parameters, the request body, and responses,
+// with every $ref inlined and object keys sorted. The document error-status
+// map is hashed the same way and is not waived by an operation allow entry.
+// A new operation is allowed. A removed operation, a hash change, or a status
+// map change fails unless the API major changes or, for an operation, the
+// allow file lists that method and path with a reason.
 import { createHash } from 'node:crypto';
 import type { OpenApiDocument } from './types.ts';
 
@@ -64,11 +66,16 @@ function operationHash(document: OpenApiDocument, method: string, path: string):
   const operation = item?.[method as Method];
   if (!operation) return null;
   const contract = sortKeys(inlineRefs(document, {
+    operationId: operation.operationId ?? null,
     parameters: operation.parameters ?? null,
     requestBody: operation.requestBody ?? null,
     responses: operation.responses ?? null,
   }, []));
-  return createHash('sha256').update(JSON.stringify(contract)).digest('hex');
+  return digest(contract);
+}
+
+function digest(value: unknown): string {
+  return createHash('sha256').update(JSON.stringify(value)).digest('hex');
 }
 
 function operations(document: OpenApiDocument): Array<{ method: string; path: string }> {
@@ -101,6 +108,11 @@ export function operationBreaks(
     const after = operationHash(next, operation.method, operation.path);
     if (after === null) breaks.push({ ...operation, change: 'removed' });
     else if (before !== after) breaks.push({ ...operation, change: 'changed' });
+  }
+  const beforeStatuses = digest(sortKeys(baseline['x-plerni-error-statuses']));
+  const afterStatuses = digest(sortKeys(next['x-plerni-error-statuses']));
+  if (beforeStatuses !== afterStatuses) {
+    breaks.push({ method: 'document', path: 'x-plerni-error-statuses', change: 'changed' });
   }
   return breaks;
 }
