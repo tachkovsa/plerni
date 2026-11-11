@@ -68,24 +68,32 @@ export async function readSessionState(trx: Transaction<Database>): Promise<Sess
   };
 }
 
+function rejectContamination(state: SessionState, evidence: HygieneEvidence): void {
+  const contamination = findContamination(state);
+  if (contamination.length === 0) return;
+  evidence.alerts.push(`SECURITY contamination on backend ${state.pid}: ${contamination.join('; ')}`);
+  throw new ContaminationError(JSON.stringify({ pid: state.pid, reasons: contamination }));
+}
+
+/** Transaction-local tenant switch. The caller already inspected this transaction. */
+export async function replaceTenantContext(trx: Transaction<Database>, tenantId: string): Promise<void> {
+  rejectBlankTenantId(tenantId);
+  await sql`SELECT set_config('plerni.tenant_id', ${tenantId}, true)`.execute(trx);
+  const after = await readSessionState(trx);
+  if (after.tenant_guc !== tenantId) {
+    throw new ContextInstallError(`readback '${after.tenant_guc}' != authorized '${tenantId}'`);
+  }
+}
+
 /** Inspect, then install and read back, on the transaction's pinned backend. */
 export async function installTenantContext(
   trx: Transaction<Database>,
   tenantId: string,
   evidence: HygieneEvidence,
 ): Promise<void> {
-  rejectBlankTenantId(tenantId);
   const before = await readSessionState(trx);
-  const contamination = findContamination(before);
-  if (contamination.length > 0) {
-    evidence.alerts.push(`SECURITY contamination on backend ${before.pid}: ${contamination.join('; ')}`);
-    throw new ContaminationError(JSON.stringify({ pid: before.pid, reasons: contamination }));
-  }
-  await sql`SELECT set_config('plerni.tenant_id', ${tenantId}, true)`.execute(trx);
-  const after = await readSessionState(trx);
-  if (after.tenant_guc !== tenantId) {
-    throw new ContextInstallError(`readback '${after.tenant_guc}' != authorized '${tenantId}'`);
-  }
+  rejectContamination(before, evidence);
+  await replaceTenantContext(trx, tenantId);
 }
 
 function isConnectionDeath(error: unknown): boolean {
@@ -97,6 +105,37 @@ function isConnectionDeath(error: unknown): boolean {
     || message.startsWith('Connection terminated')
     || message === 'Client has encountered a connection error and is not queryable'
     || message === 'Client was closed and is not queryable';
+}
+
+async function settleContamination(
+  trx: Transaction<Database>,
+  error: ContaminationError,
+  db: Kysely<Database>,
+  evidence: HygieneEvidence,
+  terminateBackend: (pid: number) => Promise<void>,
+): Promise<void> {
+  const pid = Number(JSON.parse(error.message).pid);
+  let confirmed = false;
+  try {
+    await terminateBackend(pid);
+    confirmed = true;
+  } catch (termError) {
+    unblockPool(db);
+    throw new Error(`contaminated backend ${pid} was not confirmed dead`, { cause: termError });
+  }
+  let alive = true;
+  try {
+    await sql`SELECT 1`.execute(trx);
+    alive = true;
+  } catch {
+    alive = false;
+  }
+  if (!confirmed || alive) {
+    unblockPool(db);
+    throw new Error(`contaminated backend ${pid} accepted a query after terminate`);
+  }
+  evidence.terminatedBackendPids.push(pid);
+  evidence.discardedPoolerSessions += discardPoolerSessions(db);
 }
 
 /** One hygiene transaction. The caller chooses the connection and whether to retry. */
@@ -112,33 +151,36 @@ export async function executeTenantTransaction<T>(
       await installTenantContext(trx, tenantId, evidence);
     } catch (error) {
       if (error instanceof ContaminationError) {
-        const pid = Number(JSON.parse(error.message).pid);
-        let confirmed = false;
-        try {
-          await terminateBackend(pid);
-          confirmed = true;
-        } catch (termError) {
-          unblockPool(db);
-          throw new Error(`contaminated backend ${pid} was not confirmed dead`, { cause: termError });
-        }
-        let alive = true;
-        try {
-          await sql`SELECT 1`.execute(trx);
-          alive = true;
-        } catch {
-          alive = false;
-        }
-        if (!confirmed || alive) {
-          unblockPool(db);
-          throw new Error(`contaminated backend ${pid} accepted a query after terminate`);
-        }
-        evidence.terminatedBackendPids.push(pid);
-        evidence.discardedPoolerSessions += discardPoolerSessions(db);
+        await settleContamination(trx, error, db, evidence, terminateBackend);
       }
       throw error;
     }
     return fn(trx);
   });
+}
+
+/**
+ * Inspect a transaction before any tenant is chosen. Bootstrap reads the
+ * kernel-internal registry, then installs the operator id it just allocated.
+ */
+export async function withInspectedTransaction<T>(
+  db: Kysely<Database>,
+  evidence: HygieneEvidence,
+  terminateBackend: (pid: number) => Promise<void>,
+  fn: (trx: Transaction<Database>) => Promise<T>,
+): Promise<T> {
+  return retryContaminated(evidence, () => db.transaction().execute(async (trx) => {
+    try {
+      const before = await readSessionState(trx);
+      rejectContamination(before, evidence);
+    } catch (error) {
+      if (error instanceof ContaminationError) {
+        await settleContamination(trx, error, db, evidence, terminateBackend);
+      }
+      throw error;
+    }
+    return fn(trx);
+  }));
 }
 
 /** Retry after a terminated contaminated backend. Each `run` must take a fresh connection. */

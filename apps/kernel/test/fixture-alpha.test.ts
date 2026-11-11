@@ -93,6 +93,7 @@ serial('fixture_alpha migrates its schema without a kernel migration', async () 
       '0001_kernel_schema.sql',
       '0002_tenant_registry.sql',
       '0003_plugin_grant.sql',
+      '0004_local_identity.sql',
     ]);
     const plugin = await client.query<{ version: string }>(
       'SELECT version FROM kernel.plugin_migration WHERE plugin_id = $1',
