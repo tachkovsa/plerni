@@ -179,7 +179,7 @@ test('the identity log drops secrets and keeps ids', () => {
 test('identity sources take no advisory lock and do not call the console', () => {
   const dir = join(here, '../src/identity');
   const bodies = readdirSync(dir).filter((name) => name.endsWith('.ts')).map((name) => readFileSync(join(dir, name), 'utf8'));
-  bodies.push(readFileSync(join(here, '../sql/0004_local_identity.sql'), 'utf8'));
+  bodies.push(readFileSync(join(here, '../sql/0005_local_identity.sql'), 'utf8'));
   for (const body of bodies) {
     assert.equal(/pg_advisory/i.test(body), false);
     assert.equal(body.includes('console.'), false);
