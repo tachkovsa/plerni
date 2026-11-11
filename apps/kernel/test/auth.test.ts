@@ -1096,3 +1096,186 @@ serial('recovery throttles before hashing and a used reset token dies with the p
     await db.destroy();
   }
 });
+
+function errorCode(error: unknown): string | undefined {
+  const seen = new Set<unknown>();
+  let current: unknown = error;
+  while (current && typeof current === 'object' && !seen.has(current)) {
+    seen.add(current);
+    if ('code' in current && typeof current.code === 'string') return current.code;
+    current = 'cause' in current ? current.cause : undefined;
+  }
+  return undefined;
+}
+
+serial('two admins disabling each other leave one enabled admin and do not deadlock', async () => {
+  await ready();
+  await resetIdentity();
+  const credential = secret();
+  const password = secret();
+  const secondPassword = secret();
+  const left = appDb(POOLED, 1);
+  const right = appDb(POOLED, 1);
+  try {
+    const installed = await withCredential(credential, () => bootstrapInstallation(left, {
+      credential,
+      operatorEmail: email('operator'),
+      operatorPassword: password,
+      customerEmail: email('customer'),
+      customerPassword: password,
+    }, context(new Sink()).ctx));
+    const customerEmail = await withRoot(async (client) => {
+      const result = await client.query<{ email: string }>(
+        'SELECT email FROM kernel.user_account WHERE id = $1',
+        [installed.customer.userId],
+      );
+      return result.rows[0]?.email ?? '';
+    });
+    const first = await login(left, {
+      tenantId: installed.customer.tenantId,
+      email: customerEmail,
+      password,
+    }, context(new Sink()).ctx);
+    const secondEmail = email('admin');
+    const second = await createUser(left, {
+      tenantId: installed.customer.tenantId,
+      token: first.token,
+    }, { email: secondEmail, password: secondPassword, kind: 'admin' }, context(new Sink()).ctx);
+    const secondSession = await login(right, {
+      tenantId: installed.customer.tenantId,
+      email: secondEmail,
+      password: secondPassword,
+    }, context(new Sink()).ctx);
+    const arrived = rendezvous(2);
+    const actor = { tenantId: installed.customer.tenantId };
+    const results = await Promise.allSettled([
+      disableUser(left, { ...actor, token: first.token }, second.userId, context(new Sink()).ctx, {
+        beforeAdminLock: async () => arrived(),
+      }),
+      disableUser(right, { ...actor, token: secondSession.token }, first.userId, context(new Sink()).ctx, {
+        beforeAdminLock: async () => arrived(),
+      }),
+    ]);
+    const fulfilled = results.filter((item) => item.status === 'fulfilled');
+    const rejected = results.filter((item) => item.status === 'rejected');
+    assert.equal(fulfilled.length, 1);
+    assert.equal(rejected.length, 1);
+    const reason = rejected[0]?.status === 'rejected' ? rejected[0].reason : undefined;
+    assert.notEqual(errorCode(reason), '40P01');
+    assert.equal(
+      reason instanceof SessionRejectedError || reason instanceof IdentityForbiddenError,
+      true,
+    );
+    const enabled = await withRoot(async (client) => client.query<{ count: string }>(
+      `SELECT count(*)::text AS count
+       FROM kernel.user_account u
+       JOIN kernel.user_auth_state s ON s.tenant_id = u.tenant_id AND s.id = u.id
+       WHERE u.tenant_id = $1 AND u.kind = 'admin' AND s.disabled_at IS NULL`,
+      [installed.customer.tenantId],
+    ));
+    assert.equal(enabled.rows[0]?.count, '1');
+  } finally {
+    await left.destroy();
+    await right.destroy();
+  }
+});
+
+serial('concurrent rescue attempts reserve at most the throttle limit', async () => {
+  await ready();
+  await resetIdentity();
+  const credential = secret();
+  const password = secret();
+  const db = appDb(POOLED, 8);
+  try {
+    const installed = await withCredential(credential, () => bootstrapInstallation(db, {
+      credential,
+      operatorEmail: email('operator'),
+      operatorPassword: password,
+      customerEmail: email('customer'),
+      customerPassword: password,
+    }, context(new Sink()).ctx));
+    const customerEmail = await withRoot(async (client) => {
+      const result = await client.query<{ email: string }>(
+        'SELECT email FROM kernel.user_account WHERE id = $1',
+        [installed.customer.userId],
+      );
+      return result.rows[0]?.email ?? '';
+    });
+    const arrived = rendezvous(8);
+    const results = await Promise.allSettled(Array.from({ length: 8 }, () => recoverWithRescueCode(db, {
+      tenantId: installed.customer.tenantId,
+      email: customerEmail,
+      code: 'not-a-code',
+      password: 'x',
+    }, context(new Sink()).ctx, {
+      beforeReserve: async () => arrived(),
+    })));
+    const rejected = results.filter((item) => item.status === 'rejected' && item.reason instanceof LoginRejectedError);
+    const throttled = results.filter((item) => item.status === 'rejected' && item.reason instanceof ThrottledError);
+    assert.equal(rejected.length, 5);
+    assert.equal(throttled.length, 3);
+    const stored = await withRoot(async (client) => client.query<{ failures: number }>(
+      'SELECT failures FROM kernel.login_throttle WHERE tenant_id = $1',
+      [installed.customer.tenantId],
+    ));
+    assert.equal(stored.rows[0]?.failures, 5);
+  } finally {
+    await db.destroy();
+  }
+});
+
+serial('an expired reset token is refused at consumption', async () => {
+  await ready();
+  await resetIdentity();
+  const credential = secret();
+  const password = secret();
+  const db = appDb(POOLED, 1);
+  try {
+    const installed = await withCredential(credential, () => bootstrapInstallation(db, {
+      credential,
+      operatorEmail: email('operator'),
+      operatorPassword: password,
+      customerEmail: email('customer'),
+      customerPassword: password,
+    }, context(new Sink()).ctx));
+    const operatorEmail = await withRoot(async (client) => {
+      const result = await client.query<{ email: string }>(
+        'SELECT email FROM kernel.user_account WHERE id = $1',
+        [installed.operator.userId],
+      );
+      return result.rows[0]?.email ?? '';
+    });
+    const reset = await requestPasswordReset(db, {
+      tenantId: installed.operator.tenantId,
+      email: operatorEmail,
+    }, context(new Sink()).ctx);
+    if (!reset.token) throw new Error('reset token missing');
+    const token = reset.token;
+    await assert.rejects(
+      () => confirmPasswordReset(db, {
+        tenantId: installed.operator.tenantId,
+        token,
+        password: secret(),
+      }, context(new Sink()).ctx, {
+        afterLookup: async () => {
+          await withRoot(async (client) => {
+            await client.query(
+              `UPDATE kernel.password_reset
+               SET expires_at = clock_timestamp() - interval '1 minute'
+               WHERE token_hash = $1`,
+              [sha256(token)],
+            );
+          });
+        },
+      }),
+      (error: unknown) => error instanceof LoginRejectedError,
+    );
+    await login(db, {
+      tenantId: installed.operator.tenantId,
+      email: operatorEmail,
+      password,
+    }, context(new Sink()).ctx);
+  } finally {
+    await db.destroy();
+  }
+});

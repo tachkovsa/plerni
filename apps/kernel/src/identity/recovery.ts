@@ -12,7 +12,7 @@ import { AccountDisabledError, LoginRejectedError, ThrottledError } from './erro
 import { hashPassword } from './password.ts';
 import { rescueCodeMatches } from './rescue.ts';
 import { bumpEpoch, notifyIdentity, revokeSessions, writeAuthAudit } from './store.ts';
-import { clearFailures, recordFailure, recoverySubject, throttled } from './throttle.ts';
+import { clearFailures, recoverySubject, reserveAttempt } from './throttle.ts';
 import { newSecretToken, sha256Hex } from './token.ts';
 
 async function rejectDisabled(trx: Transaction<Database>, tenantId: string, userId: string): Promise<void> {
@@ -89,10 +89,21 @@ export async function requestPasswordReset(
   return { accepted: true, token: issued };
 }
 
+export interface ResetHooks {
+  /** Runs after the token is found and before the new password is hashed. */
+  afterLookup?(): Promise<void>;
+}
+
+export interface RescueHooks {
+  /** Runs before the throttle row is locked, so concurrent attempts can arrive together. */
+  beforeReserve?(trx: Transaction<Database>): Promise<void>;
+}
+
 export async function confirmPasswordReset(
   db: Kysely<Database>,
   input: { tenantId: string; token: string; password: string },
   ctx: IdentityContext,
+  hooks: ResetHooks = {},
 ): Promise<void> {
   const tenantId = canonicalUuid(input.tenantId);
   const tokenHash = sha256Hex(input.token);
@@ -115,6 +126,7 @@ export async function confirmPasswordReset(
   });
   if (found === 'disabled') throw new AccountDisabledError();
   if (!found) throw new LoginRejectedError();
+  if (hooks.afterLookup) await hooks.afterLookup();
   const passwordHash = await hashPassword(input.password);
   await withTenant(db, tenantId, ctx.evidence, ctx.terminate, async (trx) => {
     await assertTenantContext(trx);
@@ -122,7 +134,10 @@ export async function confirmPasswordReset(
     const consumed = await sql<{ id: string }>`
       UPDATE kernel.password_reset
       SET consumed_at = clock_timestamp()
-      WHERE tenant_id = ${tenantId}::uuid AND id = ${found.id}::uuid AND consumed_at IS NULL
+      WHERE tenant_id = ${tenantId}::uuid
+        AND id = ${found.id}::uuid
+        AND consumed_at IS NULL
+        AND expires_at > clock_timestamp()
       RETURNING id::text AS id`.execute(trx);
     if (!consumed.rows[0]) throw new LoginRejectedError();
     await replacePassword(trx, tenantId, found.userId, passwordHash, 'reset');
@@ -134,13 +149,16 @@ export async function recoverWithRescueCode(
   db: Kysely<Database>,
   input: { tenantId: string; email: string; code: string; password: string },
   ctx: IdentityContext,
+  hooks: RescueHooks = {},
 ): Promise<void> {
   const tenantId = canonicalUuid(input.tenantId);
   const email = canonicalEmail(input.email);
   const subject = recoverySubject(email);
   const listed = await withTenant(db, tenantId, ctx.evidence, ctx.terminate, async (trx) => {
     await assertTenantContext(trx);
-    if (await throttled(trx, tenantId, subject)) return { ok: false as const, reason: 'throttled' as const };
+    if (hooks.beforeReserve) await hooks.beforeReserve(trx);
+    const slot = await reserveAttempt(trx, tenantId, subject);
+    if (slot === 'throttled') return { ok: false as const, reason: 'throttled' as const };
     const found = await sql<{ id: string; disabled: boolean }>`
       SELECT u.id::text AS id, (s.disabled_at IS NOT NULL) AS disabled
       FROM kernel.user_account u
@@ -148,7 +166,6 @@ export async function recoverWithRescueCode(
       WHERE u.tenant_id = ${tenantId}::uuid AND u.email = ${email}`.execute(trx);
     const account = found.rows[0];
     if (!account) {
-      await recordFailure(trx, tenantId, subject);
       await writeAuthAudit(trx, {
         tenantId,
         action: 'rescue',
@@ -188,7 +205,6 @@ export async function recoverWithRescueCode(
   if (!matched) {
     await withTenant(db, tenantId, ctx.evidence, ctx.terminate, async (trx) => {
       await assertTenantContext(trx);
-      await recordFailure(trx, tenantId, subject);
       await writeAuthAudit(trx, {
         tenantId,
         action: 'rescue',
@@ -207,7 +223,6 @@ export async function recoverWithRescueCode(
   const passwordHash = await hashPassword(input.password);
   const saved = await withTenant(db, tenantId, ctx.evidence, ctx.terminate, async (trx) => {
     await assertTenantContext(trx);
-    if (await throttled(trx, tenantId, subject)) return 'throttled' as const;
     const disabled = await sql<{ disabled: boolean }>`
       SELECT (disabled_at IS NOT NULL) AS disabled
       FROM kernel.user_auth_state
@@ -224,7 +239,6 @@ export async function recoverWithRescueCode(
     await replacePassword(trx, tenantId, listed.userId, passwordHash, 'rescue');
     return 'ok' as const;
   });
-  if (saved === 'throttled') throw new ThrottledError();
   if (saved === 'disabled') throw new AccountDisabledError();
   if (saved === 'rejected') throw new LoginRejectedError();
   ctx.log.event('account.rescue', { tenantId, action: 'rescue', outcome: 'accepted' });

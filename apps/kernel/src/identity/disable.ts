@@ -33,15 +33,18 @@ export async function disableUser(
   const target = canonicalUuid(targetUserId);
   const result = await withTenant(db, tenantId, ctx.evidence, ctx.terminate, async (trx) => {
     await assertTenantContext(trx);
-    const admin = await requireSession(trx, tenantId, actor.token, 'sensitive', leaseOf(ctx));
-    if (admin.sessionKind !== 'admin') throw new IdentityForbiddenError();
+    const preview = await requireSession(trx, tenantId, actor.token, 'sensitive', leaseOf(ctx), {
+      extendIdle: false,
+    });
+    if (preview.sessionKind !== 'admin') throw new IdentityForbiddenError();
     const kind = await sql<{ kind: string }>`
       SELECT kind FROM kernel.user_account
       WHERE tenant_id = ${tenantId}::uuid AND id = ${target}::uuid`.execute(trx);
     const accountKind = kind.rows[0]?.kind;
     if (!accountKind) throw new IdentityNotFoundError();
     if (accountKind === 'admin') {
-      // Both self-disables must take the same rows, in id order, before either counts.
+      // No session row is locked yet. The shared admin lock comes before idle extension,
+      // so two mutual disables cannot deadlock on each other's sessions.
       if (hooks.beforeAdminLock) await hooks.beforeAdminLock(trx);
       await sql`
         SELECT s.id
@@ -51,6 +54,8 @@ export async function disableUser(
         ORDER BY s.id
         FOR UPDATE OF s`.execute(trx);
     }
+    const admin = await requireSession(trx, tenantId, actor.token, 'sensitive', leaseOf(ctx));
+    if (admin.sessionKind !== 'admin') throw new IdentityForbiddenError();
     const locked = await sql<{ epoch: string; disabled: boolean }>`
       SELECT revocation_epoch::text AS epoch, (disabled_at IS NOT NULL) AS disabled
       FROM kernel.user_auth_state
