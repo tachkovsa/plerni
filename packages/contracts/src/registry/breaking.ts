@@ -51,6 +51,27 @@ function allowsExtras(schema: SchemaObject): boolean {
   return schema.additionalProperties !== false;
 }
 
+/** A missing enum accepts every value. An empty enum accepts none. */
+function enumAdded(before: SchemaObject, after: SchemaObject): boolean {
+  return before.enum === undefined && after.enum !== undefined;
+}
+
+function enumRemoved(before: SchemaObject, after: SchemaObject): boolean {
+  return before.enum !== undefined && after.enum === undefined;
+}
+
+function enumNarrowed(before: SchemaObject, after: SchemaObject): boolean {
+  if (enumAdded(before, after)) return true;
+  if (before.enum === undefined || after.enum === undefined) return false;
+  return before.enum.some((value) => !after.enum?.includes(value));
+}
+
+function enumWidened(before: SchemaObject, after: SchemaObject): boolean {
+  if (enumRemoved(before, after)) return true;
+  if (before.enum === undefined || after.enum === undefined) return false;
+  return after.enum.some((value) => !before.enum?.includes(value));
+}
+
 function requestBreaks(before: SchemaObject, after: SchemaObject, at: string): RouteBreak[] {
   const breaks: RouteBreak[] = [];
   const beforeTypes = typesOf(before);
@@ -58,7 +79,9 @@ function requestBreaks(before: SchemaObject, after: SchemaObject, at: string): R
   if (beforeTypes.length > 0 && beforeTypes.some((type) => !afterTypes.includes(type))) {
     breaks.push({ kind: 'request_tightened', path: at, detail: 'type narrowed' });
   }
-  if ((before.enum ?? []).some((value) => !(after.enum ?? []).includes(value))) {
+  if (enumAdded(before, after)) {
+    breaks.push({ kind: 'request_tightened', path: at, detail: 'enum added' });
+  } else if (enumNarrowed(before, after)) {
     breaks.push({ kind: 'request_tightened', path: at, detail: 'enum narrowed' });
   }
   if (after.pattern !== undefined && after.pattern !== before.pattern) {
@@ -100,7 +123,9 @@ function responseBreaks(before: SchemaObject, after: SchemaObject, at: string): 
   if (beforeTypes.length > 0 && typesOf(after).some((type) => !beforeTypes.includes(type))) {
     breaks.push({ kind: 'response_loosened', path: at, detail: 'type widened' });
   }
-  if ((after.enum ?? []).some((value) => !(before.enum ?? []).includes(value))) {
+  if (enumRemoved(before, after)) {
+    breaks.push({ kind: 'response_loosened', path: at, detail: 'enum removed' });
+  } else if (enumWidened(before, after)) {
     breaks.push({ kind: 'response_loosened', path: at, detail: 'enum widened' });
   }
   if ((before.minLength ?? 0) > (after.minLength ?? 0)) {

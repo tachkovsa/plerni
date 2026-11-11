@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import { dirname, join } from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 import {
   findRouteBreaks,
   generateKernelOpenApi,
@@ -8,6 +11,9 @@ import {
   type OpenApiDocument,
   type SchemaObject,
 } from '../src/index.ts';
+
+const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '../../..');
+const contractPath = 'packages/contracts/openapi/kernel.openapi.json';
 
 function clone(): OpenApiDocument {
   return structuredClone(generateKernelOpenApi());
@@ -92,6 +98,96 @@ test('removing the concurrency response is an unversioned break', () => {
   assert.ok(responses);
   delete responses['409'];
   assert.ok(unversionedRouteBreaks(before, next).some((item) => item.kind === 'response_loosened'));
+});
+
+test('dropping a response enum loosens the response', () => {
+  const before = clone();
+  const next = clone();
+  const kind = responseSchema(next).properties?.kind;
+  assert.ok(kind?.enum);
+  delete kind.enum;
+  const breaks = unversionedRouteBreaks(before, next);
+  assert.ok(breaks.some((item) => item.kind === 'response_loosened' && item.detail === 'enum removed'));
+});
+
+test('replacing a request pattern with an enum tightens the request', () => {
+  const before = clone();
+  const next = clone();
+  const key = requestSchema(next).properties?.idempotencyKey;
+  assert.ok(key?.pattern);
+  delete key.pattern;
+  key.enum = ['ok'];
+  const breaks = unversionedRouteBreaks(before, next);
+  assert.ok(breaks.some((item) => item.kind === 'request_tightened' && item.detail === 'enum added'));
+});
+
+test('removing a request enum without adding one is not a tightening', () => {
+  const before = clone();
+  const next = clone();
+  for (const document of [before, next]) {
+    const key = requestSchema(document).properties?.idempotencyKey;
+    assert.ok(key);
+    delete key.pattern;
+  }
+  const beforeKey = requestSchema(before).properties?.idempotencyKey;
+  assert.ok(beforeKey);
+  beforeKey.enum = ['alpha', 'beta'];
+  const breaks = unversionedRouteBreaks(before, next);
+  assert.equal(breaks.some((item) => item.kind === 'request_tightened'), false);
+});
+
+function contractOnRevision(revision: string): OpenApiDocument | null {
+  try {
+    const text = execFileSync('git', ['show', `${revision}:${contractPath}`], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    return JSON.parse(text) as OpenApiDocument;
+  } catch (error) {
+    const stderr = error instanceof Error && 'stderr' in error
+      ? String((error as { stderr?: unknown }).stderr)
+      : '';
+    if (stderr.includes('does not exist') || stderr.includes('exists on disk, but not')) return null;
+    throw error;
+  }
+}
+
+function parentContract(): OpenApiDocument | null {
+  try {
+    const parent = execFileSync('git', ['rev-parse', '--verify', 'HEAD^'], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim();
+    return contractOnRevision(parent);
+  } catch {
+    return null;
+  }
+}
+
+test('the generated contract has no unversioned break against the preserved baseline', () => {
+  const base = execFileSync('git', ['merge-base', 'HEAD', 'origin/dev'], {
+    cwd: repoRoot,
+    encoding: 'utf8',
+  }).trim();
+  // The merge base is the released contract. Before that blob exists, the
+  // previous commit on this branch is the preserved contract. Regenerating
+  // the working-tree file does not replace either blob.
+  const baseline = contractOnRevision(base) ?? parentContract();
+  const generated = generateKernelOpenApi();
+  if (baseline === null) {
+    assert.equal(generated.info.version, '1.0.0');
+    return;
+  }
+  assert.deepEqual(unversionedRouteBreaks(baseline, generated), []);
+});
+
+test('regenerating the OpenAPI file does not hide a break against a preserved baseline', () => {
+  const baseline = clone();
+  const regenerated = clone();
+  delete regenerated.paths['/kernel/tenants'];
+  assert.ok(unversionedRouteBreaks(baseline, regenerated).some((item) => item.kind === 'operation_removed'));
 });
 
 test('changing the CONCURRENCY_CONFLICT status changes the code meaning', () => {
