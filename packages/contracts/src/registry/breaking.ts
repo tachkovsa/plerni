@@ -138,7 +138,42 @@ function schemaFields(schema: SchemaObject): Record<string, unknown> {
   return schema as SchemaObject & Record<string, unknown>;
 }
 
+function refNames(value: unknown, found: Set<string>): void {
+  if (!value || typeof value !== 'object') return;
+  if (Array.isArray(value)) {
+    for (const item of value) refNames(item, found);
+    return;
+  }
+  const record = value as Record<string, unknown>;
+  if (typeof record.$ref === 'string') {
+    const name = record.$ref.split('/').pop();
+    if (name) found.add(name);
+  }
+  for (const key of Object.keys(record)) refNames(record[key], found);
+}
+
+function componentChanged(
+  beforeDoc: OpenApiDocument,
+  afterDoc: OpenApiDocument,
+  name: string,
+  seen = new Set<string>(),
+): boolean {
+  if (seen.has(name)) return false;
+  seen.add(name);
+  const left = beforeDoc.components.schemas[name];
+  const right = afterDoc.components.schemas[name];
+  if (JSON.stringify(left) !== JSON.stringify(right)) return true;
+  const nested = new Set<string>();
+  refNames(left, nested);
+  for (const child of nested) {
+    if (componentChanged(beforeDoc, afterDoc, child, seen)) return true;
+  }
+  return false;
+}
+
 function unsupportedBreaks(
+  beforeDoc: OpenApiDocument,
+  afterDoc: OpenApiDocument,
   before: SchemaObject,
   after: SchemaObject,
   at: string,
@@ -151,7 +186,11 @@ function unsupportedBreaks(
   const breaks: RouteBreak[] = [];
   for (const keyword of [...keywords].sort()) {
     if (SUPPORTED_KEYWORDS.has(keyword)) continue;
-    if (JSON.stringify(left[keyword]) === JSON.stringify(right[keyword])) continue;
+    const sameText = JSON.stringify(left[keyword]) === JSON.stringify(right[keyword]);
+    const names = new Set<string>();
+    if (sameText) refNames(left[keyword], names);
+    const targetChanged = sameText && [...names].some((name) => componentChanged(beforeDoc, afterDoc, name));
+    if (sameText && !targetChanged) continue;
     if (allow.some((entry) => entry.path === at && entry.keyword === keyword)) continue;
     breaks.push({ kind, path: at, detail: `unsupported schema difference: ${keyword}` });
   }
@@ -226,7 +265,7 @@ function requestBreaks(
   const before = resolve(beforeDoc, beforeSchema) ?? beforeSchema;
   const after = resolve(afterDoc, afterSchema) ?? afterSchema;
   if (visited(seen, before, after)) return breaks;
-  breaks.push(...unsupportedBreaks(before, after, at, 'request_tightened', allow));
+  breaks.push(...unsupportedBreaks(beforeDoc, afterDoc, before, after, at, 'request_tightened', allow));
   const tighterType = typeTightened(before, after);
   if (tighterType) breaks.push({ kind: 'request_tightened', path: at, detail: tighterType });
   if (enumAdded(before, after)) {
@@ -319,7 +358,7 @@ function responseBreaks(
   const before = resolve(beforeDoc, beforeSchema) ?? beforeSchema;
   const after = resolve(afterDoc, afterSchema) ?? afterSchema;
   if (visited(seen, before, after)) return breaks;
-  breaks.push(...unsupportedBreaks(before, after, at, 'response_loosened', allow));
+  breaks.push(...unsupportedBreaks(beforeDoc, afterDoc, before, after, at, 'response_loosened', allow));
   const looserType = typeLoosened(before, after);
   if (looserType) breaks.push({ kind: 'response_loosened', path: at, detail: looserType });
   if (enumRemoved(before, after)) {
@@ -428,8 +467,8 @@ export function findRouteBreaks(
         detail: `${old.method} ${old.path} -> ${found.method} ${found.path}`,
       });
     }
-    const oldRequest = resolve(before, jsonSchema(old.operation, 'request', ''));
-    const newRequest = resolve(after, jsonSchema(found.operation, 'request', ''));
+    const oldRequest = jsonSchema(old.operation, 'request', '');
+    const newRequest = jsonSchema(found.operation, 'request', '');
     if (old.operation.requestBody?.required !== true && found.operation.requestBody?.required === true) {
       breaks.push({ kind: 'request_tightened', path: operationId, detail: 'request body added' });
     }
@@ -438,8 +477,8 @@ export function findRouteBreaks(
       breaks.push({ kind: 'request_tightened', path: operationId, detail: 'request body removed' });
     }
     for (const status of Object.keys(old.operation.responses ?? {})) {
-      const oldResponse = resolve(before, jsonSchema(old.operation, 'response', status));
-      const newResponse = resolve(after, jsonSchema(found.operation, 'response', status));
+      const oldResponse = jsonSchema(old.operation, 'response', status);
+      const newResponse = jsonSchema(found.operation, 'response', status);
       if (oldResponse && newResponse) breaks.push(...responseBreaks(before, after, oldResponse, newResponse, `${operationId} ${status}`, new WeakMap(), allow));
       else if (oldResponse && !newResponse) {
         breaks.push({ kind: 'response_loosened', path: `${operationId} ${status}`, detail: 'response removed' });

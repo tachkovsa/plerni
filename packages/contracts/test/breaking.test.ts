@@ -166,6 +166,31 @@ test('an anyOf request rejects previously valid keys', () => {
   assert.ok(breaks.some((item) => item.kind === 'request_tightened' && item.detail === 'unsupported schema difference: anyOf'));
 });
 
+test('a changed component behind an unchanged anyOf fails closed', () => {
+  const before = clone();
+  const next = clone();
+  before.components.schemas.Key = { type: 'string' };
+  next.components.schemas.Key = { type: 'string', enum: ['ok'] };
+  for (const schema of [requestSchema(before), requestSchema(next)]) {
+    schema.properties = {
+      ...schema.properties,
+      idempotencyKey: { anyOf: [{ $ref: '#/components/schemas/Key' }] },
+    };
+  }
+  const breaks = unversionedRouteBreaks(before, next);
+  assert.ok(breaks.some((item) => item.kind === 'request_tightened' && item.detail === 'unsupported schema difference: anyOf'));
+});
+
+test('a constraint beside the root schema reference fails closed', () => {
+  const before = clone();
+  const next = clone();
+  const body = next.paths['/kernel/tenants']?.post?.requestBody?.content?.['application/json'];
+  assert.ok(body?.schema?.$ref);
+  Object.assign(body.schema, { enum: [{ idempotencyKey: 'ok' }] });
+  const breaks = unversionedRouteBreaks(before, next);
+  assert.ok(breaks.some((item) => item.kind === 'request_tightened' && item.detail === 'unsupported schema difference: enum'));
+});
+
 test('a constraint beside a schema reference fails closed', () => {
   const before = clone();
   const next = clone();
