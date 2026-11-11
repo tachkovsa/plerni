@@ -73,11 +73,44 @@ function allowsExtras(schema: SchemaObject): boolean {
   return schema.additionalProperties !== false;
 }
 
-/** The schema previously accepted for names that were not declared properties. */
-function extraSchema(schema: SchemaObject): SchemaObject {
-  const extra = schema.additionalProperties;
-  if (extra && typeof extra === 'object') return extra;
+/**
+ * The schema for names that are not declared properties.
+ * `null` means extras are forbidden. `{}` means they are unrestricted.
+ */
+function extraSchema(schema: SchemaObject): SchemaObject | null {
+  if (schema.additionalProperties === false) return null;
+  if (schema.additionalProperties && typeof schema.additionalProperties === 'object') return schema.additionalProperties;
   return {};
+}
+
+/** Keywords beside `$ref` are not combined with the target. A difference fails closed. */
+function refSiblingBreaks(
+  before: SchemaObject,
+  after: SchemaObject,
+  at: string,
+  kind: 'request_tightened' | 'response_loosened',
+  allow: readonly UnsupportedSchemaAllow[],
+): RouteBreak[] {
+  const siblings = (schema: SchemaObject): Record<string, unknown> => {
+    const fields = schema as SchemaObject & Record<string, unknown>;
+    if (typeof fields.$ref !== 'string') return {};
+    const copy: Record<string, unknown> = {};
+    for (const key of Object.keys(fields)) {
+      if (key !== '$ref') copy[key] = fields[key];
+    }
+    return copy;
+  };
+  const left = siblings(before);
+  const right = siblings(after);
+  if (Object.keys(left).length === 0 && Object.keys(right).length === 0) return [];
+  const keywords = new Set([...Object.keys(left), ...Object.keys(right)]);
+  const breaks: RouteBreak[] = [];
+  for (const keyword of [...keywords].sort()) {
+    if (JSON.stringify(left[keyword]) === JSON.stringify(right[keyword])) continue;
+    if (allow.some((entry) => entry.path === at && entry.keyword === keyword)) continue;
+    breaks.push({ kind, path: at, detail: `unsupported schema difference: ${keyword}` });
+  }
+  return breaks;
 }
 
 /** Compared directly. Every other keyword difference fails closed. */
@@ -188,10 +221,11 @@ function requestBreaks(
   seen: SeenPairs,
   allow: readonly UnsupportedSchemaAllow[],
 ): RouteBreak[] {
+  const breaks: RouteBreak[] = [];
+  breaks.push(...refSiblingBreaks(beforeSchema, afterSchema, at, 'request_tightened', allow));
   const before = resolve(beforeDoc, beforeSchema) ?? beforeSchema;
   const after = resolve(afterDoc, afterSchema) ?? afterSchema;
-  if (visited(seen, before, after)) return [];
-  const breaks: RouteBreak[] = [];
+  if (visited(seen, before, after)) return breaks;
   breaks.push(...unsupportedBreaks(before, after, at, 'request_tightened', allow));
   const tighterType = typeTightened(before, after);
   if (tighterType) breaks.push({ kind: 'request_tightened', path: at, detail: tighterType });
@@ -220,6 +254,18 @@ function requestBreaks(
   if (allowsExtras(before) && !allowsExtras(after)) {
     breaks.push({ kind: 'request_tightened', path: at, detail: 'additional properties rejected' });
   }
+  if (allowsExtras(before) && allowsExtras(after)
+    && (typeof before.additionalProperties === 'object' || typeof after.additionalProperties === 'object')) {
+    breaks.push(...requestBreaks(
+      beforeDoc,
+      afterDoc,
+      extraSchema(before) ?? {},
+      extraSchema(after) ?? {},
+      `${at} additionalProperties`,
+      seen,
+      allow,
+    ));
+  }
   const beforeProps = before.properties ?? {};
   const afterProps = after.properties ?? {};
   const beforeRequired = new Set(before.required ?? []);
@@ -233,7 +279,7 @@ function requestBreaks(
     breaks.push(...requestBreaks(beforeDoc, afterDoc, beforeProps[key] as SchemaObject, afterProp, `${at}.${key}`, seen, allow));
   }
   if (allowsExtras(before)) {
-    const baseline = extraSchema(before);
+    const baseline = extraSchema(before) ?? {};
     for (const key of Object.keys(afterProps)) {
       if (key in beforeProps) continue;
       const declared = afterProps[key];
@@ -263,10 +309,11 @@ function responseBreaks(
   seen: SeenPairs,
   allow: readonly UnsupportedSchemaAllow[],
 ): RouteBreak[] {
+  const breaks: RouteBreak[] = [];
+  breaks.push(...refSiblingBreaks(beforeSchema, afterSchema, at, 'response_loosened', allow));
   const before = resolve(beforeDoc, beforeSchema) ?? beforeSchema;
   const after = resolve(afterDoc, afterSchema) ?? afterSchema;
-  if (visited(seen, before, after)) return [];
-  const breaks: RouteBreak[] = [];
+  if (visited(seen, before, after)) return breaks;
   breaks.push(...unsupportedBreaks(before, after, at, 'response_loosened', allow));
   const looserType = typeLoosened(before, after);
   if (looserType) breaks.push({ kind: 'response_loosened', path: at, detail: looserType });
@@ -293,6 +340,18 @@ function responseBreaks(
   }
   if (!allowsExtras(before) && allowsExtras(after)) {
     breaks.push({ kind: 'response_loosened', path: at, detail: 'additional properties allowed' });
+  }
+  if (allowsExtras(before) && allowsExtras(after)
+    && (typeof before.additionalProperties === 'object' || typeof after.additionalProperties === 'object')) {
+    breaks.push(...responseBreaks(
+      beforeDoc,
+      afterDoc,
+      extraSchema(before) ?? {},
+      extraSchema(after) ?? {},
+      `${at} additionalProperties`,
+      seen,
+      allow,
+    ));
   }
   const beforeProps = before.properties ?? {};
   const afterProps = after.properties ?? {};
@@ -361,6 +420,9 @@ export function findRouteBreaks(
     }
     const oldRequest = resolve(before, jsonSchema(old.operation, 'request', ''));
     const newRequest = resolve(after, jsonSchema(found.operation, 'request', ''));
+    if (old.operation.requestBody?.required !== true && found.operation.requestBody?.required === true) {
+      breaks.push({ kind: 'request_tightened', path: operationId, detail: 'request body added' });
+    }
     if (oldRequest && newRequest) breaks.push(...requestBreaks(before, after, oldRequest, newRequest, operationId, new WeakMap(), allow));
     else if (oldRequest && !newRequest) {
       breaks.push({ kind: 'request_tightened', path: operationId, detail: 'request body removed' });

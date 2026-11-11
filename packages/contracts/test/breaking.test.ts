@@ -166,6 +166,58 @@ test('an anyOf request rejects previously valid keys', () => {
   assert.ok(breaks.some((item) => item.kind === 'request_tightened' && item.detail === 'unsupported schema difference: anyOf'));
 });
 
+test('a constraint beside a schema reference fails closed', () => {
+  const before = clone();
+  const next = clone();
+  for (const document of [before, next]) {
+    document.components.schemas.Key = { type: 'string' };
+  }
+  const beforeRequest = requestSchema(before);
+  const nextRequest = requestSchema(next);
+  beforeRequest.properties = {
+    ...beforeRequest.properties,
+    idempotencyKey: { $ref: '#/components/schemas/Key' },
+  };
+  nextRequest.properties = {
+    ...nextRequest.properties,
+    idempotencyKey: { $ref: '#/components/schemas/Key', enum: ['ok'] },
+  };
+  const breaks = unversionedRouteBreaks(before, next);
+  assert.ok(breaks.some((item) => item.kind === 'request_tightened' && item.detail === 'unsupported schema difference: enum'));
+});
+
+test('tightening the schema of extra request names is a break', () => {
+  const before = clone();
+  const next = clone();
+  const beforeRequest = requestSchema(before);
+  const nextRequest = requestSchema(next);
+  beforeRequest.additionalProperties = true;
+  nextRequest.additionalProperties = { type: 'string' };
+  const breaks = unversionedRouteBreaks(before, next);
+  assert.ok(breaks.some((item) => item.kind === 'request_tightened' && item.path.endsWith('additionalProperties')));
+});
+
+test('removing the schema of extra response names loosens the response', () => {
+  const before = clone();
+  const next = clone();
+  const beforeResponse = responseSchema(before);
+  const nextResponse = responseSchema(next);
+  beforeResponse.additionalProperties = { type: 'string' };
+  nextResponse.additionalProperties = true;
+  const breaks = unversionedRouteBreaks(before, next);
+  assert.ok(breaks.some((item) => item.kind === 'response_loosened' && item.path.endsWith('additionalProperties')));
+});
+
+test('adding a required request body tightens the route', () => {
+  const before = clone();
+  const next = clone();
+  const operation = before.paths['/kernel/tenants']?.post;
+  assert.ok(operation);
+  delete operation.requestBody;
+  const breaks = unversionedRouteBreaks(before, next);
+  assert.ok(breaks.some((item) => item.kind === 'request_tightened' && item.detail === 'request body added'));
+});
+
 test('an unsupported keyword fails closed unless it is allowed', () => {
   const before = clone();
   const next = clone();

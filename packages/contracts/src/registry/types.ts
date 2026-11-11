@@ -62,7 +62,10 @@ export interface OperationObject {
   operationId?: string;
   summary?: string;
   deprecated?: boolean;
-  requestBody?: { content?: { 'application/json'?: { schema?: SchemaObject } } };
+  requestBody?: {
+    required?: boolean;
+    content?: { 'application/json'?: { schema?: SchemaObject } };
+  };
   responses?: Record<string, ResponseObject>;
   'x-plerni-action'?: 'routine' | 'sensitive' | 'destructive';
   'x-plerni-scope'?: 'platform' | 'tenant';
