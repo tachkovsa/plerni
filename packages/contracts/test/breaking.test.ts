@@ -74,7 +74,19 @@ test('tightening the create-tenant request is an unversioned break', () => {
   assert.ok(breaks.some((item) => item.kind === 'request_tightened'));
 });
 
-test('an optional request field is not a break', () => {
+test('a new property tightens a request that allows extras', () => {
+  const before = clone();
+  const next = clone();
+  const beforeRequest = requestSchema(before);
+  const nextRequest = requestSchema(next);
+  beforeRequest.additionalProperties = true;
+  nextRequest.additionalProperties = true;
+  nextRequest.properties = { ...nextRequest.properties, note: { type: 'string' } };
+  const breaks = unversionedRouteBreaks(before, next);
+  assert.ok(breaks.some((item) => item.kind === 'request_tightened' && item.path.endsWith('.note')));
+});
+
+test('an optional field on a closed request object is not a break', () => {
   const before = clone();
   const next = clone();
   const request = requestSchema(next);
@@ -108,6 +120,33 @@ test('dropping a response enum loosens the response', () => {
   delete kind.enum;
   const breaks = unversionedRouteBreaks(before, next);
   assert.ok(breaks.some((item) => item.kind === 'response_loosened' && item.detail === 'enum removed'));
+});
+
+test('widening a oneOf branch rejects a value that now matches both', () => {
+  const before = clone();
+  const next = clone();
+  const beforeRequest = requestSchema(before);
+  const nextRequest = requestSchema(next);
+  beforeRequest.properties = {
+    ...beforeRequest.properties,
+    idempotencyKey: {
+      oneOf: [
+        { type: 'string', enum: ['ok'] },
+        { type: 'string', enum: ['other'] },
+      ],
+    },
+  };
+  nextRequest.properties = {
+    ...nextRequest.properties,
+    idempotencyKey: {
+      oneOf: [
+        { type: 'string', enum: ['ok', 'other'] },
+        { type: 'string', enum: ['other'] },
+      ],
+    },
+  };
+  const breaks = unversionedRouteBreaks(before, next);
+  assert.ok(breaks.some((item) => item.kind === 'request_tightened' && item.detail === 'composition changed'));
 });
 
 test('an anyOf request rejects previously valid keys', () => {

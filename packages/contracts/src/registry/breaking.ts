@@ -71,6 +71,35 @@ function allowsExtras(schema: SchemaObject): boolean {
   return schema.additionalProperties !== false;
 }
 
+/** The schema previously accepted for names that were not declared properties. */
+function extraSchema(schema: SchemaObject): SchemaObject {
+  const extra = schema.additionalProperties;
+  if (extra && typeof extra === 'object') return extra;
+  return {};
+}
+
+function fingerprint(document: OpenApiDocument, schema: SchemaObject, seen = new Set<SchemaObject>()): string {
+  const resolved = resolve(document, schema) ?? schema;
+  if (seen.has(resolved)) return '"cycle"';
+  seen.add(resolved);
+  const keys = Object.keys(resolved).filter((key) => key !== '$ref').sort();
+  const parts: string[] = [];
+  for (const key of keys) {
+    const value = resolved[key as keyof SchemaObject];
+    if (Array.isArray(value)) {
+      const rendered = value.map((item) => (
+        item && typeof item === 'object' ? fingerprint(document, item as SchemaObject, seen) : JSON.stringify(item)
+      ));
+      parts.push(`${JSON.stringify(key)}:[${rendered.join(',')}]`);
+    } else if (value && typeof value === 'object') {
+      parts.push(`${JSON.stringify(key)}:${fingerprint(document, value as SchemaObject, seen)}`);
+    } else {
+      parts.push(`${JSON.stringify(key)}:${JSON.stringify(value)}`);
+    }
+  }
+  return `{${parts.join(',')}}`;
+}
+
 /** A missing enum accepts every value. An empty enum accepts none. */
 function enumAdded(before: SchemaObject, after: SchemaObject): boolean {
   return before.enum === undefined && after.enum !== undefined;
@@ -158,6 +187,12 @@ function compositionBreaks(
   const left = before[beforeKey] ?? [];
   const right = after[beforeKey] ?? [];
   if (left.length !== right.length) return [changed()];
+  if (beforeKey === 'oneOf' && left.some((branch, index) => {
+    const other = right[index];
+    return !branch || !other || fingerprint(beforeDoc, branch) !== fingerprint(afterDoc, other);
+  })) {
+    return [changed()];
+  }
   const breaks: RouteBreak[] = [];
   for (let index = 0; index < left.length; index += 1) {
     const leftBranch = left[index];
@@ -217,6 +252,15 @@ function requestBreaks(
       continue;
     }
     breaks.push(...requestBreaks(beforeDoc, afterDoc, beforeProps[key] as SchemaObject, afterProp, `${at}.${key}`, seen));
+  }
+  if (allowsExtras(before)) {
+    const baseline = extraSchema(before);
+    for (const key of Object.keys(afterProps)) {
+      if (key in beforeProps) continue;
+      const declared = afterProps[key];
+      if (!declared) continue;
+      breaks.push(...requestBreaks(beforeDoc, afterDoc, baseline, declared, `${at}.${key}`, seen));
+    }
   }
   for (const key of afterRequired) {
     if (!beforeRequired.has(key)) {
