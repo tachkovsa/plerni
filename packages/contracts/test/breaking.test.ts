@@ -146,7 +146,7 @@ test('widening a oneOf branch rejects a value that now matches both', () => {
     },
   };
   const breaks = unversionedRouteBreaks(before, next);
-  assert.ok(breaks.some((item) => item.kind === 'request_tightened' && item.detail === 'composition changed'));
+  assert.ok(breaks.some((item) => item.kind === 'request_tightened' && item.detail === 'unsupported schema difference: oneOf'));
 });
 
 test('an anyOf request rejects previously valid keys', () => {
@@ -163,7 +163,21 @@ test('an anyOf request rejects previously valid keys', () => {
     },
   };
   const breaks = unversionedRouteBreaks(before, next);
-  assert.ok(breaks.some((item) => item.kind === 'request_tightened' && item.detail === 'composition changed'));
+  assert.ok(breaks.some((item) => item.kind === 'request_tightened' && item.detail === 'unsupported schema difference: anyOf'));
+});
+
+test('an unsupported keyword fails closed unless it is allowed', () => {
+  const before = clone();
+  const next = clone();
+  const key = requestSchema(next).properties?.idempotencyKey;
+  assert.ok(key);
+  Object.assign(key, { contentMediaType: 'text/plain' });
+  const breaks = unversionedRouteBreaks(before, next);
+  const hit = breaks.find((item) =>
+    item.kind === 'request_tightened' && item.detail === 'unsupported schema difference: contentMediaType');
+  assert.ok(hit && hit.kind === 'request_tightened');
+  const allowed = unversionedRouteBreaks(before, next, [{ path: hit.path, keyword: 'contentMediaType' }]);
+  assert.equal(allowed.some((item) => 'detail' in item && item.detail.includes('contentMediaType')), false);
 });
 
 test('a recursive object is compared once when both contracts have the cycle', () => {

@@ -30,7 +30,7 @@ export {
   generateOpenApi,
   handWrittenPaths,
 } from './registry/openapi.ts';
-export { findRouteBreaks, unversionedRouteBreaks } from './registry/breaking.ts';
+export { findRouteBreaks, unversionedRouteBreaks, type UnsupportedSchemaAllow } from './registry/breaking.ts';
 export type {
   DeprecationWindow,
   OpenApiDocument,

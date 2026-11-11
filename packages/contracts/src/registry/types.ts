@@ -44,6 +44,8 @@ export interface SchemaObject {
   items?: SchemaObject;
   minLength?: number;
   maxLength?: number;
+  minimum?: number;
+  maximum?: number;
   pattern?: string;
   format?: string;
   description?: string;
