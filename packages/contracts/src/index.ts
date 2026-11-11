@@ -30,13 +30,12 @@ export {
   generateOpenApi,
   handWrittenPaths,
 } from './registry/openapi.ts';
-export { findRouteBreaks, unversionedRouteBreaks, type UnsupportedSchemaAllow } from './registry/breaking.ts';
+export { operationBreaks, type OperationAllow, type OperationBreak } from './registry/breaking.ts';
 export type {
   DeprecationWindow,
   OpenApiDocument,
   OperationObject,
   ResponseObject,
-  RouteBreak,
   RouteContract,
   RouteSchema,
   SchemaObject,

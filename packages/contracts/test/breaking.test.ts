@@ -1,504 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import {
-  findRouteBreaks,
-  generateKernelOpenApi,
-  unversionedRouteBreaks,
-  type OpenApiDocument,
-  type SchemaObject,
-} from '../src/index.ts';
+import { generateKernelOpenApi, operationBreaks, type OpenApiDocument, type OperationAllow } from '../src/index.ts';
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '../../..');
 const contractPath = 'packages/contracts/openapi/kernel.openapi.json';
 
 function clone(): OpenApiDocument {
   return structuredClone(generateKernelOpenApi());
-}
-
-function schemaAt(document: OpenApiDocument, refOrSchema: SchemaObject | undefined): SchemaObject {
-  assert.ok(refOrSchema);
-  if (typeof refOrSchema.$ref === 'string') {
-    const name = refOrSchema.$ref.split('/').pop();
-    assert.equal(typeof name, 'string');
-    const resolved = document.components.schemas[name as string];
-    assert.ok(resolved);
-    return resolved;
-  }
-  return refOrSchema;
-}
-
-function requestSchema(document: OpenApiDocument): SchemaObject {
-  const requestBody = document.paths['/kernel/tenants']?.post?.requestBody;
-  return schemaAt(document, requestBody?.content?.['application/json']?.schema);
-}
-
-function responseSchema(document: OpenApiDocument): SchemaObject {
-  const response = document.paths['/kernel/tenants']?.post?.responses?.['201'];
-  return schemaAt(document, response?.content?.['application/json']?.schema);
-}
-
-test('the generated kernel routes have no unversioned break against themselves', () => {
-  const document = generateKernelOpenApi();
-  assert.deepEqual(unversionedRouteBreaks(document, document), []);
-});
-
-test('removing or renaming an operation id is an unversioned break', () => {
-  const next = clone();
-  const operation = next.paths['/kernel/tenants']?.post;
-  assert.ok(operation);
-  operation.operationId = 'kernel.tenant.add';
-  const breaks = unversionedRouteBreaks(clone(), next);
-  assert.ok(breaks.some((item) => item.kind === 'operation_removed' && item.operationId === 'kernel.tenant.create'));
-});
-
-test('a major version bump records the same removal as a versioned break', () => {
-  const before = clone();
-  const next = clone();
-  delete next.paths['/kernel/tenants'];
-  next.info = { ...next.info, version: '2.0.0' };
-  assert.ok(findRouteBreaks(before, next).some((item) => item.kind === 'operation_removed'));
-  assert.deepEqual(unversionedRouteBreaks(before, next), []);
-});
-
-test('tightening the create-tenant request is an unversioned break', () => {
-  const before = clone();
-  const next = clone();
-  const request = requestSchema(next);
-  request.properties = { ...request.properties, label: { type: 'string' } };
-  request.required = [...(request.required ?? []), 'label'];
-  const breaks = unversionedRouteBreaks(before, next);
-  assert.ok(breaks.some((item) => item.kind === 'request_tightened'));
-});
-
-test('a new property tightens a request that allows extras', () => {
-  const before = clone();
-  const next = clone();
-  const beforeRequest = requestSchema(before);
-  const nextRequest = requestSchema(next);
-  beforeRequest.additionalProperties = true;
-  nextRequest.additionalProperties = true;
-  nextRequest.properties = { ...nextRequest.properties, note: { type: 'string' } };
-  const breaks = unversionedRouteBreaks(before, next);
-  assert.ok(breaks.some((item) => item.kind === 'request_tightened' && item.path.endsWith('.note')));
-});
-
-test('an optional field on a closed request object is not a break', () => {
-  const before = clone();
-  const next = clone();
-  const request = requestSchema(next);
-  request.properties = { ...request.properties, note: { type: 'string' } };
-  assert.deepEqual(unversionedRouteBreaks(before, next), []);
-});
-
-test('loosening the create-tenant response is an unversioned break', () => {
-  const before = clone();
-  const next = clone();
-  const response = responseSchema(next);
-  response.required = (response.required ?? []).filter((name) => name !== 'id');
-  const breaks = unversionedRouteBreaks(before, next);
-  assert.ok(breaks.some((item) => item.kind === 'response_loosened'));
-});
-
-test('removing the concurrency response is an unversioned break', () => {
-  const before = clone();
-  const next = clone();
-  const responses = next.paths['/kernel/tenants']?.post?.responses;
-  assert.ok(responses);
-  delete responses['409'];
-  assert.ok(unversionedRouteBreaks(before, next).some((item) => item.kind === 'response_loosened'));
-});
-
-test('dropping a response enum loosens the response', () => {
-  const before = clone();
-  const next = clone();
-  const kind = responseSchema(next).properties?.kind;
-  assert.ok(kind?.enum);
-  delete kind.enum;
-  const breaks = unversionedRouteBreaks(before, next);
-  assert.ok(breaks.some((item) => item.kind === 'response_loosened' && item.detail === 'enum removed'));
-});
-
-test('widening a oneOf branch rejects a value that now matches both', () => {
-  const before = clone();
-  const next = clone();
-  const beforeRequest = requestSchema(before);
-  const nextRequest = requestSchema(next);
-  beforeRequest.properties = {
-    ...beforeRequest.properties,
-    idempotencyKey: {
-      oneOf: [
-        { type: 'string', enum: ['ok'] },
-        { type: 'string', enum: ['other'] },
-      ],
-    },
-  };
-  nextRequest.properties = {
-    ...nextRequest.properties,
-    idempotencyKey: {
-      oneOf: [
-        { type: 'string', enum: ['ok', 'other'] },
-        { type: 'string', enum: ['other'] },
-      ],
-    },
-  };
-  const breaks = unversionedRouteBreaks(before, next);
-  assert.ok(breaks.some((item) => item.kind === 'request_tightened' && item.detail === 'unsupported schema difference: oneOf'));
-});
-
-test('an anyOf request rejects previously valid keys', () => {
-  const before = clone();
-  const next = clone();
-  const request = requestSchema(next);
-  request.properties = {
-    ...request.properties,
-    idempotencyKey: {
-      anyOf: [
-        { type: 'string', enum: ['UPPER'] },
-        { type: 'string', enum: ['OTHER'] },
-      ],
-    },
-  };
-  const breaks = unversionedRouteBreaks(before, next);
-  assert.ok(breaks.some((item) => item.kind === 'request_tightened' && item.detail === 'unsupported schema difference: anyOf'));
-});
-
-test('a changed component behind an unchanged anyOf fails closed', () => {
-  const before = clone();
-  const next = clone();
-  before.components.schemas.Key = { type: 'string' };
-  next.components.schemas.Key = { type: 'string', enum: ['ok'] };
-  for (const schema of [requestSchema(before), requestSchema(next)]) {
-    schema.properties = {
-      ...schema.properties,
-      idempotencyKey: { anyOf: [{ $ref: '#/components/schemas/Key' }] },
-    };
-  }
-  const breaks = unversionedRouteBreaks(before, next);
-  assert.ok(breaks.some((item) => item.kind === 'request_tightened' && item.detail === 'unsupported schema difference: anyOf'));
-});
-
-test('a constraint beside the root schema reference fails closed', () => {
-  const before = clone();
-  const next = clone();
-  const body = next.paths['/kernel/tenants']?.post?.requestBody?.content?.['application/json'];
-  assert.ok(body?.schema?.$ref);
-  Object.assign(body.schema, { enum: [{ idempotencyKey: 'ok' }] });
-  const breaks = unversionedRouteBreaks(before, next);
-  assert.ok(breaks.some((item) => item.kind === 'request_tightened' && item.detail === 'unsupported schema difference: enum'));
-});
-
-test('a constraint beside a schema reference fails closed', () => {
-  const before = clone();
-  const next = clone();
-  for (const document of [before, next]) {
-    document.components.schemas.Key = { type: 'string' };
-  }
-  const beforeRequest = requestSchema(before);
-  const nextRequest = requestSchema(next);
-  beforeRequest.properties = {
-    ...beforeRequest.properties,
-    idempotencyKey: { $ref: '#/components/schemas/Key' },
-  };
-  nextRequest.properties = {
-    ...nextRequest.properties,
-    idempotencyKey: { $ref: '#/components/schemas/Key', enum: ['ok'] },
-  };
-  const breaks = unversionedRouteBreaks(before, next);
-  assert.ok(breaks.some((item) => item.kind === 'request_tightened' && item.detail === 'unsupported schema difference: enum'));
-});
-
-test('tightening the schema of extra request names is a break', () => {
-  const before = clone();
-  const next = clone();
-  const beforeRequest = requestSchema(before);
-  const nextRequest = requestSchema(next);
-  beforeRequest.additionalProperties = true;
-  nextRequest.additionalProperties = { type: 'string' };
-  const breaks = unversionedRouteBreaks(before, next);
-  assert.ok(breaks.some((item) => item.kind === 'request_tightened' && item.path.endsWith('additionalProperties')));
-});
-
-test('removing the schema of extra response names loosens the response', () => {
-  const before = clone();
-  const next = clone();
-  const beforeResponse = responseSchema(before);
-  const nextResponse = responseSchema(next);
-  beforeResponse.additionalProperties = { type: 'string' };
-  nextResponse.additionalProperties = true;
-  const breaks = unversionedRouteBreaks(before, next);
-  assert.ok(breaks.some((item) => item.kind === 'response_loosened' && item.path.endsWith('additionalProperties')));
-});
-
-test('removing a request property is checked against the extra schema', () => {
-  const before = clone();
-  const next = clone();
-  for (const schema of [requestSchema(before), requestSchema(next)]) {
-    schema.additionalProperties = { type: 'string' };
-  }
-  const beforeRequest = requestSchema(before);
-  beforeRequest.properties = { ...beforeRequest.properties, note: { type: 'number' } };
-  const breaks = unversionedRouteBreaks(before, next);
-  assert.ok(breaks.some((item) => item.kind === 'request_tightened' && item.path.endsWith('.note')));
-});
-
-test('a new response property wider than the extra schema is a break', () => {
-  const before = clone();
-  const next = clone();
-  const beforeResponse = responseSchema(before);
-  const nextResponse = responseSchema(next);
-  beforeResponse.additionalProperties = { type: 'string' };
-  nextResponse.additionalProperties = { type: 'string' };
-  nextResponse.properties = { ...nextResponse.properties, note: { type: 'number' } };
-  const breaks = unversionedRouteBreaks(before, next);
-  assert.ok(breaks.some((item) => item.kind === 'response_loosened' && item.path.endsWith('.note')));
-});
-
-test('adding a required request body tightens the route', () => {
-  const before = clone();
-  const next = clone();
-  const operation = before.paths['/kernel/tenants']?.post;
-  assert.ok(operation);
-  delete operation.requestBody;
-  const breaks = unversionedRouteBreaks(before, next);
-  assert.ok(breaks.some((item) => item.kind === 'request_tightened' && item.detail === 'request body added'));
-});
-
-test('an unsupported keyword fails closed unless it is allowed', () => {
-  const before = clone();
-  const next = clone();
-  const key = requestSchema(next).properties?.idempotencyKey;
-  assert.ok(key);
-  Object.assign(key, { contentMediaType: 'text/plain' });
-  const breaks = unversionedRouteBreaks(before, next);
-  const hit = breaks.find((item) =>
-    item.kind === 'request_tightened' && item.detail === 'unsupported schema difference: contentMediaType');
-  assert.ok(hit && hit.kind === 'request_tightened');
-  const allowed = unversionedRouteBreaks(before, next, [{ path: hit.path, keyword: 'contentMediaType' }]);
-  assert.equal(allowed.some((item) => 'detail' in item && item.detail.includes('contentMediaType')), false);
-});
-
-test('a recursive object is compared once when both contracts have the cycle', () => {
-  const before = clone();
-  const next = clone();
-  for (const document of [before, next]) {
-    const schema = document.components.schemas.CreateTenantRequest;
-    assert.ok(schema);
-    schema.properties = {
-      ...schema.properties,
-      child: { $ref: '#/components/schemas/CreateTenantRequest' },
-    };
-  }
-  assert.deepEqual(unversionedRouteBreaks(before, next), []);
-});
-
-test('a referenced request pattern tightens the request', () => {
-  const before = clone();
-  const next = clone();
-  next.components.schemas.IdempotencyKey = {
-    type: 'string',
-    pattern: '^[A-Z]{1,10}$',
-  };
-  const request = requestSchema(next);
-  request.properties = {
-    ...request.properties,
-    idempotencyKey: { $ref: '#/components/schemas/IdempotencyKey' },
-  };
-  const breaks = unversionedRouteBreaks(before, next);
-  assert.ok(breaks.some((item) => item.kind === 'request_tightened' && item.detail === 'pattern tightened'));
-});
-
-test('a cyclic schema reference is compared without looping', () => {
-  const before = clone();
-  const next = clone();
-  next.components.schemas.Loop = { $ref: '#/components/schemas/Loop' };
-  const request = requestSchema(next);
-  request.properties = {
-    ...request.properties,
-    idempotencyKey: { $ref: '#/components/schemas/Loop' },
-  };
-  const breaks = unversionedRouteBreaks(before, next);
-  assert.ok(Array.isArray(breaks));
-});
-
-test('replacing a request pattern with an enum tightens the request', () => {
-  const before = clone();
-  const next = clone();
-  const key = requestSchema(next).properties?.idempotencyKey;
-  assert.ok(key?.pattern);
-  delete key.pattern;
-  key.enum = ['ok'];
-  const breaks = unversionedRouteBreaks(before, next);
-  assert.ok(breaks.some((item) => item.kind === 'request_tightened' && item.detail === 'enum added'));
-});
-
-test('dropping the tenant id format loosens the response', () => {
-  const before = clone();
-  const next = clone();
-  const id = responseSchema(next).properties?.id;
-  assert.equal(id?.format, 'uuid');
-  delete id.format;
-  const breaks = unversionedRouteBreaks(before, next);
-  assert.ok(breaks.some((item) => item.kind === 'response_loosened' && item.detail === 'format removed'));
-});
-
-test('dropping the timestamp format loosens the response', () => {
-  const before = clone();
-  const next = clone();
-  const createdAt = responseSchema(next).properties?.createdAt;
-  assert.equal(createdAt?.format, 'date-time');
-  delete createdAt.format;
-  const breaks = unversionedRouteBreaks(before, next);
-  assert.ok(breaks.some((item) => item.kind === 'response_loosened' && item.detail === 'format removed'));
-});
-
-test('adding a request format tightens the request', () => {
-  const before = clone();
-  const next = clone();
-  const key = requestSchema(next).properties?.idempotencyKey;
-  assert.ok(key);
-  assert.equal(key.format, undefined);
-  key.format = 'uuid';
-  const breaks = unversionedRouteBreaks(before, next);
-  assert.ok(breaks.some((item) => item.kind === 'request_tightened' && item.detail === 'format added'));
-});
-
-test('removing a response pattern loosens the response', () => {
-  const before = clone();
-  const next = clone();
-  const beforeReason = before.components.schemas.ErrorEnvelope?.properties?.reason;
-  const nextReason = next.components.schemas.ErrorEnvelope?.properties?.reason;
-  assert.ok(beforeReason && nextReason);
-  beforeReason.pattern = '^maintenance$';
-  delete nextReason.pattern;
-  const breaks = unversionedRouteBreaks(before, next);
-  assert.ok(breaks.some((item) => item.kind === 'response_loosened' && item.detail === 'pattern removed'));
-});
-
-test('changing a response pattern loosens the response', () => {
-  const before = clone();
-  const next = clone();
-  const beforeReason = before.components.schemas.ErrorEnvelope?.properties?.reason;
-  const nextReason = next.components.schemas.ErrorEnvelope?.properties?.reason;
-  assert.ok(beforeReason && nextReason);
-  beforeReason.pattern = '^maintenance$';
-  nextReason.pattern = '^.*$';
-  const breaks = unversionedRouteBreaks(before, next);
-  assert.ok(breaks.some((item) => item.kind === 'response_loosened' && item.detail === 'pattern changed'));
-});
-
-test('adding an item schema tightens a request array', () => {
-  const before = clone();
-  const next = clone();
-  const beforeRequest = requestSchema(before);
-  const nextRequest = requestSchema(next);
-  beforeRequest.properties = { ...beforeRequest.properties, tags: { type: 'array' } };
-  nextRequest.properties = { ...nextRequest.properties, tags: { type: 'array', items: { type: 'string' } } };
-  const breaks = unversionedRouteBreaks(before, next);
-  assert.ok(breaks.some((item) => item.kind === 'request_tightened' && item.detail === 'items added'));
-});
-
-test('removing a response item schema loosens the response', () => {
-  const before = clone();
-  const next = clone();
-  const beforeResponse = responseSchema(before);
-  const nextResponse = responseSchema(next);
-  beforeResponse.properties = {
-    ...beforeResponse.properties,
-    tags: { type: 'array', items: { type: 'string' } },
-  };
-  nextResponse.properties = { ...nextResponse.properties, tags: { type: 'array' } };
-  const breaks = unversionedRouteBreaks(before, next);
-  assert.ok(breaks.some((item) => item.kind === 'response_loosened' && item.detail === 'items removed'));
-});
-
-test('removing a request item schema is not a tightening', () => {
-  const before = clone();
-  const next = clone();
-  const beforeRequest = requestSchema(before);
-  const nextRequest = requestSchema(next);
-  beforeRequest.properties = {
-    ...beforeRequest.properties,
-    tags: { type: 'array', items: { type: 'string' } },
-  };
-  nextRequest.properties = { ...nextRequest.properties, tags: { type: 'array' } };
-  const breaks = unversionedRouteBreaks(before, next);
-  assert.equal(breaks.some((item) => item.kind === 'request_tightened'), false);
-});
-
-test('dropping the message type loosens the response', () => {
-  const before = clone();
-  const next = clone();
-  const message = next.components.schemas.ErrorEnvelope?.properties?.message;
-  assert.equal(message?.type, 'string');
-  delete message.type;
-  const breaks = unversionedRouteBreaks(before, next);
-  assert.ok(breaks.some((item) => item.kind === 'response_loosened' && item.detail === 'type removed'));
-});
-
-test('removing a request type is not a tightening', () => {
-  const before = clone();
-  const next = clone();
-  const key = requestSchema(next).properties?.idempotencyKey;
-  assert.equal(key?.type, 'string');
-  delete key.type;
-  const breaks = unversionedRouteBreaks(before, next);
-  assert.equal(breaks.some((item) => item.kind === 'request_tightened'), false);
-});
-
-test('adding a request type tightens the request', () => {
-  const before = clone();
-  const next = clone();
-  const beforeKey = requestSchema(before).properties?.idempotencyKey;
-  assert.ok(beforeKey);
-  delete beforeKey.type;
-  const breaks = unversionedRouteBreaks(before, next);
-  assert.ok(breaks.some((item) => item.kind === 'request_tightened' && item.detail === 'type added'));
-});
-
-test('removing a request format is not a tightening', () => {
-  const before = clone();
-  const next = clone();
-  const beforeKey = requestSchema(before).properties?.idempotencyKey;
-  assert.ok(beforeKey);
-  beforeKey.format = 'uuid';
-  const breaks = unversionedRouteBreaks(before, next);
-  assert.equal(breaks.some((item) => 'detail' in item && (item.detail === 'format added' || item.detail === 'format changed')), false);
-});
-
-test('removing a request enum without adding one is not a tightening', () => {
-  const before = clone();
-  const next = clone();
-  for (const document of [before, next]) {
-    const key = requestSchema(document).properties?.idempotencyKey;
-    assert.ok(key);
-    delete key.pattern;
-  }
-  const beforeKey = requestSchema(before).properties?.idempotencyKey;
-  assert.ok(beforeKey);
-  beforeKey.enum = ['alpha', 'beta'];
-  const breaks = unversionedRouteBreaks(before, next);
-  assert.equal(breaks.some((item) => item.kind === 'request_tightened'), false);
-});
-
-function contractOnRevision(revision: string): OpenApiDocument | null {
-  try {
-    const text = execFileSync('git', ['show', `${revision}:${contractPath}`], {
-      cwd: repoRoot,
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    return JSON.parse(text) as OpenApiDocument;
-  } catch (error) {
-    const stderr = error instanceof Error && 'stderr' in error
-      ? String((error as { stderr?: unknown }).stderr)
-      : '';
-    if (stderr.includes('does not exist') || stderr.includes('exists on disk, but not')) return null;
-    throw error;
-  }
 }
 
 function gitOutput(args: string[]): string | null {
@@ -513,55 +26,82 @@ function gitOutput(args: string[]): string | null {
   }
 }
 
-function parentsOf(revision: string): string[] {
-  const line = gitOutput(['rev-list', '--parents', '-n', '1', revision]);
-  if (!line) return [];
-  return line.split(/\s+/).slice(1);
-}
-
-/** CI checks out a merge commit. Its second parent is the pull-request head. */
-function reviewedHead(): string {
-  const parents = parentsOf('HEAD');
-  if (parents.length >= 2 && parents[1]) return parents[1];
-  return 'HEAD';
-}
-
-test('the generated contract has no unversioned break against the preserved baseline', () => {
-  const head = reviewedHead();
-  const originDev = gitOutput(['rev-parse', '--verify', 'origin/dev']);
-  const released = originDev
-    ? contractOnRevision(execFileSync('git', ['merge-base', head, 'origin/dev'], {
+function contractOnRevision(revision: string): OpenApiDocument | null {
+  try {
+    const text = execFileSync('git', ['show', `${revision}:${contractPath}`], {
       cwd: repoRoot,
       encoding: 'utf8',
-    }).trim())
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    return JSON.parse(text) as OpenApiDocument;
+  } catch (error) {
+    const stderr = error instanceof Error && 'stderr' in error ? String((error as { stderr?: unknown }).stderr) : '';
+    if (stderr.includes('does not exist') || stderr.includes('exists on disk, but not')) return null;
+    throw error;
+  }
+}
+
+test('an unchanged contract passes', () => {
+  const document = clone();
+  assert.deepEqual(operationBreaks(document, document), []);
+});
+
+test('a new operation passes', () => {
+  const baseline = clone();
+  const next = clone();
+  next.paths['/kernel/health'] = { get: { operationId: 'kernel.health.get', responses: { '200': { description: 'ok' } } } };
+  assert.deepEqual(operationBreaks(baseline, next), []);
+});
+
+test('a changed existing operation fails', () => {
+  const baseline = clone();
+  const next = clone();
+  const response = next.paths['/kernel/tenants']?.post?.responses?.['201'];
+  assert.ok(response);
+  response.description = 'changed';
+  const breaks = operationBreaks(baseline, next);
+  assert.deepEqual(breaks, [{ method: 'post', path: '/kernel/tenants', change: 'changed' }]);
+});
+
+test('a removed operation fails', () => {
+  const baseline = clone();
+  const next = clone();
+  delete next.paths['/kernel/tenants'];
+  const breaks = operationBreaks(baseline, next);
+  assert.deepEqual(breaks, [{ method: 'post', path: '/kernel/tenants', change: 'removed' }]);
+});
+
+test('an allow-file entry passes', () => {
+  const baseline = clone();
+  const next = clone();
+  delete next.paths['/kernel/tenants'];
+  const allow: OperationAllow[] = [{ method: 'post', path: '/kernel/tenants', reason: 'operation retired in this review' }];
+  assert.deepEqual(operationBreaks(baseline, next, allow), []);
+});
+
+test('a version bump passes', () => {
+  const baseline = clone();
+  const next = clone();
+  delete next.paths['/kernel/tenants'];
+  next.info = { ...next.info, version: '2.0.0' };
+  assert.deepEqual(operationBreaks(baseline, next), []);
+});
+
+test('the generated contract matches the committed snapshot', () => {
+  const parents = gitOutput(['rev-list', '--parents', '-n', '1', 'HEAD'])?.split(/\s+/) ?? [];
+  const head = parents.length >= 3 && parents[2] ? parents[2] : 'HEAD';
+  const originDev = gitOutput(['rev-parse', '--verify', 'origin/dev']);
+  const released = originDev
+    ? contractOnRevision(execFileSync('git', ['merge-base', head, 'origin/dev'], { cwd: repoRoot, encoding: 'utf8' }).trim())
     : null;
-  // The merge base is the released contract. Before that blob exists, the
-  // previous commit on the reviewed head is the preserved contract.
-  // Regenerating the working-tree file does not replace either blob.
-  const previous = parentsOf(head)[0];
-  const baseline = released ?? (previous ? contractOnRevision(previous) : null);
+  const previous = parents.length >= 2 ? parents[1] : undefined;
+  const reviewedParents = gitOutput(['rev-list', '--parents', '-n', '1', head])?.split(/\s+/).slice(1) ?? [];
+  const baseline = released ?? (reviewedParents[0] ? contractOnRevision(reviewedParents[0]) : null) ?? (previous ? contractOnRevision(previous) : null);
   const generated = generateKernelOpenApi();
   if (baseline === null) {
     assert.equal(generated.info.version, '1.0.0');
     return;
   }
-  assert.deepEqual(unversionedRouteBreaks(baseline, generated), []);
-});
-
-test('regenerating the OpenAPI file does not hide a break against a preserved baseline', () => {
-  const baseline = clone();
-  const regenerated = clone();
-  delete regenerated.paths['/kernel/tenants'];
-  assert.ok(unversionedRouteBreaks(baseline, regenerated).some((item) => item.kind === 'operation_removed'));
-});
-
-test('changing the CONCURRENCY_CONFLICT status changes the code meaning', () => {
-  const before = clone();
-  const next = clone();
-  next['x-plerni-error-statuses'] = {
-    ...next['x-plerni-error-statuses'],
-    CONCURRENCY_CONFLICT: 400,
-  };
-  const breaks = unversionedRouteBreaks(before, next);
-  assert.ok(breaks.some((item) => item.kind === 'error_code_meaning' && item.code === 'CONCURRENCY_CONFLICT'));
+  const allow = JSON.parse(readFileSync(new URL('../openapi/operation-allow.json', import.meta.url), 'utf8')) as OperationAllow[];
+  assert.deepEqual(operationBreaks(baseline, generated, allow), []);
 });

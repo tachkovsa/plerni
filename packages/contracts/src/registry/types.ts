@@ -38,14 +38,9 @@ export interface SchemaObject {
   required?: string[];
   additionalProperties?: boolean | SchemaObject;
   enum?: string[];
-  allOf?: SchemaObject[];
-  anyOf?: SchemaObject[];
-  oneOf?: SchemaObject[];
   items?: SchemaObject;
   minLength?: number;
   maxLength?: number;
-  minimum?: number;
-  maximum?: number;
   pattern?: string;
   format?: string;
   description?: string;
@@ -79,10 +74,3 @@ export interface OpenApiDocument {
   components: { schemas: Record<string, SchemaObject> };
   'x-plerni-error-statuses': Record<string, number>;
 }
-
-export type RouteBreak =
-  | { kind: 'operation_removed'; operationId: string }
-  | { kind: 'operation_moved'; operationId: string; detail: string }
-  | { kind: 'request_tightened'; path: string; detail: string }
-  | { kind: 'response_loosened'; path: string; detail: string }
-  | { kind: 'error_code_meaning'; code: string; from: number; to?: number };
