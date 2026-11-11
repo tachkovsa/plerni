@@ -110,6 +110,35 @@ test('dropping a response enum loosens the response', () => {
   assert.ok(breaks.some((item) => item.kind === 'response_loosened' && item.detail === 'enum removed'));
 });
 
+test('a referenced request pattern tightens the request', () => {
+  const before = clone();
+  const next = clone();
+  next.components.schemas.IdempotencyKey = {
+    type: 'string',
+    pattern: '^[A-Z]{1,10}$',
+  };
+  const request = requestSchema(next);
+  request.properties = {
+    ...request.properties,
+    idempotencyKey: { $ref: '#/components/schemas/IdempotencyKey' },
+  };
+  const breaks = unversionedRouteBreaks(before, next);
+  assert.ok(breaks.some((item) => item.kind === 'request_tightened' && item.detail === 'pattern tightened'));
+});
+
+test('a cyclic schema reference is compared without looping', () => {
+  const before = clone();
+  const next = clone();
+  next.components.schemas.Loop = { $ref: '#/components/schemas/Loop' };
+  const request = requestSchema(next);
+  request.properties = {
+    ...request.properties,
+    idempotencyKey: { $ref: '#/components/schemas/Loop' },
+  };
+  const breaks = unversionedRouteBreaks(before, next);
+  assert.ok(Array.isArray(breaks));
+});
+
 test('replacing a request pattern with an enum tightens the request', () => {
   const before = clone();
   const next = clone();
