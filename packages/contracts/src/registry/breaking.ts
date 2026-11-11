@@ -105,6 +105,12 @@ function formatLoosened(before: SchemaObject, after: SchemaObject): 'format remo
   return after.format === undefined ? 'format removed' : 'format changed';
 }
 
+function patternLoosened(before: SchemaObject, after: SchemaObject): 'pattern removed' | 'pattern changed' | null {
+  if (before.pattern === after.pattern) return null;
+  if (before.pattern === undefined) return null;
+  return after.pattern === undefined ? 'pattern removed' : 'pattern changed';
+}
+
 type ComposeKey = 'allOf' | 'anyOf' | 'oneOf';
 type SeenPairs = WeakMap<SchemaObject, WeakSet<SchemaObject>>;
 
@@ -217,7 +223,11 @@ function requestBreaks(
       breaks.push({ kind: 'request_tightened', path: `${at}.${key}`, detail: 'property became required' });
     }
   }
-  if (before.items && after.items) breaks.push(...requestBreaks(beforeDoc, afterDoc, before.items, after.items, `${at}[]`, seen));
+  if (!before.items && after.items) {
+    breaks.push({ kind: 'request_tightened', path: `${at}[]`, detail: 'items added' });
+  } else if (before.items && after.items) {
+    breaks.push(...requestBreaks(beforeDoc, afterDoc, before.items, after.items, `${at}[]`, seen));
+  }
   return breaks;
 }
 
@@ -244,6 +254,8 @@ function responseBreaks(
   }
   const looserFormat = formatLoosened(before, after);
   if (looserFormat) breaks.push({ kind: 'response_loosened', path: at, detail: looserFormat });
+  const looserPattern = patternLoosened(before, after);
+  if (looserPattern) breaks.push({ kind: 'response_loosened', path: at, detail: looserPattern });
   if ((before.minLength ?? 0) > (after.minLength ?? 0)) {
     breaks.push({ kind: 'response_loosened', path: at, detail: 'minLength decreased' });
   }
@@ -275,7 +287,11 @@ function responseBreaks(
       breaks.push({ kind: 'response_loosened', path: `${at}.${key}`, detail: 'property added' });
     }
   }
-  if (before.items && after.items) breaks.push(...responseBreaks(beforeDoc, afterDoc, before.items, after.items, `${at}[]`, seen));
+  if (before.items && !after.items) {
+    breaks.push({ kind: 'response_loosened', path: `${at}[]`, detail: 'items removed' });
+  } else if (before.items && after.items) {
+    breaks.push(...responseBreaks(beforeDoc, afterDoc, before.items, after.items, `${at}[]`, seen));
+  }
   return breaks;
 }
 

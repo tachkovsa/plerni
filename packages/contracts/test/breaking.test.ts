@@ -212,6 +212,69 @@ test('adding a request format tightens the request', () => {
   assert.ok(breaks.some((item) => item.kind === 'request_tightened' && item.detail === 'format added'));
 });
 
+test('removing a response pattern loosens the response', () => {
+  const before = clone();
+  const next = clone();
+  const beforeReason = before.components.schemas.ErrorEnvelope?.properties?.reason;
+  const nextReason = next.components.schemas.ErrorEnvelope?.properties?.reason;
+  assert.ok(beforeReason && nextReason);
+  beforeReason.pattern = '^maintenance$';
+  delete nextReason.pattern;
+  const breaks = unversionedRouteBreaks(before, next);
+  assert.ok(breaks.some((item) => item.kind === 'response_loosened' && item.detail === 'pattern removed'));
+});
+
+test('changing a response pattern loosens the response', () => {
+  const before = clone();
+  const next = clone();
+  const beforeReason = before.components.schemas.ErrorEnvelope?.properties?.reason;
+  const nextReason = next.components.schemas.ErrorEnvelope?.properties?.reason;
+  assert.ok(beforeReason && nextReason);
+  beforeReason.pattern = '^maintenance$';
+  nextReason.pattern = '^.*$';
+  const breaks = unversionedRouteBreaks(before, next);
+  assert.ok(breaks.some((item) => item.kind === 'response_loosened' && item.detail === 'pattern changed'));
+});
+
+test('adding an item schema tightens a request array', () => {
+  const before = clone();
+  const next = clone();
+  const beforeRequest = requestSchema(before);
+  const nextRequest = requestSchema(next);
+  beforeRequest.properties = { ...beforeRequest.properties, tags: { type: 'array' } };
+  nextRequest.properties = { ...nextRequest.properties, tags: { type: 'array', items: { type: 'string' } } };
+  const breaks = unversionedRouteBreaks(before, next);
+  assert.ok(breaks.some((item) => item.kind === 'request_tightened' && item.detail === 'items added'));
+});
+
+test('removing a response item schema loosens the response', () => {
+  const before = clone();
+  const next = clone();
+  const beforeResponse = responseSchema(before);
+  const nextResponse = responseSchema(next);
+  beforeResponse.properties = {
+    ...beforeResponse.properties,
+    tags: { type: 'array', items: { type: 'string' } },
+  };
+  nextResponse.properties = { ...nextResponse.properties, tags: { type: 'array' } };
+  const breaks = unversionedRouteBreaks(before, next);
+  assert.ok(breaks.some((item) => item.kind === 'response_loosened' && item.detail === 'items removed'));
+});
+
+test('removing a request item schema is not a tightening', () => {
+  const before = clone();
+  const next = clone();
+  const beforeRequest = requestSchema(before);
+  const nextRequest = requestSchema(next);
+  beforeRequest.properties = {
+    ...beforeRequest.properties,
+    tags: { type: 'array', items: { type: 'string' } },
+  };
+  nextRequest.properties = { ...nextRequest.properties, tags: { type: 'array' } };
+  const breaks = unversionedRouteBreaks(before, next);
+  assert.equal(breaks.some((item) => item.kind === 'request_tightened'), false);
+});
+
 test('dropping the message type loosens the response', () => {
   const before = clone();
   const next = clone();
