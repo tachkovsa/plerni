@@ -72,6 +72,19 @@ function enumWidened(before: SchemaObject, after: SchemaObject): boolean {
   return after.enum.some((value) => !before.enum?.includes(value));
 }
 
+/** A missing format accepts every string of that type. */
+function formatTightened(before: SchemaObject, after: SchemaObject): 'format added' | 'format changed' | null {
+  if (before.format === after.format) return null;
+  if (after.format === undefined) return null;
+  return before.format === undefined ? 'format added' : 'format changed';
+}
+
+function formatLoosened(before: SchemaObject, after: SchemaObject): 'format removed' | 'format changed' | null {
+  if (before.format === after.format) return null;
+  if (before.format === undefined) return null;
+  return after.format === undefined ? 'format removed' : 'format changed';
+}
+
 function requestBreaks(before: SchemaObject, after: SchemaObject, at: string): RouteBreak[] {
   const breaks: RouteBreak[] = [];
   const beforeTypes = typesOf(before);
@@ -87,6 +100,8 @@ function requestBreaks(before: SchemaObject, after: SchemaObject, at: string): R
   if (after.pattern !== undefined && after.pattern !== before.pattern) {
     breaks.push({ kind: 'request_tightened', path: at, detail: 'pattern tightened' });
   }
+  const tighterFormat = formatTightened(before, after);
+  if (tighterFormat) breaks.push({ kind: 'request_tightened', path: at, detail: tighterFormat });
   if ((after.minLength ?? 0) > (before.minLength ?? 0)) {
     breaks.push({ kind: 'request_tightened', path: at, detail: 'minLength increased' });
   }
@@ -128,6 +143,8 @@ function responseBreaks(before: SchemaObject, after: SchemaObject, at: string): 
   } else if (enumWidened(before, after)) {
     breaks.push({ kind: 'response_loosened', path: at, detail: 'enum widened' });
   }
+  const looserFormat = formatLoosened(before, after);
+  if (looserFormat) breaks.push({ kind: 'response_loosened', path: at, detail: looserFormat });
   if ((before.minLength ?? 0) > (after.minLength ?? 0)) {
     breaks.push({ kind: 'response_loosened', path: at, detail: 'minLength decreased' });
   }

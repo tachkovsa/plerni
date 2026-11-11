@@ -25,7 +25,7 @@ HTTP status comes from the code. Each code has one status: `VALIDATION` 400, `UN
 
 `generateKernelOpenApi()` builds an OpenAPI 3.1 document from the registry. `openapi/kernel.openapi.json` is that document. The contract test fails when the file drifts, and when a document contains a path the registry did not declare.
 
-`unversionedRouteBreaks` fails a document that, without a public-API major bump, removes or renames an operation id, tightens a request, loosens a response, or changes an error code's HTTP status (convention R2.2). An absent enum is unrestricted: adding one tightens a request, and removing one loosens a response. The contract test compares the generated document with the OpenAPI blob on the merge base of `HEAD` and `origin/dev`. That blob is absent for the first publication. Regenerating `openapi/kernel.openapi.json` does not replace it.
+`unversionedRouteBreaks` fails a document that, without a public-API major bump, removes or renames an operation id, tightens a request, loosens a response, or changes an error code's HTTP status (convention R2.2). An absent enum or `format` is unrestricted: adding one tightens a request, and removing one loosens a response. The contract test compares the generated document with the OpenAPI blob on the merge base of the reviewed head and `origin/dev`. A pull-request checkout is a merge commit, so the reviewed head is that commit's second parent. Until the blob exists, the test uses the previous commit on the reviewed head. Regenerating `openapi/kernel.openapi.json` does not replace either blob. The `gates` job runs this test on every pull request.
 
 ```bash
 pnpm --filter @plerni/contracts test

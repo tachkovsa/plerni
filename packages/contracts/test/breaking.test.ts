@@ -121,6 +121,47 @@ test('replacing a request pattern with an enum tightens the request', () => {
   assert.ok(breaks.some((item) => item.kind === 'request_tightened' && item.detail === 'enum added'));
 });
 
+test('dropping the tenant id format loosens the response', () => {
+  const before = clone();
+  const next = clone();
+  const id = responseSchema(next).properties?.id;
+  assert.equal(id?.format, 'uuid');
+  delete id.format;
+  const breaks = unversionedRouteBreaks(before, next);
+  assert.ok(breaks.some((item) => item.kind === 'response_loosened' && item.detail === 'format removed'));
+});
+
+test('dropping the timestamp format loosens the response', () => {
+  const before = clone();
+  const next = clone();
+  const createdAt = responseSchema(next).properties?.createdAt;
+  assert.equal(createdAt?.format, 'date-time');
+  delete createdAt.format;
+  const breaks = unversionedRouteBreaks(before, next);
+  assert.ok(breaks.some((item) => item.kind === 'response_loosened' && item.detail === 'format removed'));
+});
+
+test('adding a request format tightens the request', () => {
+  const before = clone();
+  const next = clone();
+  const key = requestSchema(next).properties?.idempotencyKey;
+  assert.ok(key);
+  assert.equal(key.format, undefined);
+  key.format = 'uuid';
+  const breaks = unversionedRouteBreaks(before, next);
+  assert.ok(breaks.some((item) => item.kind === 'request_tightened' && item.detail === 'format added'));
+});
+
+test('removing a request format is not a tightening', () => {
+  const before = clone();
+  const next = clone();
+  const beforeKey = requestSchema(before).properties?.idempotencyKey;
+  assert.ok(beforeKey);
+  beforeKey.format = 'uuid';
+  const breaks = unversionedRouteBreaks(before, next);
+  assert.equal(breaks.some((item) => 'detail' in item && (item.detail === 'format added' || item.detail === 'format changed')), false);
+});
+
 test('removing a request enum without adding one is not a tightening', () => {
   const before = clone();
   const next = clone();
@@ -153,28 +194,45 @@ function contractOnRevision(revision: string): OpenApiDocument | null {
   }
 }
 
-function parentContract(): OpenApiDocument | null {
+function gitOutput(args: string[]): string | null {
   try {
-    const parent = execFileSync('git', ['rev-parse', '--verify', 'HEAD^'], {
+    return execFileSync('git', args, {
       cwd: repoRoot,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
     }).trim();
-    return contractOnRevision(parent);
   } catch {
     return null;
   }
 }
 
+function parentsOf(revision: string): string[] {
+  const line = gitOutput(['rev-list', '--parents', '-n', '1', revision]);
+  if (!line) return [];
+  return line.split(/\s+/).slice(1);
+}
+
+/** CI checks out a merge commit. Its second parent is the pull-request head. */
+function reviewedHead(): string {
+  const parents = parentsOf('HEAD');
+  if (parents.length >= 2 && parents[1]) return parents[1];
+  return 'HEAD';
+}
+
 test('the generated contract has no unversioned break against the preserved baseline', () => {
-  const base = execFileSync('git', ['merge-base', 'HEAD', 'origin/dev'], {
-    cwd: repoRoot,
-    encoding: 'utf8',
-  }).trim();
+  const head = reviewedHead();
+  const originDev = gitOutput(['rev-parse', '--verify', 'origin/dev']);
+  const released = originDev
+    ? contractOnRevision(execFileSync('git', ['merge-base', head, 'origin/dev'], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+    }).trim())
+    : null;
   // The merge base is the released contract. Before that blob exists, the
-  // previous commit on this branch is the preserved contract. Regenerating
-  // the working-tree file does not replace either blob.
-  const baseline = contractOnRevision(base) ?? parentContract();
+  // previous commit on the reviewed head is the preserved contract.
+  // Regenerating the working-tree file does not replace either blob.
+  const previous = parentsOf(head)[0];
+  const baseline = released ?? (previous ? contractOnRevision(previous) : null);
   const generated = generateKernelOpenApi();
   if (baseline === null) {
     assert.equal(generated.info.version, '1.0.0');
