@@ -24,3 +24,4 @@ The pre-implementation decision record (32 decisions with evidence and flip cond
 - [0012 — Adding a plugin leaves the kernel tree unchanged](0012-plugin-addition-leaves-kernel-unchanged.md) (Proposed)
 - [0013 — P1 keeps sensitive and destructive actions on human sessions](0013-p1-human-commit-boundary.md) (Proposed)
 - [0014 — Frozen error envelope and HTTP status map](0014-error-envelope.md) (Proposed)
+- [0015 — Object keys use a derived tenant and plugin prefix](0015-object-storage-prefix.md) (Proposed)
