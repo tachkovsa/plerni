@@ -6,9 +6,9 @@ import assert from 'node:assert/strict';
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { createConnection, createServer } from 'node:net';
 import { after, before, test } from 'node:test';
-import { CreateBucketCommand, GetObjectCommand, ListObjectsV2Command, S3Client } from '@aws-sdk/client-s3';
+import { CreateBucketCommand, GetObjectCommand, ListObjectsV2Command, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { ContractFailure, errorEnvelopeSchema, errorStatus } from '@plerni/contracts';
-import { getObject, putObject, type StorageCaller } from '../src/storage/gateway.ts';
+import { MAX_OBJECT_BYTES, getObject, putObject, type StorageCaller } from '../src/storage/gateway.ts';
 import { createS3Client, createS3ObjectStore } from '../src/storage/s3.ts';
 import type { ObjectStore } from '../src/storage/store.ts';
 
@@ -21,6 +21,7 @@ const MOTO_VERSION = '5.2.5';
 let server: ChildProcess | undefined;
 let client: S3Client | undefined;
 let store: ObjectStore | undefined;
+let endpoint = '';
 
 function caller(tenantId: string, pluginId: string): StorageCaller {
   return { tenantId, pluginId, grants: ['storage.prefix'] };
@@ -128,8 +129,9 @@ before(async () => {
     stdio: 'ignore',
   });
   await waitForPort(port);
+  endpoint = `http://127.0.0.1:${port}`;
   const config = {
-    endpoint: `http://127.0.0.1:${port}`,
+    endpoint,
     bucket: BUCKET,
     region: REGION,
     accessKeyId: 'test',
@@ -215,6 +217,40 @@ test('the tenant id is canonical and a later put replaces the object', async () 
   await putObject(objects(), caller(TENANT_A, 'alpha'), key, Uint8Array.from([2, 2]));
   assert.deepEqual(await getObject(objects(), caller(TENANT_A, 'alpha'), key), Uint8Array.from([2, 2]));
   assert.deepEqual(await rawGet(stored), Uint8Array.from([2, 2]));
+});
+
+test('a missing bucket is INTERNAL and not a missing object', async () => {
+  const absent = createS3ObjectStore({
+    endpoint,
+    bucket: 'absent-bucket',
+    region: REGION,
+    accessKeyId: 'test',
+    secretAccessKey: 'test',
+  });
+  try {
+    await assert.rejects(
+      () => getObject(absent, caller(TENANT_A, 'alpha'), 'notes/one'),
+      (error: unknown) => envelope(error).code === 'INTERNAL',
+    );
+  } finally {
+    absent.close();
+  }
+});
+
+test('a stored object over the cap is INTERNAL and is not returned', async () => {
+  assert.ok(client);
+  const key = `t/${TENANT_A}/p/alpha/notes/huge`;
+  const body = new Uint8Array(MAX_OBJECT_BYTES + 1);
+  await client.send(new PutObjectCommand({
+    Bucket: BUCKET,
+    Key: key,
+    Body: body,
+    ContentLength: body.byteLength,
+  }));
+  await assert.rejects(
+    () => getObject(objects(), caller(TENANT_A, 'alpha'), 'notes/huge'),
+    (error: unknown) => envelope(error).code === 'INTERNAL',
+  );
 });
 
 test('an empty body round-trips and is not NOT_FOUND', async () => {

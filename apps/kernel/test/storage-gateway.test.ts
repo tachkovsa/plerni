@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { ContractFailure, errorEnvelopeSchema } from '@plerni/contracts';
 import { MAX_OBJECT_BYTES, getObject, putObject, type StorageCaller } from '../src/storage/gateway.ts';
+import { readLimited } from '../src/storage/s3.ts';
 import type { ObjectStore } from '../src/storage/store.ts';
 
 const TENANT_A = '11111111-1111-4111-8111-111111111111';
@@ -98,6 +99,42 @@ test('tenant B does not receive tenant A bytes from the derived key', async () =
   );
   assert.deepEqual(store.keys(), [`t/${TENANT_A}/p/alpha/notes/one`]);
   assert.deepEqual(await getObject(store, caller(TENANT_A), 'notes/one'), bytes);
+});
+
+function byteStream(parts: Uint8Array[]) {
+  const state = { destroyed: false };
+  return {
+    get destroyed() {
+      return state.destroyed;
+    },
+    destroy() {
+      state.destroyed = true;
+    },
+    async *[Symbol.asyncIterator]() {
+      for (const part of parts) {
+        if (state.destroyed) return;
+        yield part;
+      }
+    },
+  };
+}
+
+test('a declared length over the cap destroys the stream before it is read', async () => {
+  const stream = byteStream([Uint8Array.from([1, 2, 3, 4, 5])]);
+  await assert.rejects(() => readLimited(stream, 5, 4));
+  assert.equal(stream.destroyed, true);
+});
+
+test('a body that grows past the cap stops and does not return the bytes', async () => {
+  const stream = byteStream([Uint8Array.from([1, 2, 3]), Uint8Array.from([4, 5, 6])]);
+  await assert.rejects(() => readLimited(stream, undefined, 4));
+  assert.equal(stream.destroyed, true);
+});
+
+test('a body inside the cap is returned whole', async () => {
+  const stream = byteStream([Uint8Array.from([1, 2]), Uint8Array.from([3])]);
+  assert.deepEqual(await readLimited(stream, 3, 4), Uint8Array.from([1, 2, 3]));
+  assert.equal(stream.destroyed, false);
 });
 
 test('a store failure is INTERNAL and drops the store message', async () => {

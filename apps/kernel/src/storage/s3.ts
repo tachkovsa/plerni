@@ -7,8 +7,8 @@ import {
   NoSuchKey,
   PutObjectCommand,
   S3Client,
-  S3ServiceException,
 } from '@aws-sdk/client-s3';
+import { MAX_OBJECT_BYTES } from './gateway.ts';
 import type { ObjectStore } from './store.ts';
 
 export interface S3StoreConfig {
@@ -59,13 +59,60 @@ export function createS3Client(config: S3StoreConfig): S3Client {
   });
 }
 
+/** Only a missing key. A missing bucket is also HTTP 404 and stays a store failure. */
 function isMissing(error: unknown): boolean {
-  if (error instanceof NoSuchKey) return true;
-  if (error instanceof S3ServiceException) {
-    if (error.name === 'NoSuchKey' || error.name === 'NotFound') return true;
-    if (error.$metadata.httpStatusCode === 404) return true;
+  return error instanceof NoSuchKey || (error instanceof Error && error.name === 'NoSuchKey');
+}
+
+function destroyStream(body: object): void {
+  const destroy = (body as { destroy?: () => void }).destroy;
+  if (typeof destroy !== 'function') return;
+  try {
+    destroy.call(body);
+  } catch {
+    // The caller is already failing the read.
   }
-  return false;
+}
+
+/**
+ * Read at most `limit` bytes. A declared length over the limit, or a body that
+ * grows past it, fails before the rest is buffered.
+ */
+export async function readLimited(
+  body: object,
+  contentLength: number | undefined,
+  limit: number,
+): Promise<Uint8Array> {
+  if (
+    contentLength !== undefined
+    && (!Number.isSafeInteger(contentLength) || contentLength < 0 || contentLength > limit)
+  ) {
+    destroyStream(body);
+    throw failed();
+  }
+  if (!(Symbol.asyncIterator in body)) throw failed();
+  const parts: Uint8Array[] = [];
+  let total = 0;
+  for await (const chunk of body as AsyncIterable<unknown>) {
+    if (!(chunk instanceof Uint8Array)) {
+      destroyStream(body);
+      throw failed();
+    }
+    if (total + chunk.byteLength > limit) {
+      destroyStream(body);
+      throw failed();
+    }
+    parts.push(chunk);
+    total += chunk.byteLength;
+  }
+  if (contentLength !== undefined && total !== contentLength) throw failed();
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const part of parts) {
+    out.set(part, offset);
+    offset += part.byteLength;
+  }
+  return out;
 }
 
 function failed(): Error {
@@ -92,8 +139,11 @@ export function createS3ObjectStore(config: S3StoreConfig): ObjectStore {
       try {
         const response = await client.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
         const body = response.Body;
-        if (!body || typeof body.transformToByteArray !== 'function') return new Uint8Array();
-        return await body.transformToByteArray();
+        if (!body) {
+          if (response.ContentLength === undefined || response.ContentLength === 0) return new Uint8Array();
+          throw failed();
+        }
+        return await readLimited(body, response.ContentLength, MAX_OBJECT_BYTES);
       } catch (error) {
         if (isMissing(error)) return null;
         throw failed();
