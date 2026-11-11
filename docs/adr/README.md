@@ -23,3 +23,4 @@ The pre-implementation decision record (32 decisions with evidence and flip cond
 - [0011 — Plugins sign digests; the secret store keeps the keys](0011-digest-signing-port.md) (Proposed)
 - [0012 — Adding a plugin leaves the kernel tree unchanged](0012-plugin-addition-leaves-kernel-unchanged.md) (Proposed)
 - [0013 — P1 keeps sensitive and destructive actions on human sessions](0013-p1-human-commit-boundary.md) (Proposed)
+- [0014 — Frozen error envelope and HTTP status map](0014-error-envelope.md) (Proposed)
