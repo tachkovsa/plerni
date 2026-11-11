@@ -208,6 +208,30 @@ test('removing the schema of extra response names loosens the response', () => {
   assert.ok(breaks.some((item) => item.kind === 'response_loosened' && item.path.endsWith('additionalProperties')));
 });
 
+test('removing a request property is checked against the extra schema', () => {
+  const before = clone();
+  const next = clone();
+  for (const schema of [requestSchema(before), requestSchema(next)]) {
+    schema.additionalProperties = { type: 'string' };
+  }
+  const beforeRequest = requestSchema(before);
+  beforeRequest.properties = { ...beforeRequest.properties, note: { type: 'number' } };
+  const breaks = unversionedRouteBreaks(before, next);
+  assert.ok(breaks.some((item) => item.kind === 'request_tightened' && item.path.endsWith('.note')));
+});
+
+test('a new response property wider than the extra schema is a break', () => {
+  const before = clone();
+  const next = clone();
+  const beforeResponse = responseSchema(before);
+  const nextResponse = responseSchema(next);
+  beforeResponse.additionalProperties = { type: 'string' };
+  nextResponse.additionalProperties = { type: 'string' };
+  nextResponse.properties = { ...nextResponse.properties, note: { type: 'number' } };
+  const breaks = unversionedRouteBreaks(before, next);
+  assert.ok(breaks.some((item) => item.kind === 'response_loosened' && item.path.endsWith('.note')));
+});
+
 test('adding a required request body tightens the route', () => {
   const before = clone();
   const next = clone();

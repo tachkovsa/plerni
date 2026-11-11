@@ -273,7 +273,12 @@ function requestBreaks(
   for (const key of Object.keys(beforeProps)) {
     const afterProp = afterProps[key];
     if (!afterProp) {
-      if (!allowsExtras(after)) breaks.push({ kind: 'request_tightened', path: `${at}.${key}`, detail: 'property removed' });
+      const declared = beforeProps[key];
+      if (!allowsExtras(after)) {
+        breaks.push({ kind: 'request_tightened', path: `${at}.${key}`, detail: 'property removed' });
+      } else if (declared) {
+        breaks.push(...requestBreaks(beforeDoc, afterDoc, declared, extraSchema(after) ?? {}, `${at}.${key}`, seen, allow));
+      }
       continue;
     }
     breaks.push(...requestBreaks(beforeDoc, afterDoc, beforeProps[key] as SchemaObject, afterProp, `${at}.${key}`, seen, allow));
@@ -371,8 +376,13 @@ function responseBreaks(
     breaks.push(...responseBreaks(beforeDoc, afterDoc, beforeProps[key] as SchemaObject, afterProp, `${at}.${key}`, seen, allow));
   }
   for (const key of Object.keys(afterProps)) {
-    if (!(key in beforeProps) && !allowsExtras(before)) {
+    if (key in beforeProps) continue;
+    const declared = afterProps[key];
+    if (!declared) continue;
+    if (!allowsExtras(before)) {
       breaks.push({ kind: 'response_loosened', path: `${at}.${key}`, detail: 'property added' });
+    } else {
+      breaks.push(...responseBreaks(beforeDoc, afterDoc, extraSchema(before) ?? {}, declared, `${at}.${key}`, seen, allow));
     }
   }
   if (before.items && !after.items) {
