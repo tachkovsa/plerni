@@ -12,6 +12,9 @@ import {
   kernelNotificationList,
   kernelNotificationPreferenceRecord,
   kernelNotificationSend,
+  kernelOidcAuthorize,
+  kernelOidcCallback,
+  kernelOidcConfigure,
   kernelRoutes,
   type ErrorEnvelope,
 } from '@plerni/contracts';
@@ -30,6 +33,10 @@ import {
   type PreferenceInput,
   type PreferenceRecord,
 } from '../notify/preference.ts';
+import type { IdentityContext } from '../identity/context.ts';
+import type { IdentityLog } from '../identity/log.ts';
+import { configureOidc } from '../identity/oidc-config.ts';
+import { finishOidc, startOidc } from '../identity/oidc-flow.ts';
 import type { HygieneEvidence } from '../tenancy/hygiene.ts';
 import {
   IdempotencyConflict,
@@ -39,6 +46,7 @@ import {
 } from '../tenant/errors.ts';
 import { createTenant, type TenantRecord, type TenantSession } from '../tenant/registry.ts';
 import { handleNotificationRequest, type NotificationSession } from './notify-request.ts';
+import { handleOidcRequest, type OidcHandlers } from './oidc-request.ts';
 
 export interface KernelCaller extends TenantSession {
   actorId?: string;
@@ -51,6 +59,9 @@ export interface KernelHttpContext {
   recordNotificationPreference?: (input: PreferenceInput, caller: PreferenceCaller) => Promise<PreferenceRecord>;
   sendNotification?: (input: SendNotificationInput, caller: NotifyCaller) => Promise<DeliveryRecord>;
   listNotifications?: (caller: InboxCaller) => Promise<DeliveryRecord[]>;
+  configureOidc?: OidcHandlers['configureOidc'];
+  startOidc?: OidcHandlers['startOidc'];
+  finishOidc?: OidcHandlers['finishOidc'];
 }
 
 function json(status: number, body: unknown): Response {
@@ -167,6 +178,17 @@ export async function handleKernelRequest(request: Request, ctx: KernelHttpConte
       next_step: 'Use an operation id published in the kernel OpenAPI document.',
     }));
   }
+  if (
+    route.operationId === kernelOidcConfigure.operationId
+    || route.operationId === kernelOidcAuthorize.operationId
+    || route.operationId === kernelOidcCallback.operationId
+  ) {
+    return handleOidcRequest(route.operationId, request, ctx.session, {
+      ...(ctx.configureOidc ? { configureOidc: ctx.configureOidc } : {}),
+      ...(ctx.startOidc ? { startOidc: ctx.startOidc } : {}),
+      ...(ctx.finishOidc ? { finishOidc: ctx.finishOidc } : {}),
+    });
+  }
   if (!ctx.session) {
     const nextStep = route.scope === 'tenant'
       ? 'Retry with a tenant session.'
@@ -206,7 +228,13 @@ export function kernelRequestContext(deps: {
   db: Kysely<Database>;
   evidence: HygieneEvidence;
   terminateBackend: (pid: number) => Promise<void>;
+  log?: IdentityLog;
 }): KernelHttpContext {
+  const identity: IdentityContext = {
+    evidence: deps.evidence,
+    terminate: deps.terminateBackend,
+    log: deps.log ?? { event() { return undefined; } },
+  };
   return {
     session: deps.session,
     createTenant: (input, session) => createTenant(
@@ -236,5 +264,8 @@ export function kernelRequestContext(deps: {
       deps.evidence,
       deps.terminateBackend,
     ),
+    configureOidc: (actor, input) => configureOidc(deps.db, actor, input, identity),
+    startOidc: (input) => startOidc(deps.db, input, identity),
+    finishOidc: (currentUrl) => finishOidc(deps.db, currentUrl, identity),
   };
 }

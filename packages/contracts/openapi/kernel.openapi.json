@@ -266,6 +266,121 @@
           "deliveries"
         ],
         "additionalProperties": false
+      },
+      "OidcConfigureResponse": {
+        "type": "object",
+        "properties": {
+          "issuer": {
+            "type": "string",
+            "minLength": 12,
+            "maxLength": 300
+          },
+          "clientId": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9._~-]{1,200}$"
+          },
+          "redirectUri": {
+            "type": "string",
+            "minLength": 12,
+            "maxLength": 300
+          }
+        },
+        "required": [
+          "issuer",
+          "clientId",
+          "redirectUri"
+        ],
+        "additionalProperties": false
+      },
+      "OidcConfigureRequest": {
+        "type": "object",
+        "properties": {
+          "issuer": {
+            "type": "string",
+            "minLength": 12,
+            "maxLength": 300
+          },
+          "clientId": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9._~-]{1,200}$"
+          },
+          "clientSecret": {
+            "type": "string",
+            "minLength": 16,
+            "maxLength": 200
+          },
+          "redirectUri": {
+            "type": "string",
+            "minLength": 12,
+            "maxLength": 300
+          }
+        },
+        "required": [
+          "issuer",
+          "clientId",
+          "clientSecret",
+          "redirectUri"
+        ],
+        "additionalProperties": false
+      },
+      "OidcAuthorizeResponse": {
+        "type": "object",
+        "properties": {
+          "authorizationUrl": {
+            "type": "string",
+            "minLength": 12,
+            "maxLength": 4000
+          }
+        },
+        "required": [
+          "authorizationUrl"
+        ],
+        "additionalProperties": false
+      },
+      "OidcAuthorizeRequest": {
+        "type": "object",
+        "properties": {
+          "tenantId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "redirectUri": {
+            "type": "string",
+            "minLength": 12,
+            "maxLength": 300
+          }
+        },
+        "required": [
+          "tenantId",
+          "redirectUri"
+        ],
+        "additionalProperties": false
+      },
+      "OidcCallbackResponse": {
+        "type": "object",
+        "properties": {
+          "token": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "userId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "sessionKind": {
+            "type": "string",
+            "enum": [
+              "admin",
+              "member"
+            ]
+          }
+        },
+        "required": [
+          "token",
+          "userId",
+          "sessionKind"
+        ],
+        "additionalProperties": false
       }
     },
     "parameters": {}
@@ -563,6 +678,203 @@
           }
         },
         "x-plerni-scope": "tenant"
+      }
+    },
+    "/kernel/oidc": {
+      "post": {
+        "operationId": "kernel.oidc.configure",
+        "summary": "Configure the tenant OIDC issuer. The response does not include the client secret.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OidcConfigureRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The stored issuer, client id, and exact redirect URI.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OidcConfigureResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "VALIDATION",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "VALIDATION"
+          },
+          "401": {
+            "description": "UNAUTHENTICATED",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "UNAUTHENTICATED"
+          },
+          "403": {
+            "description": "FORBIDDEN",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "FORBIDDEN"
+          },
+          "500": {
+            "description": "INTERNAL",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "INTERNAL"
+          }
+        },
+        "x-plerni-action": "sensitive",
+        "x-plerni-scope": "tenant"
+      }
+    },
+    "/kernel/oidc/authorizations": {
+      "post": {
+        "operationId": "kernel.oidc.authorize",
+        "summary": "Start an authorization-code login. The redirect URI must match the configured value exactly.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OidcAuthorizeRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The identity-provider authorization URL for this exact redirect URI.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OidcAuthorizeResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "VALIDATION",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "VALIDATION"
+          },
+          "404": {
+            "description": "NOT_FOUND",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "NOT_FOUND"
+          },
+          "500": {
+            "description": "INTERNAL",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "INTERNAL"
+          },
+          "503": {
+            "description": "UNAVAILABLE",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "UNAVAILABLE"
+          }
+        }
+      }
+    },
+    "/kernel/oidc/callback": {
+      "get": {
+        "operationId": "kernel.oidc.callback",
+        "summary": "Finish the authorization code login and return a local session token.",
+        "responses": {
+          "200": {
+            "description": "A local session token. An identity-provider token is not accepted as this token.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OidcCallbackResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "UNAUTHENTICATED",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "UNAUTHENTICATED"
+          },
+          "500": {
+            "description": "INTERNAL",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "INTERNAL"
+          },
+          "503": {
+            "description": "UNAVAILABLE",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "UNAVAILABLE"
+          }
+        }
       }
     }
   },

@@ -30,6 +30,12 @@ Passwords and rescue codes are argon2id PHC strings (`@noble/hashes` 2.4.0, m=19
 
 Role chain, with no shell: the bootstrap credential creates both admins and then stops working. The customer admin logs in, creates a member, and disables that member; the member token then fails, and disabling the only admin is refused. A member cannot disable. A customer token does not authenticate as the operator tenant. A plugin role cannot select `kernel.user_account`. Rescue codes and reset tokens are stored hashed, and none of those secrets appear in the identity log.
 
+## OIDC
+
+`POST /kernel/oidc` stores one issuer, client id, client secret, and redirect URI for the tenant. The response leaves the secret out. `POST /kernel/oidc/authorizations` refuses a redirect URI that is not that stored string. The authorization request uses PKCE S256, state, and nonce. `GET /kernel/oidc/callback` checks the issuer parameter, the state, the nonce, and the code verifier, then returns a local session token. An identity-provider token is not stored and is not accepted as a session token. A disabled account stays disabled.
+
+The client is `openid-client` 6.8.9. The suite runs against `oidc-provider` 9.13.3 on a loopback port. The client secret in that suite is a fixed synthetic value.
+
 ## Grants and the fixture schema
 
 ADR-0008 is the capability wall. `kernel.plugin_grant` stores the operator-approved grant names. `kernel.principal_grant` is the tenant-scoped row a synthetic principal must hold before the broker runs that plugin's read. `kernel.plugin_migration` records package SQL. None of these tables name a plugin schema.

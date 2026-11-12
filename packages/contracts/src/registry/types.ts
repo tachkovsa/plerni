@@ -18,6 +18,8 @@ export interface RouteContract {
   path: string;
   summary: string;
   visibility: 'public' | 'plugin-private';
+  /** Absent means the route requires a session. `none` is a login route. */
+  authentication?: 'none';
   action?: 'routine' | 'sensitive' | 'destructive';
   scope?: 'platform' | 'tenant';
   deprecation?: DeprecationWindow;

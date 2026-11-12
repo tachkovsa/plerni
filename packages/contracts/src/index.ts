@@ -37,6 +37,16 @@ export {
   notificationSendResponseSchema,
 } from './registry/routes.ts';
 export {
+  kernelOidcAuthorize,
+  kernelOidcCallback,
+  kernelOidcConfigure,
+  oidcAuthorizeRequestSchema,
+  oidcAuthorizeResponseSchema,
+  oidcCallbackResponseSchema,
+  oidcConfigureRequestSchema,
+  oidcConfigureResponseSchema,
+} from './registry/oidc.ts';
+export {
   assertOpenApiReview,
   generateKernelOpenApi,
   generateOpenApi,

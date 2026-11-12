@@ -13,7 +13,10 @@ const ID_FIELDS = new Set([
 ]);
 
 const WORDS: Readonly<Record<string, ReadonlySet<string>>> = {
-  action: new Set(['login', 'login_rejected', 'refresh', 'logout', 'disable', 'rescue', 'reset', 'create', 'bootstrap']),
+  action: new Set([
+    'login', 'login_rejected', 'refresh', 'logout', 'disable', 'rescue', 'reset', 'create', 'bootstrap',
+    'oidc_configure',
+  ]),
   outcome: new Set(['rejected', 'closed', 'accepted', 'disabled', 'throttled']),
   validation: new Set(['lease', 'per_request']),
 };

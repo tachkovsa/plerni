@@ -42,8 +42,11 @@ export async function writeAuthAudit(
     epochBefore: number | null;
     epochAfter: number | null;
     reason: string;
+    decisionBasis?: 'local' | 'idp-confirmed';
   },
 ): Promise<void> {
+  const basis = row.decisionBasis ?? 'local';
+  if (basis !== 'local' && basis !== 'idp-confirmed') throw new Error('audit basis rejected');
   await sql`
     INSERT INTO kernel.auth_audit (
       tenant_id, id, action, actor_user_id, target_user_id, session_hash,
@@ -58,7 +61,7 @@ export async function writeAuthAudit(
       ${row.epochBefore}::bigint,
       ${row.epochAfter}::bigint,
       ${row.reason},
-      'local'
+      ${basis}
     )`.execute(trx);
 }
 

@@ -90,6 +90,15 @@ export class IdentityNotFoundError extends Error {
   }
 }
 
+export class OidcUnavailableError extends Error {
+  readonly code = 'UNAVAILABLE' as const;
+
+  constructor() {
+    super('identity provider unavailable');
+    this.name = 'OidcUnavailableError';
+  }
+}
+
 export class EmailInUseError extends Error {
   readonly code = 'VALIDATION' as const;
 

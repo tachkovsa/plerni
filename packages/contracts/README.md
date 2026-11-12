@@ -21,6 +21,8 @@ HTTP status comes from the code. Each code has one status: `VALIDATION` 400, `UN
 
 `POST /kernel/tenants` (`kernel.tenant.create`) creates a customer tenant. The body is `{ "idempotencyKey": "..." }` with 1–200 characters from letters, digits, and `. _ : -`. The success body is the customer id, kind, and `createdAt`. The same key returns the same tenant.
 
+`POST /kernel/oidc` (`kernel.oidc.configure`) stores one issuer for the tenant. The response does not include the client secret. `POST /kernel/oidc/authorizations` (`kernel.oidc.authorize`) starts an authorization-code login and requires the configured redirect URI exactly. `GET /kernel/oidc/callback` (`kernel.oidc.callback`) returns a local session token.
+
 ## OpenAPI and the breaking-change check
 
 `generateKernelOpenApi()` builds an OpenAPI 3.1 document from the registry. `openapi/kernel.openapi.json` is that document. The contract test fails when the file drifts, and when a document contains a path the registry did not declare.

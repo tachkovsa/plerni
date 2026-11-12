@@ -142,7 +142,7 @@ export interface Database {
     epoch_before: string | null;
     epoch_after: string | null;
     reason: string;
-    decision_basis: 'local';
+    decision_basis: 'local' | 'idp-confirmed';
     created_at: Date;
   };
   tenant_auth_policy: {
@@ -161,6 +161,34 @@ export interface Database {
     recipient_id: string;
     channel: string;
     enabled: boolean;
+  };
+  oidc_provider: {
+    tenant_id: string;
+    id: string;
+    issuer: string;
+    client_id: string;
+    client_secret: string;
+    redirect_uri: string;
+    created_at: Date;
+  };
+  oidc_login: {
+    tenant_id: string;
+    id: string;
+    state_hash: string;
+    nonce: string;
+    code_verifier: string | null;
+    redirect_uri: string;
+    expires_at: Date;
+    consumed_at: Date | null;
+    created_at: Date;
+  };
+  oidc_link: {
+    tenant_id: string;
+    id: string;
+    user_id: string;
+    issuer: string;
+    subject: string;
+    created_at: Date;
   };
   notification_delivery: {
     tenant_id: string;
