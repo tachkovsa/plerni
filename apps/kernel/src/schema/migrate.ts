@@ -41,6 +41,8 @@ export async function applyKernelMigrations(connectionString: string): Promise<r
       ...(await inspectTenantTable(client, { schema: 'kernel', table: 'scoped_link', foreignKey: SCOPED_LINK_FK })),
       ...(await inspectTenantTable(client, { schema: 'kernel', table: 'audit_record' })),
       ...(await inspectTenantTable(client, { schema: 'kernel', table: 'principal_grant' })),
+      ...(await inspectTenantTable(client, { schema: 'kernel', table: 'notification_preference' })),
+      ...(await inspectTenantTable(client, { schema: 'kernel', table: 'notification_delivery' })),
     ];
     if (violations.length > 0) {
       const summary = violations.map((item) => `${item.table}:${item.code}`).join(', ');

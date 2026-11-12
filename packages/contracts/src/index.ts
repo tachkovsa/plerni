@@ -18,11 +18,23 @@ export {
 export {
   IDEMPOTENCY_KEY_PATTERN,
   KERNEL_API_VERSION,
+  NOTIFICATION_BODY_MAX,
+  NOTIFICATION_CHANNEL,
+  NOTIFICATION_LIST_MAX,
   createTenantRequestSchema,
   createTenantResponseSchema,
   isIdempotencyKey,
+  isUuid,
+  kernelNotificationList,
+  kernelNotificationPreferenceRecord,
+  kernelNotificationSend,
   kernelRoutes,
   kernelTenantCreate,
+  notificationDeliveryListSchema,
+  notificationPreferenceRequestSchema,
+  notificationPreferenceResponseSchema,
+  notificationSendRequestSchema,
+  notificationSendResponseSchema,
 } from './registry/routes.ts';
 export {
   assertOpenApiReview,

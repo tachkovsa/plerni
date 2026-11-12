@@ -80,4 +80,21 @@ export interface Database {
     resource: string;
     action: string;
   };
+  notification_preference: {
+    tenant_id: string;
+    id: string;
+    recipient_id: string;
+    channel: string;
+    enabled: boolean;
+  };
+  notification_delivery: {
+    tenant_id: string;
+    id: string;
+    idempotency_key: string;
+    recipient_id: string;
+    channel: string;
+    body: string;
+    outcome: string;
+    created_at: Date;
+  };
 }
