@@ -90,6 +90,15 @@ export class IdentityNotFoundError extends Error {
   }
 }
 
+export class PrincipalNotFoundError extends Error {
+  readonly code = 'NOT_FOUND' as const;
+
+  constructor() {
+    super('service principal not found');
+    this.name = 'PrincipalNotFoundError';
+  }
+}
+
 export class EmailInUseError extends Error {
   readonly code = 'VALIDATION' as const;
 

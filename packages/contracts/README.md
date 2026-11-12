@@ -21,6 +21,8 @@ HTTP status comes from the code. Each code has one status: `VALIDATION` 400, `UN
 
 `POST /kernel/tenants` (`kernel.tenant.create`) creates a customer tenant. The body is `{ "idempotencyKey": "..." }` with 1–200 characters from letters, digits, and `. _ : -`. The success body is the customer id, kind, and `createdAt`. The same key returns the same tenant.
 
+`POST /kernel/service-principals` provisions a service principal. `POST /kernel/service-principal-rotations` replaces its credential. `POST /kernel/service-principal-revocations` revokes it. The credential is in the provision and rotate success bodies only. Notification preference, send, and list stay the K12 routes.
+
 ## OpenAPI and the breaking-change check
 
 `generateKernelOpenApi()` builds an OpenAPI 3.1 document from the registry. `openapi/kernel.openapi.json` is that document. The contract test fails when the file drifts, and when a document contains a path the registry did not declare.
