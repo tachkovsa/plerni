@@ -9,10 +9,27 @@ import {
   createTenantResponseSchema,
   errorEnvelope,
   errorStatus,
+  kernelNotificationList,
+  kernelNotificationPreferenceRecord,
+  kernelNotificationSend,
   kernelRoutes,
   type ErrorEnvelope,
 } from '@plerni/contracts';
 import type { Database } from '../db/database.ts';
+import {
+  listNotifications,
+  sendNotification,
+  type DeliveryRecord,
+  type InboxCaller,
+  type NotifyCaller,
+  type SendNotificationInput,
+} from '../notify/deliver.ts';
+import {
+  recordNotificationPreference,
+  type PreferenceCaller,
+  type PreferenceInput,
+  type PreferenceRecord,
+} from '../notify/preference.ts';
 import type { HygieneEvidence } from '../tenancy/hygiene.ts';
 import {
   IdempotencyConflict,
@@ -21,10 +38,19 @@ import {
   PlatformScopeError,
 } from '../tenant/errors.ts';
 import { createTenant, type TenantRecord, type TenantSession } from '../tenant/registry.ts';
+import { handleNotificationRequest, type NotificationSession } from './notify-request.ts';
+
+export interface KernelCaller extends TenantSession {
+  actorId?: string;
+  grants?: readonly string[];
+}
 
 export interface KernelHttpContext {
-  session: TenantSession | null;
+  session: KernelCaller | null;
   createTenant: (input: { idempotencyKey: string }, session: TenantSession) => Promise<TenantRecord>;
+  recordNotificationPreference?: (input: PreferenceInput, caller: PreferenceCaller) => Promise<PreferenceRecord>;
+  sendNotification?: (input: SendNotificationInput, caller: NotifyCaller) => Promise<DeliveryRecord>;
+  listNotifications?: (caller: InboxCaller) => Promise<DeliveryRecord[]>;
 }
 
 function json(status: number, body: unknown): Response {
@@ -142,20 +168,41 @@ export async function handleKernelRequest(request: Request, ctx: KernelHttpConte
     }));
   }
   if (!ctx.session) {
+    const nextStep = route.scope === 'tenant'
+      ? 'Retry with a tenant session.'
+      : 'Retry with an operator session.';
     return fail(errorEnvelope({
       code: 'UNAUTHENTICATED',
       message: 'The request has no session.',
-      next_step: 'Retry with an operator session.',
+      next_step: nextStep,
     }));
   }
   if (route.operationId === 'kernel.tenant.create') {
     return createTenantResponse(request, ctx.session, ctx.createTenant);
   }
+  if (
+    route.operationId === kernelNotificationPreferenceRecord.operationId
+    || route.operationId === kernelNotificationSend.operationId
+    || route.operationId === kernelNotificationList.operationId
+  ) {
+    const session: NotificationSession = {
+      tenantId: ctx.session.tenantId,
+      ...(ctx.session.actorId !== undefined ? { actorId: ctx.session.actorId } : {}),
+      ...(ctx.session.grants !== undefined ? { grants: ctx.session.grants } : {}),
+    };
+    return handleNotificationRequest(route.operationId, request, session, {
+      ...(ctx.recordNotificationPreference
+        ? { recordNotificationPreference: ctx.recordNotificationPreference }
+        : {}),
+      ...(ctx.sendNotification ? { sendNotification: ctx.sendNotification } : {}),
+      ...(ctx.listNotifications ? { listNotifications: ctx.listNotifications } : {}),
+    });
+  }
   return fail(internalFailure());
 }
 
 export function kernelRequestContext(deps: {
-  session: TenantSession | null;
+  session: KernelCaller | null;
   db: Kysely<Database>;
   evidence: HygieneEvidence;
   terminateBackend: (pid: number) => Promise<void>;
@@ -166,6 +213,26 @@ export function kernelRequestContext(deps: {
       deps.db,
       session,
       input,
+      deps.evidence,
+      deps.terminateBackend,
+    ),
+    recordNotificationPreference: (input, caller) => recordNotificationPreference(
+      deps.db,
+      caller,
+      input,
+      deps.evidence,
+      deps.terminateBackend,
+    ),
+    sendNotification: (input, caller) => sendNotification(
+      deps.db,
+      caller,
+      input,
+      deps.evidence,
+      deps.terminateBackend,
+    ),
+    listNotifications: (caller) => listNotifications(
+      deps.db,
+      caller,
       deps.evidence,
       deps.terminateBackend,
     ),

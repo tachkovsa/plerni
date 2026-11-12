@@ -60,10 +60,19 @@ async function drainAppBackends(): Promise<void> {
 
 async function resetRegistry(): Promise<void> {
   await withRoot(async (client) => {
+    await client.query('DELETE FROM kernel.password_reset');
+    await client.query('DELETE FROM kernel.rescue_code');
+    await client.query('DELETE FROM kernel.session');
+    await client.query('DELETE FROM kernel.login_throttle');
+    await client.query('DELETE FROM kernel.auth_audit');
+    await client.query('DELETE FROM kernel.user_auth_state');
+    await client.query('DELETE FROM kernel.user_account');
+    await client.query('DELETE FROM kernel.tenant_auth_policy');
     await client.query('DELETE FROM kernel.tenant_idempotency');
     await client.query('DELETE FROM kernel.audit_record');
     await client.query('DELETE FROM kernel.outbox');
     await client.query('DELETE FROM kernel.tenants');
+    await client.query('UPDATE kernel.bootstrap_state SET consumed_at = NULL');
   });
 }
 

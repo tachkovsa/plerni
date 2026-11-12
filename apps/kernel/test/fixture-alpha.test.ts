@@ -1285,8 +1285,8 @@ serial('codegen of the kernel schema is stable and excludes the fixture schema',
     const second = codegen('kernel.*', join(dir, 'kernel-b.ts'));
     assert.equal(second, first);
     assert.match(first, /principal_grant/);
+    assert.match(first, /notification_delivery/);
     assert.equal(first.includes('plugin_fixture_alpha'), false);
-    assert.equal(first.includes('body:'), false);
     const plugin = codegen('plugin_fixture_alpha.*', join(dir, 'plugin.ts'));
     assert.match(plugin, /note/);
     assert.match(plugin, /body/);

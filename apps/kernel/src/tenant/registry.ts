@@ -83,7 +83,7 @@ async function readTenant(db: Executor, id: string): Promise<TenantRecord | null
   return row ? toRecord(row) : null;
 }
 
-async function readOperator(db: Executor): Promise<TenantRecord | null> {
+export async function readOperatorTenant(db: Executor): Promise<TenantRecord | null> {
   const result = await sql<TenantRow>`
     SELECT id::text AS id, kind, created_at
     FROM kernel.tenants
@@ -103,7 +103,7 @@ async function readIdempotentTenant(db: Executor, key: string): Promise<TenantRe
   return readTenant(db, id);
 }
 
-async function insertTenant(trx: Transaction<Database>, id: string, kind: TenantRecord['kind']): Promise<void> {
+export async function insertTenantRow(trx: Transaction<Database>, id: string, kind: TenantRecord['kind']): Promise<void> {
   await sql`
     INSERT INTO kernel.tenants (id, kind, aggregate_version)
     VALUES (${id}::uuid, ${kind}, 0)`.execute(trx);
@@ -113,7 +113,7 @@ async function insertTenant(trx: Transaction<Database>, id: string, kind: Tenant
  * Lock the aggregate, assign the next version, then allocate seq and append.
  * The row lock is held until the transaction ends. nextval is not an advisory lock.
  */
-async function appendTenantCreated(
+export async function recordTenantCreated(
   trx: Transaction<Database>,
   actorTenantId: string,
   tenantId: string,
@@ -172,7 +172,7 @@ export async function bootstrapOperatorTenant(
   const id = randomUUID();
   return withTenant(db, id, evidence, terminateBackend, async (trx) => {
     await assertTenantContext(trx);
-    const existing = await readOperator(trx);
+    const existing = await readOperatorTenant(trx);
     if (existing) return existing;
     const inserted = await sql<{ id: string }>`
       INSERT INTO kernel.tenants (id, kind, aggregate_version)
@@ -180,11 +180,11 @@ export async function bootstrapOperatorTenant(
       ON CONFLICT (kind) WHERE kind = 'operator' DO NOTHING
       RETURNING id::text AS id`.execute(trx);
     if (!inserted.rows[0]) {
-      const winner = await readOperator(trx);
+      const winner = await readOperatorTenant(trx);
       if (!winner) throw new Error('operator tenant missing after conflict');
       return winner;
     }
-    await appendTenantCreated(trx, id, id, 'operator');
+    await recordTenantCreated(trx, id, id, 'operator');
     const created = await readTenant(trx, id);
     if (!created) throw new Error('operator tenant missing after insert');
     return created;
@@ -213,8 +213,8 @@ export async function createTenant(
       // until the other request has also missed the key.
       if (afterKeyMiss) await afterKeyMiss(trx);
       const id = randomUUID();
-      await insertTenant(trx, id, 'customer');
-      await appendTenantCreated(trx, session.tenantId, id, 'customer');
+      await insertTenantRow(trx, id, 'customer');
+      await recordTenantCreated(trx, session.tenantId, id, 'customer');
       const stored = await sql<{ id: string }>`
         INSERT INTO kernel.tenant_idempotency (idempotency_key, tenant_id)
         VALUES (${key}, ${id}::uuid)
