@@ -15,6 +15,12 @@ export async function retainLog(db: Kysely<Database>): Promise<number> {
       DELETE FROM kernel.outbox
       WHERE (SELECT seq FROM low) IS NOT NULL
         AND seq < (SELECT seq FROM low)
+        AND NOT EXISTS (
+          SELECT 1
+          FROM kernel.job_dispatch AS pending
+          WHERE pending.seq = kernel.outbox.seq
+            AND pending.status = 'pending'
+        )
       RETURNING seq
     )
     SELECT count(*)::text AS deleted FROM removed`.execute(db);
