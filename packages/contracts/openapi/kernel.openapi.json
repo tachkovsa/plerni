@@ -266,6 +266,138 @@
           "deliveries"
         ],
         "additionalProperties": false
+      },
+      "ServicePrincipalCredential": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "permissions": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9_.:-]{1,200}$"
+            },
+            "maxItems": 16
+          },
+          "expiresAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "credential": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        },
+        "required": [
+          "id",
+          "permissions",
+          "expiresAt",
+          "credential"
+        ],
+        "additionalProperties": false
+      },
+      "ServicePrincipalProvisionRequest": {
+        "type": "object",
+        "properties": {
+          "permissions": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9_.:-]{1,200}$"
+            },
+            "maxItems": 16
+          },
+          "expiresAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "permissions",
+          "expiresAt"
+        ],
+        "additionalProperties": false
+      },
+      "ServicePrincipalRotatedCredential": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "permissions": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9_.:-]{1,200}$"
+            },
+            "maxItems": 16
+          },
+          "expiresAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "credential": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        },
+        "required": [
+          "id",
+          "permissions",
+          "expiresAt",
+          "credential"
+        ],
+        "additionalProperties": false
+      },
+      "ServicePrincipalIdRequest": {
+        "type": "object",
+        "properties": {
+          "principalId": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "principalId"
+        ],
+        "additionalProperties": false
+      },
+      "ServicePrincipalRevokeResponse": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "revoked": {
+            "type": "boolean",
+            "enum": [
+              true
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "revoked"
+        ],
+        "additionalProperties": false
+      },
+      "ServicePrincipalRevokeRequest": {
+        "type": "object",
+        "properties": {
+          "principalId": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "principalId"
+        ],
+        "additionalProperties": false
       }
     },
     "parameters": {}
@@ -562,6 +694,250 @@
             "x-plerni-error-code": "INTERNAL"
           }
         },
+        "x-plerni-scope": "tenant"
+      }
+    },
+    "/kernel/service-principals": {
+      "post": {
+        "operationId": "kernel.service_principal.provision",
+        "summary": "Provision a tenant-scoped service principal and return its credential once",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ServicePrincipalProvisionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "The principal and the credential. The credential is not returned again.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServicePrincipalCredential"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "VALIDATION",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "VALIDATION"
+          },
+          "401": {
+            "description": "UNAUTHENTICATED",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "UNAUTHENTICATED"
+          },
+          "403": {
+            "description": "FORBIDDEN",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "FORBIDDEN"
+          },
+          "500": {
+            "description": "INTERNAL",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "INTERNAL"
+          }
+        },
+        "x-plerni-action": "sensitive",
+        "x-plerni-scope": "tenant"
+      }
+    },
+    "/kernel/service-principal-rotations": {
+      "post": {
+        "operationId": "kernel.service_principal.rotate",
+        "summary": "Rotate a service principal credential",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ServicePrincipalIdRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The new credential. The previous credential no longer authenticates.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServicePrincipalRotatedCredential"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "VALIDATION",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "VALIDATION"
+          },
+          "401": {
+            "description": "UNAUTHENTICATED",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "UNAUTHENTICATED"
+          },
+          "403": {
+            "description": "FORBIDDEN",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "FORBIDDEN"
+          },
+          "404": {
+            "description": "NOT_FOUND",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "NOT_FOUND"
+          },
+          "500": {
+            "description": "INTERNAL",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "INTERNAL"
+          }
+        },
+        "x-plerni-action": "sensitive",
+        "x-plerni-scope": "tenant"
+      }
+    },
+    "/kernel/service-principal-revocations": {
+      "post": {
+        "operationId": "kernel.service_principal.revoke",
+        "summary": "Revoke a service principal",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ServicePrincipalRevokeRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The principal is revoked. Its credentials no longer authenticate.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServicePrincipalRevokeResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "VALIDATION",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "VALIDATION"
+          },
+          "401": {
+            "description": "UNAUTHENTICATED",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "UNAUTHENTICATED"
+          },
+          "403": {
+            "description": "FORBIDDEN",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "FORBIDDEN"
+          },
+          "404": {
+            "description": "NOT_FOUND",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "NOT_FOUND"
+          },
+          "500": {
+            "description": "INTERNAL",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "INTERNAL"
+          }
+        },
+        "x-plerni-action": "sensitive",
         "x-plerni-scope": "tenant"
       }
     }

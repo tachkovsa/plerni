@@ -85,6 +85,9 @@ async function withRoot<T>(fn: (client: pg.Client) => Promise<T>): Promise<T> {
 
 async function resetIdentity(): Promise<void> {
   await withRoot(async (client) => {
+    await client.query('DELETE FROM kernel.service_credential');
+    await client.query('DELETE FROM kernel.service_principal_scope');
+    await client.query('DELETE FROM kernel.service_principal');
     await client.query('DELETE FROM kernel.password_reset');
     await client.query('DELETE FROM kernel.rescue_code');
     await client.query('DELETE FROM kernel.session');

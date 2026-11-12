@@ -155,6 +155,29 @@ export interface Database {
     id: boolean;
     consumed_at: Date | null;
   };
+  service_principal: {
+    tenant_id: string;
+    id: string;
+    created_by: string;
+    expires_at: Date;
+    revoked_at: Date | null;
+    created_at: Date;
+  };
+  service_credential: {
+    tenant_id: string;
+    id: string;
+    principal_id: string;
+    token_hash: string;
+    expires_at: Date;
+    revoked_at: Date | null;
+    created_at: Date;
+  };
+  service_principal_scope: {
+    tenant_id: string;
+    id: string;
+    principal_id: string;
+    permission: string;
+  };
   notification_preference: {
     tenant_id: string;
     id: string;
