@@ -2,17 +2,20 @@
   "name": "@plerni/kernel",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=22" },
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node --test --test-concurrency=1 --test-reporter spec test/hygiene.test.ts test/surviving-client.test.ts test/schema.test.ts test/tenancy.test.ts test/tenant-registry.test.ts test/auth.test.ts test/bus-writers.test.ts test/bus-relay.test.ts test/fixture-sql.test.ts test/manifest.test.ts test/migrate-order.test.ts test/fixture-alpha.test.ts test/directory.test.ts test/create-tenant-route.test.ts test/storage-gateway.test.ts test/storage-s3.test.ts test/notify.test.ts"
+    "test": "node --test --test-concurrency=1 --test-reporter spec test/hygiene.test.ts test/surviving-client.test.ts test/schema.test.ts test/tenancy.test.ts test/tenant-registry.test.ts test/auth.test.ts test/bus-writers.test.ts test/bus-relay.test.ts test/job-handoff.test.ts test/fixture-sql.test.ts test/manifest.test.ts test/migrate-order.test.ts test/fixture-alpha.test.ts test/directory.test.ts test/create-tenant-route.test.ts test/storage-gateway.test.ts test/storage-s3.test.ts test/notify.test.ts test/principal.test.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "3.1166.0",
     "@noble/hashes": "2.4.0",
     "@plerni/contracts": "workspace:*",
     "kysely": "0.29.6",
-    "pg": "8.23.1"
+    "pg": "8.23.1",
+    "pg-boss": "12.38.2"
   },
   "devDependencies": {
     "@types/node": "26.6.5",

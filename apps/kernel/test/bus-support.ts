@@ -23,6 +23,10 @@ export async function resetBus(): Promise<void> {
     await client.query('DELETE FROM kernel.dead_letter');
     await client.query('DELETE FROM kernel.delivery');
     await client.query('DELETE FROM kernel.subscription');
+    await client.query('DELETE FROM kernel.service_credential');
+    await client.query('DELETE FROM kernel.service_principal_scope');
+    await client.query('DELETE FROM kernel.service_principal');
+    await client.query('DELETE FROM kernel.job_dispatch');
     await client.query('DELETE FROM kernel.password_reset');
     await client.query('DELETE FROM kernel.rescue_code');
     await client.query('DELETE FROM kernel.session');
