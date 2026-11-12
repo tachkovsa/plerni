@@ -51,6 +51,11 @@ export async function applyKernelMigrations(connectionString: string): Promise<r
       ...(await inspectTenantTable(client, { schema: 'kernel', table: 'tenant_auth_policy' })),
       ...(await inspectTenantTable(client, { schema: 'kernel', table: 'notification_preference' })),
       ...(await inspectTenantTable(client, { schema: 'kernel', table: 'notification_delivery' })),
+      ...(await inspectTenantTable(client, { schema: 'kernel', table: 'directory_user' })),
+      ...(await inspectTenantTable(client, { schema: 'kernel', table: 'directory_group' })),
+      ...(await inspectTenantTable(client, { schema: 'kernel', table: 'directory_edge_type' })),
+      ...(await inspectTenantTable(client, { schema: 'kernel', table: 'directory_membership', tenantForeignKeys: true })),
+      ...(await inspectTenantTable(client, { schema: 'kernel', table: 'directory_edge', tenantForeignKeys: true })),
     ];
     if (violations.length > 0) {
       const summary = violations.map((item) => `${item.table}:${item.code}`).join(', ');

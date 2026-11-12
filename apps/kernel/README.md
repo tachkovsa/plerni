@@ -52,6 +52,16 @@ Role chain, with no shell: a caller with the grant puts bytes and reads them bac
 
 `POST /kernel/notification-preferences`, `POST /kernel/notifications`, and `GET /kernel/notifications` are the public routes. The list returns the caller's delivered rows, newest first, at most 50. Failures use the error envelope.
 
+## Directory
+
+`kernel.directory_user`, `kernel.directory_group`, `kernel.directory_membership`, `kernel.directory_edge_type`, and `kernel.directory_edge` are tenant-domain tables. Creating, reading, updating, and deleting stay inside the session tenant. Another tenant's list is empty, including when the ids match. Lists are ordered by id and return at most 50 rows.
+
+An edge type is a row. `registerDirectoryEdgeType` inserts that row for a name `registeredEdgeTypes` returns, and only when the manifest also holds `directory.register_edge_type`. It does not add a kernel migration. `insertDirectoryEdge` inserts an edge only for a name that same parsing lists. The broker writes it as the app role, in the caller's transaction, so a plugin statement in that transaction commits or rolls back with the edge. The plugin role has no `INSERT` on these tables.
+
+This port does not add a public route. Failures are the error envelope (`ContractFailure`). Plan §7's directory read tools are a later task.
+
+Role chain, with no shell: tenant A creates a user and a group and adds the user to the group; tenant B sees none of those rows and can store the same user id with a different label; the fixture manifest lists no edge type, so a write in the same transaction as a fixture row rolls that row back; a parsed manifest that lists one type registers a row and the broker writes the edge with a fixture row; the plugin role's insert is rejected.
+
 ## Tenancy suite
 
 The suite talks to the dev harness (PostgreSQL through PgBouncer, transaction mode). Export `POSTGRES_PASSWORD`, `PLERNI_APP_PASSWORD`, `PLERNI_MIGRATE_PASSWORD`, and `PLERNI_ADMIN_PASSWORD`, then reset the harness, then:

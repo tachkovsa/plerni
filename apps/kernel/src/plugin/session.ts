@@ -108,6 +108,16 @@ export async function installPluginRole(trx: Transaction<Database>, pluginId: st
   }
 }
 
+/** Back to the session user for a broker statement later in the same transaction. */
+export async function resumeSessionRole(trx: Transaction<Database>): Promise<void> {
+  await sql.raw('SET LOCAL ROLE NONE').execute(trx);
+  await sql`SELECT set_config('search_path', ${PINNED_SEARCH_PATH}, true)`.execute(trx);
+  const state = await readSessionState(trx);
+  if (state.current_user !== state.session_user || state.search_path !== PINNED_SEARCH_PATH) {
+    throw new PluginPackageError('session role was not restored');
+  }
+}
+
 export async function withPluginRole<T>(
   db: Kysely<Database>,
   tenantId: string,
