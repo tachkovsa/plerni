@@ -1405,3 +1405,104 @@ serial('concurrent login attempts reserve at most the throttle limit', async () 
     await db.destroy();
   }
 });
+
+serial('password reset issuance stops after the throttle limit', async () => {
+  await ready();
+  await resetIdentity();
+  const credential = secret();
+  const password = secret();
+  const db = appDb(POOLED, 1);
+  try {
+    const installed = await withCredential(credential, () => bootstrapInstallation(db, {
+      credential,
+      operatorEmail: email('operator'),
+      operatorPassword: password,
+      customerEmail: email('customer'),
+      customerPassword: password,
+    }, context(new Sink()).ctx));
+    const operatorEmail = await withRoot(async (client) => {
+      const result = await client.query<{ email: string }>(
+        'SELECT email FROM kernel.user_account WHERE id = $1',
+        [installed.operator.userId],
+      );
+      return result.rows[0]?.email ?? '';
+    });
+    const issued = [];
+    for (let attempt = 0; attempt < 6; attempt += 1) {
+      issued.push(await requestPasswordReset(db, {
+        tenantId: installed.operator.tenantId,
+        email: operatorEmail,
+      }, context(new Sink()).ctx));
+    }
+    assert.equal(issued.filter((item) => item.token !== undefined).length, 5);
+    assert.equal(issued[5]?.token, undefined);
+    const stored = await withRoot(async (client) => client.query<{ tokens: string; failures: number }>(
+      `SELECT
+         (SELECT count(*) FROM kernel.password_reset WHERE tenant_id = $1)::text AS tokens,
+         failures
+       FROM kernel.login_throttle
+       WHERE tenant_id = $1`,
+      [installed.operator.tenantId],
+    ));
+    assert.equal(stored.rows.length, 1);
+    assert.equal(stored.rows[0]?.tokens, '5');
+    assert.equal(stored.rows[0]?.failures, 5);
+    const absent = await requestPasswordReset(db, {
+      tenantId: installed.operator.tenantId,
+      email: email('missing'),
+    }, context(new Sink()).ctx);
+    assert.equal(absent.token, undefined);
+    const after = await withRoot(async (client) => client.query<{ count: string }>(
+      'SELECT count(*)::text AS count FROM kernel.login_throttle WHERE tenant_id = $1',
+      [installed.operator.tenantId],
+    ));
+    assert.equal(after.rows[0]?.count, '1');
+  } finally {
+    await db.destroy();
+  }
+});
+
+serial('concurrent password reset requests reserve at most the throttle limit', async () => {
+  await ready();
+  await resetIdentity();
+  const credential = secret();
+  const password = secret();
+  const db = appDb(POOLED, 8);
+  try {
+    const installed = await withCredential(credential, () => bootstrapInstallation(db, {
+      credential,
+      operatorEmail: email('operator'),
+      operatorPassword: password,
+      customerEmail: email('customer'),
+      customerPassword: password,
+    }, context(new Sink()).ctx));
+    const operatorEmail = await withRoot(async (client) => {
+      const result = await client.query<{ email: string }>(
+        'SELECT email FROM kernel.user_account WHERE id = $1',
+        [installed.operator.userId],
+      );
+      return result.rows[0]?.email ?? '';
+    });
+    const arrived = rendezvous(8);
+    const results = await Promise.all(Array.from({ length: 8 }, () => requestPasswordReset(db, {
+      tenantId: installed.operator.tenantId,
+      email: operatorEmail,
+    }, context(new Sink()).ctx, {
+      beforeReserve: async () => arrived(),
+    })));
+    assert.equal(results.filter((item) => item.token !== undefined).length, 5);
+    const stored = await withRoot(async (client) => client.query<{ tokens: string; failures: number }>(
+      `SELECT
+         (SELECT count(*) FROM kernel.password_reset WHERE tenant_id = $1)::text AS tokens,
+         failures
+       FROM kernel.login_throttle
+       WHERE tenant_id = $1`,
+      [installed.operator.tenantId],
+    ));
+    assert.equal(stored.rows.length, 1);
+    assert.equal(stored.rows[0]?.tokens, '5');
+    assert.equal(stored.rows[0]?.failures, 5);
+  } finally {
+    await db.destroy();
+  }
+});

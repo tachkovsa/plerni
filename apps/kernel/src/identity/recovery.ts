@@ -12,7 +12,7 @@ import { AccountDisabledError, LoginRejectedError, ThrottledError } from './erro
 import { hashPassword } from './password.ts';
 import { rescueCodeMatches } from './rescue.ts';
 import { bumpEpoch, notifyIdentity, revokeSessions, writeAuthAudit } from './store.ts';
-import { clearFailures, recoverySubject, reserveAttempt } from './throttle.ts';
+import { clearFailures, recoverySubject, reserveAttempt, resetSubject } from './throttle.ts';
 import { newSecretToken, sha256Hex } from './token.ts';
 
 async function rejectDisabled(trx: Transaction<Database>, tenantId: string, userId: string): Promise<void> {
@@ -57,6 +57,8 @@ async function replacePassword(
 }
 
 export interface IssueResetHooks {
+  /** Runs before the throttle row is locked, so concurrent requests can arrive together. */
+  beforeReserve?(trx: Transaction<Database>): Promise<void>;
   /** Runs after the token insert, while the auth-state row lock is still held. */
   afterInsert?(trx: Transaction<Database>): Promise<void>;
 }
@@ -69,29 +71,44 @@ export async function requestPasswordReset(
 ): Promise<{ accepted: true; token?: string }> {
   const tenantId = canonicalUuid(input.tenantId);
   const email = canonicalEmail(input.email);
+  const subject = resetSubject(email);
   const issued = await withTenant(db, tenantId, ctx.evidence, ctx.terminate, async (trx) => {
     await assertTenantContext(trx);
+    if (hooks.beforeReserve) await hooks.beforeReserve(trx);
     const found = await sql<{ id: string; disabled: boolean }>`
       SELECT u.id::text AS id, (s.disabled_at IS NOT NULL) AS disabled
       FROM kernel.user_account u
       JOIN kernel.user_auth_state s ON s.tenant_id = u.tenant_id AND s.id = u.id
-      WHERE u.tenant_id = ${tenantId}::uuid AND u.email = ${email}
-      FOR UPDATE OF s`.execute(trx);
+      WHERE u.tenant_id = ${tenantId}::uuid AND u.email = ${email}`.execute(trx);
     const account = found.rows[0];
     if (!account || account.disabled) return null;
+    const slot = await reserveAttempt(trx, tenantId, subject);
+    if (slot === 'throttled') return 'throttled' as const;
+    const locked = await sql<{ id: string; disabled: boolean }>`
+      SELECT u.id::text AS id, (s.disabled_at IS NOT NULL) AS disabled
+      FROM kernel.user_account u
+      JOIN kernel.user_auth_state s ON s.tenant_id = u.tenant_id AND s.id = u.id
+      WHERE u.tenant_id = ${tenantId}::uuid AND u.id = ${account.id}::uuid
+      FOR UPDATE OF s`.execute(trx);
+    const current = locked.rows[0];
+    if (!current || current.disabled) return null;
     const token = newSecretToken();
     await sql`
       INSERT INTO kernel.password_reset (tenant_id, id, user_id, token_hash, expires_at)
       VALUES (
         ${tenantId}::uuid,
         ${randomUUID()}::uuid,
-        ${account.id}::uuid,
+        ${current.id}::uuid,
         ${sha256Hex(token)},
         clock_timestamp() + make_interval(mins => ${RESET_MINUTES}::int)
       )`.execute(trx);
     if (hooks.afterInsert) await hooks.afterInsert(trx);
     return token;
   });
+  if (issued === 'throttled') {
+    ctx.log.event('password.reset', { tenantId, action: 'reset', outcome: 'throttled' });
+    return { accepted: true };
+  }
   ctx.log.event('password.reset', { tenantId, action: 'reset', outcome: 'accepted' });
   if (!issued) return { accepted: true };
   return { accepted: true, token: issued };

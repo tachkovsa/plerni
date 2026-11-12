@@ -16,6 +16,10 @@ export function recoverySubject(email: string): string {
   return sha256Hex(`recovery:${email}`);
 }
 
+export function resetSubject(email: string): string {
+  return sha256Hex(`reset:${email}`);
+}
+
 export async function throttled(
   trx: Transaction<Database>,
   tenantId: string,
