@@ -86,6 +86,257 @@
           "idempotencyKey"
         ],
         "additionalProperties": false
+      },
+      "InstallPackageResponse": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]{0,40}$"
+          },
+          "version": {
+            "type": "string",
+            "pattern": "^\\d+\\.\\d+\\.\\d+$"
+          },
+          "digest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "subscriptionId": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "id",
+          "version",
+          "digest",
+          "subscriptionId"
+        ],
+        "additionalProperties": false
+      },
+      "InstallPackageRequest": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]{0,40}$"
+          },
+          "version": {
+            "type": "string",
+            "pattern": "^\\d+\\.\\d+\\.\\d+$"
+          },
+          "digest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "filter": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*){2}$"
+                },
+                "versions": {
+                  "type": "array",
+                  "items": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "minItems": 1,
+                  "maxItems": 16
+                }
+              },
+              "required": [
+                "type",
+                "versions"
+              ],
+              "additionalProperties": false
+            },
+            "maxItems": 32
+          },
+          "requires": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "plugin": {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9_]{0,40}$"
+                },
+                "contract": {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9_.]{0,80}$"
+                },
+                "range": {
+                  "type": "string",
+                  "pattern": "^(?:\\*|(\\^|~|>=|<=|>|<)?\\d+\\.\\d+\\.\\d+)$"
+                }
+              },
+              "required": [
+                "plugin",
+                "contract",
+                "range"
+              ],
+              "additionalProperties": false
+            },
+            "maxItems": 32
+          },
+          "optionalRequires": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "plugin": {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9_]{0,40}$"
+                },
+                "contract": {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9_.]{0,80}$"
+                },
+                "range": {
+                  "type": "string",
+                  "pattern": "^(?:\\*|(\\^|~|>=|<=|>|<)?\\d+\\.\\d+\\.\\d+)$"
+                }
+              },
+              "required": [
+                "plugin",
+                "contract",
+                "range"
+              ],
+              "additionalProperties": false
+            },
+            "maxItems": 32
+          }
+        },
+        "required": [
+          "id",
+          "version",
+          "digest",
+          "filter",
+          "requires",
+          "optionalRequires"
+        ],
+        "additionalProperties": false
+      },
+      "PackageEnablementResponse": {
+        "type": "object",
+        "properties": {
+          "packageId": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]{0,40}$"
+          },
+          "tenantId": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "watermarkSeq": {
+            "type": "string",
+            "pattern": "^[0-9]+$"
+          }
+        },
+        "required": [
+          "packageId",
+          "tenantId",
+          "enabled",
+          "watermarkSeq"
+        ],
+        "additionalProperties": false
+      },
+      "PackageEnablementRequest": {
+        "type": "object",
+        "properties": {
+          "packageId": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]{0,40}$"
+          },
+          "enabled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "packageId",
+          "enabled"
+        ],
+        "additionalProperties": false
+      },
+      "PackageExportResponse": {
+        "type": "object",
+        "properties": {
+          "packageId": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]{0,40}$"
+          },
+          "exportedAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "packageId",
+          "exportedAt"
+        ],
+        "additionalProperties": false
+      },
+      "PackageExportRequest": {
+        "type": "object",
+        "properties": {
+          "packageId": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]{0,40}$"
+          }
+        },
+        "required": [
+          "packageId"
+        ],
+        "additionalProperties": false
+      },
+      "PackageForceAdvanceResponse": {
+        "type": "object",
+        "properties": {
+          "packageId": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]{0,40}$"
+          },
+          "tenantId": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i"
+          },
+          "watermarkSeq": {
+            "type": "string",
+            "pattern": "^[0-9]+$"
+          }
+        },
+        "required": [
+          "packageId",
+          "tenantId",
+          "watermarkSeq"
+        ],
+        "additionalProperties": false
+      },
+      "PackageForceAdvanceRequest": {
+        "type": "object",
+        "properties": {
+          "packageId": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]{0,40}$"
+          },
+          "tenantId": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i"
+          }
+        },
+        "required": [
+          "packageId",
+          "tenantId"
+        ],
+        "additionalProperties": false
       }
     },
     "parameters": {}
@@ -173,6 +424,346 @@
           }
         },
         "x-plerni-action": "sensitive",
+        "x-plerni-scope": "platform"
+      }
+    },
+    "/kernel/packages": {
+      "post": {
+        "operationId": "kernel.package.install",
+        "summary": "Register an installed package",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InstallPackageRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "The registry row. The same id, version, and digest returns that row again.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InstallPackageResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "VALIDATION",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "VALIDATION"
+          },
+          "401": {
+            "description": "UNAUTHENTICATED",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "UNAUTHENTICATED"
+          },
+          "403": {
+            "description": "FORBIDDEN",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "FORBIDDEN"
+          },
+          "409": {
+            "description": "CONCURRENCY_CONFLICT",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "CONCURRENCY_CONFLICT"
+          },
+          "500": {
+            "description": "INTERNAL",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "INTERNAL"
+          }
+        },
+        "x-plerni-action": "sensitive",
+        "x-plerni-scope": "platform"
+      }
+    },
+    "/kernel/package-enablement": {
+      "post": {
+        "operationId": "kernel.package.enablement",
+        "summary": "Enable or disable a package for the session tenant",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PackageEnablementRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The enablement row for the session tenant. Grants are unchanged.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PackageEnablementResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "VALIDATION",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "VALIDATION"
+          },
+          "401": {
+            "description": "UNAUTHENTICATED",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "UNAUTHENTICATED"
+          },
+          "403": {
+            "description": "FORBIDDEN",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "FORBIDDEN"
+          },
+          "404": {
+            "description": "NOT_FOUND",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "NOT_FOUND"
+          },
+          "500": {
+            "description": "INTERNAL",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "INTERNAL"
+          }
+        },
+        "x-plerni-action": "sensitive",
+        "x-plerni-scope": "tenant"
+      }
+    },
+    "/kernel/package-export": {
+      "post": {
+        "operationId": "kernel.package.export",
+        "summary": "Record the export procedure for a package",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PackageExportRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The export timestamp. Repeating the call keeps the first timestamp.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PackageExportResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "VALIDATION",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "VALIDATION"
+          },
+          "401": {
+            "description": "UNAUTHENTICATED",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "UNAUTHENTICATED"
+          },
+          "403": {
+            "description": "FORBIDDEN",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "FORBIDDEN"
+          },
+          "404": {
+            "description": "NOT_FOUND",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "NOT_FOUND"
+          },
+          "500": {
+            "description": "INTERNAL",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "INTERNAL"
+          }
+        },
+        "x-plerni-action": "sensitive",
+        "x-plerni-scope": "platform"
+      }
+    },
+    "/kernel/package-force-advance": {
+      "post": {
+        "operationId": "kernel.package.forceAdvance",
+        "summary": "Force-advance a disabled tenant watermark after export",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PackageForceAdvanceRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The watermark after it leaves the retention minimum. Log rows are not deleted here.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PackageForceAdvanceResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "VALIDATION",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "VALIDATION"
+          },
+          "401": {
+            "description": "UNAUTHENTICATED",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "UNAUTHENTICATED"
+          },
+          "403": {
+            "description": "FORBIDDEN",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "FORBIDDEN"
+          },
+          "404": {
+            "description": "NOT_FOUND",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "NOT_FOUND"
+          },
+          "500": {
+            "description": "INTERNAL",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "INTERNAL"
+          }
+        },
+        "x-plerni-action": "destructive",
         "x-plerni-scope": "platform"
       }
     }

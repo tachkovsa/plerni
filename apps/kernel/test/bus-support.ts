@@ -20,6 +20,9 @@ export async function resetBus(): Promise<void> {
   await ready();
   await withRoot(async (client) => {
     await client.query('DROP TABLE IF EXISTS kernel.bus_effect');
+    await client.query('DELETE FROM kernel.quota_warning');
+    await client.query('DELETE FROM kernel.package_enablement');
+    await client.query('DELETE FROM kernel.package');
     await client.query('DELETE FROM kernel.dead_letter');
     await client.query('DELETE FROM kernel.delivery');
     await client.query('DELETE FROM kernel.subscription');

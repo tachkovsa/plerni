@@ -25,7 +25,7 @@ export function rememberAlert(alerts: string[], message: string): void {
 
 /** Cursor progress at the step budget means eligible rows may remain. */
 export function continueDrain(report: DeliverReport): boolean {
-  const progress = report.delivered + report.skipped + report.parked + report.duplicates;
+  const progress = report.delivered + report.skipped + report.withheld + report.parked + report.duplicates;
   return report.budgetExhausted && progress > 0;
 }
 

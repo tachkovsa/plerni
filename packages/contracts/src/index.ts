@@ -25,6 +25,21 @@ export {
   kernelTenantCreate,
 } from './registry/routes.ts';
 export {
+  installPackageRequestSchema,
+  installPackageResponseSchema,
+  kernelPackageEnablement,
+  kernelPackageExport,
+  kernelPackageForceAdvance,
+  kernelPackageInstall,
+  packageEnablementRequestSchema,
+  packageEnablementResponseSchema,
+  packageExportRequestSchema,
+  packageExportResponseSchema,
+  packageForceAdvanceRequestSchema,
+  packageForceAdvanceResponseSchema,
+  packageRoutes,
+} from './registry/packages.ts';
+export {
   assertOpenApiReview,
   generateKernelOpenApi,
   generateOpenApi,

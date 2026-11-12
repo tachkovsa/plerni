@@ -18,9 +18,17 @@ Tenant work goes through `withTenant`: one transaction, hygiene inspect before a
 
 ## Outbox relay
 
-`kernel.subscription` is one global cursor. `kernel.delivery` is `UNIQUE(subscription, seq)`. The relay claims a live subscription with `FOR UPDATE SKIP LOCKED`, then delivers one event in its own transaction: dedup marker, handler effect, cursor advance, and the fencing predicate. `safe_point` is the maximum committed `seq` whose `created_at` is at least 10 seconds old. A missing `seq` at or below that cutoff is a rolled-back `nextval` and is skipped. A filter skips other types and still advances. A payload version the subscription lists and does not accept parks that subscription with `UNKNOWN_EVENT_VERSION`; the cursor and the row stay. Retention deletes log rows strictly below the minimum subscription cursor, live or parked. `LISTEN` uses a direct connection. Polling still delivers when no listener is visible in `pg_stat_activity`. Enablement watermarks, the backlog quota, and export-then-force-advance are a later task. Two relays are a later task.
+`kernel.subscription` is one global cursor. `kernel.delivery` is `UNIQUE(subscription, seq)`. The relay claims a live subscription with `FOR UPDATE SKIP LOCKED`, then delivers one event in its own transaction: dedup marker, handler effect, cursor advance, and the fencing predicate. `safe_point` is the maximum committed `seq` whose `created_at` is at least 10 seconds old. A missing `seq` at or below that cutoff is a rolled-back `nextval` and is skipped. A filter skips other types and still advances. A payload version the subscription lists and does not accept parks that subscription with `UNKNOWN_EVENT_VERSION`; the cursor and the row stay. Retention deletes log rows strictly below the minimum of unreleased subscription cursors and unreleased enablement watermarks. A parked cursor stays in that minimum until export-then-force-advance. `LISTEN` uses a direct connection. Polling still delivers when no listener is visible in `pg_stat_activity`. Two relays are a later task.
 
 Role chain for this API, with no shell: an operator session creates a customer and can read the audit row for that action; the customer session is refused and sees no audit row; a plugin role cannot select the registry.
+
+## Package registry
+
+`kernel.package` is the registry row: id, version, digest, and the installation subscription. `kernel.package_enablement` is the per-tenant watermark. Install is an operator route (`kernel.package.install`). Enable and disable are the session tenant's route (`kernel.package.enablement`). Neither route writes `kernel.plugin_grant`. A `requires` edge blocks enablement until that package is enabled for the same tenant. `optionalRequires` does not.
+
+Disabling a tenant freezes that tenant's watermark and stops delivery for that `tenant_id`. The installation cursor keeps advancing. Re-enable catch-up delivers at most 8 retained events per call, starting at the watermark. The backlog quota is 30 days or 256 MiB. Crossing it inserts `kernel.quota_warning` and does not delete rows. Export (`kernel.package.export`) records the procedure. Force-advance (`kernel.package.forceAdvance`) then moves a disabled watermark forward and drops it out of the retention minimum. The route itself deletes no log row. A later retention pass may drop rows the watermark was holding. The same rule, without a route, releases a parked subscription after its own export and writes a `FORCE_ADVANCE` dead letter. This pass is one process.
+
+`test/enablement.test.ts` is the enablement suite. It runs in the same harness command as the rest of the kernel tests.
 
 ## Grants and the fixture schema
 

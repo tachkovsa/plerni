@@ -21,10 +21,12 @@ import {
   PlatformScopeError,
 } from '../tenant/errors.ts';
 import { createTenant, type TenantRecord, type TenantSession } from '../tenant/registry.ts';
+import { handlePackageRequest, packageHttp, type PackageHttp } from './package-request.ts';
 
 export interface KernelHttpContext {
   session: TenantSession | null;
   createTenant: (input: { idempotencyKey: string }, session: TenantSession) => Promise<TenantRecord>;
+  packages?: PackageHttp;
 }
 
 function json(status: number, body: unknown): Response {
@@ -151,6 +153,10 @@ export async function handleKernelRequest(request: Request, ctx: KernelHttpConte
   if (route.operationId === 'kernel.tenant.create') {
     return createTenantResponse(request, ctx.session, ctx.createTenant);
   }
+  if (route.operationId.startsWith('kernel.package.')) {
+    if (!ctx.packages) return fail(internalFailure());
+    return handlePackageRequest(request, route.operationId, ctx.session, ctx.packages);
+  }
   return fail(internalFailure());
 }
 
@@ -169,5 +175,6 @@ export function kernelRequestContext(deps: {
       deps.evidence,
       deps.terminateBackend,
     ),
+    packages: packageHttp(deps),
   };
 }

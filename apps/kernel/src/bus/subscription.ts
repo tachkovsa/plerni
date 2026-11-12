@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // One global cursor per subscription (plan §4.2). A new subscription starts
 // at the current high-water seq, or at a declared start seq. It does not
-// replay history unless the caller asks. Enablement watermarks are K18.
+// replay history unless the caller asks. Package installation cursors are
+// created by the registry. Per-tenant watermarks are separate rows.
 import { sql, type Kysely } from 'kysely';
 import type { Database } from '../db/database.ts';
 import { assertFilter, assertSeq, assertUuid, type TypeFilter } from './validate.ts';

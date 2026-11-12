@@ -851,6 +851,7 @@ test('a pass of only failures does not continue, and cursor progress does', () =
   const empty = {
     delivered: 0,
     skipped: 0,
+    withheld: 0,
     parked: 0,
     duplicates: 0,
     alerts: [],

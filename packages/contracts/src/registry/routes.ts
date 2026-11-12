@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
-// Kernel routes that exist at K19. Create-tenant is the K2 API. Bootstrap
-// stays an internal call and is not a public route.
+// Kernel routes. Create-tenant is the K2 API. Package routes are K18.
+// Bootstrap stays an internal call and is not a public route.
 import { z } from 'zod';
+import { packageRoutes } from './packages.ts';
 import type { RouteContract } from './types.ts';
 
 /** The same rule createTenant enforces for a direct caller. */
@@ -42,6 +43,9 @@ export const kernelTenantCreate: RouteContract = {
   errors: ['VALIDATION', 'UNAUTHENTICATED', 'FORBIDDEN', 'CONCURRENCY_CONFLICT', 'INTERNAL'],
 };
 
-export const kernelRoutes: readonly RouteContract[] = Object.freeze([kernelTenantCreate]);
+export const kernelRoutes: readonly RouteContract[] = Object.freeze([
+  kernelTenantCreate,
+  ...packageRoutes,
+]);
 
 export const KERNEL_API_VERSION = '1.0.0';
