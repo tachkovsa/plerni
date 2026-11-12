@@ -54,6 +54,7 @@ export async function applyKernelMigrations(connectionString: string): Promise<r
       ...(await inspectKernelInternal(client, 'subscription')),
       ...(await inspectKernelInternal(client, 'delivery')),
       ...(await inspectKernelInternal(client, 'dead_letter')),
+      ...(await inspectKernelInternal(client, 'job_dispatch')),
       ...(await inspectKernelInternal(client, 'plugin_grant')),
       ...(await inspectKernelInternal(client, 'plugin_migration')),
     ];

@@ -3,7 +3,7 @@
 // The aggregate row is kernel.tenants. aggregate_version is incremented
 // under FOR UPDATE, then nextval allocates seq. Nothing takes an advisory
 // lock. NOTIFY is a zero-payload wake-up in the same transaction.
-import { sql, type Kysely } from 'kysely';
+import { sql, type Kysely, type Transaction } from 'kysely';
 import type { Database } from '../db/database.ts';
 import { withTenant, type HygieneEvidence } from '../tenancy/hygiene.ts';
 import { OUTBOX_CHANNEL } from './constants.ts';
@@ -34,7 +34,7 @@ export async function appendEvent(
   input: AppendInput,
   evidence: HygieneEvidence,
   terminateBackend: (pid: number) => Promise<void>,
-  afterAssign?: (assigned: AppendedEvent) => Promise<void>,
+  afterAssign?: (assigned: AppendedEvent, trx: Transaction<Database>) => Promise<void>,
 ): Promise<AppendedEvent> {
   assertUuid(tenantId, 'tenant id');
   assertAggregateType(input.aggregateType);
@@ -81,7 +81,7 @@ export async function appendEvent(
     const backendPid = Number(pidRow.rows[0]?.pid);
     if (!Number.isInteger(backendPid)) throw new Error('backend pid missing');
     const assigned = { seq, aggregateVersion, backendPid };
-    if (afterAssign) await afterAssign(assigned);
+    if (afterAssign) await afterAssign(assigned, trx);
     return assigned;
   });
 }
