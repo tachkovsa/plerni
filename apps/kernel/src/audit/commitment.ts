@@ -42,10 +42,19 @@ function sorted(value: unknown): unknown {
     if (Object.getPrototypeOf(value) !== Object.prototype) throw new AuditPayloadError();
     const record = value as Record<string, unknown>;
     if (Object.getOwnPropertySymbols(record).length > 0) throw new AuditPayloadError();
-    const out: Record<string, unknown> = {};
+    // A normal object drops an own "__proto__" key on assignment. The accumulator
+    // has no prototype, and each key is an own data property.
+    const out = Object.create(null) as Record<string, unknown>;
     for (const key of Object.keys(record).sort()) {
-      if (record[key] === undefined) throw new AuditPayloadError();
-      out[key] = sorted(record[key]);
+      const descriptor = Object.getOwnPropertyDescriptor(record, key);
+      if (!descriptor || !Object.hasOwn(descriptor, 'value')) throw new AuditPayloadError();
+      if (descriptor.value === undefined) throw new AuditPayloadError();
+      Object.defineProperty(out, key, {
+        value: sorted(descriptor.value),
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      });
     }
     return out;
   }
@@ -148,28 +157,39 @@ export async function verifyAuditChain(
   tenantId: string,
 ): Promise<AuditChainStatus> {
   await assertSameTenant(trx, tenantId);
+  // One statement, so the head and the entries share a snapshot. Ordering uses
+  // the bigint column. The text alias would sort "10" before "2".
   const rows = await sql<{
-    seq: string;
-    action: string;
-    payload_hash: string;
-    previous_hash: string;
-    entry_hash: string;
+    seq: string | null;
+    action: string | null;
+    payload_hash: string | null;
+    previous_hash: string | null;
+    entry_hash: string | null;
+    head_seq: string | null;
+    head_hash: string | null;
   }>`
-    SELECT seq::text AS seq, action, payload_hash, previous_hash, entry_hash
-    FROM kernel.audit_commitment
-    WHERE tenant_id = ${tenantId}::uuid
-    ORDER BY seq`.execute(trx);
-  const heads = await sql<{ seq: string; head_hash: string }>`
-    SELECT seq::text AS seq, head_hash
-    FROM kernel.audit_chain_head
-    WHERE tenant_id = ${tenantId}::uuid`.execute(trx);
-  const head = heads.rows[0];
-  if (rows.rows.length === 0 && !head) return { count: 0, headHash: null };
-  if (!head || rows.rows.length === 0) throw new AuditChainError();
+    SELECT c.seq::text AS seq,
+           c.action,
+           c.payload_hash,
+           c.previous_hash,
+           c.entry_hash,
+           h.seq::text AS head_seq,
+           h.head_hash
+    FROM kernel.audit_chain_head h
+    FULL OUTER JOIN kernel.audit_commitment c ON c.tenant_id = h.tenant_id
+    WHERE COALESCE(h.tenant_id, c.tenant_id) = ${tenantId}::uuid
+    ORDER BY c.seq`.execute(trx);
+  if (rows.rows.length === 0) return { count: 0, headHash: null };
+  const headSeq = rows.rows[0]?.head_seq;
+  const headHash = rows.rows[0]?.head_hash;
+  if (!headSeq || !headHash) throw new AuditChainError();
   let previous = AUDIT_GENESIS_HASH;
   for (let index = 0; index < rows.rows.length; index += 1) {
     const row = rows.rows[index];
-    if (!row) throw new AuditChainError();
+    if (!row || row.head_seq !== headSeq || row.head_hash !== headHash) throw new AuditChainError();
+    if (!row.seq || !row.action || !row.payload_hash || !row.previous_hash || !row.entry_hash) {
+      throw new AuditChainError();
+    }
     const seq = asSeq(row.seq);
     if (seq !== index + 1 || row.previous_hash !== previous) throw new AuditChainError();
     const expected = entryHashOf({
@@ -183,6 +203,6 @@ export async function verifyAuditChain(
     previous = row.entry_hash;
   }
   const last = rows.rows[rows.rows.length - 1];
-  if (!last || head.seq !== last.seq || head.head_hash !== last.entry_hash) throw new AuditChainError();
-  return { count: rows.rows.length, headHash: last.entry_hash };
+  if (!last || headSeq !== last.seq || headHash !== last.entry_hash) throw new AuditChainError();
+  return { count: rows.rows.length, headHash };
 }

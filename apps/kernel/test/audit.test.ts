@@ -170,7 +170,7 @@ async function chainRows(tenantId: string): Promise<ChainRow[]> {
               concat_ws(' ', seq::text, action, payload_hash, previous_hash, entry_hash, id::text) AS body
        FROM kernel.audit_commitment
        WHERE tenant_id = $1::uuid
-       ORDER BY seq`,
+       ORDER BY kernel.audit_commitment.seq`,
       [tenantId],
     );
     return result.rows;
@@ -361,5 +361,80 @@ test('disabling a user commits the per-tenant hash chain, and a rollback writes 
     await withRoot(async (client) => {
       await client.query("DELETE FROM kernel.scoped_row WHERE marker = 'marker'");
     });
+  }
+});
+
+const T3 = 'c3333333-3333-4333-8333-333333333333';
+const RECORDED = 'kernel.audit.recorded';
+
+async function resetTenant(tenantId: string): Promise<void> {
+  await withRoot(async (client) => {
+    await client.query('DELETE FROM kernel.audit_commitment WHERE tenant_id = $1::uuid', [tenantId]);
+    await client.query('DELETE FROM kernel.audit_chain_head WHERE tenant_id = $1::uuid', [tenantId]);
+    await client.query('DELETE FROM kernel.tenants WHERE id = $1::uuid', [tenantId]);
+  });
+}
+
+test('an own __proto__ key changes the payload hash', async () => {
+  await ready();
+  await resetTenant(T3);
+  await withRoot(async (client) => {
+    await client.query(
+      `INSERT INTO kernel.tenants (id, kind, aggregate_version) VALUES ($1::uuid, 'customer', 0)`,
+      [T3],
+    );
+  });
+  const db = appDb(DIRECT, 1);
+  try {
+    const hashes = await withTenant(db, T3, blankEvidence(), terminate, async (trx) => {
+      const first = await appendAuditCommitment(trx, {
+        tenantId: T3,
+        action: RECORDED,
+        payload: JSON.parse('{"__proto__":{"amount":1},"x":1}') as unknown,
+      });
+      const second = await appendAuditCommitment(trx, {
+        tenantId: T3,
+        action: RECORDED,
+        payload: JSON.parse('{"__proto__":{"amount":2},"x":1}') as unknown,
+      });
+      const verified = await verifyAuditChain(trx, T3);
+      return { first: first.payloadHash, second: second.payloadHash, count: verified.count };
+    });
+    assert.notEqual(hashes.first, hashes.second);
+    assert.equal(hashes.count, 2);
+  } finally {
+    await db.destroy();
+    await resetTenant(T3);
+  }
+});
+
+test('verification follows the numeric sequence through twelve entries', async () => {
+  await ready();
+  await resetTenant(T3);
+  await withRoot(async (client) => {
+    await client.query(
+      `INSERT INTO kernel.tenants (id, kind, aggregate_version) VALUES ($1::uuid, 'customer', 0)`,
+      [T3],
+    );
+  });
+  const db = appDb(DIRECT, 1);
+  try {
+    const verified = await withTenant(db, T3, blankEvidence(), terminate, async (trx) => {
+      for (let n = 1; n <= 12; n += 1) {
+        await appendAuditCommitment(trx, { tenantId: T3, action: RECORDED, payload: { n } });
+      }
+      return verifyAuditChain(trx, T3);
+    });
+    assert.equal(verified.count, 12);
+    const rows = await chainRows(T3);
+    assert.deepEqual(rows.map((row) => row.seq), ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12']);
+    const tenth = rows[9];
+    const ninth = rows[8];
+    assert.ok(tenth && ninth);
+    assert.equal(tenth.previous_hash, ninth.entry_hash);
+    assert.equal(verified.headHash, rows[11]?.entry_hash);
+  } finally {
+    await db.destroy();
+    await resetTenant(T3);
   }
 });
