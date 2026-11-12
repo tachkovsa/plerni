@@ -21,3 +21,6 @@ export const NO_LISTENER_ALERT = 'no relay listener';
 
 /** LISTEN setup failed. Polling still runs. */
 export const LISTENER_FAILED = 'relay listener failed';
+
+/** Repeated alerts do not grow the relay process without a bound. */
+export const ALERT_CAP = 32;

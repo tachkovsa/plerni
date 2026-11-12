@@ -4,9 +4,15 @@
 // pass plus one rerun. Two processes are K15. pg-boss is K14.
 import type { Kysely } from 'kysely';
 import type { Database } from '../db/database.ts';
-import { LISTENER_FAILED, POLL_MS } from './constants.ts';
+import { ALERT_CAP, LISTENER_FAILED, POLL_MS } from './constants.ts';
 import { deliverAvailable, RelayDeliveryError, type DeliveryHandler } from './deliver.ts';
 import { listenForOutbox } from './listen.ts';
+
+export function rememberAlert(alerts: string[], message: string): void {
+  if (alerts.at(-1) === message) return;
+  alerts.push(message);
+  if (alerts.length > ALERT_CAP) alerts.splice(0, alerts.length - ALERT_CAP);
+}
 
 export function createPassScheduler(run: () => Promise<void>): {
   kick: () => void;
@@ -60,12 +66,14 @@ export async function startRelay(input: {
   const scheduler = createPassScheduler(async () => {
     try {
       const report = await deliverAvailable(input.db, input.handler, input.terminateBackend);
-      alerts.push(...report.alerts);
+      for (const alert of report.alerts) rememberAlert(alerts, alert);
     } catch (error) {
       const cause = error instanceof RelayDeliveryError ? error.cause : error;
-      if (error instanceof RelayDeliveryError) alerts.push(...error.alerts);
+      if (error instanceof RelayDeliveryError) {
+        for (const alert of error.alerts) rememberAlert(alerts, alert);
+      }
       const name = cause instanceof Error ? cause.name : 'Error';
-      alerts.push(`relay failed: ${name}`);
+      rememberAlert(alerts, `relay failed: ${name}`);
     }
   });
   const timer = setInterval(() => {
@@ -82,7 +90,7 @@ export async function startRelay(input: {
       },
     );
   } catch {
-    alerts.push(LISTENER_FAILED);
+    rememberAlert(alerts, LISTENER_FAILED);
   }
   scheduler.kick();
   return {

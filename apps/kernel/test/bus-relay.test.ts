@@ -14,8 +14,8 @@ import {
   deliveryKey,
   type DeliveredEvent,
 } from '../src/bus/deliver.ts';
-import { assertDirectListen, countRelayListeners, listenForOutbox } from '../src/bus/listen.ts';
-import { createPassScheduler, startRelay } from '../src/bus/relay.ts';
+import { assertDirectListen, countRelayListeners, listenForOutbox, listenOrClose } from '../src/bus/listen.ts';
+import { createPassScheduler, rememberAlert, startRelay } from '../src/bus/relay.ts';
 import { retainLog } from '../src/bus/retain.ts';
 import { registerSubscription } from '../src/bus/subscription.ts';
 import type { Database } from '../src/db/database.ts';
@@ -665,4 +665,39 @@ test('wake-ups during a pass collapse into one rerun', async () => {
   release();
   await scheduler.idle();
   assert.equal(entered, 2);
+});
+
+test('a pooled address with no port is still refused for LISTEN', () => {
+  assert.throws(
+    () => assertDirectListen('postgres://pooler/plerni', 'postgres://pooler/plerni'),
+    /pooled connection/,
+  );
+  assertDirectListen('postgres://direct.example:5432/plerni', 'postgres://pooler.example:5432/plerni');
+});
+
+test('a rejected LISTEN closes the connected client', async () => {
+  let ended = 0;
+  const client = {
+    on() {
+      return undefined;
+    },
+    async query() {
+      throw new Error('listen rejected');
+    },
+    async end() {
+      ended += 1;
+    },
+  };
+  await assert.rejects(() => listenOrClose(client), /listen rejected/);
+  assert.equal(ended, 1);
+});
+
+test('repeated relay alerts stay bounded', () => {
+  const alerts: string[] = [];
+  for (let i = 0; i < 10_000; i += 1) rememberAlert(alerts, 'no relay listener');
+  assert.deepEqual(alerts, ['no relay listener']);
+  for (let i = 0; i < 100; i += 1) {
+    rememberAlert(alerts, i % 2 === 0 ? 'handler failed' : 'relay failed: Error');
+  }
+  assert.ok(alerts.length <= 32);
 });

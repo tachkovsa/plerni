@@ -7,6 +7,11 @@ import type { Database } from '../db/database.ts';
 import { LISTEN_APPLICATION, OUTBOX_CHANNEL } from './constants.ts';
 import { assertIdentifier } from './validate.ts';
 
+function endpoint(value: URL): string {
+  const port = value.port === '' ? '5432' : value.port;
+  return `${value.hostname.toLowerCase()}:${port}`;
+}
+
 export function assertDirectListen(connectionString: string, pooledConnectionString: string): void {
   let listen: URL;
   let pooled: URL;
@@ -16,8 +21,21 @@ export function assertDirectListen(connectionString: string, pooledConnectionStr
   } catch {
     throw new Error('listen connection rejected');
   }
-  if (listen.port !== '' && listen.port === pooled.port) {
+  if (endpoint(listen) === endpoint(pooled)) {
     throw new Error('LISTEN is not allowed on the pooled connection');
+  }
+}
+
+/** LISTEN, or close the already-connected client if the statement fails. */
+export async function listenOrClose(client: {
+  query(sqlText: string): Promise<unknown>;
+  end(): Promise<void>;
+}): Promise<void> {
+  try {
+    await client.query(`LISTEN ${OUTBOX_CHANNEL}`);
+  } catch (error) {
+    await client.end().catch(() => undefined);
+    throw error;
   }
 }
 
@@ -49,8 +67,13 @@ export async function listenForOutbox(
     if (message.channel !== OUTBOX_CHANNEL) return;
     onWake(message.payload ?? '');
   });
-  await client.connect();
-  await client.query(`LISTEN ${OUTBOX_CHANNEL}`);
+  try {
+    await client.connect();
+  } catch (error) {
+    await client.end().catch(() => undefined);
+    throw error;
+  }
+  await listenOrClose(client);
   return {
     close: async () => {
       await client.query(`UNLISTEN ${OUTBOX_CHANNEL}`).catch(() => undefined);
