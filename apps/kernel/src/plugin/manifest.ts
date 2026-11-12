@@ -73,8 +73,8 @@ function objects(value: unknown, label: string): Record<string, unknown>[] {
 
 /**
  * Names a manifest registers with `directory.register_edge_type`.
- * An empty list registers nothing. K17's fixture is empty. The directory
- * insert is a later task; this function does not write.
+ * An empty list registers nothing. K17's fixture is empty. This function
+ * does not write the row.
  */
 export function registeredEdgeTypes(manifest: PluginManifest): readonly string[] {
   return manifest.edgeTypes;

@@ -201,4 +201,38 @@ export interface Database {
     outcome: string;
     created_at: Date;
   };
+  directory_user: {
+    tenant_id: string;
+    id: string;
+    display_name: string;
+    created_at: Date;
+  };
+  directory_group: {
+    tenant_id: string;
+    id: string;
+    name: string;
+    created_at: Date;
+  };
+  directory_edge_type: {
+    tenant_id: string;
+    id: string;
+    name: string;
+    plugin_id: string;
+    created_at: Date;
+  };
+  directory_membership: {
+    tenant_id: string;
+    id: string;
+    group_id: string;
+    user_id: string;
+    created_at: Date;
+  };
+  directory_edge: {
+    tenant_id: string;
+    id: string;
+    type_id: string;
+    subject_user_id: string;
+    object_user_id: string;
+    created_at: Date;
+  };
 }
