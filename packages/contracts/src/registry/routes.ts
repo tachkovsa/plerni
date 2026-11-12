@@ -147,11 +147,104 @@ export const kernelNotificationList: RouteContract = {
   errors: ['UNAUTHENTICATED', 'VALIDATION', 'INTERNAL'],
 };
 
+const PERMISSION_NAME = /^[a-z][a-z0-9_.:-]{1,200}$/;
+
+export const servicePrincipalProvisionRequestSchema = z.strictObject({
+  permissions: z.array(z.string().regex(PERMISSION_NAME)).max(16),
+  expiresAt: z.iso.datetime(),
+});
+
+const credentialShape = {
+  id: z.uuid(),
+  permissions: z.array(z.string().regex(PERMISSION_NAME)).max(16),
+  expiresAt: z.iso.datetime(),
+  credential: z.string().regex(/^[0-9a-f]{64}$/),
+};
+
+export const servicePrincipalCredentialSchema = z.strictObject(credentialShape);
+export const servicePrincipalRotatedCredentialSchema = z.strictObject(credentialShape);
+
+const principalIdShape = { principalId: z.uuid() };
+
+export const servicePrincipalIdRequestSchema = z.strictObject(principalIdShape);
+export const servicePrincipalRevokeRequestSchema = z.strictObject(principalIdShape);
+
+export const servicePrincipalRevokeResponseSchema = z.strictObject({
+  id: z.uuid(),
+  revoked: z.literal(true),
+});
+
+export const kernelServicePrincipalProvision: RouteContract = {
+  operationId: 'kernel.service_principal.provision',
+  method: 'post',
+  path: '/kernel/service-principals',
+  summary: 'Provision a tenant-scoped service principal and return its credential once',
+  visibility: 'public',
+  action: 'sensitive',
+  scope: 'tenant',
+  request: {
+    schemaName: 'ServicePrincipalProvisionRequest',
+    schema: servicePrincipalProvisionRequestSchema,
+  },
+  success: {
+    status: 201,
+    description: 'The principal and the credential. The credential is not returned again.',
+    schemaName: 'ServicePrincipalCredential',
+    schema: servicePrincipalCredentialSchema,
+  },
+  errors: ['VALIDATION', 'UNAUTHENTICATED', 'FORBIDDEN', 'INTERNAL'],
+};
+
+export const kernelServicePrincipalRotate: RouteContract = {
+  operationId: 'kernel.service_principal.rotate',
+  method: 'post',
+  path: '/kernel/service-principal-rotations',
+  summary: 'Rotate a service principal credential',
+  visibility: 'public',
+  action: 'sensitive',
+  scope: 'tenant',
+  request: {
+    schemaName: 'ServicePrincipalIdRequest',
+    schema: servicePrincipalIdRequestSchema,
+  },
+  success: {
+    status: 200,
+    description: 'The new credential. The previous credential no longer authenticates.',
+    schemaName: 'ServicePrincipalRotatedCredential',
+    schema: servicePrincipalRotatedCredentialSchema,
+  },
+  errors: ['VALIDATION', 'UNAUTHENTICATED', 'FORBIDDEN', 'NOT_FOUND', 'INTERNAL'],
+};
+
+export const kernelServicePrincipalRevoke: RouteContract = {
+  operationId: 'kernel.service_principal.revoke',
+  method: 'post',
+  path: '/kernel/service-principal-revocations',
+  summary: 'Revoke a service principal',
+  visibility: 'public',
+  action: 'sensitive',
+  scope: 'tenant',
+  request: {
+    schemaName: 'ServicePrincipalRevokeRequest',
+    schema: servicePrincipalRevokeRequestSchema,
+  },
+  success: {
+    status: 200,
+    description: 'The principal is revoked. Its credentials no longer authenticate.',
+    schemaName: 'ServicePrincipalRevokeResponse',
+    schema: servicePrincipalRevokeResponseSchema,
+  },
+  errors: ['VALIDATION', 'UNAUTHENTICATED', 'FORBIDDEN', 'NOT_FOUND', 'INTERNAL'],
+};
+
 export const kernelRoutes: readonly RouteContract[] = Object.freeze([
   kernelTenantCreate,
   kernelNotificationPreferenceRecord,
   kernelNotificationSend,
   kernelNotificationList,
+  kernelServicePrincipalProvision,
+  kernelServicePrincipalRotate,
+  kernelServicePrincipalRevoke,
 ]);
 
 export const KERNEL_API_VERSION = '1.0.0';

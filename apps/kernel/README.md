@@ -56,6 +56,14 @@ Role chain, with no shell: a caller with the grant puts bytes and reads them bac
 
 `POST /kernel/notification-preferences`, `POST /kernel/notifications`, and `GET /kernel/notifications` are the public routes. The list returns the caller's delivered rows, newest first, at most 50. Failures use the error envelope.
 
+## Service principals
+
+`kernel.service_principal` is tenant-scoped. `kernel.service_credential` stores sha256 of a 256-bit token, never the token. `kernel.service_principal_scope` stores the permissions the administrator declared, and no others. A credential expires within 90 days. Rotate revokes the previous credential and returns a new one. Revoke marks the principal and its credentials revoked.
+
+`POST /kernel/service-principals`, `POST /kernel/service-principal-rotations`, and `POST /kernel/service-principal-revocations` are administrator routes. The bearer is an administrator session. A service credential presented to those routes is not an administrator session. On a routine route, an `Authorization: Bearer` credential replaces any grants on the injected caller. `POST /kernel/notifications` is that routine route: it requires `notify.send` in the stored scope. A token that is not 64 hex, including an upstream IdP token, is rejected. A user session token is not a service credential. Denial of a `sensitive` or `destructive` route is a later task.
+
+Role chain, with no shell: a customer administrator provisions a principal whose scope is the declared permissions. That credential calls the routine notification route when the scope includes `notify.send`. A scope that does not declare `notify.send` is `FORBIDDEN` even if the caller object lists that permission. After rotate, the previous credential fails and the new one calls the route. After revoke, the current credential fails. The identity log and the stored rows do not contain the secret.
+
 ## Tenancy suite
 
 The suite talks to the dev harness (PostgreSQL through PgBouncer, transaction mode). Export `POSTGRES_PASSWORD`, `PLERNI_APP_PASSWORD`, `PLERNI_MIGRATE_PASSWORD`, and `PLERNI_ADMIN_PASSWORD`, then reset the harness, then:

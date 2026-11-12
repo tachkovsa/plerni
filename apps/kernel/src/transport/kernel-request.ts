@@ -16,6 +16,15 @@ import {
   type ErrorEnvelope,
 } from '@plerni/contracts';
 import type { Database } from '../db/database.ts';
+import type { IdentityContext } from '../identity/context.ts';
+import { createIdentityLog } from '../identity/log.ts';
+import {
+  authenticateServicePrincipal,
+  provisionServicePrincipal,
+  revokeServicePrincipal,
+  rotateServicePrincipal,
+  type AuthenticatedPrincipal,
+} from '../identity/principal.ts';
 import {
   listNotifications,
   sendNotification,
@@ -39,18 +48,26 @@ import {
 } from '../tenant/errors.ts';
 import { createTenant, type TenantRecord, type TenantSession } from '../tenant/registry.ts';
 import { handleNotificationRequest, type NotificationSession } from './notify-request.ts';
+import {
+  authorizationBearer,
+  bearerFailure,
+  handlePrincipalRequest,
+  rejectedServiceCredential,
+  type PrincipalHandlers,
+} from './principal-request.ts';
 
 export interface KernelCaller extends TenantSession {
   actorId?: string;
   grants?: readonly string[];
 }
 
-export interface KernelHttpContext {
+export interface KernelHttpContext extends PrincipalHandlers {
   session: KernelCaller | null;
   createTenant: (input: { idempotencyKey: string }, session: TenantSession) => Promise<TenantRecord>;
   recordNotificationPreference?: (input: PreferenceInput, caller: PreferenceCaller) => Promise<PreferenceRecord>;
   sendNotification?: (input: SendNotificationInput, caller: NotifyCaller) => Promise<DeliveryRecord>;
   listNotifications?: (caller: InboxCaller) => Promise<DeliveryRecord[]>;
+  authenticatePrincipal?: (input: { tenantId: string; token: string }) => Promise<AuthenticatedPrincipal>;
 }
 
 function json(status: number, body: unknown): Response {
@@ -167,30 +184,29 @@ export async function handleKernelRequest(request: Request, ctx: KernelHttpConte
       next_step: 'Use an operation id published in the kernel OpenAPI document.',
     }));
   }
-  if (!ctx.session) {
-    const nextStep = route.scope === 'tenant'
-      ? 'Retry with a tenant session.'
-      : 'Retry with an operator session.';
-    return fail(errorEnvelope({
-      code: 'UNAUTHENTICATED',
-      message: 'The request has no session.',
-      next_step: nextStep,
-    }));
+  if (
+    route.operationId === 'kernel.service_principal.provision'
+    || route.operationId === 'kernel.service_principal.rotate'
+    || route.operationId === 'kernel.service_principal.revoke'
+  ) {
+    return handlePrincipalRequest(route.operationId, request, ctx.session?.tenantId, ctx);
   }
+  const session = await resolveCaller(request, route.scope, ctx);
+  if (session instanceof Response) return session;
   if (route.operationId === 'kernel.tenant.create') {
-    return createTenantResponse(request, ctx.session, ctx.createTenant);
+    return createTenantResponse(request, session, ctx.createTenant);
   }
   if (
     route.operationId === kernelNotificationPreferenceRecord.operationId
     || route.operationId === kernelNotificationSend.operationId
     || route.operationId === kernelNotificationList.operationId
   ) {
-    const session: NotificationSession = {
-      tenantId: ctx.session.tenantId,
-      ...(ctx.session.actorId !== undefined ? { actorId: ctx.session.actorId } : {}),
-      ...(ctx.session.grants !== undefined ? { grants: ctx.session.grants } : {}),
+    const caller: NotificationSession = {
+      tenantId: session.tenantId,
+      ...(session.actorId !== undefined ? { actorId: session.actorId } : {}),
+      ...(session.grants !== undefined ? { grants: session.grants } : {}),
     };
-    return handleNotificationRequest(route.operationId, request, session, {
+    return handleNotificationRequest(route.operationId, request, caller, {
       ...(ctx.recordNotificationPreference
         ? { recordNotificationPreference: ctx.recordNotificationPreference }
         : {}),
@@ -201,12 +217,52 @@ export async function handleKernelRequest(request: Request, ctx: KernelHttpConte
   return fail(internalFailure());
 }
 
+async function resolveCaller(
+  request: Request,
+  scope: 'platform' | 'tenant' | undefined,
+  ctx: KernelHttpContext,
+): Promise<KernelCaller | Response> {
+  const auth = authorizationBearer(request);
+  if (!auth.present) {
+    if (ctx.session) return ctx.session;
+    const nextStep = scope === 'tenant'
+      ? 'Retry with a tenant session.'
+      : 'Retry with an operator session.';
+    return fail(errorEnvelope({
+      code: 'UNAUTHENTICATED',
+      message: 'The request has no session.',
+      next_step: nextStep,
+    }));
+  }
+  if (!auth.token || !ctx.session?.tenantId) return fail(rejectedServiceCredential());
+  if (!ctx.authenticatePrincipal) return fail(internalFailure());
+  try {
+    const principal = await ctx.authenticatePrincipal({
+      tenantId: ctx.session.tenantId,
+      token: auth.token,
+    });
+    return {
+      tenantId: principal.tenantId,
+      actorId: principal.principalId,
+      grants: [...principal.permissions],
+    };
+  } catch (error) {
+    return fail(bearerFailure(error));
+  }
+}
+
 export function kernelRequestContext(deps: {
   session: KernelCaller | null;
   db: Kysely<Database>;
   evidence: HygieneEvidence;
   terminateBackend: (pid: number) => Promise<void>;
+  log?: IdentityContext['log'];
 }): KernelHttpContext {
+  const identity: IdentityContext = {
+    evidence: deps.evidence,
+    terminate: deps.terminateBackend,
+    log: deps.log ?? createIdentityLog(() => undefined),
+  };
   return {
     session: deps.session,
     createTenant: (input, session) => createTenant(
@@ -236,5 +292,9 @@ export function kernelRequestContext(deps: {
       deps.evidence,
       deps.terminateBackend,
     ),
+    provisionServicePrincipal: (input, actor) => provisionServicePrincipal(deps.db, actor, input, identity),
+    rotateServicePrincipal: (principalId, actor) => rotateServicePrincipal(deps.db, actor, principalId, identity),
+    revokeServicePrincipal: (principalId, actor) => revokeServicePrincipal(deps.db, actor, principalId, identity),
+    authenticatePrincipal: (input) => authenticateServicePrincipal(deps.db, input, identity),
   };
 }

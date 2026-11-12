@@ -10,10 +10,14 @@ const ID_FIELDS = new Set([
   'customerTenantId',
   'tenantId',
   'userId',
+  'principalId',
 ]);
 
 const WORDS: Readonly<Record<string, ReadonlySet<string>>> = {
-  action: new Set(['login', 'login_rejected', 'refresh', 'logout', 'disable', 'rescue', 'reset', 'create', 'bootstrap']),
+  action: new Set([
+    'login', 'login_rejected', 'refresh', 'logout', 'disable', 'rescue', 'reset', 'create', 'bootstrap',
+    'provision', 'rotate', 'revoke',
+  ]),
   outcome: new Set(['rejected', 'closed', 'accepted', 'disabled', 'throttled']),
   validation: new Set(['lease', 'per_request']),
 };
