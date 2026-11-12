@@ -56,7 +56,7 @@ Role chain, with no shell: a caller with the grant puts bytes and reads them bac
 
 `kernel.directory_user`, `kernel.directory_group`, `kernel.directory_membership`, `kernel.directory_edge_type`, and `kernel.directory_edge` are tenant-domain tables. Creating, reading, updating, and deleting stay inside the session tenant. Another tenant's list is empty, including when the ids match. Lists are ordered by id and return at most 50 rows.
 
-An edge type is a row. `registerDirectoryEdgeType` inserts that row for a name `registeredEdgeTypes` returns, and only when the manifest also holds `directory.register_edge_type`. It does not add a kernel migration. `insertDirectoryEdge` inserts an edge only for a name that same parsing lists. The broker writes it as the app role, in the caller's transaction, so a plugin statement in that transaction commits or rolls back with the edge. The plugin role has no `INSERT` on these tables.
+An edge type is a row. `registerDirectoryEdgeType` inserts that row for a name `registeredEdgeTypes` returns, and only when `kernel.plugin_grant` holds both `directory.register_edge_type` and `directory.write_edge:<type>` for that plugin. It does not add a kernel migration. `insertDirectoryEdge` inserts an edge only for a name that same parsing lists and only when that write grant is installed. The check reads the grant table inside the tenant transaction. The broker writes the edge as the app role, in the caller's transaction, so a plugin statement in that transaction commits or rolls back with the edge. The plugin role has no `INSERT` on these tables.
 
 This port does not add a public route. Failures are the error envelope (`ContractFailure`). Plan §7's directory read tools are a later task.
 

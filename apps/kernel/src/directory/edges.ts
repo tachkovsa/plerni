@@ -4,6 +4,7 @@
 // type registeredEdgeTypes lists (plan §5.3, §10.2 question 3). The plugin
 // role has no SQL grant on these tables. The broker writes the row.
 import { randomUUID } from 'node:crypto';
+import type { ContractFailure } from '@plerni/contracts';
 import { sql, type Kysely, type Transaction } from 'kysely';
 import type { Database } from '../db/database.ts';
 import { PluginPackageError } from '../plugin/errors.ts';
@@ -97,6 +98,29 @@ function requireListed(manifest: PluginManifest, typeName: string): void {
   if (!listedTypes(manifest).includes(typeName)) throw edgeTypeForbidden();
 }
 
+/** Operator approval is a row, not the manifest the caller presents (ADR-0008 decision 1). */
+async function requireInstalledGrant(
+  trx: Transaction<Database>,
+  pluginId: string,
+  grantName: string,
+  deny: () => ContractFailure,
+): Promise<void> {
+  const approved = await sql<{ ok: number }>`
+    SELECT 1 AS ok FROM kernel.plugin_grant
+    WHERE plugin_id = ${pluginId} AND grant_name = ${grantName}`.execute(trx);
+  if (!approved.rows[0]) throw deny();
+}
+
+function pluginIdOf(manifest: PluginManifest): string {
+  try {
+    assertPluginId(manifest.id);
+  } catch (error) {
+    if (error instanceof PluginPackageError) throw rejectedPlugin();
+    throw error;
+  }
+  return manifest.id;
+}
+
 async function readType(trx: Transaction<Database>, name: string): Promise<DirectoryEdgeType | null> {
   const result = await sql<TypeRow>`
     SELECT id::text AS id, name, plugin_id
@@ -119,15 +143,11 @@ export async function registerDirectoryEdgeType(
     throw registerForbidden();
   }
   requireListed(manifest, name);
-  let pluginId: string;
-  try {
-    assertPluginId(manifest.id);
-    pluginId = manifest.id;
-  } catch (error) {
-    if (error instanceof PluginPackageError) throw rejectedPlugin();
-    throw error;
-  }
+  const pluginId = pluginIdOf(manifest);
+  const writeGrant = `directory.write_edge:${name}`;
   return inDirectory(db, tenantId, evidence, terminateBackend, async (trx, tenant) => {
+    await requireInstalledGrant(trx, pluginId, 'directory.register_edge_type', registerForbidden);
+    await requireInstalledGrant(trx, pluginId, writeGrant, edgeTypeForbidden);
     const inserted = await sql<TypeRow>`
       INSERT INTO kernel.directory_edge_type (tenant_id, id, name, plugin_id)
       VALUES (${tenant}::uuid, ${randomUUID()}::uuid, ${name}, ${pluginId})
@@ -154,6 +174,7 @@ export async function insertDirectoryEdge(
   const tenant = await brokerTenant(trx);
   const typeName = assertEdgeTypeName(input.typeName);
   requireListed(manifest, typeName);
+  await requireInstalledGrant(trx, pluginIdOf(manifest), `directory.write_edge:${typeName}`, edgeTypeForbidden);
   const subjectUserId = assertDirectoryId(input.subjectUserId);
   const objectUserId = assertDirectoryId(input.objectUserId);
   if (subjectUserId === objectUserId) throw rejectedEdgeUsers();

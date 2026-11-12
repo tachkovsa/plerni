@@ -51,6 +51,8 @@ const GROUP_1 = '00000000-0000-4000-8000-0000000000b1';
 const NOTE_1 = '00000000-0000-4000-8000-0000000000d1';
 const NOTE_2 = '00000000-0000-4000-8000-0000000000d2';
 const NOTE_3 = '00000000-0000-4000-8000-0000000000d3';
+const NOTE_4 = '00000000-0000-4000-8000-0000000000d4';
+const APPROVED = ['db.own_schema', 'directory.register_edge_type', 'directory.write_edge:linked'] as const;
 
 function userId(n: number): string {
   return `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
@@ -90,6 +92,28 @@ async function withApp<T>(fn: (db: Kysely<Database>) => Promise<T>): Promise<T> 
     return await fn(db);
   } finally {
     await db.destroy();
+  }
+}
+
+async function setGrants(pluginId: string, grants: readonly string[]): Promise<void> {
+  const client = new pg.Client({ connectionString: MIGRATE });
+  client.on('error', () => undefined);
+  await client.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('DELETE FROM kernel.plugin_grant WHERE plugin_id = $1', [pluginId]);
+    for (const grant of grants) {
+      await client.query(
+        'INSERT INTO kernel.plugin_grant (plugin_id, grant_name) VALUES ($1, $2)',
+        [pluginId, grant],
+      );
+    }
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    await client.end();
   }
 }
 
@@ -374,6 +398,7 @@ serial('registering an edge type is a row, and write_edge shares the fixture tra
   const listed = listedManifest();
   assert.deepEqual(fixture.edgeTypes, []);
   assert.deepEqual(listed.edgeTypes, ['linked']);
+  try {
   await withApp(async (db) => {
     const evidence = blankEvidence();
     await createDirectoryUser(db, TENANT_A, { id: USER_1, displayName: 'alpha' }, evidence, terminate);
@@ -382,6 +407,25 @@ serial('registering an edge type is a row, and write_edge shares the fixture tra
       () => registerDirectoryEdgeType(db, TENANT_A, fixture, 'linked', evidence, terminate),
       (error: unknown) => failure(error, 'FORBIDDEN', 'The caller cannot register an edge type.'),
     );
+    const edgeInput = { typeName: 'linked', subjectUserId: USER_1, objectUserId: USER_2 };
+    await assert.rejects(
+      () => registerDirectoryEdgeType(db, TENANT_A, listed, 'linked', evidence, terminate),
+      (error: unknown) => failure(error, 'FORBIDDEN', 'The caller cannot register an edge type.'),
+    );
+    await assert.rejects(
+      () => inPinnedTransaction(db, TENANT_A, blankEvidence(), terminate, async (trx) => {
+        await assertTenantContext(trx);
+        await installPluginRole(trx, PLUGIN);
+        await sql`
+          INSERT INTO plugin_fixture_alpha.note (tenant_id, id, body)
+          VALUES (${TENANT_A}::uuid, ${NOTE_4}::uuid, 'unapproved')`.execute(trx);
+        await resumeSessionRole(trx);
+        await insertDirectoryEdge(trx, listed, edgeInput);
+      }),
+      (error: unknown) => failure(error, 'FORBIDDEN', 'The edge type is not listed for this caller.'),
+    );
+    assert.deepEqual(await counts(), { users: 2, groups: 0, edges: 0, notes: 0, types: 0 });
+    await setGrants(PLUGIN, APPROVED);
     const registered = await registerDirectoryEdgeType(db, TENANT_A, listed, 'linked', evidence, terminate);
     assert.equal(registered.name, 'linked');
     assert.equal(registered.pluginId, PLUGIN);
@@ -391,6 +435,7 @@ serial('registering an edge type is a row, and write_edge shares the fixture tra
       () => registerDirectoryEdgeType(db, TENANT_A, listed, 'other', evidence, terminate),
       (error: unknown) => failure(error, 'FORBIDDEN', 'The edge type is not listed for this caller.'),
     );
+    await setGrants('fixture_beta', APPROVED);
     await assert.rejects(
       () => registerDirectoryEdgeType(db, TENANT_A, listedManifest('fixture_beta'), 'linked', evidence, terminate),
       (error: unknown) => failure(error, 'CONCURRENCY_CONFLICT', 'The directory record is in conflict.'),
@@ -412,7 +457,6 @@ serial('registering an edge type is a row, and write_edge shares the fixture tra
       (error: unknown) => errorCode(error) === '42501',
     );
     assert.equal((await counts()).edges, 0);
-    const edgeInput = { typeName: 'linked', subjectUserId: USER_1, objectUserId: USER_2 };
     await assert.rejects(
       () => inPinnedTransaction(db, TENANT_A, blankEvidence(), terminate, async (trx) => {
         await assertTenantContext(trx);
@@ -461,6 +505,21 @@ serial('registering an edge type is a row, and write_edge shares the fixture tra
     assert.deepEqual(visible, [written]);
     assert.deepEqual(await listDirectoryEdges(db, TENANT_B, { typeName: 'linked' }, evidence, terminate), []);
     assert.deepEqual(await listDirectoryEdges(db, TENANT_A, { typeName: 'other' }, evidence, terminate), []);
+    await setGrants(PLUGIN, ['db.own_schema', 'directory.register_edge_type']);
+    await assert.rejects(
+      () => inPinnedTransaction(db, TENANT_A, blankEvidence(), terminate, async (trx) => {
+        await assertTenantContext(trx);
+        await installPluginRole(trx, PLUGIN);
+        await sql`
+          INSERT INTO plugin_fixture_alpha.note (tenant_id, id, body)
+          VALUES (${TENANT_A}::uuid, ${NOTE_2}::uuid, 'revoked')`.execute(trx);
+        await resumeSessionRole(trx);
+        await insertDirectoryEdge(trx, listed, edgeInput);
+      }),
+      (error: unknown) => failure(error, 'FORBIDDEN', 'The edge type is not listed for this caller.'),
+    );
+    assert.equal((await counts()).edges, 1);
+    assert.equal((await counts()).notes, 1);
     await deleteDirectoryUser(db, TENANT_A, USER_1, evidence, terminate);
     assert.equal((await counts()).edges, 0);
     assert.equal((await getDirectoryUser(db, TENANT_A, USER_2, evidence, terminate)).displayName, 'beta');
@@ -470,6 +529,10 @@ serial('registering an edge type is a row, and write_edge shares the fixture tra
       (error: unknown) => failure(error, 'NOT_FOUND', 'The directory record was not found.'),
     );
   });
+  } finally {
+    await setGrants(PLUGIN, ['db.own_schema']);
+    await setGrants('fixture_beta', []);
+  }
   assert.deepEqual(sqlFiles(), filesBefore);
   const versionsAfter = await withRoot(async (client) => {
     const result = await client.query<{ version: string }>(
