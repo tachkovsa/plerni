@@ -432,6 +432,25 @@ test('a live heartbeat blocks reclaim and a stale fence updates zero rows', asyn
     assert.equal(again[0]?.id, attempt.id);
     assert.equal(again[0]?.retryCount, 1);
     const workerB = { id: attempt.id, retryCount: again[0]?.retryCount ?? 0 };
+    const claimed = await jobState(attempt.id);
+    assert.equal(claimed.state, 'active');
+    assert.equal(claimed.retryCount, '1');
+    const stillOpen = await withRoot(async (client) => {
+      const result = await client.query<{ state: string }>(
+        'SELECT state FROM pg_stat_activity WHERE pid = $1',
+        [backend],
+      );
+      return result.rows[0]?.state ?? '';
+    });
+    assert.equal(stillOpen, 'idle in transaction');
+    release();
+    await assert.rejects(held, (error: unknown) => error instanceof StaleJobFence);
+    const afterStale = await jobState(attempt.id);
+    assert.equal(afterStale.state, 'active');
+    assert.equal(afterStale.retryCount, '1');
+    const rolledBack = await sql<{ count: string }>`
+      SELECT count(*)::text AS count FROM job_effect_probe`.execute(db);
+    assert.equal(rolledBack.rows[0]?.count, '0');
     await settleJob(
       db,
       boss,
@@ -445,8 +464,6 @@ test('a live heartbeat blocks reclaim and a stale fence updates zero rows', asyn
           VALUES (${attemptToken(workerB.id, workerB.retryCount)}, 'b')`.execute(trx);
       },
     );
-    release();
-    await assert.rejects(held, (error: unknown) => error instanceof StaleJobFence);
     const effects = await sql<{ attempt_token: string; marker: string }>`
       SELECT attempt_token, marker FROM job_effect_probe ORDER BY marker`.execute(db);
     assert.deepEqual(effects.rows, [{

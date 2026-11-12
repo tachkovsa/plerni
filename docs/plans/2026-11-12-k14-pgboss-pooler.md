@@ -63,7 +63,7 @@ The job cases in that run:
 ✔ heartbeat renewal refuses the pooled application name
 ```
 
-The zombie case is the long one (about 12 seconds): heartbeats still landing after the lease, no redispatch, then a missed heartbeat while the effects transaction is open, redispatch, the stale token updates zero rows, and the new token commits.
+The zombie case is the long one (about 12 seconds): heartbeats still landing after the lease, no redispatch, then a missed heartbeat while the effects transaction is open, redispatch. The replacement worker claims and leaves the job active. The stale token then updates zero rows and its effect rolls back. The replacement token commits after that.
 
 ```
 pnpm gates
