@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 import test from 'node:test';
 import { sql } from 'kysely';
 import pg from 'pg';
-import { fromKysely, type Db } from 'pg-boss';
+import type { Db, PgBoss } from 'pg-boss';
 import { appendEvent } from '../src/bus/append.ts';
 import {
   HEARTBEAT_APPLICATION,
@@ -213,33 +213,34 @@ test('a rolled-back handoff leaves the row pending and inserts no job', async ()
   const boss = openJobBoss(config.pooled);
   try {
     const pending = await appendJob(db, tenantId, request(), blankEvidence(), terminate);
-    await assert.rejects(() => handoffPending(db, boss));
+    await boss.start();
+    const send = boss.send.bind(boss);
+    boss.send = (async (...args: Parameters<PgBoss['send']>) => {
+      await send(...args);
+      throw new Error('abort after insert');
+    }) as unknown as typeof boss.send;
+    await assert.rejects(() => handoffPending(db, boss), /abort after insert/);
+    boss.send = send;
     const row = await sql<{ status: string; job_id: string | null }>`
       SELECT status, job_id::text AS job_id
       FROM kernel.job_dispatch
       WHERE seq = ${pending.seq}::bigint`.execute(db);
     assert.equal(row.rows[0]?.status, 'pending');
     assert.equal(row.rows[0]?.job_id, null);
+    const aborted = await sql<{ count: string }>`
+      SELECT count(*)::text AS count FROM pgboss.job WHERE name = ${JOB_QUEUE}`.execute(db);
+    assert.equal(aborted.rows[0]?.count, '0');
+    const handed = await handoffPending(db, boss);
+    assert.equal(handed?.seq, pending.seq);
     const jobs = await sql<{ count: string }>`
       SELECT count(*)::text AS count FROM pgboss.job WHERE name = ${JOB_QUEUE}`.execute(db);
-    assert.equal(jobs.rows[0]?.count, '0');
-    await boss.start();
-    await assert.rejects(db.transaction().execute(async (trx) => {
-      const inserted = await boss.send(JOB_QUEUE, { marker: 'abort' }, {
-        db: fromKysely(trx),
-        expireInSeconds: 60,
-        heartbeatSeconds: 20,
-        retryLimit: 1,
-      });
-      assert.ok(inserted);
-      throw new Error('abort handoff');
-    }));
-    const aborted = await sql<{ count: string }>`
-      SELECT count(*)::text AS count
-      FROM pgboss.job
-      WHERE name = ${JOB_QUEUE}
-        AND data->>'marker' = 'abort'`.execute(db);
-    assert.equal(aborted.rows[0]?.count, '0');
+    assert.equal(jobs.rows[0]?.count, '1');
+    const marked = await sql<{ status: string; job_id: string }>`
+      SELECT status, job_id::text AS job_id
+      FROM kernel.job_dispatch
+      WHERE seq = ${pending.seq}::bigint`.execute(db);
+    assert.equal(marked.rows[0]?.status, 'dispatched');
+    assert.equal(marked.rows[0]?.job_id, handed?.jobId);
   } finally {
     await boss.stop().catch(() => undefined);
     await db.destroy();
