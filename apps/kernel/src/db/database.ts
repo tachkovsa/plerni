@@ -56,6 +56,12 @@ export interface Database {
     reason: string;
     created_at: Date;
   };
+  job_dispatch: {
+    seq: string;
+    status: string;
+    job_id: string | null;
+    dispatched_at: Date | null;
+  };
   audit_record: {
     tenant_id: string;
     id: string;

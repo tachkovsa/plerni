@@ -34,6 +34,8 @@
  * the same source as its parent. A child of a package verified from
  * pnpm-lock.yaml is the version in that parent's snapshot, never a package
  * Node resolves by name. A required child with no snapshot entry fails closed.
+ * A parenthesized SPDX OR of allowlisted identifiers is allowlisted. Any
+ * other expression, including one disjunct outside the allowlist, is not.
  * Usage: node scripts/gates/license-audit.mjs [--root <dir>]
  */
 import { createHash } from "node:crypto";
@@ -135,9 +137,17 @@ const licenseOf = (pkg) => {
   return typeof lic === "string" ? lic : lic?.type ?? "";
 };
 
+const licenseAllowed = (licStr) => {
+  const text = licStr.trim();
+  if (ALLOWED.has(text)) return true;
+  if (!text.startsWith("(") || !text.endsWith(")") || text.slice(1, -1).includes("(")) return false;
+  const parts = text.slice(1, -1).split(/\s+OR\s+/);
+  return parts.length > 1 && parts.every((part) => ALLOWED.has(part.trim()));
+};
+
 const judge = (label, licStr) => {
-  if (ALLOWED.has(licStr)) return null;
   if (FORBIDDEN_HINTS.test(licStr)) return `${label}: forbidden license "${licStr}"`;
+  if (licenseAllowed(licStr)) return null;
   return `${label}: unknown/unlisted license "${licStr || "MISSING"}" — review and allowlist explicitly`;
 };
 
