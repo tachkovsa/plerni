@@ -69,6 +69,22 @@ export interface Database {
     target_tenant_id: string;
     created_at: Date;
   };
+  audit_chain_head: {
+    tenant_id: string;
+    id: string;
+    seq: string;
+    head_hash: string;
+  };
+  audit_commitment: {
+    tenant_id: string;
+    id: string;
+    seq: string;
+    action: string;
+    payload_hash: string;
+    previous_hash: string;
+    entry_hash: string;
+    created_at: Date;
+  };
   plugin_grant: {
     plugin_id: string;
     grant_name: string;

@@ -37,6 +37,8 @@ export async function resetBus(): Promise<void> {
     await client.query('DELETE FROM kernel.tenant_auth_policy');
     await client.query('DELETE FROM kernel.outbox');
     await client.query('DELETE FROM kernel.tenant_idempotency');
+    await client.query('DELETE FROM kernel.audit_commitment');
+    await client.query('DELETE FROM kernel.audit_chain_head');
     await client.query('DELETE FROM kernel.audit_record');
     await client.query('DELETE FROM kernel.tenants');
   });
