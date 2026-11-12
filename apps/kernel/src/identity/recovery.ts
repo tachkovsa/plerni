@@ -56,10 +56,16 @@ async function replacePassword(
   await notifyIdentity(trx);
 }
 
+export interface IssueResetHooks {
+  /** Runs after the token insert, while the auth-state row lock is still held. */
+  afterInsert?(trx: Transaction<Database>): Promise<void>;
+}
+
 export async function requestPasswordReset(
   db: Kysely<Database>,
   input: { tenantId: string; email: string },
   ctx: IdentityContext,
+  hooks: IssueResetHooks = {},
 ): Promise<{ accepted: true; token?: string }> {
   const tenantId = canonicalUuid(input.tenantId);
   const email = canonicalEmail(input.email);
@@ -69,7 +75,8 @@ export async function requestPasswordReset(
       SELECT u.id::text AS id, (s.disabled_at IS NOT NULL) AS disabled
       FROM kernel.user_account u
       JOIN kernel.user_auth_state s ON s.tenant_id = u.tenant_id AND s.id = u.id
-      WHERE u.tenant_id = ${tenantId}::uuid AND u.email = ${email}`.execute(trx);
+      WHERE u.tenant_id = ${tenantId}::uuid AND u.email = ${email}
+      FOR UPDATE OF s`.execute(trx);
     const account = found.rows[0];
     if (!account || account.disabled) return null;
     const token = newSecretToken();
@@ -82,6 +89,7 @@ export async function requestPasswordReset(
         ${sha256Hex(token)},
         clock_timestamp() + make_interval(mins => ${RESET_MINUTES}::int)
       )`.execute(trx);
+    if (hooks.afterInsert) await hooks.afterInsert(trx);
     return token;
   });
   ctx.log.event('password.reset', { tenantId, action: 'reset', outcome: 'accepted' });
@@ -97,6 +105,8 @@ export interface ResetHooks {
 export interface RescueHooks {
   /** Runs before the throttle row is locked, so concurrent attempts can arrive together. */
   beforeReserve?(trx: Transaction<Database>): Promise<void>;
+  /** Runs in the password-replacement transaction before the auth-state lock. */
+  beforeReplace?(trx: Transaction<Database>): Promise<void>;
 }
 
 export async function confirmPasswordReset(
@@ -223,6 +233,7 @@ export async function recoverWithRescueCode(
   const passwordHash = await hashPassword(input.password);
   const saved = await withTenant(db, tenantId, ctx.evidence, ctx.terminate, async (trx) => {
     await assertTenantContext(trx);
+    if (hooks.beforeReplace) await hooks.beforeReplace(trx);
     const disabled = await sql<{ disabled: boolean }>`
       SELECT (disabled_at IS NOT NULL) AS disabled
       FROM kernel.user_auth_state

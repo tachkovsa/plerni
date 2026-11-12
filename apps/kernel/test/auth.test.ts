@@ -1280,6 +1280,89 @@ serial('an expired reset token is refused at consumption', async () => {
   }
 });
 
+serial('a reset token inserted before recovery commits is consumed', async () => {
+  await ready();
+  await resetIdentity();
+  const credential = secret();
+  const password = secret();
+  const recoveredPassword = secret();
+  const left = appDb(POOLED, 1);
+  const right = appDb(POOLED, 1);
+  let releaseIssue: () => void = () => undefined;
+  try {
+    const installed = await withCredential(credential, () => bootstrapInstallation(left, {
+      credential,
+      operatorEmail: email('operator'),
+      operatorPassword: password,
+      customerEmail: email('customer'),
+      customerPassword: password,
+    }, context(new Sink()).ctx));
+    const operatorEmail = await withRoot(async (client) => {
+      const result = await client.query<{ email: string }>(
+        'SELECT email FROM kernel.user_account WHERE id = $1',
+        [installed.operator.userId],
+      );
+      return result.rows[0]?.email ?? '';
+    });
+    const code = installed.operator.rescueCodes[0];
+    if (!code) throw new Error('rescue code missing');
+    const release = new Promise<void>((resolve) => {
+      releaseIssue = resolve;
+    });
+    let markInserted: () => void = () => undefined;
+    const inserted = new Promise<void>((resolve) => {
+      markInserted = resolve;
+    });
+    const issued = requestPasswordReset(left, {
+      tenantId: installed.operator.tenantId,
+      email: operatorEmail,
+    }, context(new Sink()).ctx, {
+      afterInsert: async () => {
+        markInserted();
+        await release;
+      },
+    });
+    await inserted;
+    let markAtReplace: () => void = () => undefined;
+    const atReplace = new Promise<void>((resolve) => {
+      markAtReplace = resolve;
+    });
+    const recovery = recoverWithRescueCode(right, {
+      tenantId: installed.operator.tenantId,
+      email: operatorEmail,
+      code,
+      password: recoveredPassword,
+    }, context(new Sink()).ctx, {
+      beforeReplace: async () => {
+        markAtReplace();
+      },
+    });
+    await atReplace;
+    releaseIssue();
+    const reset = await issued;
+    await recovery;
+    if (!reset.token) throw new Error('reset token missing');
+    const token = reset.token;
+    await assert.rejects(
+      () => confirmPasswordReset(right, {
+        tenantId: installed.operator.tenantId,
+        token,
+        password: secret(),
+      }, context(new Sink()).ctx),
+      (error: unknown) => error instanceof LoginRejectedError,
+    );
+    await login(right, {
+      tenantId: installed.operator.tenantId,
+      email: operatorEmail,
+      password: recoveredPassword,
+    }, context(new Sink()).ctx);
+  } finally {
+    releaseIssue();
+    await left.destroy();
+    await right.destroy();
+  }
+});
+
 serial('concurrent login attempts reserve at most the throttle limit', async () => {
   await ready();
   await resetIdentity();
