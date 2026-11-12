@@ -13,6 +13,9 @@ export const POLL_MS = 1000;
 /** One drain pass stops here so a poll returns while a backlog remains. */
 export const DRAIN_LIMIT = 256;
 
+/** Steps kept for deferred retries even when other subscriptions fill the pass. */
+export const RETRY_RESERVE = 1;
+
 export const PARK_UNKNOWN_VERSION = 'UNKNOWN_EVENT_VERSION';
 
 export const HANDLER_FAILED = 'HANDLER_FAILED';

@@ -7,7 +7,7 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { sql, type Kysely } from 'kysely';
 import { appendEvent, type AppendedEvent } from '../src/bus/append.ts';
-import { DRAIN_LIMIT, LISTENER_FAILED, NO_LISTENER_ALERT } from '../src/bus/constants.ts';
+import { DRAIN_LIMIT, LISTENER_FAILED, NO_LISTENER_ALERT, RETRY_RESERVE } from '../src/bus/constants.ts';
 import {
   createFailureGate,
   deliverAvailable,
@@ -71,6 +71,32 @@ async function cursor(db: Kysely<Database>, id: string): Promise<{
   const row = result.rows[0];
   if (!row) throw new Error('subscription missing');
   return { lastSeq: row.last_seq, status: row.status, parkReason: row.park_reason };
+}
+
+async function insertAged(tenantId: string, count: number): Promise<string[]> {
+  const seqs = await withRoot(async (client) => {
+    const result = await client.query<{ seq: string }>(
+      `INSERT INTO kernel.outbox (
+         seq, tenant_id, aggregate_type, aggregate_id, aggregate_version,
+         type, version, payload, created_at
+       )
+       SELECT nextval('kernel.outbox_seq'),
+              $1::uuid,
+              $2,
+              $1::uuid,
+              n,
+              $3,
+              1,
+              '{"marker":"backlog"}'::jsonb,
+              clock_timestamp() - interval '11 seconds'
+       FROM generate_series(1, $4::int) AS n
+       RETURNING seq::text AS seq`,
+      [tenantId, FIXTURE_AGGREGATE, FIXTURE_TYPE, count],
+    );
+    return result.rows.map((row) => row.seq);
+  });
+  seqs.sort((left, right) => (BigInt(left) < BigInt(right) ? -1 : 1));
+  return seqs;
 }
 
 async function outboxSeqs(): Promise<string[]> {
@@ -625,6 +651,82 @@ test('a full drain of failing subscriptions yields on the next pass', { timeout:
     const again = await deliverAvailable(db, handler, terminate, gate);
     assert.equal(again.delivered, 1);
     assert.equal((await cursor(db, healthyId)).lastSeq, second.seq);
+  } finally {
+    await db.destroy();
+  }
+});
+
+test('a deferred subscription is retried while other work fills the pass', async () => {
+  await resetBus();
+  const tenantId = randomUUID();
+  await insertCustomer(tenantId);
+  const db = appDb(POOLED, 2);
+  const poisonId = '00000000-0000-4000-8000-0000000000b1';
+  const healthyId = 'ffffffff-ffff-4fff-8fff-ffffffffffff';
+  const fresh = DRAIN_LIMIT - RETRY_RESERVE;
+  try {
+    const seqs = await insertAged(tenantId, DRAIN_LIMIT);
+    await registerSubscription(db, {
+      id: poisonId,
+      filter: [{ type: FIXTURE_TYPE, versions: [1] }],
+      start: '0',
+    });
+    const gate = createFailureGate();
+    let recover = false;
+    const handler = async (_trx: Kysely<Database>, event: DeliveredEvent): Promise<void> => {
+      if (!recover && event.subscriptionId === poisonId) throw new Error('poison handler');
+    };
+    const blocked = await deliverAvailable(db, handler, terminate, gate);
+    assert.equal(blocked.delivered, 0);
+    assert.equal((await cursor(db, poisonId)).lastSeq, '0');
+    await registerSubscription(db, {
+      id: healthyId,
+      filter: [{ type: FIXTURE_TYPE, versions: [1] }],
+      start: '0',
+    });
+    recover = true;
+    const report = await deliverAvailable(db, handler, terminate, gate);
+    assert.equal(report.delivered, fresh + 1);
+    assert.equal((await cursor(db, poisonId)).lastSeq, seqs[0]);
+    assert.equal((await cursor(db, healthyId)).lastSeq, seqs[fresh - 1]);
+  } finally {
+    await db.destroy();
+  }
+});
+
+test('reserved retries rotate across passes that stay full', async () => {
+  await resetBus();
+  const tenantId = randomUUID();
+  await insertCustomer(tenantId);
+  const db = appDb(POOLED, 2);
+  const lowId = '00000000-0000-4000-8000-0000000000c1';
+  const highId = '00000000-0000-4000-8000-0000000000c2';
+  const healthyId = 'ffffffff-ffff-4fff-8fff-ffffffffffff';
+  const fresh = DRAIN_LIMIT - RETRY_RESERVE;
+  try {
+    await insertAged(tenantId, fresh * 2 + 1);
+    const filter = [{ type: FIXTURE_TYPE, versions: [1] }] as const;
+    await registerSubscription(db, { id: lowId, filter, start: '0' });
+    await registerSubscription(db, { id: highId, filter, start: '0' });
+    const gate = createFailureGate();
+    const calls = new Map<string, number>();
+    const handler = async (_trx: Kysely<Database>, event: DeliveredEvent): Promise<void> => {
+      calls.set(event.subscriptionId, (calls.get(event.subscriptionId) ?? 0) + 1);
+      if (event.subscriptionId !== healthyId) throw new Error('poison handler');
+    };
+    await deliverAvailable(db, handler, terminate, gate);
+    assert.equal(calls.get(lowId), 1);
+    assert.equal(calls.get(highId), 1);
+    await registerSubscription(db, { id: healthyId, filter, start: '0' });
+    const first = await deliverAvailable(db, handler, terminate, gate);
+    assert.equal(first.delivered, fresh);
+    assert.equal(calls.get(lowId), 2);
+    assert.equal(calls.get(highId), 1);
+    const second = await deliverAvailable(db, handler, terminate, gate);
+    assert.equal(second.delivered, fresh);
+    assert.equal(calls.get(lowId), 2);
+    assert.equal(calls.get(highId), 2);
+    assert.equal(calls.get(healthyId), fresh * 2);
   } finally {
     await db.destroy();
   }

@@ -6,12 +6,19 @@
 // A filtered type advances. An unlisted payload version parks the subscription
 // and leaves the cursor and the row. A rolled-back nextval is a missing seq
 // and is skipped. A handler failure dead-letters that event and leaves the
-// cursor. The failure gate then keeps that subscription from filling later
-// passes until other subscriptions are idle. No advisory lock.
+// cursor. The failure gate keeps that subscription from filling later passes,
+// and each pass reserves a retry step for one deferred subscription so a
+// recovery does not wait for every other subscription to go idle. No advisory lock.
 import { sql, type Kysely, type Transaction } from 'kysely';
 import type { Database } from '../db/database.ts';
 import { blankEvidence, withTenant, type HygieneEvidence } from '../tenancy/hygiene.ts';
-import { DRAIN_LIMIT, HANDLER_FAILED, NO_LISTENER_ALERT, PARK_UNKNOWN_VERSION } from './constants.ts';
+import {
+  DRAIN_LIMIT,
+  HANDLER_FAILED,
+  NO_LISTENER_ALERT,
+  PARK_UNKNOWN_VERSION,
+  RETRY_RESERVE,
+} from './constants.ts';
 import { countRelayListeners } from './listen.ts';
 import { decide, parseFilter } from './validate.ts';
 
@@ -66,15 +73,17 @@ export interface DeliverStep {
 
 /**
  * Handler failures remembered across passes. The relay holds one gate.
- * A pass serves every other subscription before it spends leftover steps
- * retrying the deferred set, so a poison set cannot fill every budget.
+ * Each pass keeps {@link RETRY_RESERVE} steps for this set, rotating through
+ * `after`, even when other subscriptions fill the rest of the budget.
  */
 export interface FailureGate {
   readonly deferred: Set<string>;
+  /** Last deferred id offered a reserved retry. The next pass continues after it. */
+  after: string | null;
 }
 
 export function createFailureGate(): FailureGate {
-  return { deferred: new Set() };
+  return { deferred: new Set(), after: null };
 }
 
 /** A delivery pass failed after hygiene recorded alerts that must not be dropped. */
@@ -182,6 +191,20 @@ async function nextOutboxEvent(
   };
 }
 
+function toClaim(
+  subscription: { id: string; last_seq: string; fence: string },
+  safePoint: string,
+  event: OutboxEvent,
+): Claim {
+  return {
+    subscriptionId: subscription.id,
+    fence: subscription.fence,
+    lastSeq: subscription.last_seq,
+    safePoint,
+    event: { seq: event.seq, tenantId: event.tenantId },
+  };
+}
+
 async function claimNext(db: Kysely<Database>, exclude: readonly string[]): Promise<Claim | null> {
   return db.transaction().execute(async (trx) => {
     const safePoint = await readSafePoint(trx);
@@ -199,14 +222,62 @@ async function claimNext(db: Kysely<Database>, exclude: readonly string[]): Prom
     if (!subscription) return null;
     const event = await nextOutboxEvent(trx, subscription.last_seq, safePoint);
     if (!event) return null;
-    return {
-      subscriptionId: subscription.id,
-      fence: subscription.fence,
-      lastSeq: subscription.last_seq,
-      safePoint,
-      event: { seq: event.seq, tenantId: event.tenantId },
-    };
+    return toClaim(subscription, safePoint, event);
   });
+}
+
+async function claimId(db: Kysely<Database>, id: string): Promise<Claim | null> {
+  return db.transaction().execute(async (trx) => {
+    const safePoint = await readSafePoint(trx);
+    if (!safePoint) return null;
+    const claimed = await sql<{ id: string; last_seq: string; fence: string }>`
+      SELECT id::text AS id, last_seq::text AS last_seq, fence::text AS fence
+      FROM kernel.subscription
+      WHERE id = ${id}::uuid
+        AND status = 'live'
+        AND last_seq < ${safePoint}::bigint
+      FOR UPDATE SKIP LOCKED`.execute(trx);
+    const subscription = claimed.rows[0];
+    if (!subscription) return null;
+    const event = await nextOutboxEvent(trx, subscription.last_seq, safePoint);
+    if (!event) return null;
+    return toClaim(subscription, safePoint, event);
+  });
+}
+
+/** A deferred id with nothing left to deliver should not keep a retry slot. */
+async function subscriptionPending(db: Kysely<Database>, id: string): Promise<boolean> {
+  const result = await sql<{ pending: boolean }>`
+    SELECT EXISTS (
+      SELECT 1
+      FROM kernel.subscription AS s
+      WHERE s.id = ${id}::uuid
+        AND s.status = 'live'
+        AND EXISTS (
+          SELECT 1
+          FROM kernel.outbox AS o
+          WHERE o.seq > s.last_seq
+            AND o.created_at <= clock_timestamp() - interval '10 seconds'
+        )
+    ) AS pending`.execute(db);
+  return result.rows[0]?.pending === true;
+}
+
+function selectRetryIds(deferred: ReadonlySet<string>, after: string | null, count: number): string[] {
+  if (count <= 0 || deferred.size === 0) return [];
+  const ids = [...deferred].sort();
+  let start = 0;
+  if (after !== null) {
+    const found = ids.findIndex((id) => id > after);
+    start = found === -1 ? 0 : found;
+  }
+  const take = Math.min(count, ids.length);
+  const chosen: string[] = [];
+  for (let i = 0; i < take; i += 1) {
+    const id = ids[(start + i) % ids.length];
+    if (id !== undefined) chosen.push(id);
+  }
+  return chosen;
 }
 
 async function lockSubscription(
@@ -344,16 +415,12 @@ async function applyClaim(
   });
 }
 
-export async function deliverOne(
+async function settle(
   db: Kysely<Database>,
+  claim: Claim,
   handler: DeliveryHandler,
   terminateBackend: (pid: number) => Promise<void>,
-  afterClaim?: (claim: Claim) => Promise<void>,
-  exclude: readonly string[] = [],
 ): Promise<DeliverStep> {
-  const claim = await claimNext(db, exclude);
-  if (!claim) return { outcome: { kind: 'idle' }, alerts: [] };
-  if (afterClaim) await afterClaim(claim);
   const evidence = blankEvidence();
   try {
     const outcome = await applyClaim(db, claim, handler, terminateBackend, evidence);
@@ -371,6 +438,19 @@ export async function deliverOne(
       alerts: ['handler failed', ...evidence.alerts],
     };
   }
+}
+
+export async function deliverOne(
+  db: Kysely<Database>,
+  handler: DeliveryHandler,
+  terminateBackend: (pid: number) => Promise<void>,
+  afterClaim?: (claim: Claim) => Promise<void>,
+  exclude: readonly string[] = [],
+): Promise<DeliverStep> {
+  const claim = await claimNext(db, exclude);
+  if (!claim) return { outcome: { kind: 'idle' }, alerts: [] };
+  if (afterClaim) await afterClaim(claim);
+  return settle(db, claim, handler, terminateBackend);
 }
 
 function recordOutcome(report: DeliverReport, step: DeliverStep): boolean {
@@ -409,9 +489,11 @@ export async function deliverAvailable(
   };
   const failed = new Set<string>();
   try {
+    const reserved = selectRetryIds(gate.deferred, gate.after, RETRY_RESERVE);
+    const freshLimit = DRAIN_LIMIT - reserved.length;
     let steps = 0;
     let freshIdle = false;
-    while (steps < DRAIN_LIMIT) {
+    while (steps < freshLimit) {
       const current = await deliverOne(
         db,
         handler,
@@ -426,17 +508,30 @@ export async function deliverAvailable(
       steps += 1;
       if (current.outcome.kind === 'failed') failed.add(current.outcome.subscriptionId);
     }
-    // Leftover budget retries known failures only after every other
+    for (const id of reserved) {
+      gate.after = id;
+      const claim = await claimId(db, id);
+      if (!claim) {
+        if (!(await subscriptionPending(db, id))) gate.deferred.delete(id);
+        continue;
+      }
+      const current = await settle(db, claim, handler, terminateBackend);
+      if (!recordOutcome(report, current)) continue;
+      steps += 1;
+      if (current.outcome.kind === 'failed') failed.add(current.outcome.subscriptionId);
+      else if (advanced(current.outcome)) gate.deferred.delete(current.outcome.subscriptionId);
+    }
+    // Leftover budget retries more known failures only after every other
     // subscription has gone idle, and never retries a failure from this pass.
     if (freshIdle) {
-      const retried = new Set<string>();
+      const retried = new Set<string>(failed);
       while (steps < DRAIN_LIMIT) {
         const current = await deliverOne(
           db,
           handler,
           terminateBackend,
           undefined,
-          [...failed, ...retried],
+          [...retried],
         );
         if (!recordOutcome(report, current)) break;
         steps += 1;
