@@ -567,7 +567,16 @@ export async function deliverAvailable(
     } else if (freshLimit > 0 && steps >= freshLimit) {
       report.budgetExhausted = true;
     }
-    report.delivered += await catchUpBacklog(db, handler, blankEvidence(), terminateBackend);
+    const catchEvidence = blankEvidence();
+    try {
+      const caught = await catchUpBacklog(db, handler, catchEvidence, terminateBackend);
+      report.delivered += caught.delivered;
+      report.alerts.push(...catchEvidence.alerts);
+      if (caught.pending) report.budgetExhausted = true;
+    } catch (error) {
+      report.alerts.push(...catchEvidence.alerts);
+      throw error;
+    }
   } catch (error) {
     if (error instanceof RelayDeliveryError) report.alerts.push(...error.alerts);
     throw new RelayDeliveryError(error, report.alerts);

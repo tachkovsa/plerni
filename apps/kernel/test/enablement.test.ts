@@ -755,10 +755,17 @@ test('re-enable through the route resumes catch-up past one batch', async () => 
     );
     assert.equal(enabled.status, 200);
     const seen: string[] = [];
-    await deliverAvailable(db, async (_trx, event) => {
+    const first = await deliverAvailable(db, async (_trx, event) => {
+      seen.push(event.seq);
+    }, terminate);
+    assert.equal(first.delivered, CATCHUP_BATCH);
+    assert.equal(first.budgetExhausted, true);
+    assert.deepEqual(seen, seqs.slice(0, CATCHUP_BATCH));
+    const second = await deliverAvailable(db, async (_trx, event) => {
       seen.push(event.seq);
     }, terminate);
     assert.deepEqual(seen, seqs);
+    assert.equal(second.budgetExhausted, false);
   } finally {
     await db.destroy();
   }
@@ -833,6 +840,76 @@ test('catch-up locks the subscription before the enablement row', async () => {
   } finally {
     await relay.query('ROLLBACK').catch(() => undefined);
     await relay.end();
+    await db.destroy();
+  }
+});
+
+test('a failing catch-up tenant does not block the next tenant', async () => {
+  await resetBus();
+  await insertCustomer(TENANT_A);
+  await insertCustomer(TENANT_B);
+  const db = appDb(POOLED, 2);
+  try {
+    const operator = await bootstrapOperatorTenant(db, blankEvidence(), terminate);
+    const installed = await installPackage(
+      db,
+      { tenantId: operator.id },
+      installInput('fixture_split'),
+      blankEvidence(),
+      terminate,
+    );
+    await setPackageEnabled(db, { tenantId: TENANT_A }, installed.id, false, blankEvidence(), terminate);
+    await setPackageEnabled(db, { tenantId: TENANT_B }, installed.id, false, blankEvidence(), terminate);
+    const failed = await publish(db, TENANT_A, FIXTURE_TYPE, 1);
+    const healthy = await publish(db, TENANT_B, FIXTURE_TYPE, 1);
+    await ageSeqs([failed.seq, healthy.seq]);
+    await deliverAvailable(db, async () => undefined, terminate);
+    await setPackageEnabled(db, { tenantId: TENANT_A }, installed.id, true, blankEvidence(), terminate);
+    await setPackageEnabled(db, { tenantId: TENANT_B }, installed.id, true, blankEvidence(), terminate);
+    const seen: string[] = [];
+    const blocked = await deliverAvailable(db, async (_trx, event) => {
+      if (event.tenantId === TENANT_A) throw new Error('tenant A handler failed');
+      seen.push(event.seq);
+    }, terminate);
+    assert.deepEqual(seen, [healthy.seq]);
+    assert.ok(blocked.alerts.includes('handler failed'));
+    assert.ok(BigInt(await watermark(db, installed.id, TENANT_A)) < BigInt(failed.seq));
+    const recovered: string[] = [];
+    await deliverAvailable(db, async (_trx, event) => {
+      recovered.push(event.seq);
+    }, terminate);
+    assert.deepEqual(recovered, [failed.seq]);
+  } finally {
+    await db.destroy();
+  }
+});
+
+test('catch-up keeps a contamination alert on the relay report', async () => {
+  await resetBus();
+  await insertCustomer(TENANT_A);
+  const db = appDb(POOLED, 1);
+  try {
+    const operator = await bootstrapOperatorTenant(db, blankEvidence(), terminate);
+    const installed = await installPackage(
+      db,
+      { tenantId: operator.id },
+      installInput('fixture_alert'),
+      blankEvidence(),
+      terminate,
+    );
+    await setPackageEnabled(db, { tenantId: TENANT_A }, installed.id, false, blankEvidence(), terminate);
+    const appended = await publish(db, TENANT_A, FIXTURE_TYPE, 1);
+    await ageSeqs([appended.seq]);
+    await deliverAvailable(db, async () => undefined, terminate);
+    await setPackageEnabled(db, { tenantId: TENANT_A }, installed.id, true, blankEvidence(), terminate);
+    await sql`SELECT set_config('plerni.tenant_id', ${TENANT_A}, false)`.execute(db);
+    const seen: string[] = [];
+    const report = await deliverAvailable(db, async (_trx, event) => {
+      seen.push(event.seq);
+    }, terminate);
+    assert.deepEqual(seen, [appended.seq]);
+    assert.ok(report.alerts.some((alert) => alert.includes('SECURITY contamination')));
+  } finally {
     await db.destroy();
   }
 });

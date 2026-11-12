@@ -30,8 +30,14 @@ type CatchHandler = (
   },
 ) => Promise<void>;
 
-function deliveryKey(subscriptionId: string, seq: string): string {
-  return `${subscriptionId}:${seq}`;
+class CatchUpHandlerFailed extends Error {
+  readonly delivered: number;
+
+  constructor(cause: unknown, delivered = 0) {
+    super('handler failed', { cause });
+    this.name = 'CatchUpHandlerFailed';
+    this.delivered = delivered;
+  }
 }
 
 async function safePoint(trx: Transaction<Database>): Promise<string | null> {
@@ -42,6 +48,10 @@ async function safePoint(trx: Transaction<Database>): Promise<string | null> {
   return result.rows[0]?.safe_point ?? null;
 }
 
+function deliveryKey(subscriptionId: string, seq: string): string {
+  return `${subscriptionId}:${seq}`;
+}
+
 export async function catchUpTenant(
   db: Kysely<Database>,
   packageId: string,
@@ -49,13 +59,19 @@ export async function catchUpTenant(
   handler: CatchHandler,
   evidence: HygieneEvidence,
   terminateBackend: (pid: number) => Promise<void>,
+  limit = CATCHUP_BATCH,
 ): Promise<number> {
-    let delivered = 0;
-  for (let step = 0; step < CATCHUP_BATCH; step += 1) {
-    const outcome = await withTenant(db, tenantId, evidence, terminateBackend, async (trx) =>
-      deliverOne(trx, packageId, tenantId, handler));
-    if (outcome === 'idle' || outcome === 'stopped' || outcome === 'blocked') break;
-    if (outcome === 'delivered') delivered += 1;
+  let delivered = 0;
+  for (let step = 0; step < limit; step += 1) {
+    try {
+      const outcome = await withTenant(db, tenantId, evidence, terminateBackend, async (trx) =>
+        deliverOne(trx, packageId, tenantId, handler));
+      if (outcome === 'idle' || outcome === 'stopped' || outcome === 'blocked') break;
+      if (outcome === 'delivered') delivered += 1;
+    } catch (error) {
+      if (error instanceof CatchUpHandlerFailed) throw new CatchUpHandlerFailed(error.cause, delivered);
+      throw error;
+    }
   }
   return delivered;
 }
@@ -124,18 +140,22 @@ async function deliverOne(
     ON CONFLICT (subscription_id, seq) DO NOTHING
     RETURNING seq::text AS seq`.execute(trx);
   if (inserted.rows.length === 1) {
-    await handler(trx, {
-      subscriptionId: subscription.subscription_id,
-      seq: event.seq,
-      tenantId: event.tenant_id,
-      aggregateType: event.aggregate_type,
-      aggregateId: event.aggregate_id,
-      aggregateVersion: event.aggregate_version,
-      type: event.type,
-      version: event.version,
-      payload: event.payload,
-      idempotencyKey: key,
-    });
+    try {
+      await handler(trx, {
+        subscriptionId: subscription.subscription_id,
+        seq: event.seq,
+        tenantId: event.tenant_id,
+        aggregateType: event.aggregate_type,
+        aggregateId: event.aggregate_id,
+        aggregateVersion: event.aggregate_version,
+        type: event.type,
+        version: event.version,
+        payload: event.payload,
+        idempotencyKey: key,
+      });
+    } catch (error) {
+      throw new CatchUpHandlerFailed(error);
+    }
   }
   const moved = await sql<{ package_id: string }>`
     UPDATE kernel.package_enablement
@@ -154,13 +174,13 @@ function accepted(filter: readonly TypeFilter[], type: string, version: number):
   return match !== undefined && match.versions.includes(version);
 }
 
-/** Drain every enabled tenant whose watermark is behind its installation cursor. */
+/** One relay pass of catch-up. At most {@link CATCHUP_BATCH} new deliveries. */
 export async function catchUpBacklog(
   db: Kysely<Database>,
   handler: CatchHandler,
   evidence: HygieneEvidence,
   terminateBackend: (pid: number) => Promise<void>,
-): Promise<number> {
+): Promise<{ delivered: number; pending: boolean }> {
   const due = await sql<{ package_id: string; tenant_id: string }>`
     SELECT e.package_id, e.tenant_id::text AS tenant_id
     FROM kernel.package_enablement AS e
@@ -170,20 +190,38 @@ export async function catchUpBacklog(
       AND e.released_at IS NULL
       AND e.watermark_seq < s.last_seq
     ORDER BY e.package_id, e.tenant_id`.execute(db);
-  let total = 0;
+  let delivered = 0;
+  const skipped = new Set<string>();
   for (const row of due.rows) {
-    for (;;) {
-      const delivered = await catchUpTenant(
+    if (delivered >= CATCHUP_BATCH) break;
+    const key = `${row.package_id}:${row.tenant_id}`;
+    if (skipped.has(key)) continue;
+    try {
+      delivered += await catchUpTenant(
         db,
         row.package_id,
         row.tenant_id,
         handler,
         evidence,
         terminateBackend,
+        CATCHUP_BATCH - delivered,
       );
-      total += delivered;
-      if (delivered === 0) break;
+    } catch (error) {
+      if (!(error instanceof CatchUpHandlerFailed)) throw error;
+      delivered += error.delivered;
+      skipped.add(key);
+      evidence.alerts.push('handler failed');
     }
   }
-  return total;
+  const pending = await sql<{ pending: boolean }>`
+    SELECT EXISTS (
+      SELECT 1
+      FROM kernel.package_enablement AS e
+      JOIN kernel.package AS p ON p.id = e.package_id
+      JOIN kernel.subscription AS s ON s.id = p.subscription_id
+      WHERE e.enabled = true
+        AND e.released_at IS NULL
+        AND e.watermark_seq < s.last_seq
+    ) AS pending`.execute(db);
+  return { delivered, pending: pending.rows[0]?.pending === true };
 }
