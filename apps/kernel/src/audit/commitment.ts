@@ -42,8 +42,8 @@ function sorted(value: unknown): unknown {
     if (Object.getPrototypeOf(value) !== Object.prototype) throw new AuditPayloadError();
     const record = value as Record<string, unknown>;
     if (Object.getOwnPropertySymbols(record).length > 0) throw new AuditPayloadError();
-    // A normal object drops an own "__proto__" key on assignment. The accumulator
-    // has no prototype, and each key is an own data property.
+    // A normal object drops an own "__proto__" key when it is written with `=`.
+    // The accumulator has no prototype, and each key is an own data property.
     const out = Object.create(null) as Record<string, unknown>;
     for (const key of Object.keys(record).sort()) {
       const descriptor = Object.getOwnPropertyDescriptor(record, key);
