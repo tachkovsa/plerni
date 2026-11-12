@@ -35,6 +35,27 @@ export interface Database {
     payload: unknown;
     created_at: Date;
   };
+  subscription: {
+    id: string;
+    last_seq: string;
+    status: string;
+    park_reason: string | null;
+    fence: string;
+    filter: unknown;
+    created_at: Date;
+  };
+  delivery: {
+    subscription_id: string;
+    seq: string;
+    idempotency_key: string;
+    created_at: Date;
+  };
+  dead_letter: {
+    subscription_id: string;
+    seq: string;
+    reason: string;
+    created_at: Date;
+  };
   audit_record: {
     tenant_id: string;
     id: string;

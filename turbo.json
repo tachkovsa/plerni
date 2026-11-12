@@ -1,6 +1,13 @@
 {
   "$schema": "https://turborepo.com/schema.json",
+  "agentGuidance": false,
   "globalDependencies": ["tsconfig.base.json"],
+  "globalPassThroughEnv": [
+    "PLERNI_APP_PASSWORD",
+    "PLERNI_MIGRATE_PASSWORD",
+    "PLERNI_ADMIN_PASSWORD",
+    "POSTGRES_PASSWORD"
+  ],
   "tasks": {
     "build": { "dependsOn": ["^build"], "outputs": ["dist/**"] },
     "test": { "dependsOn": ["^build"] },
