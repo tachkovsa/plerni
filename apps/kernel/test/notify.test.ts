@@ -621,38 +621,54 @@ test('the http route delivers once and the recipient can read the stored text', 
 });
 
 test('an uppercase recipient id delivers once and a different case is the same delivery', async () => {
+  const tenantId = 'a1b2c3d4-e5f6-4a7b-8c9d-abcdef012345';
+  const recipientId = 'b0b0c0de-cafe-4bad-8bed-abcdefabcdef';
+  assert.notEqual(tenantId, tenantId.toUpperCase());
+  assert.notEqual(recipientId, recipientId.toUpperCase());
   await ready();
   await resetNotify();
   const db = appDb(DIRECT, 1);
   try {
     await recordNotificationPreference(
       db,
-      { tenantId: TENANT, actorId: RECIPIENT.toUpperCase() },
+      { tenantId: tenantId.toUpperCase(), actorId: recipientId.toUpperCase() },
       { channel: 'in_app', enabled: true },
       blankEvidence(),
       terminate,
     );
+    const caller = {
+      tenantId: tenantId.toUpperCase(),
+      actorId: SENDER,
+      grants: ['notify.send'] as const,
+    };
     const first = await sendNotification(
       db,
-      sender,
-      sendInput({ recipientId: RECIPIENT.toUpperCase() }),
+      caller,
+      sendInput({ recipientId: recipientId.toUpperCase() }),
       blankEvidence(),
       terminate,
     );
-    const second = await sendNotification(db, sender, sendInput(), blankEvidence(), terminate);
+    const second = await sendNotification(
+      db,
+      { ...caller, tenantId },
+      sendInput({ recipientId }),
+      blankEvidence(),
+      terminate,
+    );
     assert.equal(first.body, COPY);
-    assert.equal(first.recipientId, RECIPIENT);
+    assert.equal(first.recipientId, recipientId);
     assert.equal(second.id, first.id);
     assert.equal(second.body, COPY);
     const inbox = await listNotifications(
       db,
-      { tenantId: TENANT.toUpperCase(), actorId: RECIPIENT.toUpperCase() },
+      { tenantId: tenantId.toUpperCase(), actorId: recipientId.toUpperCase() },
       blankEvidence(),
       terminate,
     );
     assert.equal(inbox.length, 1);
     assert.equal(inbox[0]?.body, COPY);
-    const tally = await counts(TENANT);
+    assert.equal(inbox[0]?.recipientId, recipientId);
+    const tally = await counts(tenantId);
     assert.equal(tally.rows, 1);
     assert.equal(tally.delivered, 1);
   } finally {
