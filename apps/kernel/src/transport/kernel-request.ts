@@ -9,10 +9,36 @@ import {
   createTenantResponseSchema,
   errorEnvelope,
   errorStatus,
+  kernelNotificationList,
+  kernelNotificationPreferenceRecord,
+  kernelNotificationSend,
   kernelRoutes,
   type ErrorEnvelope,
 } from '@plerni/contracts';
 import type { Database } from '../db/database.ts';
+import type { IdentityContext } from '../identity/context.ts';
+import { createIdentityLog } from '../identity/log.ts';
+import {
+  authenticateServicePrincipal,
+  provisionServicePrincipal,
+  revokeServicePrincipal,
+  rotateServicePrincipal,
+  type AuthenticatedPrincipal,
+} from '../identity/principal.ts';
+import {
+  listNotifications,
+  sendNotification,
+  type DeliveryRecord,
+  type InboxCaller,
+  type NotifyCaller,
+  type SendNotificationInput,
+} from '../notify/deliver.ts';
+import {
+  recordNotificationPreference,
+  type PreferenceCaller,
+  type PreferenceInput,
+  type PreferenceRecord,
+} from '../notify/preference.ts';
 import type { HygieneEvidence } from '../tenancy/hygiene.ts';
 import {
   IdempotencyConflict,
@@ -22,11 +48,28 @@ import {
 } from '../tenant/errors.ts';
 import { createTenant, type TenantRecord, type TenantSession } from '../tenant/registry.ts';
 import { handlePackageRequest, packageHttp, type PackageHttp } from './package-request.ts';
+import { handleNotificationRequest, type NotificationSession } from './notify-request.ts';
+import {
+  authorizationBearer,
+  bearerFailure,
+  handlePrincipalRequest,
+  rejectedServiceCredential,
+  type PrincipalHandlers,
+} from './principal-request.ts';
 
-export interface KernelHttpContext {
-  session: TenantSession | null;
+export interface KernelCaller extends TenantSession {
+  actorId?: string;
+  grants?: readonly string[];
+}
+
+export interface KernelHttpContext extends PrincipalHandlers {
+  session: KernelCaller | null;
   createTenant: (input: { idempotencyKey: string }, session: TenantSession) => Promise<TenantRecord>;
   packages?: PackageHttp;
+  recordNotificationPreference?: (input: PreferenceInput, caller: PreferenceCaller) => Promise<PreferenceRecord>;
+  sendNotification?: (input: SendNotificationInput, caller: NotifyCaller) => Promise<DeliveryRecord>;
+  listNotifications?: (caller: InboxCaller) => Promise<DeliveryRecord[]>;
+  authenticatePrincipal?: (input: { tenantId: string; token: string }) => Promise<AuthenticatedPrincipal>;
 }
 
 function json(status: number, body: unknown): Response {
@@ -143,29 +186,89 @@ export async function handleKernelRequest(request: Request, ctx: KernelHttpConte
       next_step: 'Use an operation id published in the kernel OpenAPI document.',
     }));
   }
-  if (!ctx.session) {
-    return fail(errorEnvelope({
-      code: 'UNAUTHENTICATED',
-      message: 'The request has no session.',
-      next_step: 'Retry with an operator session.',
-    }));
+  if (
+    route.operationId === 'kernel.service_principal.provision'
+    || route.operationId === 'kernel.service_principal.rotate'
+    || route.operationId === 'kernel.service_principal.revoke'
+  ) {
+    return handlePrincipalRequest(route.operationId, request, ctx.session?.tenantId, ctx);
   }
+  const session = await resolveCaller(request, route.scope, ctx);
+  if (session instanceof Response) return session;
   if (route.operationId === 'kernel.tenant.create') {
-    return createTenantResponse(request, ctx.session, ctx.createTenant);
+    return createTenantResponse(request, session, ctx.createTenant);
+  }
+  if (
+    route.operationId === kernelNotificationPreferenceRecord.operationId
+    || route.operationId === kernelNotificationSend.operationId
+    || route.operationId === kernelNotificationList.operationId
+  ) {
+    const caller: NotificationSession = {
+      tenantId: session.tenantId,
+      ...(session.actorId !== undefined ? { actorId: session.actorId } : {}),
+      ...(session.grants !== undefined ? { grants: session.grants } : {}),
+    };
+    return handleNotificationRequest(route.operationId, request, caller, {
+      ...(ctx.recordNotificationPreference
+        ? { recordNotificationPreference: ctx.recordNotificationPreference }
+        : {}),
+      ...(ctx.sendNotification ? { sendNotification: ctx.sendNotification } : {}),
+      ...(ctx.listNotifications ? { listNotifications: ctx.listNotifications } : {}),
+    });
   }
   if (route.operationId.startsWith('kernel.package.')) {
     if (!ctx.packages) return fail(internalFailure());
-    return handlePackageRequest(request, route.operationId, ctx.session, ctx.packages);
+    return handlePackageRequest(request, route.operationId, session, ctx.packages);
   }
   return fail(internalFailure());
 }
 
+async function resolveCaller(
+  request: Request,
+  scope: 'platform' | 'tenant' | undefined,
+  ctx: KernelHttpContext,
+): Promise<KernelCaller | Response> {
+  const auth = authorizationBearer(request);
+  if (!auth.present) {
+    if (ctx.session) return ctx.session;
+    const nextStep = scope === 'tenant'
+      ? 'Retry with a tenant session.'
+      : 'Retry with an operator session.';
+    return fail(errorEnvelope({
+      code: 'UNAUTHENTICATED',
+      message: 'The request has no session.',
+      next_step: nextStep,
+    }));
+  }
+  if (!auth.token || !ctx.session?.tenantId) return fail(rejectedServiceCredential());
+  if (!ctx.authenticatePrincipal) return fail(internalFailure());
+  try {
+    const principal = await ctx.authenticatePrincipal({
+      tenantId: ctx.session.tenantId,
+      token: auth.token,
+    });
+    return {
+      tenantId: principal.tenantId,
+      actorId: principal.principalId,
+      grants: [...principal.permissions],
+    };
+  } catch (error) {
+    return fail(bearerFailure(error));
+  }
+}
+
 export function kernelRequestContext(deps: {
-  session: TenantSession | null;
+  session: KernelCaller | null;
   db: Kysely<Database>;
   evidence: HygieneEvidence;
   terminateBackend: (pid: number) => Promise<void>;
+  log?: IdentityContext['log'];
 }): KernelHttpContext {
+  const identity: IdentityContext = {
+    evidence: deps.evidence,
+    terminate: deps.terminateBackend,
+    log: deps.log ?? createIdentityLog(() => undefined),
+  };
   return {
     session: deps.session,
     createTenant: (input, session) => createTenant(
@@ -176,5 +279,29 @@ export function kernelRequestContext(deps: {
       deps.terminateBackend,
     ),
     packages: packageHttp(deps),
+    recordNotificationPreference: (input, caller) => recordNotificationPreference(
+      deps.db,
+      caller,
+      input,
+      deps.evidence,
+      deps.terminateBackend,
+    ),
+    sendNotification: (input, caller) => sendNotification(
+      deps.db,
+      caller,
+      input,
+      deps.evidence,
+      deps.terminateBackend,
+    ),
+    listNotifications: (caller) => listNotifications(
+      deps.db,
+      caller,
+      deps.evidence,
+      deps.terminateBackend,
+    ),
+    provisionServicePrincipal: (input, actor) => provisionServicePrincipal(deps.db, actor, input, identity),
+    rotateServicePrincipal: (principalId, actor) => rotateServicePrincipal(deps.db, actor, principalId, identity),
+    revokeServicePrincipal: (principalId, actor) => revokeServicePrincipal(deps.db, actor, principalId, identity),
+    authenticatePrincipal: (input) => authenticateServicePrincipal(deps.db, input, identity),
   };
 }

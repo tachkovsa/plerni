@@ -71,7 +71,7 @@ test('kernel OpenAPI is generated from the zod registry', () => {
 test('a plugin-private route is marked on the registry and omitted from OpenAPI', () => {
   const routes = [...kernelRoutes, privateRoute()];
   const document = generateOpenApi(routes);
-  assert.equal(routes.at(-1)?.visibility, 'plugin-private');
+  assert.equal(routes.find((route) => route.operationId === 'plugin.note.list')?.visibility, 'plugin-private');
   assert.equal(document.paths['/plugin/notes'], undefined);
   assert.equal(document.components.schemas.PrivateNoteList, undefined);
   assert.ok(document.paths['/kernel/tenants']?.post);

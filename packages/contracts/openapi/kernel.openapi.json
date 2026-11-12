@@ -87,6 +87,318 @@
         ],
         "additionalProperties": false
       },
+      "NotificationPreferenceResponse": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "recipientId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "channel": {
+            "type": "string",
+            "enum": [
+              "in_app"
+            ]
+          },
+          "enabled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "id",
+          "recipientId",
+          "channel",
+          "enabled"
+        ],
+        "additionalProperties": false
+      },
+      "NotificationPreferenceRequest": {
+        "type": "object",
+        "properties": {
+          "channel": {
+            "type": "string",
+            "enum": [
+              "in_app"
+            ]
+          },
+          "enabled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "channel",
+          "enabled"
+        ],
+        "additionalProperties": false
+      },
+      "NotificationSendResponse": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "idempotencyKey": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9._:-]{1,200}$"
+          },
+          "recipientId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "channel": {
+            "type": "string",
+            "enum": [
+              "in_app"
+            ]
+          },
+          "outcome": {
+            "type": "string",
+            "enum": [
+              "delivered",
+              "suppressed"
+            ]
+          },
+          "body": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4000
+          }
+        },
+        "required": [
+          "id",
+          "idempotencyKey",
+          "recipientId",
+          "channel",
+          "outcome",
+          "body"
+        ],
+        "additionalProperties": false
+      },
+      "NotificationSendRequest": {
+        "type": "object",
+        "properties": {
+          "idempotencyKey": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9._:-]{1,200}$"
+          },
+          "recipientId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "channel": {
+            "type": "string",
+            "enum": [
+              "in_app"
+            ]
+          },
+          "body": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4000
+          }
+        },
+        "required": [
+          "idempotencyKey",
+          "recipientId",
+          "channel",
+          "body"
+        ],
+        "additionalProperties": false
+      },
+      "NotificationDeliveryList": {
+        "type": "object",
+        "properties": {
+          "deliveries": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "idempotencyKey": {
+                  "type": "string",
+                  "pattern": "^[A-Za-z0-9._:-]{1,200}$"
+                },
+                "recipientId": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "channel": {
+                  "type": "string",
+                  "enum": [
+                    "in_app"
+                  ]
+                },
+                "outcome": {
+                  "type": "string",
+                  "enum": [
+                    "delivered",
+                    "suppressed"
+                  ]
+                },
+                "body": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 4000
+                }
+              },
+              "required": [
+                "id",
+                "idempotencyKey",
+                "recipientId",
+                "channel",
+                "outcome",
+                "body"
+              ],
+              "additionalProperties": false
+            },
+            "maxItems": 50
+          }
+        },
+        "required": [
+          "deliveries"
+        ],
+        "additionalProperties": false
+      },
+      "ServicePrincipalCredential": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "permissions": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9_.:-]{1,200}$"
+            },
+            "maxItems": 16
+          },
+          "expiresAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "credential": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        },
+        "required": [
+          "id",
+          "permissions",
+          "expiresAt",
+          "credential"
+        ],
+        "additionalProperties": false
+      },
+      "ServicePrincipalProvisionRequest": {
+        "type": "object",
+        "properties": {
+          "permissions": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9_.:-]{1,200}$"
+            },
+            "maxItems": 16
+          },
+          "expiresAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "permissions",
+          "expiresAt"
+        ],
+        "additionalProperties": false
+      },
+      "ServicePrincipalRotatedCredential": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "permissions": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9_.:-]{1,200}$"
+            },
+            "maxItems": 16
+          },
+          "expiresAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "credential": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        },
+        "required": [
+          "id",
+          "permissions",
+          "expiresAt",
+          "credential"
+        ],
+        "additionalProperties": false
+      },
+      "ServicePrincipalIdRequest": {
+        "type": "object",
+        "properties": {
+          "principalId": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "principalId"
+        ],
+        "additionalProperties": false
+      },
+      "ServicePrincipalRevokeResponse": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "revoked": {
+            "type": "boolean",
+            "enum": [
+              true
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "revoked"
+        ],
+        "additionalProperties": false
+      },
+      "ServicePrincipalRevokeRequest": {
+        "type": "object",
+        "properties": {
+          "principalId": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "principalId"
+        ],
+        "additionalProperties": false
+      },
       "InstallPackageResponse": {
         "type": "object",
         "properties": {
@@ -440,6 +752,459 @@
         },
         "x-plerni-action": "sensitive",
         "x-plerni-scope": "platform"
+      }
+    },
+    "/kernel/notification-preferences": {
+      "post": {
+        "operationId": "kernel.notification.preference.record",
+        "summary": "Record the caller preference for the in-app channel",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NotificationPreferenceRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The recorded preference. A later record for the same caller updates that row.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotificationPreferenceResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "VALIDATION",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "VALIDATION"
+          },
+          "401": {
+            "description": "UNAUTHENTICATED",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "UNAUTHENTICATED"
+          },
+          "500": {
+            "description": "INTERNAL",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "INTERNAL"
+          }
+        },
+        "x-plerni-action": "routine",
+        "x-plerni-scope": "tenant"
+      }
+    },
+    "/kernel/notifications": {
+      "post": {
+        "operationId": "kernel.notification.send",
+        "summary": "Deliver one notification, or return the delivery already stored for the key",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NotificationSendRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The delivery for this idempotency key. A duplicate send returns that delivery.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotificationSendResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "VALIDATION",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "VALIDATION"
+          },
+          "401": {
+            "description": "UNAUTHENTICATED",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "UNAUTHENTICATED"
+          },
+          "403": {
+            "description": "FORBIDDEN",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "FORBIDDEN"
+          },
+          "404": {
+            "description": "NOT_FOUND",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "NOT_FOUND"
+          },
+          "409": {
+            "description": "CONCURRENCY_CONFLICT",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "CONCURRENCY_CONFLICT"
+          },
+          "500": {
+            "description": "INTERNAL",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "INTERNAL"
+          }
+        },
+        "x-plerni-action": "routine",
+        "x-plerni-scope": "tenant"
+      },
+      "get": {
+        "operationId": "kernel.notification.list",
+        "summary": "List delivered in-app notifications for the caller",
+        "responses": {
+          "200": {
+            "description": "Delivered rows for the caller, newest first, at most 50.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotificationDeliveryList"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "VALIDATION",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "VALIDATION"
+          },
+          "401": {
+            "description": "UNAUTHENTICATED",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "UNAUTHENTICATED"
+          },
+          "500": {
+            "description": "INTERNAL",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "INTERNAL"
+          }
+        },
+        "x-plerni-scope": "tenant"
+      }
+    },
+    "/kernel/service-principals": {
+      "post": {
+        "operationId": "kernel.service_principal.provision",
+        "summary": "Provision a tenant-scoped service principal and return its credential once",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ServicePrincipalProvisionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "The principal and the credential. The credential is not returned again.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServicePrincipalCredential"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "VALIDATION",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "VALIDATION"
+          },
+          "401": {
+            "description": "UNAUTHENTICATED",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "UNAUTHENTICATED"
+          },
+          "403": {
+            "description": "FORBIDDEN",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "FORBIDDEN"
+          },
+          "500": {
+            "description": "INTERNAL",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "INTERNAL"
+          }
+        },
+        "x-plerni-action": "sensitive",
+        "x-plerni-scope": "tenant"
+      }
+    },
+    "/kernel/service-principal-rotations": {
+      "post": {
+        "operationId": "kernel.service_principal.rotate",
+        "summary": "Rotate a service principal credential",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ServicePrincipalIdRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The new credential. The previous credential no longer authenticates.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServicePrincipalRotatedCredential"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "VALIDATION",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "VALIDATION"
+          },
+          "401": {
+            "description": "UNAUTHENTICATED",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "UNAUTHENTICATED"
+          },
+          "403": {
+            "description": "FORBIDDEN",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "FORBIDDEN"
+          },
+          "404": {
+            "description": "NOT_FOUND",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "NOT_FOUND"
+          },
+          "500": {
+            "description": "INTERNAL",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "INTERNAL"
+          }
+        },
+        "x-plerni-action": "sensitive",
+        "x-plerni-scope": "tenant"
+      }
+    },
+    "/kernel/service-principal-revocations": {
+      "post": {
+        "operationId": "kernel.service_principal.revoke",
+        "summary": "Revoke a service principal",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ServicePrincipalRevokeRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The principal is revoked. Its credentials no longer authenticate.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServicePrincipalRevokeResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "VALIDATION",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "VALIDATION"
+          },
+          "401": {
+            "description": "UNAUTHENTICATED",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "UNAUTHENTICATED"
+          },
+          "403": {
+            "description": "FORBIDDEN",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "FORBIDDEN"
+          },
+          "404": {
+            "description": "NOT_FOUND",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "NOT_FOUND"
+          },
+          "500": {
+            "description": "INTERNAL",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "INTERNAL"
+          }
+        },
+        "x-plerni-action": "sensitive",
+        "x-plerni-scope": "tenant"
       }
     },
     "/kernel/packages": {
