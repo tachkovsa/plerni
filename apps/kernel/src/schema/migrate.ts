@@ -40,6 +40,8 @@ export async function applyKernelMigrations(connectionString: string): Promise<r
       ...(await inspectTenantTable(client, { schema: 'kernel', table: 'scoped_row' })),
       ...(await inspectTenantTable(client, { schema: 'kernel', table: 'scoped_link', foreignKey: SCOPED_LINK_FK })),
       ...(await inspectTenantTable(client, { schema: 'kernel', table: 'audit_record' })),
+      ...(await inspectTenantTable(client, { schema: 'kernel', table: 'audit_chain_head' })),
+      ...(await inspectTenantTable(client, { schema: 'kernel', table: 'audit_commitment' })),
       ...(await inspectTenantTable(client, { schema: 'kernel', table: 'principal_grant' })),
       ...(await inspectTenantTable(client, { schema: 'kernel', table: 'user_account' })),
       ...(await inspectTenantTable(client, { schema: 'kernel', table: 'user_auth_state' })),

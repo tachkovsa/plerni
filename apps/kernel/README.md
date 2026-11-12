@@ -26,9 +26,13 @@ Role chain for this API, with no shell: an operator session creates a customer a
 
 `bootstrapInstallation` reads `PLERNI_BOOTSTRAP_CREDENTIAL` from the process environment. The value is compared and then discarded. It is not stored, logged, or written into a fixture. One call creates the operator tenant and its admin, then one customer tenant and its admin, and marks the credential consumed. A later call with the same value is rejected.
 
-Passwords and rescue codes are argon2id PHC strings (`@noble/hashes` 2.4.0, m=19456 KiB, t=2, p=1). Session tokens and reset tokens are sha256 of 256-bit random values. `disableUser` sets `disabled_at`, bumps `revocation_epoch`, revokes sessions, writes `kernel.audit_record` and `kernel.auth_audit`, and `NOTIFY`s in one transaction. A revoked token or a stale epoch fails on the next read. The freshness-lease object is a stub: a hit does not authorize. The commitment chain, TOTP ciphertext, and the cache are later tasks.
+Passwords and rescue codes are argon2id PHC strings (`@noble/hashes` 2.4.0, m=19456 KiB, t=2, p=1). Session tokens and reset tokens are sha256 of 256-bit random values. `disableUser` sets `disabled_at`, bumps `revocation_epoch`, revokes sessions, writes `kernel.audit_record` and `kernel.auth_audit`, appends the commitment, and `NOTIFY`s in one transaction. A revoked token or a stale epoch fails on the next read. The freshness-lease object is a stub: a hit does not authorize. TOTP ciphertext and the cache are later tasks.
 
 Role chain, with no shell: the bootstrap credential creates both admins and then stops working. The customer admin logs in, creates a member, and disables that member; the member token then fails, and disabling the only admin is refused. A member cannot disable. A customer token does not authenticate as the operator tenant. A plugin role cannot select `kernel.user_account`. Rescue codes and reset tokens are stored hashed, and none of those secrets appear in the identity log.
+
+## Audit commitment chain
+
+`kernel.audit_commitment` is append-only. A disable writes that row in the same transaction as the account change. The row stores `payload_hash`, the sha256 of the canonical payload, and `entry_hash`, which covers the tenant, the per-tenant sequence, the action, the payload hash, and the previous entry hash. The payload itself is not stored. The first previous hash is 64 zero digits. `kernel.audit_chain_head` is locked with `FOR UPDATE` for that tenant, so two tenants do not share the chain or the lock. A thrown hook rolls the account change and the chain row back together. Another tenant's session reads none of the rows. Changing a stored hash makes `verifyAuditChain` fail. The app role cannot update a commitment row.
 
 ## Grants and the fixture schema
 

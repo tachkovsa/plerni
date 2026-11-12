@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Local disable is one transaction: disabled_at, epoch bump, session revoke,
-// audit row, auth_audit row, and NOTIFY. A thrown hook rolls all of them back.
+// audit row, auth_audit row, commitment, and NOTIFY. A thrown hook rolls all
+// of them back.
 import { sql, type Kysely, type Transaction } from 'kysely';
+import { appendAuditCommitment } from '../audit/commitment.ts';
 import type { Database } from '../db/database.ts';
 import { assertTenantContext } from '../tenancy/guard.ts';
 import { withTenant } from '../tenancy/hygiene.ts';
@@ -101,6 +103,17 @@ export async function disableUser(
         reason: 'admin',
       });
       await writeAuditRecord(trx, tenantId, 'kernel.identity.disabled');
+      await appendAuditCommitment(trx, {
+        tenantId,
+        action: 'kernel.identity.disabled',
+        payload: {
+          actorUserId: admin.userId,
+          epochAfter,
+          epochBefore,
+          revokedSessions,
+          targetUserId: target,
+        },
+      });
       await notifyIdentity(trx);
     }
     if (hooks.afterWrite) await hooks.afterWrite(trx);
