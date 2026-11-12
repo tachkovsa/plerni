@@ -97,13 +97,13 @@ export async function listDirectoryUsers(
       ? await sql<UserRow>`
           SELECT ${USER_COLUMNS}
           FROM kernel.directory_user
-          ORDER BY id
+          ORDER BY kernel.directory_user.id
           LIMIT ${DIRECTORY_PAGE_MAX}`.execute(trx)
       : await sql<UserRow>`
           SELECT ${USER_COLUMNS}
           FROM kernel.directory_user
           WHERE id > ${after}::uuid
-          ORDER BY id
+          ORDER BY kernel.directory_user.id
           LIMIT ${DIRECTORY_PAGE_MAX}`.execute(trx);
     return result.rows.map(toUser);
   });
@@ -137,19 +137,32 @@ export async function deleteDirectoryUser(
   id: string,
   evidence: HygieneEvidence,
   terminateBackend: (pid: number) => Promise<void>,
+  afterLock?: () => Promise<void>,
 ): Promise<void> {
   const userId = assertDirectoryId(id);
   await inDirectory(db, tenantId, evidence, terminateBackend, async (trx) => {
-    await sql`
-      DELETE FROM kernel.directory_edge
-      WHERE subject_user_id = ${userId}::uuid OR object_user_id = ${userId}::uuid`.execute(trx);
-    await sql`
-      DELETE FROM kernel.directory_membership
-      WHERE user_id = ${userId}::uuid`.execute(trx);
-    const deleted = await sql<{ id: string }>`
-      DELETE FROM kernel.directory_user
+    const locked = await sql<{ id: string }>`
+      SELECT id::text AS id
+      FROM kernel.directory_user
       WHERE id = ${userId}::uuid
-      RETURNING id::text AS id`.execute(trx);
-    if (!deleted.rows[0]) throw directoryNotFound('Use the id of a user in this tenant.');
+      FOR UPDATE`.execute(trx);
+    if (!locked.rows[0]) throw directoryNotFound('Use the id of a user in this tenant.');
+    if (afterLock) await afterLock();
+    try {
+      await sql`
+        DELETE FROM kernel.directory_edge
+        WHERE subject_user_id = ${userId}::uuid OR object_user_id = ${userId}::uuid`.execute(trx);
+      await sql`
+        DELETE FROM kernel.directory_membership
+        WHERE user_id = ${userId}::uuid`.execute(trx);
+      const deleted = await sql<{ id: string }>`
+        DELETE FROM kernel.directory_user
+        WHERE id = ${userId}::uuid
+        RETURNING id::text AS id`.execute(trx);
+      if (!deleted.rows[0]) throw directoryNotFound('Use the id of a user in this tenant.');
+    } catch (error) {
+      if (postgresCode(error) === '23503') throw directoryNotFound('Use the id of a user in this tenant.');
+      throw error;
+    }
   });
 }

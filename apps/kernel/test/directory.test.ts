@@ -117,6 +117,38 @@ async function setGrants(pluginId: string, grants: readonly string[]): Promise<v
   }
 }
 
+async function waitFor(label: string, probe: () => Promise<boolean>): Promise<void> {
+  const deadline = performance.now() + 5_000;
+  for (;;) {
+    if (await probe()) return;
+    if (performance.now() >= deadline) throw new Error(`deadline: ${label}`);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
+async function referenceIsWaiting(lockedQuery: string, waitingQuery: string): Promise<boolean> {
+  return withRoot(async (client) => {
+    const result = await client.query(
+      `SELECT 1
+       FROM pg_stat_activity waiter
+       JOIN pg_locks waiting_lock
+         ON waiting_lock.pid = waiter.pid
+        AND NOT waiting_lock.granted
+        AND waiting_lock.locktype = 'transactionid'
+       JOIN pg_stat_activity holder
+         ON holder.pid <> waiter.pid
+        AND holder.usename = 'plerni_app'
+        AND holder.state = 'idle in transaction'
+        AND holder.query LIKE $1
+       WHERE waiter.usename = 'plerni_app'
+         AND waiter.wait_event_type = 'Lock'
+         AND waiter.query LIKE $2`,
+      [`%${lockedQuery}%`, `%${waitingQuery}%`],
+    );
+    return (result.rowCount ?? 0) > 0;
+  });
+}
+
 async function migrateFixture(): Promise<void> {
   const admin = new pg.Client({ connectionString: ROOT });
   const migrate = new pg.Client({ connectionString: MIGRATE });
@@ -542,4 +574,62 @@ serial('registering an edge type is a row, and write_edge shares the fixture tra
   });
   assert.deepEqual(versionsAfter, versionsBefore);
   assert.equal(versionsBefore.includes('0010_directory.sql'), true);
+});
+
+serial('delete locks the parent until a concurrent reference is waiting', async () => {
+  await resetDirectory();
+  await migrateFixture();
+  await setGrants(PLUGIN, APPROVED);
+  const listed = listedManifest();
+  const db = appDb(POOLED, 2);
+  try {
+    const evidence = blankEvidence();
+    await createDirectoryUser(db, TENANT_A, { id: USER_1, displayName: 'alpha' }, evidence, terminate);
+    await createDirectoryUser(db, TENANT_A, { id: USER_2, displayName: 'beta' }, evidence, terminate);
+    await registerDirectoryEdgeType(db, TENANT_A, listed, 'linked', evidence, terminate);
+    let edgeInsert: Promise<unknown> | undefined;
+    await deleteDirectoryUser(db, TENANT_A, USER_1, evidence, terminate, async () => {
+      edgeInsert = inPinnedTransaction(db, TENANT_A, blankEvidence(), terminate, async (trx) => {
+        await insertDirectoryEdge(trx, listed, {
+          typeName: 'linked',
+          subjectUserId: USER_1,
+          objectUserId: USER_2,
+        });
+      });
+      await waitFor(
+        'edge insert waits on the locked user',
+        () => referenceIsWaiting('FROM kernel.directory_user', 'INSERT INTO kernel.directory_edge'),
+      );
+    });
+    assert.ok(edgeInsert);
+    await assert.rejects(
+      edgeInsert,
+      (error: unknown) => failure(error, 'NOT_FOUND', 'The directory record was not found.'),
+    );
+    assert.equal((await counts()).edges, 0);
+    const group = await createDirectoryGroup(db, TENANT_A, { id: GROUP_1, name: 'circle' }, evidence, terminate);
+    let memberInsert: Promise<unknown> | undefined;
+    await deleteDirectoryGroup(db, TENANT_A, group.id, evidence, terminate, async () => {
+      memberInsert = addDirectoryMember(
+        db,
+        TENANT_A,
+        { groupId: group.id, userId: USER_2 },
+        blankEvidence(),
+        terminate,
+      );
+      await waitFor(
+        'membership insert waits on the locked group',
+        () => referenceIsWaiting('FROM kernel.directory_group', 'INSERT INTO kernel.directory_membership'),
+      );
+    });
+    assert.ok(memberInsert);
+    await assert.rejects(
+      memberInsert,
+      (error: unknown) => failure(error, 'NOT_FOUND', 'The directory record was not found.'),
+    );
+    assert.equal((await counts()).groups, 0);
+  } finally {
+    await db.destroy();
+    await setGrants(PLUGIN, ['db.own_schema']);
+  }
 });

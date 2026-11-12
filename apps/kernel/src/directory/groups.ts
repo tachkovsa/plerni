@@ -96,13 +96,13 @@ export async function listDirectoryGroups(
       ? await sql<GroupRow>`
           SELECT id::text AS id, name
           FROM kernel.directory_group
-          ORDER BY id
+          ORDER BY kernel.directory_group.id
           LIMIT ${DIRECTORY_PAGE_MAX}`.execute(trx)
       : await sql<GroupRow>`
           SELECT id::text AS id, name
           FROM kernel.directory_group
           WHERE id > ${after}::uuid
-          ORDER BY id
+          ORDER BY kernel.directory_group.id
           LIMIT ${DIRECTORY_PAGE_MAX}`.execute(trx);
     return result.rows.map(toGroup);
   });
@@ -141,15 +141,28 @@ export async function deleteDirectoryGroup(
   id: string,
   evidence: HygieneEvidence,
   terminateBackend: (pid: number) => Promise<void>,
+  afterLock?: () => Promise<void>,
 ): Promise<void> {
   const groupId = assertDirectoryId(id);
   await inDirectory(db, tenantId, evidence, terminateBackend, async (trx) => {
-    await sql`DELETE FROM kernel.directory_membership WHERE group_id = ${groupId}::uuid`.execute(trx);
-    const deleted = await sql<{ id: string }>`
-      DELETE FROM kernel.directory_group
+    const locked = await sql<{ id: string }>`
+      SELECT id::text AS id
+      FROM kernel.directory_group
       WHERE id = ${groupId}::uuid
-      RETURNING id::text AS id`.execute(trx);
-    if (!deleted.rows[0]) throw directoryNotFound('Use the id of a group in this tenant.');
+      FOR UPDATE`.execute(trx);
+    if (!locked.rows[0]) throw directoryNotFound('Use the id of a group in this tenant.');
+    if (afterLock) await afterLock();
+    try {
+      await sql`DELETE FROM kernel.directory_membership WHERE group_id = ${groupId}::uuid`.execute(trx);
+      const deleted = await sql<{ id: string }>`
+        DELETE FROM kernel.directory_group
+        WHERE id = ${groupId}::uuid
+        RETURNING id::text AS id`.execute(trx);
+      if (!deleted.rows[0]) throw directoryNotFound('Use the id of a group in this tenant.');
+    } catch (error) {
+      if (postgresCode(error) === '23503') throw directoryNotFound('Use the id of a group in this tenant.');
+      throw error;
+    }
   });
 }
 
@@ -205,13 +218,13 @@ export async function listDirectoryMembers(
           SELECT id::text AS id, group_id::text AS group_id, user_id::text AS user_id
           FROM kernel.directory_membership
           WHERE group_id = ${group}::uuid
-          ORDER BY id
+          ORDER BY kernel.directory_membership.id
           LIMIT ${DIRECTORY_PAGE_MAX}`.execute(trx)
       : await sql<MembershipRow>`
           SELECT id::text AS id, group_id::text AS group_id, user_id::text AS user_id
           FROM kernel.directory_membership
           WHERE group_id = ${group}::uuid AND id > ${after}::uuid
-          ORDER BY id
+          ORDER BY kernel.directory_membership.id
           LIMIT ${DIRECTORY_PAGE_MAX}`.execute(trx);
     return result.rows.map(toMembership);
   });
