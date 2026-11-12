@@ -8,7 +8,9 @@
 // and is skipped. A handler failure dead-letters that event and leaves the
 // cursor. The failure gate keeps that subscription from filling later passes,
 // and each pass reserves a retry step for one deferred subscription so a
-// recovery does not wait for every other subscription to go idle. No advisory lock.
+// recovery does not wait for every other subscription to go idle.
+// An installation subscription withholds a disabled tenant: the cursor
+// advances and that tenant's watermark does not. No advisory lock.
 import { sql, type Kysely, type Transaction } from 'kysely';
 import type { Database } from '../db/database.ts';
 import { blankEvidence, withTenant, type HygieneEvidence } from '../tenancy/hygiene.ts';
@@ -20,6 +22,8 @@ import {
   RETRY_RESERVE,
 } from './constants.ts';
 import { countRelayListeners } from './listen.ts';
+import { installationDelivery, noteInstallationCursor } from '../package/delivery.ts';
+import { catchUpBacklog } from '../package/catchup.ts';
 import { decide, parseFilter } from './validate.ts';
 
 export interface DeliveredEvent {
@@ -53,6 +57,7 @@ export type DeliverOutcome =
   | { kind: 'stale'; subscriptionId: string }
   | { kind: 'retry'; subscriptionId: string }
   | { kind: 'skipped'; subscriptionId: string; seq: string }
+  | { kind: 'withheld'; subscriptionId: string; seq: string }
   | { kind: 'parked'; subscriptionId: string; seq: string }
   | { kind: 'delivered'; subscriptionId: string; seq: string; idempotencyKey: string }
   | { kind: 'duplicate'; subscriptionId: string; seq: string; idempotencyKey: string }
@@ -61,6 +66,7 @@ export type DeliverOutcome =
 export interface DeliverReport {
   delivered: number;
   skipped: number;
+  withheld: number;
   parked: number;
   duplicates: number;
   alerts: string[];
@@ -393,12 +399,20 @@ async function applyClaim(
     if (action === 'skip') {
       const advanced = await advanceCursor(trx, current, event.seq);
       if (!advanced) return { kind: 'stale', subscriptionId: claim.subscriptionId };
+      await noteInstallationCursor(trx, current.id, event.seq);
       return { kind: 'skipped', subscriptionId: claim.subscriptionId, seq: event.seq };
     }
     if (action === 'park') {
       const parked = await parkSubscription(trx, current);
       if (!parked) return { kind: 'stale', subscriptionId: claim.subscriptionId };
       return { kind: 'parked', subscriptionId: claim.subscriptionId, seq: event.seq };
+    }
+    const gate = await installationDelivery(trx, current.id, event.tenantId, event.seq);
+    if (gate === 'withhold') {
+      const withheld = await advanceCursor(trx, current, event.seq);
+      if (!withheld) return { kind: 'stale', subscriptionId: claim.subscriptionId };
+      await noteInstallationCursor(trx, current.id, event.seq);
+      return { kind: 'withheld', subscriptionId: current.id, seq: event.seq };
     }
     const key = deliveryKey(current.id, event.seq);
     const inserted = await insertMarker(trx, current.id, event.seq, key);
@@ -409,6 +423,7 @@ async function applyClaim(
         throw new HandlerFailed(error);
       }
     }
+    if (gate === 'accept') await noteInstallationCursor(trx, current.id, event.seq);
     const advanced = await advanceCursor(trx, current, event.seq);
     if (!advanced) throw new Error('cursor advance lost the fencing check');
     return inserted
@@ -461,6 +476,7 @@ function recordOutcome(report: DeliverReport, step: DeliverStep): boolean {
   if (outcome.kind === 'idle') return false;
   if (outcome.kind === 'delivered') report.delivered += 1;
   else if (outcome.kind === 'skipped') report.skipped += 1;
+  else if (outcome.kind === 'withheld') report.withheld += 1;
   else if (outcome.kind === 'parked') report.parked += 1;
   else if (outcome.kind === 'duplicate') report.duplicates += 1;
   return true;
@@ -472,6 +488,7 @@ function advanced(outcome: DeliverOutcome): outcome is Extract<
 > {
   return outcome.kind === 'delivered'
     || outcome.kind === 'skipped'
+    || outcome.kind === 'withheld'
     || outcome.kind === 'parked'
     || outcome.kind === 'duplicate';
 }
@@ -485,6 +502,7 @@ export async function deliverAvailable(
   const report: DeliverReport = {
     delivered: 0,
     skipped: 0,
+    withheld: 0,
     parked: 0,
     duplicates: 0,
     alerts: [],
@@ -548,6 +566,16 @@ export async function deliverAvailable(
       if (steps >= DRAIN_LIMIT) report.budgetExhausted = true;
     } else if (freshLimit > 0 && steps >= freshLimit) {
       report.budgetExhausted = true;
+    }
+    const catchEvidence = blankEvidence();
+    try {
+      const caught = await catchUpBacklog(db, handler, catchEvidence, terminateBackend);
+      report.delivered += caught.delivered;
+      report.alerts.push(...catchEvidence.alerts);
+      if (caught.pending) report.budgetExhausted = true;
+    } catch (error) {
+      report.alerts.push(...catchEvidence.alerts);
+      throw error;
     }
   } catch (error) {
     if (error instanceof RelayDeliveryError) report.alerts.push(...error.alerts);

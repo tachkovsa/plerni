@@ -96,6 +96,8 @@ async function resetIdentity(): Promise<void> {
     await client.query('DELETE FROM kernel.user_auth_state');
     await client.query('DELETE FROM kernel.user_account');
     await client.query('DELETE FROM kernel.tenant_auth_policy');
+    await client.query('DELETE FROM kernel.quota_warning');
+    await client.query('DELETE FROM kernel.package_enablement');
     await client.query('DELETE FROM kernel.tenant_idempotency');
     await client.query('DELETE FROM kernel.audit_record');
     await client.query('DELETE FROM kernel.outbox');

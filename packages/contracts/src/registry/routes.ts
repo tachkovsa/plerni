@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Kernel routes. Create-tenant is the K2 API. Notification preference and
-// send are the K12 API. Bootstrap stays an internal call and is not a public route.
+// send are the K12 API. Service principals are the K5 API. Package routes
+// are K18. Bootstrap stays an internal call and is not a public route.
 import { z } from 'zod';
+import { packageRoutes } from './packages.ts';
 import type { RouteContract } from './types.ts';
 
 /** The same rule createTenant enforces for a direct caller. */
@@ -245,6 +247,7 @@ export const kernelRoutes: readonly RouteContract[] = Object.freeze([
   kernelServicePrincipalProvision,
   kernelServicePrincipalRotate,
   kernelServicePrincipalRevoke,
+  ...packageRoutes,
 ]);
 
 export const KERNEL_API_VERSION = '1.0.0';

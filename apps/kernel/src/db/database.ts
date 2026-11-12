@@ -43,6 +43,36 @@ export interface Database {
     fence: string;
     filter: unknown;
     created_at: Date;
+    exported_at: Date | null;
+    released_at: Date | null;
+  };
+  package: {
+    id: string;
+    version: string;
+    digest: string;
+    status: string;
+    subscription_id: string;
+    requires: unknown;
+    optional_requires: unknown;
+    installed_at: Date;
+  };
+  package_enablement: {
+    package_id: string;
+    tenant_id: string;
+    enabled: boolean;
+    watermark_seq: string;
+    held_since: Date;
+    released_at: Date | null;
+    exported_through_seq: string | null;
+    exported_at: Date | null;
+  };
+  quota_warning: {
+    id: string;
+    package_id: string | null;
+    tenant_id: string | null;
+    subscription_id: string | null;
+    reason: string;
+    warned_at: Date;
   };
   delivery: {
     subscription_id: string;

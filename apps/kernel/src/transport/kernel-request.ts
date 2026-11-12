@@ -47,6 +47,7 @@ import {
   PlatformScopeError,
 } from '../tenant/errors.ts';
 import { createTenant, type TenantRecord, type TenantSession } from '../tenant/registry.ts';
+import { handlePackageRequest, packageHttp, type PackageHttp } from './package-request.ts';
 import { handleNotificationRequest, type NotificationSession } from './notify-request.ts';
 import {
   authorizationBearer,
@@ -64,6 +65,7 @@ export interface KernelCaller extends TenantSession {
 export interface KernelHttpContext extends PrincipalHandlers {
   session: KernelCaller | null;
   createTenant: (input: { idempotencyKey: string }, session: TenantSession) => Promise<TenantRecord>;
+  packages?: PackageHttp;
   recordNotificationPreference?: (input: PreferenceInput, caller: PreferenceCaller) => Promise<PreferenceRecord>;
   sendNotification?: (input: SendNotificationInput, caller: NotifyCaller) => Promise<DeliveryRecord>;
   listNotifications?: (caller: InboxCaller) => Promise<DeliveryRecord[]>;
@@ -214,6 +216,10 @@ export async function handleKernelRequest(request: Request, ctx: KernelHttpConte
       ...(ctx.listNotifications ? { listNotifications: ctx.listNotifications } : {}),
     });
   }
+  if (route.operationId.startsWith('kernel.package.')) {
+    if (!ctx.packages) return fail(internalFailure());
+    return handlePackageRequest(request, route.operationId, session, ctx.packages);
+  }
   return fail(internalFailure());
 }
 
@@ -272,6 +278,7 @@ export function kernelRequestContext(deps: {
       deps.evidence,
       deps.terminateBackend,
     ),
+    packages: packageHttp(deps),
     recordNotificationPreference: (input, caller) => recordNotificationPreference(
       deps.db,
       caller,

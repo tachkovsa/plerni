@@ -60,6 +60,8 @@ async function drainAppBackends(): Promise<void> {
 
 async function resetRegistry(): Promise<void> {
   await withRoot(async (client) => {
+    await client.query('DELETE FROM kernel.quota_warning');
+    await client.query('DELETE FROM kernel.package_enablement');
     await client.query('DELETE FROM kernel.service_credential');
     await client.query('DELETE FROM kernel.service_principal_scope');
     await client.query('DELETE FROM kernel.service_principal');

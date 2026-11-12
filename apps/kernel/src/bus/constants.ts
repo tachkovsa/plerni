@@ -27,3 +27,13 @@ export const LISTENER_FAILED = 'relay listener failed';
 
 /** Repeated alerts do not grow the relay process without a bound. */
 export const ALERT_CAP = 32;
+
+/** Operator force-advance of a parked cursor. Not a handler failure. */
+export const FORCE_ADVANCE = 'FORCE_ADVANCE';
+
+/** Backlog quota: 30 days or 256 MiB, whichever is hit first (plan §4.4). */
+export const QUOTA_DAYS = 30;
+export const QUOTA_BYTES = 256 * 1024 * 1024;
+
+/** Re-enable catch-up delivers at most this many events per call. */
+export const CATCHUP_BATCH = 8;
