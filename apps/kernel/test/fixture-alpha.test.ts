@@ -77,9 +77,14 @@ function serial(name: string, fn: () => Promise<void>): void {
 
 serial('fixture_alpha migrates its schema without a kernel migration', async () => {
   await ready();
+  let kernelBefore: string[] = [];
   await withRoot(async (client) => {
     await client.query('DELETE FROM kernel.plugin_migration WHERE plugin_id = $1', [PLUGIN]);
     await client.query('DROP SCHEMA IF EXISTS plugin_fixture_alpha CASCADE');
+    const kernel = await client.query<{ version: string }>(
+      'SELECT version FROM kernel.schema_migration ORDER BY version',
+    );
+    kernelBefore = kernel.rows.map((row) => row.version);
   });
   const first = await migrateFixture();
   assert.deepEqual(first, ['0001_note.sql']);
@@ -89,11 +94,7 @@ serial('fixture_alpha migrates its schema without a kernel migration', async () 
     const kernel = await client.query<{ version: string }>(
       'SELECT version FROM kernel.schema_migration ORDER BY version',
     );
-    assert.deepEqual(kernel.rows.map((row) => row.version), [
-      '0001_kernel_schema.sql',
-      '0002_tenant_registry.sql',
-      '0003_plugin_grant.sql',
-    ]);
+    assert.deepEqual(kernel.rows.map((row) => row.version), kernelBefore);
     const plugin = await client.query<{ version: string }>(
       'SELECT version FROM kernel.plugin_migration WHERE plugin_id = $1',
       [PLUGIN],

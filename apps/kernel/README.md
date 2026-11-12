@@ -14,7 +14,11 @@ Tenant work goes through `withTenant`: one transaction, hygiene inspect before a
 
 `createTenant` is the create-tenant API. The session tenant must be the operator. The call allocates an id and, in one `withTenant` transaction, inserts the customer row, an audit record, and a `kernel.tenant.created` outbox row. It does not seed reference data. The same idempotency key returns the original tenant. When two requests both miss that key before either commits, the loser rolls its writes back and reads the winner inside a new hygiene transaction. A customer session is refused.
 
-`kernel.outbox` is the append-only log. `seq` comes from `nextval` inside that transaction, and `aggregate_version` is incremented under a row lock on the tenant. This path takes no advisory lock. The relay that reads the log is a later change and is not started here.
+`kernel.outbox` is the append-only log. `seq` comes from `nextval` inside that transaction, and `aggregate_version` is incremented under a row lock on the tenant. This path takes no advisory lock. A zero-payload `NOTIFY` shares the transaction. The relay is a separate module and is not started by the registry.
+
+## Outbox relay
+
+`kernel.subscription` is one global cursor. `kernel.delivery` is `UNIQUE(subscription, seq)`. The relay claims a live subscription with `FOR UPDATE SKIP LOCKED`, then delivers one event in its own transaction: dedup marker, handler effect, cursor advance, and the fencing predicate. `safe_point` is the maximum committed `seq` whose `created_at` is at least 10 seconds old. A missing `seq` at or below that cutoff is a rolled-back `nextval` and is skipped. A filter skips other types and still advances. A payload version the subscription lists and does not accept parks that subscription with `UNKNOWN_EVENT_VERSION`; the cursor and the row stay. Retention deletes log rows strictly below the minimum subscription cursor, live or parked. `LISTEN` uses a direct connection. Polling still delivers when no listener is visible in `pg_stat_activity`. Enablement watermarks, the backlog quota, and export-then-force-advance are a later task. Two relays are a later task.
 
 Role chain for this API, with no shell: an operator session creates a customer and can read the audit row for that action; the customer session is refused and sees no audit row; a plugin role cannot select the registry.
 
