@@ -65,6 +65,10 @@ jobs:
         with:
           node-version-file: .nvmrc
       - run: pnpm install --frozen-lockfile
+      - name: kernel contract tests
+        run: |
+          git fetch origin dev
+          pnpm --filter @plerni/contracts test
       - name: install brand exporter without lifecycle scripts
         working-directory: assets/brand
         run: npm ci --ignore-scripts

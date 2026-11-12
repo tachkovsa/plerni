@@ -9,6 +9,7 @@
 // (plan §4.2, ADR-0009). No advisory lock is taken. A zero-payload NOTIFY
 // shares this transaction. This module does not start the relay.
 import { randomUUID } from 'node:crypto';
+import { isIdempotencyKey } from '@plerni/contracts';
 import { sql, type Kysely, type Transaction } from 'kysely';
 import type { Database } from '../db/database.ts';
 import { assertTenantContext } from '../tenancy/guard.ts';
@@ -22,7 +23,6 @@ import {
 } from './errors.ts';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const IDEMPOTENCY_KEY = /^[A-Za-z0-9._:-]{1,200}$/;
 
 export const TENANT_CREATED_EVENT = 'kernel.tenant.created';
 
@@ -201,7 +201,7 @@ export async function createTenant(
 ): Promise<TenantRecord> {
   assertUuid(session.tenantId);
   const key = input.idempotencyKey;
-  if (typeof key !== 'string' || !IDEMPOTENCY_KEY.test(key)) throw new InvalidIdempotencyKeyError();
+  if (typeof key !== 'string' || !isIdempotencyKey(key)) throw new InvalidIdempotencyKeyError();
   try {
     return await withTenant(db, session.tenantId, evidence, terminateBackend, async (trx) => {
       await assertTenantContext(trx);

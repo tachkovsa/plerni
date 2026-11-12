@@ -606,12 +606,6 @@ test('a recovered contaminated connection still reports the security alert', asy
     assert.ok(report.alerts.some((alert) => alert.includes('SECURITY contamination')));
   } finally {
     await db.destroy();
-    await withRoot(async (client) => {
-      await client.query(
-        `SELECT pg_terminate_backend(pid) FROM pg_stat_activity
-         WHERE usename = 'plerni_app' AND pid <> pg_backend_pid()`,
-      );
-    });
   }
 });
 
