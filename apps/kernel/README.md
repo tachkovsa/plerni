@@ -22,6 +22,14 @@ Tenant work goes through `withTenant`: one transaction, hygiene inspect before a
 
 Role chain for this API, with no shell: an operator session creates a customer and can read the audit row for that action; the customer session is refused and sees no audit row; a plugin role cannot select the registry.
 
+## Local accounts and sessions
+
+`bootstrapInstallation` reads `PLERNI_BOOTSTRAP_CREDENTIAL` from the process environment. The value is compared and then discarded. It is not stored, logged, or written into a fixture. One call creates the operator tenant and its admin, then one customer tenant and its admin, and marks the credential consumed. A later call with the same value is rejected.
+
+Passwords and rescue codes are argon2id PHC strings (`@noble/hashes` 2.4.0, m=19456 KiB, t=2, p=1). Session tokens and reset tokens are sha256 of 256-bit random values. `disableUser` sets `disabled_at`, bumps `revocation_epoch`, revokes sessions, writes `kernel.audit_record` and `kernel.auth_audit`, and `NOTIFY`s in one transaction. A revoked token or a stale epoch fails on the next read. The freshness-lease object is a stub: a hit does not authorize. The commitment chain, TOTP ciphertext, and the cache are later tasks.
+
+Role chain, with no shell: the bootstrap credential creates both admins and then stops working. The customer admin logs in, creates a member, and disables that member; the member token then fails, and disabling the only admin is refused. A member cannot disable. A customer token does not authenticate as the operator tenant. A plugin role cannot select `kernel.user_account`. Rescue codes and reset tokens are stored hashed, and none of those secrets appear in the identity log.
+
 ## Grants and the fixture schema
 
 ADR-0008 is the capability wall. `kernel.plugin_grant` stores the operator-approved grant names. `kernel.principal_grant` is the tenant-scoped row a synthetic principal must hold before the broker runs that plugin's read. `kernel.plugin_migration` records package SQL. None of these tables name a plugin schema.

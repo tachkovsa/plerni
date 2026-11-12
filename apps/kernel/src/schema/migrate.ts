@@ -41,6 +41,14 @@ export async function applyKernelMigrations(connectionString: string): Promise<r
       ...(await inspectTenantTable(client, { schema: 'kernel', table: 'scoped_link', foreignKey: SCOPED_LINK_FK })),
       ...(await inspectTenantTable(client, { schema: 'kernel', table: 'audit_record' })),
       ...(await inspectTenantTable(client, { schema: 'kernel', table: 'principal_grant' })),
+      ...(await inspectTenantTable(client, { schema: 'kernel', table: 'user_account' })),
+      ...(await inspectTenantTable(client, { schema: 'kernel', table: 'user_auth_state' })),
+      ...(await inspectTenantTable(client, { schema: 'kernel', table: 'session' })),
+      ...(await inspectTenantTable(client, { schema: 'kernel', table: 'rescue_code' })),
+      ...(await inspectTenantTable(client, { schema: 'kernel', table: 'password_reset' })),
+      ...(await inspectTenantTable(client, { schema: 'kernel', table: 'login_throttle' })),
+      ...(await inspectTenantTable(client, { schema: 'kernel', table: 'auth_audit' })),
+      ...(await inspectTenantTable(client, { schema: 'kernel', table: 'tenant_auth_policy' })),
       ...(await inspectTenantTable(client, { schema: 'kernel', table: 'notification_preference' })),
       ...(await inspectTenantTable(client, { schema: 'kernel', table: 'notification_delivery' })),
     ];
@@ -58,6 +66,7 @@ export async function applyKernelMigrations(connectionString: string): Promise<r
       ...(await inspectKernelInternal(client, 'dead_letter')),
       ...(await inspectKernelInternal(client, 'plugin_grant')),
       ...(await inspectKernelInternal(client, 'plugin_migration')),
+      ...(await inspectKernelInternal(client, 'bootstrap_state')),
     ];
     if (internal.length > 0) {
       throw new Error(`kernel-internal relations failed the shape check: ${internal.join(', ')}`);
