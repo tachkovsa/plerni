@@ -9,11 +9,30 @@ import { sql, type Kysely, type Transaction } from 'kysely';
 import type { Database } from '../db/database.ts';
 import { withTenant, type HygieneEvidence } from '../tenancy/hygiene.ts';
 import { CATCHUP_BATCH } from '../bus/constants.ts';
-import { deliveryKey, type DeliveredEvent, type DeliveryHandler } from '../bus/deliver.ts';
 import { parseFilter, type TypeFilter } from '../bus/validate.ts';
 import { EnablementNotFoundError, PackageNotFoundError } from './errors.ts';
 
 type Step = 'delivered' | 'duplicate' | 'idle' | 'stopped' | 'blocked';
+
+type CatchHandler = (
+  trx: Transaction<Database>,
+  event: {
+    subscriptionId: string;
+    seq: string;
+    tenantId: string;
+    aggregateType: string;
+    aggregateId: string;
+    aggregateVersion: string;
+    type: string;
+    version: number;
+    payload: unknown;
+    idempotencyKey: string;
+  },
+) => Promise<void>;
+
+function deliveryKey(subscriptionId: string, seq: string): string {
+  return `${subscriptionId}:${seq}`;
+}
 
 async function safePoint(trx: Transaction<Database>): Promise<string | null> {
   const result = await sql<{ safe_point: string | null }>`
@@ -27,7 +46,7 @@ export async function catchUpTenant(
   db: Kysely<Database>,
   packageId: string,
   tenantId: string,
-  handler: DeliveryHandler,
+  handler: CatchHandler,
   evidence: HygieneEvidence,
   terminateBackend: (pid: number) => Promise<void>,
 ): Promise<number> {
@@ -45,37 +64,30 @@ async function deliverOne(
   trx: Transaction<Database>,
   packageId: string,
   tenantId: string,
-  handler: DeliveryHandler,
+  handler: CatchHandler,
 ): Promise<Step> {
-  const held = await sql<{
-    enabled: boolean;
-    watermark_seq: string;
-    subscription_id: string;
-    last_seq: string;
-    filter: unknown;
-  }>`
-    SELECT e.enabled,
-           e.watermark_seq::text AS watermark_seq,
-           p.subscription_id::text AS subscription_id,
+  const locked = await sql<{ subscription_id: string; last_seq: string; filter: unknown }>`
+    SELECT p.subscription_id::text AS subscription_id,
            s.last_seq::text AS last_seq,
            s.filter
-    FROM kernel.package_enablement AS e
-    JOIN kernel.package AS p ON p.id = e.package_id
+    FROM kernel.package AS p
     JOIN kernel.subscription AS s ON s.id = p.subscription_id
-    WHERE e.package_id = ${packageId}
-      AND e.tenant_id = ${tenantId}::uuid
-    FOR UPDATE OF e`.execute(trx);
+    WHERE p.id = ${packageId}
+    FOR UPDATE OF s`.execute(trx);
+  const subscription = locked.rows[0];
+  if (!subscription) throw new PackageNotFoundError();
+  const held = await sql<{ enabled: boolean; watermark_seq: string }>`
+    SELECT enabled, watermark_seq::text AS watermark_seq
+    FROM kernel.package_enablement
+    WHERE package_id = ${packageId}
+      AND tenant_id = ${tenantId}::uuid
+    FOR UPDATE`.execute(trx);
   const row = held.rows[0];
-  if (!row) {
-    const packageRow = await sql<{ id: string }>`
-      SELECT id FROM kernel.package WHERE id = ${packageId}`.execute(trx);
-    if (!packageRow.rows[0]) throw new PackageNotFoundError();
-    throw new EnablementNotFoundError();
-  }
+  if (!row) throw new EnablementNotFoundError();
   if (!row.enabled) return 'stopped';
   const point = await safePoint(trx);
   if (!point) return 'idle';
-  const filter = parseFilter(row.filter);
+  const filter = parseFilter(subscription.filter);
   const types = filter.map((entry) => entry.type);
   const next = await sql<{
     seq: string;
@@ -98,22 +110,22 @@ async function deliverOne(
     FROM kernel.outbox
     WHERE tenant_id = ${tenantId}::uuid
       AND seq > ${row.watermark_seq}::bigint
-      AND seq <= LEAST(${point}::bigint, ${row.last_seq}::bigint)
+      AND seq <= LEAST(${point}::bigint, ${subscription.last_seq}::bigint)
       AND type = ANY(${types}::text[])
     ORDER BY seq
     LIMIT 1`.execute(trx);
   const event = next.rows[0];
   if (!event) return 'idle';
   if (!accepted(filter, event.type, event.version)) return 'blocked';
-  const key = deliveryKey(row.subscription_id, event.seq);
+  const key = deliveryKey(subscription.subscription_id, event.seq);
   const inserted = await sql<{ seq: string }>`
     INSERT INTO kernel.delivery (subscription_id, seq, idempotency_key)
-    VALUES (${row.subscription_id}::uuid, ${event.seq}::bigint, ${key})
+    VALUES (${subscription.subscription_id}::uuid, ${event.seq}::bigint, ${key})
     ON CONFLICT (subscription_id, seq) DO NOTHING
     RETURNING seq::text AS seq`.execute(trx);
   if (inserted.rows.length === 1) {
     await handler(trx, {
-      subscriptionId: row.subscription_id,
+      subscriptionId: subscription.subscription_id,
       seq: event.seq,
       tenantId: event.tenant_id,
       aggregateType: event.aggregate_type,
@@ -123,7 +135,7 @@ async function deliverOne(
       version: event.version,
       payload: event.payload,
       idempotencyKey: key,
-    } satisfies DeliveredEvent);
+    });
   }
   const moved = await sql<{ package_id: string }>`
     UPDATE kernel.package_enablement
@@ -140,4 +152,38 @@ async function deliverOne(
 function accepted(filter: readonly TypeFilter[], type: string, version: number): boolean {
   const match = filter.find((entry) => entry.type === type);
   return match !== undefined && match.versions.includes(version);
+}
+
+/** Drain every enabled tenant whose watermark is behind its installation cursor. */
+export async function catchUpBacklog(
+  db: Kysely<Database>,
+  handler: CatchHandler,
+  evidence: HygieneEvidence,
+  terminateBackend: (pid: number) => Promise<void>,
+): Promise<number> {
+  const due = await sql<{ package_id: string; tenant_id: string }>`
+    SELECT e.package_id, e.tenant_id::text AS tenant_id
+    FROM kernel.package_enablement AS e
+    JOIN kernel.package AS p ON p.id = e.package_id
+    JOIN kernel.subscription AS s ON s.id = p.subscription_id
+    WHERE e.enabled = true
+      AND e.released_at IS NULL
+      AND e.watermark_seq < s.last_seq
+    ORDER BY e.package_id, e.tenant_id`.execute(db);
+  let total = 0;
+  for (const row of due.rows) {
+    for (;;) {
+      const delivered = await catchUpTenant(
+        db,
+        row.package_id,
+        row.tenant_id,
+        handler,
+        evidence,
+        terminateBackend,
+      );
+      total += delivered;
+      if (delivered === 0) break;
+    }
+  }
+  return total;
 }

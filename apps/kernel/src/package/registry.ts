@@ -276,9 +276,13 @@ export async function setPackageEnabled(
       SET enabled = EXCLUDED.enabled,
           held_since = CASE
             WHEN EXCLUDED.enabled THEN kernel.package_enablement.held_since
-            ELSE clock_timestamp()
+            WHEN kernel.package_enablement.enabled THEN clock_timestamp()
+            ELSE kernel.package_enablement.held_since
           END,
-          released_at = NULL`.execute(trx);
+          released_at = CASE
+            WHEN EXCLUDED.enabled OR NOT kernel.package_enablement.enabled THEN kernel.package_enablement.released_at
+            ELSE NULL
+          END`.execute(trx);
     const stored = await sql<{ enabled: boolean; watermark_seq: string }>`
       SELECT enabled, watermark_seq::text AS watermark_seq
       FROM kernel.package_enablement
@@ -398,8 +402,7 @@ export async function forceAdvancePackage(
     const target = covered ? cursorSeq : row.exported_through_seq;
     const advanced = await sql<{ enabled: boolean; watermark_seq: string }>`
       UPDATE kernel.package_enablement
-      SET watermark_seq = GREATEST(watermark_seq, ${target}::bigint),
-          released_at = CASE WHEN ${covered} THEN clock_timestamp() ELSE released_at END
+      SET watermark_seq = GREATEST(watermark_seq, ${target}::bigint)
       WHERE package_id = ${packageId}
         AND tenant_id = ${tenantId}::uuid
         AND enabled = false

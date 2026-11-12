@@ -23,6 +23,7 @@ import {
 } from './constants.ts';
 import { countRelayListeners } from './listen.ts';
 import { installationDelivery, noteInstallationCursor } from '../package/delivery.ts';
+import { catchUpBacklog } from '../package/catchup.ts';
 import { decide, parseFilter } from './validate.ts';
 
 export interface DeliveredEvent {
@@ -566,6 +567,7 @@ export async function deliverAvailable(
     } else if (freshLimit > 0 && steps >= freshLimit) {
       report.budgetExhausted = true;
     }
+    report.delivered += await catchUpBacklog(db, handler, blankEvidence(), terminateBackend);
   } catch (error) {
     if (error instanceof RelayDeliveryError) report.alerts.push(...error.alerts);
     throw new RelayDeliveryError(error, report.alerts);

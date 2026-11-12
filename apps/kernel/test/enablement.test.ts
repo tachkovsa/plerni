@@ -37,6 +37,7 @@ import {
   ageSeqs,
   insertCustomer,
   resetBus,
+  waitFor,
   withRoot,
 } from './bus-support.ts';
 import { DIRECT, POOLED, TENANT_A, TENANT_B, appDb, terminate } from './support.ts';
@@ -325,19 +326,18 @@ test('catch-up stays behind the installation cursor and does not deliver twice',
     await deliverAvailable(db, async (_trx, event) => {
       relayAgain.push(event.seq);
     }, terminate);
-    assert.deepEqual(relayAgain, []);
+    assert.deepEqual(relayAgain, [seqs[CATCHUP_BATCH]]);
     const second = await catchUpTenant(
       db,
       installed.id,
       TENANT_A,
-      async (_trx, event) => {
-        seen.push(event.seq);
+      async () => {
+        throw new Error('the relay catch-up already delivered the last event');
       },
       blankEvidence(),
       terminate,
     );
-    assert.equal(second, 1);
-    assert.deepEqual(seen, seqs);
+    assert.equal(second, 0);
     const markers = await sql<{ count: string }>`
       SELECT count(*)::text AS count
       FROM kernel.delivery
@@ -371,22 +371,11 @@ test('re-enable does not advance the watermark past retained backlog', async () 
     await setPackageEnabled(db, { tenantId: TENANT_A }, installed.id, true, blankEvidence(), terminate);
     const newer = await publish(db, TENANT_A, FIXTURE_TYPE, 1);
     await ageSeqs([newer.seq]);
-    await deliverAvailable(db, async () => {
-      throw new Error('live delivery skipped the retained backlog');
-    }, terminate);
-    assert.equal(await watermark(db, installed.id, TENANT_A), frozen);
+    assert.ok(BigInt(frozen) < BigInt(newer.seq));
     const caught: string[] = [];
-    const delivered = await catchUpTenant(
-      db,
-      installed.id,
-      TENANT_A,
-      async (_trx, event) => {
-        caught.push(event.seq);
-      },
-      blankEvidence(),
-      terminate,
-    );
-    assert.equal(delivered, 2);
+    await deliverAvailable(db, async (_trx, event) => {
+      caught.push(event.seq);
+    }, terminate);
     assert.deepEqual(caught, [older.seq, newer.seq]);
     assert.equal(await watermark(db, installed.id, TENANT_A), newer.seq);
   } finally {
@@ -641,6 +630,209 @@ test('enablement routes use the envelope and do not widen grants', async () => {
     }
     assert.deepEqual(await grants('fixture_grant'), approved);
   } finally {
+    await db.destroy();
+  }
+});
+
+test('force-advance keeps a later unexported event in the log', async () => {
+  await resetBus();
+  await insertCustomer(TENANT_B);
+  const db = appDb(POOLED, 2);
+  try {
+    const operator = await bootstrapOperatorTenant(db, blankEvidence(), terminate);
+    const session = { tenantId: operator.id };
+    const installed = await installPackage(
+      db,
+      session,
+      installInput('fixture_hold'),
+      blankEvidence(),
+      terminate,
+    );
+    await setPackageEnabled(db, { tenantId: TENANT_B }, installed.id, false, blankEvidence(), terminate);
+    const covered = await publish(db, TENANT_B, FIXTURE_TYPE, 1);
+    await ageSeqs([covered.seq]);
+    await deliverAvailable(db, async () => undefined, terminate);
+    await exportPackage(db, session, installed.id, TENANT_B, blankEvidence(), terminate);
+    await forceAdvancePackage(db, session, installed.id, TENANT_B, blankEvidence(), terminate);
+    const middle = await publish(db, TENANT_B, FIXTURE_TYPE, 1);
+    const last = await publish(db, TENANT_B, FIXTURE_TYPE, 1);
+    await ageSeqs([middle.seq, last.seq]);
+    await deliverAvailable(db, async () => undefined, terminate);
+    await retainLog(db);
+    const remaining = await outboxSeqs(db);
+    assert.equal(remaining.includes(middle.seq), true);
+    assert.equal(remaining.includes(last.seq), true);
+  } finally {
+    await db.destroy();
+  }
+});
+
+test('repeating disable does not restart the quota clock', async () => {
+  await resetBus();
+  await insertCustomer(TENANT_A);
+  const db = appDb(POOLED, 2);
+  try {
+    const operator = await bootstrapOperatorTenant(db, blankEvidence(), terminate);
+    const installed = await installPackage(
+      db,
+      { tenantId: operator.id },
+      installInput('fixture_clock'),
+      blankEvidence(),
+      terminate,
+    );
+    await setPackageEnabled(db, { tenantId: TENANT_A }, installed.id, false, blankEvidence(), terminate);
+    await withRoot(async (client) => {
+      const updated = await client.query(
+        `UPDATE kernel.package_enablement
+         SET held_since = clock_timestamp() - interval '31 days'
+         WHERE package_id = $1 AND tenant_id = $2::uuid`,
+        [installed.id, TENANT_A],
+      );
+      assert.equal(updated.rowCount, 1);
+    });
+    const readHeld = async (): Promise<string> => {
+      const result = await sql<{ held_since: Date }>`
+        SELECT held_since
+        FROM kernel.package_enablement
+        WHERE package_id = ${installed.id} AND tenant_id = ${TENANT_A}::uuid`.execute(db);
+      const held = result.rows[0]?.held_since;
+      if (!held) throw new Error('hold clock missing');
+      return held.toISOString();
+    };
+    const before = await readHeld();
+    await setPackageEnabled(db, { tenantId: TENANT_A }, installed.id, false, blankEvidence(), terminate);
+    assert.equal(await readHeld(), before);
+    await retainLog(db);
+    const warned = await sql<{ reason: string }>`
+      SELECT reason FROM kernel.quota_warning
+      WHERE package_id = ${installed.id} AND tenant_id = ${TENANT_A}::uuid`.execute(db);
+    assert.equal(warned.rows[0]?.reason, 'age');
+  } finally {
+    await db.destroy();
+  }
+});
+
+test('re-enable through the route resumes catch-up past one batch', async () => {
+  await resetBus();
+  await insertCustomer(TENANT_A);
+  const db = appDb(POOLED, 2);
+  try {
+    const operator = await bootstrapOperatorTenant(db, blankEvidence(), terminate);
+    const operatorCtx = kernelRequestContext({
+      session: { tenantId: operator.id },
+      db,
+      evidence: blankEvidence(),
+      terminateBackend: terminate,
+    });
+    const tenantCtx = kernelRequestContext({
+      session: { tenantId: TENANT_A },
+      db,
+      evidence: blankEvidence(),
+      terminateBackend: terminate,
+    });
+    const created = await handleKernelRequest(
+      request('/kernel/packages', installInput('fixture_resume')),
+      operatorCtx,
+    );
+    assert.equal(created.status, 201);
+    const disabled = await handleKernelRequest(
+      request('/kernel/package-enablement', { packageId: 'fixture_resume', enabled: false }),
+      tenantCtx,
+    );
+    assert.equal(disabled.status, 200);
+    const seqs: string[] = [];
+    for (let i = 0; i < CATCHUP_BATCH + 1; i += 1) {
+      const appended = await publish(db, TENANT_A, FIXTURE_TYPE, 1);
+      seqs.push(appended.seq);
+    }
+    await ageSeqs(seqs);
+    await deliverAvailable(db, async () => {
+      throw new Error('disabled tenant received an event');
+    }, terminate);
+    const enabled = await handleKernelRequest(
+      request('/kernel/package-enablement', { packageId: 'fixture_resume', enabled: true }),
+      tenantCtx,
+    );
+    assert.equal(enabled.status, 200);
+    const seen: string[] = [];
+    await deliverAvailable(db, async (_trx, event) => {
+      seen.push(event.seq);
+    }, terminate);
+    assert.deepEqual(seen, seqs);
+  } finally {
+    await db.destroy();
+  }
+});
+
+test('catch-up locks the subscription before the enablement row', async () => {
+  await resetBus();
+  await insertCustomer(TENANT_A);
+  const db = appDb(POOLED, 2);
+  const relay = new pg.Client({ connectionString: DIRECT });
+  relay.on('error', () => undefined);
+  await relay.connect();
+  try {
+    const operator = await bootstrapOperatorTenant(db, blankEvidence(), terminate);
+    const installed = await installPackage(
+      db,
+      { tenantId: operator.id },
+      installInput('fixture_lock'),
+      blankEvidence(),
+      terminate,
+    );
+    await setPackageEnabled(db, { tenantId: TENANT_A }, installed.id, true, blankEvidence(), terminate);
+    await relay.query('BEGIN');
+    await relay.query("SET LOCAL statement_timeout = '3s'");
+    await relay.query(
+      'SELECT id FROM kernel.subscription WHERE id = $1::uuid FOR UPDATE',
+      [installed.subscriptionId],
+    );
+    let catchError: unknown = null;
+    let catchDone = false;
+    const catching = catchUpTenant(
+      db,
+      installed.id,
+      TENANT_A,
+      async () => undefined,
+      blankEvidence(),
+      terminate,
+    ).then(() => {
+      catchDone = true;
+    }, (error: unknown) => {
+      catchError = error;
+      catchDone = true;
+    });
+    await waitFor('catch-up waits on the subscription', async () => {
+      if (catchError) throw catchError;
+      if (catchDone) throw new Error('catch-up finished without waiting');
+      return withRoot(async (client) => {
+        const waiting = await client.query(
+          `SELECT l.locktype, l.mode
+           FROM pg_locks AS l
+           JOIN pg_stat_activity AS a ON a.pid = l.pid
+           WHERE a.usename = 'plerni_app'
+             AND NOT l.granted`,
+        );
+        return (waiting.rowCount ?? 0) > 0;
+      });
+    }, () => withRoot(async (client) => {
+      const activity = await client.query(
+        `SELECT a.state, a.wait_event_type, a.wait_event, left(a.query, 120) AS query
+         FROM pg_stat_activity AS a
+         WHERE a.usename = 'plerni_app'`,
+      );
+      return JSON.stringify(activity.rows);
+    }));
+    await relay.query(
+      'SELECT package_id FROM kernel.package_enablement WHERE package_id = $1 FOR UPDATE',
+      [installed.id],
+    );
+    await relay.query('COMMIT');
+    await catching;
+    assert.equal(catchError, null);
+  } finally {
+    await relay.query('ROLLBACK').catch(() => undefined);
+    await relay.end();
     await db.destroy();
   }
 });
