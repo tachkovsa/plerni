@@ -7,8 +7,9 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { sql, type Kysely } from 'kysely';
 import { appendEvent, type AppendedEvent } from '../src/bus/append.ts';
-import { LISTENER_FAILED, NO_LISTENER_ALERT } from '../src/bus/constants.ts';
+import { DRAIN_LIMIT, LISTENER_FAILED, NO_LISTENER_ALERT } from '../src/bus/constants.ts';
 import {
+  createFailureGate,
   deliverAvailable,
   deliverOne,
   deliveryKey,
@@ -270,7 +271,8 @@ test('a crash after the effect redelivers the same key and the unique pair leave
         throw new Error('crash after effect before ack');
       }
     };
-    const failed = await deliverAvailable(db, handler, terminate);
+    const gate = createFailureGate();
+    const failed = await deliverAvailable(db, handler, terminate, gate);
     assert.equal(failed.delivered, 0);
     assert.ok(failed.alerts.includes('handler failed'));
     assert.deepEqual(keys, [deliveryKey(subscriptionId, appended.seq)]);
@@ -286,7 +288,7 @@ test('a crash after the effect redelivers the same key and the unique pair leave
       WHERE subscription_id = ${subscriptionId}::uuid AND seq = ${appended.seq}::bigint`.execute(db);
     assert.equal(letters.rows[0]?.reason, 'HANDLER_FAILED');
     assert.ok((await outboxSeqs()).includes(appended.seq));
-    const delivered = await deliverAvailable(db, handler, terminate);
+    const delivered = await deliverAvailable(db, handler, terminate, gate);
     assert.equal(delivered.delivered, 1);
     assert.deepEqual(keys, [
       deliveryKey(subscriptionId, appended.seq),
@@ -297,7 +299,7 @@ test('a crash after the effect redelivers the same key and the unique pair leave
       UPDATE kernel.subscription
       SET last_seq = 0
       WHERE id = ${subscriptionId}::uuid`.execute(db);
-    const duplicate = await deliverAvailable(db, handler, terminate);
+    const duplicate = await deliverAvailable(db, handler, terminate, gate);
     assert.equal(duplicate.duplicates, 1);
     assert.equal(duplicate.delivered, 0);
     assert.equal(keys.length, 2);
@@ -578,6 +580,51 @@ test('a failing subscription does not stop a later healthy subscription in the s
     });
     assert.equal(effects, 1);
     assert.ok((await outboxSeqs()).includes(appended.seq));
+  } finally {
+    await db.destroy();
+  }
+});
+
+test('a full drain of failing subscriptions yields on the next pass', { timeout: 60_000 }, async () => {
+  await resetBus();
+  const tenantId = randomUUID();
+  await insertCustomer(tenantId);
+  const db = appDb(POOLED, 2);
+  const healthyId = 'ffffffff-ffff-4fff-8fff-ffffffffffff';
+  try {
+    const first = await publish(db, tenantId, FIXTURE_TYPE, 1);
+    await ageSeqs([first.seq]);
+    const filter = JSON.stringify([{ type: FIXTURE_TYPE, versions: [1] }]);
+    await withRoot(async (client) => {
+      await client.query(
+        `INSERT INTO kernel.subscription (id, last_seq, status, park_reason, fence, filter)
+         SELECT (
+           '00000000-0000-4000-8000-' || lpad(to_hex(n), 12, '0')
+         )::uuid, 0, 'live', NULL, 1, $1::jsonb
+         FROM generate_series(1, $2::int) AS n`,
+        [filter, DRAIN_LIMIT],
+      );
+    });
+    await registerSubscription(db, {
+      id: healthyId,
+      filter: [{ type: FIXTURE_TYPE, versions: [1] }],
+      start: '0',
+    });
+    const gate = createFailureGate();
+    const handler = async (_trx: Kysely<Database>, event: DeliveredEvent): Promise<void> => {
+      if (event.subscriptionId !== healthyId) throw new Error('poison handler');
+    };
+    const blocked = await deliverAvailable(db, handler, terminate, gate);
+    assert.equal(blocked.delivered, 0);
+    assert.equal((await cursor(db, healthyId)).lastSeq, '0');
+    const released = await deliverAvailable(db, handler, terminate, gate);
+    assert.equal(released.delivered, 1);
+    assert.equal((await cursor(db, healthyId)).lastSeq, first.seq);
+    const second = await publish(db, tenantId, FIXTURE_TYPE, 1);
+    await ageSeqs([second.seq]);
+    const again = await deliverAvailable(db, handler, terminate, gate);
+    assert.equal(again.delivered, 1);
+    assert.equal((await cursor(db, healthyId)).lastSeq, second.seq);
   } finally {
     await db.destroy();
   }

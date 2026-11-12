@@ -5,7 +5,12 @@
 import type { Kysely } from 'kysely';
 import type { Database } from '../db/database.ts';
 import { ALERT_CAP, LISTENER_FAILED, POLL_MS } from './constants.ts';
-import { deliverAvailable, RelayDeliveryError, type DeliveryHandler } from './deliver.ts';
+import {
+  createFailureGate,
+  deliverAvailable,
+  RelayDeliveryError,
+  type DeliveryHandler,
+} from './deliver.ts';
 import { listenForOutbox } from './listen.ts';
 
 export function rememberAlert(alerts: string[], message: string): void {
@@ -63,9 +68,15 @@ export async function startRelay(input: {
   terminateBackend: (pid: number) => Promise<void>;
 }): Promise<{ stop: () => Promise<void>; alerts: () => readonly string[] }> {
   const alerts: string[] = [];
+  const gate = createFailureGate();
   const scheduler = createPassScheduler(async () => {
     try {
-      const report = await deliverAvailable(input.db, input.handler, input.terminateBackend);
+      const report = await deliverAvailable(
+        input.db,
+        input.handler,
+        input.terminateBackend,
+        gate,
+      );
       for (const alert of report.alerts) rememberAlert(alerts, alert);
     } catch (error) {
       const cause = error instanceof RelayDeliveryError ? error.cause : error;

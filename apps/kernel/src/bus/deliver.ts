@@ -5,7 +5,9 @@
 // one transaction: dedup marker, handler effect, cursor advance, fencing check.
 // A filtered type advances. An unlisted payload version parks the subscription
 // and leaves the cursor and the row. A rolled-back nextval is a missing seq
-// and is skipped. No advisory lock.
+// and is skipped. A handler failure dead-letters that event and leaves the
+// cursor. The failure gate then keeps that subscription from filling later
+// passes until other subscriptions are idle. No advisory lock.
 import { sql, type Kysely, type Transaction } from 'kysely';
 import type { Database } from '../db/database.ts';
 import { blankEvidence, withTenant, type HygieneEvidence } from '../tenancy/hygiene.ts';
@@ -60,6 +62,19 @@ export interface DeliverReport {
 export interface DeliverStep {
   outcome: DeliverOutcome;
   alerts: readonly string[];
+}
+
+/**
+ * Handler failures remembered across passes. The relay holds one gate.
+ * A pass serves every other subscription before it spends leftover steps
+ * retrying the deferred set, so a poison set cannot fill every budget.
+ */
+export interface FailureGate {
+  readonly deferred: Set<string>;
+}
+
+export function createFailureGate(): FailureGate {
+  return { deferred: new Set() };
 }
 
 /** A delivery pass failed after hygiene recorded alerts that must not be dropped. */
@@ -358,10 +373,32 @@ export async function deliverOne(
   }
 }
 
+function recordOutcome(report: DeliverReport, step: DeliverStep): boolean {
+  report.alerts.push(...step.alerts);
+  const outcome = step.outcome;
+  if (outcome.kind === 'idle') return false;
+  if (outcome.kind === 'delivered') report.delivered += 1;
+  else if (outcome.kind === 'skipped') report.skipped += 1;
+  else if (outcome.kind === 'parked') report.parked += 1;
+  else if (outcome.kind === 'duplicate') report.duplicates += 1;
+  return true;
+}
+
+function advanced(outcome: DeliverOutcome): outcome is Extract<
+  DeliverOutcome,
+  { kind: 'delivered' | 'skipped' | 'parked' | 'duplicate' }
+> {
+  return outcome.kind === 'delivered'
+    || outcome.kind === 'skipped'
+    || outcome.kind === 'parked'
+    || outcome.kind === 'duplicate';
+}
+
 export async function deliverAvailable(
   db: Kysely<Database>,
   handler: DeliveryHandler,
   terminateBackend: (pid: number) => Promise<void>,
+  gate: FailureGate = createFailureGate(),
 ): Promise<DeliverReport> {
   const report: DeliverReport = {
     delivered: 0,
@@ -372,20 +409,50 @@ export async function deliverAvailable(
   };
   const failed = new Set<string>();
   try {
-    for (let step = 0; step < DRAIN_LIMIT; step += 1) {
-      const current = await deliverOne(db, handler, terminateBackend, undefined, [...failed]);
-      report.alerts.push(...current.alerts);
-      const outcome = current.outcome;
-      if (outcome.kind === 'idle') break;
-      if (outcome.kind === 'delivered') report.delivered += 1;
-      else if (outcome.kind === 'skipped') report.skipped += 1;
-      else if (outcome.kind === 'parked') report.parked += 1;
-      else if (outcome.kind === 'duplicate') report.duplicates += 1;
-      else if (outcome.kind === 'failed') failed.add(outcome.subscriptionId);
+    let steps = 0;
+    let freshIdle = false;
+    while (steps < DRAIN_LIMIT) {
+      const current = await deliverOne(
+        db,
+        handler,
+        terminateBackend,
+        undefined,
+        [...gate.deferred, ...failed],
+      );
+      if (!recordOutcome(report, current)) {
+        freshIdle = true;
+        break;
+      }
+      steps += 1;
+      if (current.outcome.kind === 'failed') failed.add(current.outcome.subscriptionId);
+    }
+    // Leftover budget retries known failures only after every other
+    // subscription has gone idle, and never retries a failure from this pass.
+    if (freshIdle) {
+      const retried = new Set<string>();
+      while (steps < DRAIN_LIMIT) {
+        const current = await deliverOne(
+          db,
+          handler,
+          terminateBackend,
+          undefined,
+          [...failed, ...retried],
+        );
+        if (!recordOutcome(report, current)) break;
+        steps += 1;
+        if (current.outcome.kind === 'failed') {
+          retried.add(current.outcome.subscriptionId);
+          gate.deferred.add(current.outcome.subscriptionId);
+        } else if (advanced(current.outcome)) {
+          gate.deferred.delete(current.outcome.subscriptionId);
+        }
+      }
     }
   } catch (error) {
     if (error instanceof RelayDeliveryError) report.alerts.push(...error.alerts);
     throw new RelayDeliveryError(error, report.alerts);
+  } finally {
+    for (const id of failed) gate.deferred.add(id);
   }
   const listeners = await countRelayListeners(db);
   if (listeners === 0) report.alerts.push(NO_LISTENER_ALERT);
