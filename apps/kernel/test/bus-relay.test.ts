@@ -16,7 +16,13 @@ import {
   type DeliveredEvent,
 } from '../src/bus/deliver.ts';
 import { assertDirectListen, countRelayListeners, listenForOutbox, listenOrClose } from '../src/bus/listen.ts';
-import { createPassScheduler, rememberAlert, startRelay } from '../src/bus/relay.ts';
+import {
+  continueDrain,
+  createPassScheduler,
+  rememberAlert,
+  runRelayPass,
+  startRelay,
+} from '../src/bus/relay.ts';
 import { retainLog } from '../src/bus/retain.ts';
 import { registerSubscription } from '../src/bus/subscription.ts';
 import type { Database } from '../src/db/database.ts';
@@ -839,6 +845,60 @@ test('a rejected LISTEN closes the connected client', async () => {
   };
   await assert.rejects(() => listenOrClose(client), /listen rejected/);
   assert.equal(ended, 1);
+});
+
+test('a pass of only failures does not continue, and cursor progress does', () => {
+  const empty = {
+    delivered: 0,
+    skipped: 0,
+    parked: 0,
+    duplicates: 0,
+    alerts: [],
+    budgetExhausted: true,
+  };
+  assert.equal(continueDrain(empty), false);
+  assert.equal(continueDrain({ ...empty, delivered: 1 }), true);
+  assert.equal(continueDrain({ ...empty, delivered: 1, budgetExhausted: false }), false);
+  assert.equal(continueDrain({ ...empty, skipped: 1 }), true);
+});
+
+test('one kick drains a backlog larger than the pass budget', async () => {
+  await resetBus();
+  const tenantId = randomUUID();
+  await insertCustomer(tenantId);
+  const db = appDb(POOLED, 2);
+  const count = DRAIN_LIMIT * 2 + 88;
+  try {
+    const seqs = await insertAged(tenantId, count);
+    await registerSubscription(db, {
+      id: randomUUID(),
+      filter: [{ type: FIXTURE_TYPE, versions: [1] }],
+      start: '0',
+    });
+    const seen: string[] = [];
+    const gate = createFailureGate();
+    const alerts: string[] = [];
+    const scheduler = createPassScheduler(() => runRelayPass(
+      {
+        db,
+        handler: async (_trx, event) => {
+          seen.push(event.seq);
+        },
+        terminateBackend: terminate,
+      },
+      gate,
+      alerts,
+      () => {
+        scheduler.kick();
+      },
+    ));
+    scheduler.kick();
+    await scheduler.idle();
+    assert.equal(seen.length, count);
+    assert.deepEqual(seen, seqs);
+  } finally {
+    await db.destroy();
+  }
 });
 
 test('repeated relay alerts stay bounded', () => {

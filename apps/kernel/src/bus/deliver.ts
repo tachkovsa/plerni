@@ -64,6 +64,8 @@ export interface DeliverReport {
   parked: number;
   duplicates: number;
   alerts: string[];
+  /** The pass stopped at the step budget, so eligible work may remain. */
+  budgetExhausted: boolean;
 }
 
 export interface DeliverStep {
@@ -486,6 +488,7 @@ export async function deliverAvailable(
     parked: 0,
     duplicates: 0,
     alerts: [],
+    budgetExhausted: false,
   };
   const failed = new Set<string>();
   try {
@@ -542,6 +545,9 @@ export async function deliverAvailable(
           gate.deferred.delete(current.outcome.subscriptionId);
         }
       }
+      if (steps >= DRAIN_LIMIT) report.budgetExhausted = true;
+    } else if (freshLimit > 0 && steps >= freshLimit) {
+      report.budgetExhausted = true;
     }
   } catch (error) {
     if (error instanceof RelayDeliveryError) report.alerts.push(...error.alerts);
