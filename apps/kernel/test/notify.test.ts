@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { ContractFailure, errorStatus } from '@plerni/contracts';
 import { sql } from 'kysely';
 import pg from 'pg';
-import { sendNotification } from '../src/notify/deliver.ts';
+import { listNotifications, sendNotification } from '../src/notify/deliver.ts';
 import { recordNotificationPreference } from '../src/notify/preference.ts';
 import { inspectTenantTable } from '../src/schema/tenant-table.ts';
 import { blankEvidence, withTenant } from '../src/tenancy/hygiene.ts';
@@ -86,7 +86,7 @@ async function read(response: Response): Promise<Record<string, unknown>> {
   return await response.json() as Record<string, unknown>;
 }
 
-test('the kernel stores no message pattern and no message text column', () => {
+test('the kernel stores the rendered text and no message pattern', () => {
   const sqlText = readFileSync(join(here, '../sql/0006_notifications.sql'), 'utf8');
   const sources = [sqlText];
   const notifyDir = join(here, '../src/notify');
@@ -95,7 +95,8 @@ test('the kernel stores no message pattern and no message text column', () => {
   }
   sources.push(readFileSync(join(here, '../src/transport/notify-request.ts'), 'utf8'));
   for (const source of sources) assert.equal(/\btemplate\b/i.test(source), false);
-  assert.equal(/\bbody\b/i.test(sqlText), false);
+  assert.equal(sqlText.includes('content_digest'), false);
+  assert.match(sqlText, /\bbody text NOT NULL\b/);
 });
 
 test('a missing session on the send route is UNAUTHENTICATED and does not send', async () => {
@@ -267,15 +268,16 @@ test('delivers once, and a duplicate send does not deliver again', async () => {
     assert.equal(first.outcome, 'delivered');
     assert.equal(second.id, first.id);
     assert.equal(second.outcome, 'delivered');
+    assert.equal(second.body, COPY);
     const tally = await counts(TENANT);
     assert.equal(tally.delivered, 1);
     assert.equal(tally.rows, 1);
     const stored = await withRoot(async (client) => {
-      const result = await client.query('SELECT * FROM kernel.notification_delivery');
+      const result = await client.query<{ body: string }>('SELECT body FROM kernel.notification_delivery');
       return result.rows;
     });
     assert.equal(stored.length, 1);
-    assert.equal(JSON.stringify(stored).includes(COPY), false);
+    assert.equal(stored[0]?.body, COPY);
   } finally {
     await db.destroy();
   }
@@ -478,7 +480,7 @@ test('notification tables match the tenant shape and hide rows when the tenant i
        ORDER BY ordinal_position`,
     );
     assert.deepEqual(columns.rows.map((row) => row.column_name), [
-      'tenant_id', 'id', 'idempotency_key', 'recipient_id', 'channel', 'content_digest', 'outcome', 'created_at',
+      'tenant_id', 'id', 'idempotency_key', 'recipient_id', 'channel', 'body', 'outcome', 'created_at',
     ]);
   });
   const app = new pg.Client({ connectionString: DIRECT });
@@ -552,7 +554,7 @@ test('two pooled sends that both miss the key leave one delivery', async () => {
   }
 });
 
-test('the http route delivers once and does not return the message text', async () => {
+test('the http route delivers once and the recipient can read the stored text', async () => {
   await ready();
   await resetNotify();
   const db = appDb(DIRECT, 1);
@@ -591,12 +593,91 @@ test('the http route delivers once and does not return the message text', async 
     const firstBody = await read(first);
     const secondBody = await read(second);
     assert.equal(firstBody.outcome, 'delivered');
+    assert.equal(firstBody.body, COPY);
     assert.equal(secondBody.id, firstBody.id);
-    assert.equal(JSON.stringify(firstBody).includes(COPY), false);
-    assert.equal(JSON.stringify(secondBody).includes(COPY), false);
+    assert.equal(secondBody.body, COPY);
     const tally = await counts(TENANT);
     assert.equal(tally.delivered, 1);
     assert.equal(tally.rows, 1);
+    const inbox = await handleKernelRequest(request('/kernel/notifications', undefined, 'GET'), {
+      ...ctx,
+      session: { tenantId: TENANT, actorId: RECIPIENT },
+    });
+    assert.equal(inbox.status, 200);
+    const listed = await read(inbox);
+    const deliveries = listed.deliveries as { id?: string; body?: string }[];
+    assert.equal(deliveries.length, 1);
+    assert.equal(deliveries[0]?.id, firstBody.id);
+    assert.equal(deliveries[0]?.body, COPY);
+    const otherInbox = await handleKernelRequest(request('/kernel/notifications', undefined, 'GET'), {
+      ...ctx,
+      session: { tenantId: TENANT, actorId: SENDER },
+    });
+    assert.equal(otherInbox.status, 200);
+    assert.deepEqual((await read(otherInbox)).deliveries, []);
+  } finally {
+    await db.destroy();
+  }
+});
+
+test('an uppercase recipient id delivers once and a different case is the same delivery', async () => {
+  await ready();
+  await resetNotify();
+  const db = appDb(DIRECT, 1);
+  try {
+    await recordNotificationPreference(
+      db,
+      { tenantId: TENANT, actorId: RECIPIENT.toUpperCase() },
+      { channel: 'in_app', enabled: true },
+      blankEvidence(),
+      terminate,
+    );
+    const first = await sendNotification(
+      db,
+      sender,
+      sendInput({ recipientId: RECIPIENT.toUpperCase() }),
+      blankEvidence(),
+      terminate,
+    );
+    const second = await sendNotification(db, sender, sendInput(), blankEvidence(), terminate);
+    assert.equal(first.body, COPY);
+    assert.equal(first.recipientId, RECIPIENT);
+    assert.equal(second.id, first.id);
+    assert.equal(second.body, COPY);
+    const inbox = await listNotifications(
+      db,
+      { tenantId: TENANT.toUpperCase(), actorId: RECIPIENT.toUpperCase() },
+      blankEvidence(),
+      terminate,
+    );
+    assert.equal(inbox.length, 1);
+    assert.equal(inbox[0]?.body, COPY);
+    const tally = await counts(TENANT);
+    assert.equal(tally.rows, 1);
+    assert.equal(tally.delivered, 1);
+  } finally {
+    await db.destroy();
+  }
+});
+
+test('a suppressed send is stored once and is not listed to the recipient', async () => {
+  await ready();
+  await resetNotify();
+  const db = appDb(DIRECT, 1);
+  try {
+    await recordNotificationPreference(
+      db, recipient, { channel: 'in_app', enabled: false }, blankEvidence(), terminate,
+    );
+    const stored = await sendNotification(
+      db, sender, sendInput({ idempotencyKey: 'hidden' }), blankEvidence(), terminate,
+    );
+    assert.equal(stored.outcome, 'suppressed');
+    assert.equal(stored.body, COPY);
+    const inbox = await listNotifications(db, recipient, blankEvidence(), terminate);
+    assert.deepEqual(inbox, []);
+    const tally = await counts(TENANT);
+    assert.equal(tally.rows, 1);
+    assert.equal(tally.delivered, 0);
   } finally {
     await db.destroy();
   }

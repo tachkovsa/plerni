@@ -7,13 +7,19 @@ function invalid(message: string, nextStep: string): ContractFailure {
   return new ContractFailure({ code: 'VALIDATION', message, next_step: nextStep });
 }
 
-export function assertTenantActor(tenantId: string, actorId: string): void {
+/** PostgreSQL prints uuid values in lowercase. Comparisons use that form. */
+export function canonicalUuid(value: string): string {
+  return value.toLowerCase();
+}
+
+export function assertTenantActor(tenantId: string, actorId: string): { tenantId: string; actorId: string } {
   if (!isUuid(tenantId)) {
     throw invalid('The tenant id was rejected.', 'Retry with a session tenant id that is a UUID.');
   }
   if (!isUuid(actorId)) {
     throw invalid('The actor id was rejected.', 'Retry with a session actor id that is a UUID.');
   }
+  return { tenantId: canonicalUuid(tenantId), actorId: canonicalUuid(actorId) };
 }
 
 export function assertSendGrant(grants: readonly string[]): void {

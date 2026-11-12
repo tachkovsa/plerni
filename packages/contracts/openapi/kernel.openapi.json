@@ -162,6 +162,11 @@
               "delivered",
               "suppressed"
             ]
+          },
+          "body": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4000
           }
         },
         "required": [
@@ -169,7 +174,8 @@
           "idempotencyKey",
           "recipientId",
           "channel",
-          "outcome"
+          "outcome",
+          "body"
         ],
         "additionalProperties": false
       },
@@ -201,6 +207,63 @@
           "recipientId",
           "channel",
           "body"
+        ],
+        "additionalProperties": false
+      },
+      "NotificationDeliveryList": {
+        "type": "object",
+        "properties": {
+          "deliveries": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "idempotencyKey": {
+                  "type": "string",
+                  "pattern": "^[A-Za-z0-9._:-]{1,200}$"
+                },
+                "recipientId": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "channel": {
+                  "type": "string",
+                  "enum": [
+                    "in_app"
+                  ]
+                },
+                "outcome": {
+                  "type": "string",
+                  "enum": [
+                    "delivered",
+                    "suppressed"
+                  ]
+                },
+                "body": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 4000
+                }
+              },
+              "required": [
+                "id",
+                "idempotencyKey",
+                "recipientId",
+                "channel",
+                "outcome",
+                "body"
+              ],
+              "additionalProperties": false
+            },
+            "maxItems": 50
+          }
+        },
+        "required": [
+          "deliveries"
         ],
         "additionalProperties": false
       }
@@ -449,6 +512,56 @@
           }
         },
         "x-plerni-action": "routine",
+        "x-plerni-scope": "tenant"
+      },
+      "get": {
+        "operationId": "kernel.notification.list",
+        "summary": "List delivered in-app notifications for the caller",
+        "responses": {
+          "200": {
+            "description": "Delivered rows for the caller, newest first, at most 50.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotificationDeliveryList"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "VALIDATION",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "VALIDATION"
+          },
+          "401": {
+            "description": "UNAUTHENTICATED",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "UNAUTHENTICATED"
+          },
+          "500": {
+            "description": "INTERNAL",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "x-plerni-error-code": "INTERNAL"
+          }
+        },
         "x-plerni-scope": "tenant"
       }
     }

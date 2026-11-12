@@ -9,6 +9,7 @@ import {
   createTenantResponseSchema,
   errorEnvelope,
   errorStatus,
+  kernelNotificationList,
   kernelNotificationPreferenceRecord,
   kernelNotificationSend,
   kernelRoutes,
@@ -16,8 +17,10 @@ import {
 } from '@plerni/contracts';
 import type { Database } from '../db/database.ts';
 import {
+  listNotifications,
   sendNotification,
   type DeliveryRecord,
+  type InboxCaller,
   type NotifyCaller,
   type SendNotificationInput,
 } from '../notify/deliver.ts';
@@ -47,6 +50,7 @@ export interface KernelHttpContext {
   createTenant: (input: { idempotencyKey: string }, session: TenantSession) => Promise<TenantRecord>;
   recordNotificationPreference?: (input: PreferenceInput, caller: PreferenceCaller) => Promise<PreferenceRecord>;
   sendNotification?: (input: SendNotificationInput, caller: NotifyCaller) => Promise<DeliveryRecord>;
+  listNotifications?: (caller: InboxCaller) => Promise<DeliveryRecord[]>;
 }
 
 function json(status: number, body: unknown): Response {
@@ -179,6 +183,7 @@ export async function handleKernelRequest(request: Request, ctx: KernelHttpConte
   if (
     route.operationId === kernelNotificationPreferenceRecord.operationId
     || route.operationId === kernelNotificationSend.operationId
+    || route.operationId === kernelNotificationList.operationId
   ) {
     const session: NotificationSession = {
       tenantId: ctx.session.tenantId,
@@ -190,6 +195,7 @@ export async function handleKernelRequest(request: Request, ctx: KernelHttpConte
         ? { recordNotificationPreference: ctx.recordNotificationPreference }
         : {}),
       ...(ctx.sendNotification ? { sendNotification: ctx.sendNotification } : {}),
+      ...(ctx.listNotifications ? { listNotifications: ctx.listNotifications } : {}),
     });
   }
   return fail(internalFailure());
@@ -221,6 +227,12 @@ export function kernelRequestContext(deps: {
       deps.db,
       caller,
       input,
+      deps.evidence,
+      deps.terminateBackend,
+    ),
+    listNotifications: (caller) => listNotifications(
+      deps.db,
+      caller,
       deps.evidence,
       deps.terminateBackend,
     ),

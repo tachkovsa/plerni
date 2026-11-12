@@ -36,9 +36,9 @@ Role chain, with no shell: a caller with the grant puts bytes and reads them bac
 
 ## Notification plumbing
 
-`kernel.notification_preference` and `kernel.notification_delivery` are tenant-domain tables. A session actor records their own in-app preference. A caller holding `notify.send` sends to a recipient. The first accepted send for an idempotency key inserts one row. A later send with that key returns the same row and does not insert another. A different recipient, channel, or message text is `CONCURRENCY_CONFLICT`. A missing preference is `NOT_FOUND` and writes nothing. A disabled preference inserts one suppressed row. The message text is not stored; the row keeps a sha256 digest. No template is stored.
+`kernel.notification_preference` and `kernel.notification_delivery` are tenant-domain tables. A session actor records their own in-app preference. A caller holding `notify.send` sends to a recipient. The first accepted send for an idempotency key inserts one row and stores the text the caller supplied. That row is the in-app delivery. A later send with that key returns the same row and does not insert another. A different recipient, channel, or message text is `CONCURRENCY_CONFLICT`. A missing preference is `NOT_FOUND` and writes nothing. A disabled preference inserts one suppressed row, which is not listed to the recipient. No template is stored.
 
-`POST /kernel/notification-preferences` and `POST /kernel/notifications` are the public routes. Failures use the error envelope.
+`POST /kernel/notification-preferences`, `POST /kernel/notifications`, and `GET /kernel/notifications` are the public routes. The list returns the caller's delivered rows, newest first, at most 50. Failures use the error envelope.
 
 ## Tenancy suite
 

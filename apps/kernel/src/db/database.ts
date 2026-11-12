@@ -72,7 +72,7 @@ export interface Database {
     idempotency_key: string;
     recipient_id: string;
     channel: string;
-    content_digest: string;
+    body: string;
     outcome: string;
     created_at: Date;
   };

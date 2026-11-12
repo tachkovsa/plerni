@@ -1,7 +1,7 @@
 -- SPDX-License-Identifier: Apache-2.0
 -- Notification plumbing (plan K12). Preferences and deliveries are
--- tenant-domain rows. The caller keeps the message text. The delivery row
--- stores a sha256 digest so a different text cannot reuse the key.
+-- tenant-domain rows. The delivery row is the in-app channel: it stores the
+-- text the caller already rendered. The kernel does not render that text.
 -- The approval for this migration is unsigned. The maintainer signs it.
 
 CREATE TABLE IF NOT EXISTS kernel.notification_preference (
@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS kernel.notification_delivery (
   idempotency_key text NOT NULL,
   recipient_id uuid NOT NULL,
   channel text NOT NULL,
-  content_digest text NOT NULL,
+  body text NOT NULL,
   outcome text NOT NULL,
   created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
   PRIMARY KEY (tenant_id, id),
@@ -41,7 +41,7 @@ CREATE TABLE IF NOT EXISTS kernel.notification_delivery (
   CONSTRAINT notification_delivery_key_shape CHECK (
     idempotency_key ~ '^[A-Za-z0-9._:-]{1,200}$'
   ),
-  CONSTRAINT notification_delivery_digest CHECK (content_digest ~ '^[0-9a-f]{64}$'),
+  CONSTRAINT notification_delivery_body_len CHECK (char_length(body) BETWEEN 1 AND 4000),
   CONSTRAINT notification_delivery_once UNIQUE (tenant_id, idempotency_key)
 );
 

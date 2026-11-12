@@ -49,10 +49,13 @@ export const kernelTenantCreate: RouteContract = {
   errors: ['VALIDATION', 'UNAUTHENTICATED', 'FORBIDDEN', 'CONCURRENCY_CONFLICT', 'INTERNAL'],
 };
 
-/** The only channel K12 delivers. Message text stays with the caller. */
+/** The only channel K12 delivers. The caller supplies the already rendered text. */
 export const NOTIFICATION_CHANNEL = 'in_app' as const;
 
 export const NOTIFICATION_BODY_MAX = 4000;
+
+/** Newest delivered rows returned to the recipient. */
+export const NOTIFICATION_LIST_MAX = 50;
 
 export const notificationPreferenceRequestSchema = z.strictObject({
   channel: z.literal(NOTIFICATION_CHANNEL),
@@ -79,6 +82,11 @@ export const notificationSendResponseSchema = z.strictObject({
   recipientId: z.uuid(),
   channel: z.literal(NOTIFICATION_CHANNEL),
   outcome: z.enum(['delivered', 'suppressed']),
+  body: z.string().min(1).max(NOTIFICATION_BODY_MAX),
+});
+
+export const notificationDeliveryListSchema = z.strictObject({
+  deliveries: z.array(notificationSendResponseSchema).max(NOTIFICATION_LIST_MAX),
 });
 
 export const kernelNotificationPreferenceRecord: RouteContract = {
@@ -123,10 +131,27 @@ export const kernelNotificationSend: RouteContract = {
   errors: ['VALIDATION', 'UNAUTHENTICATED', 'FORBIDDEN', 'NOT_FOUND', 'CONCURRENCY_CONFLICT', 'INTERNAL'],
 };
 
+export const kernelNotificationList: RouteContract = {
+  operationId: 'kernel.notification.list',
+  method: 'get',
+  path: '/kernel/notifications',
+  summary: 'List delivered in-app notifications for the caller',
+  visibility: 'public',
+  scope: 'tenant',
+  success: {
+    status: 200,
+    description: `Delivered rows for the caller, newest first, at most ${NOTIFICATION_LIST_MAX}.`,
+    schemaName: 'NotificationDeliveryList',
+    schema: notificationDeliveryListSchema,
+  },
+  errors: ['UNAUTHENTICATED', 'VALIDATION', 'INTERNAL'],
+};
+
 export const kernelRoutes: readonly RouteContract[] = Object.freeze([
   kernelTenantCreate,
   kernelNotificationPreferenceRecord,
   kernelNotificationSend,
+  kernelNotificationList,
 ]);
 
 export const KERNEL_API_VERSION = '1.0.0';

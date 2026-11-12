@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // HTTP adapter for the notification routes. The session actor is the only
-// recipient a preference record can name. The message text is not returned.
+// recipient a preference record can name. A delivery response includes the
+// stored text. The list returns that text to the recipient.
 import {
   ContractFailure,
   errorEnvelope,
   errorStatus,
+  kernelNotificationList,
   kernelNotificationPreferenceRecord,
   kernelNotificationSend,
+  notificationDeliveryListSchema,
   notificationPreferenceRequestSchema,
   notificationPreferenceResponseSchema,
   notificationSendRequestSchema,
@@ -14,7 +17,7 @@ import {
   type ErrorEnvelope,
 } from '@plerni/contracts';
 import { NOTIFY_SEND } from '../notify/failures.ts';
-import type { DeliveryRecord, NotifyCaller, SendNotificationInput } from '../notify/deliver.ts';
+import type { DeliveryRecord, InboxCaller, NotifyCaller, SendNotificationInput } from '../notify/deliver.ts';
 import type { PreferenceCaller, PreferenceInput, PreferenceRecord } from '../notify/preference.ts';
 
 export interface NotificationHandlers {
@@ -26,6 +29,7 @@ export interface NotificationHandlers {
     input: SendNotificationInput,
     caller: NotifyCaller,
   ) => Promise<DeliveryRecord>;
+  listNotifications?: (caller: InboxCaller) => Promise<DeliveryRecord[]>;
 }
 
 export interface NotificationSession {
@@ -113,6 +117,18 @@ export async function handleNotificationRequest(
     try {
       const stored = await record(parsed.data, { tenantId: session.tenantId, actorId: session.actorId });
       const checked = notificationPreferenceResponseSchema.safeParse(stored);
+      if (!checked.success) return fail(internalFailure());
+      return json(200, checked.data);
+    } catch (error) {
+      return fail(fromError(error));
+    }
+  }
+  if (operationId === kernelNotificationList.operationId) {
+    const list = handlers.listNotifications;
+    if (!list) return fail(internalFailure());
+    try {
+      const deliveries = await list({ tenantId: session.tenantId, actorId: session.actorId });
+      const checked = notificationDeliveryListSchema.safeParse({ deliveries });
       if (!checked.success) return fail(internalFailure());
       return json(200, checked.data);
     } catch (error) {

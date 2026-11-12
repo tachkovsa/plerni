@@ -40,18 +40,18 @@ export async function recordNotificationPreference(
   evidence: HygieneEvidence,
   terminateBackend: (pid: number) => Promise<void>,
 ): Promise<PreferenceRecord> {
-  assertTenantActor(caller.tenantId, caller.actorId);
+  const actor = assertTenantActor(caller.tenantId, caller.actorId);
   const parsed = notificationPreferenceRequestSchema.safeParse(input);
   if (!parsed.success) throw rejectedPreference();
-  return withTenant(db, caller.tenantId, evidence, terminateBackend, async (trx) => {
+  return withTenant(db, actor.tenantId, evidence, terminateBackend, async (trx) => {
     await assertTenantContext(trx);
     const id = randomUUID();
     const stored = await sql<PreferenceRow>`
       INSERT INTO kernel.notification_preference (tenant_id, id, recipient_id, channel, enabled)
       VALUES (
-        ${caller.tenantId}::uuid,
+        ${actor.tenantId}::uuid,
         ${id}::uuid,
-        ${caller.actorId}::uuid,
+        ${actor.actorId}::uuid,
         ${parsed.data.channel},
         ${parsed.data.enabled}
       )
