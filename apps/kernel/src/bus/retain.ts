@@ -2,7 +2,8 @@
 // Retention low-water is the minimum of unreleased subscription cursors
 // and unreleased enablement watermarks (plan §4.2, §4.4). Quota expiry
 // records a warning and leaves the hold in that minimum. A row at or above
-// the minimum stays. Released holds are out of the minimum.
+// the minimum stays. Released holds are out of the minimum. An enabled
+// watermark with no older matching event moves with the installation cursor.
 import { sql, type Kysely } from 'kysely';
 import type { Database } from '../db/database.ts';
 import { QUOTA_BYTES, QUOTA_DAYS } from './constants.ts';

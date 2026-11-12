@@ -273,6 +273,14 @@
             "type": "string",
             "pattern": "^[a-z][a-z0-9_]{0,40}$"
           },
+          "tenantId": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i"
+          },
+          "exportedThroughSeq": {
+            "type": "string",
+            "pattern": "^[0-9]+$"
+          },
           "exportedAt": {
             "type": "string",
             "format": "date-time"
@@ -280,6 +288,8 @@
         },
         "required": [
           "packageId",
+          "tenantId",
+          "exportedThroughSeq",
           "exportedAt"
         ],
         "additionalProperties": false
@@ -290,10 +300,15 @@
           "packageId": {
             "type": "string",
             "pattern": "^[a-z][a-z0-9_]{0,40}$"
+          },
+          "tenantId": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i"
           }
         },
         "required": [
-          "packageId"
+          "packageId",
+          "tenantId"
         ],
         "additionalProperties": false
       },

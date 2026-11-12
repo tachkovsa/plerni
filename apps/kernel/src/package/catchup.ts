@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Throttled re-enable catch-up (plan §4.4). One call delivers at most
-// CATCHUP_BATCH events for one tenant, starting at that tenant's watermark.
-// The installation cursor is not moved. A payload version the filter lists
-// and does not accept stops the pass and leaves the watermark.
+// CATCHUP_BATCH events for one tenant, starting at that tenant's watermark
+// and stopping at the installation cursor. The cursor is not moved. The
+// delivery marker is the same pair the relay uses, so a later relay pass
+// does not apply the event again. A payload version the filter lists and
+// does not accept stops the pass and leaves the watermark.
 import { sql, type Kysely, type Transaction } from 'kysely';
 import type { Database } from '../db/database.ts';
 import { withTenant, type HygieneEvidence } from '../tenancy/hygiene.ts';
@@ -11,7 +13,7 @@ import { deliveryKey, type DeliveredEvent, type DeliveryHandler } from '../bus/d
 import { parseFilter, type TypeFilter } from '../bus/validate.ts';
 import { EnablementNotFoundError, PackageNotFoundError } from './errors.ts';
 
-type Step = 'delivered' | 'idle' | 'stopped' | 'blocked';
+type Step = 'delivered' | 'duplicate' | 'idle' | 'stopped' | 'blocked';
 
 async function safePoint(trx: Transaction<Database>): Promise<string | null> {
   const result = await sql<{ safe_point: string | null }>`
@@ -29,12 +31,12 @@ export async function catchUpTenant(
   evidence: HygieneEvidence,
   terminateBackend: (pid: number) => Promise<void>,
 ): Promise<number> {
-  let delivered = 0;
+    let delivered = 0;
   for (let step = 0; step < CATCHUP_BATCH; step += 1) {
     const outcome = await withTenant(db, tenantId, evidence, terminateBackend, async (trx) =>
       deliverOne(trx, packageId, tenantId, handler));
-    if (outcome !== 'delivered') break;
-    delivered += 1;
+    if (outcome === 'idle' || outcome === 'stopped' || outcome === 'blocked') break;
+    if (outcome === 'delivered') delivered += 1;
   }
   return delivered;
 }
@@ -49,11 +51,13 @@ async function deliverOne(
     enabled: boolean;
     watermark_seq: string;
     subscription_id: string;
+    last_seq: string;
     filter: unknown;
   }>`
     SELECT e.enabled,
            e.watermark_seq::text AS watermark_seq,
            p.subscription_id::text AS subscription_id,
+           s.last_seq::text AS last_seq,
            s.filter
     FROM kernel.package_enablement AS e
     JOIN kernel.package AS p ON p.id = e.package_id
@@ -94,7 +98,7 @@ async function deliverOne(
     FROM kernel.outbox
     WHERE tenant_id = ${tenantId}::uuid
       AND seq > ${row.watermark_seq}::bigint
-      AND seq <= ${point}::bigint
+      AND seq <= LEAST(${point}::bigint, ${row.last_seq}::bigint)
       AND type = ANY(${types}::text[])
     ORDER BY seq
     LIMIT 1`.execute(trx);
@@ -102,18 +106,25 @@ async function deliverOne(
   if (!event) return 'idle';
   if (!accepted(filter, event.type, event.version)) return 'blocked';
   const key = deliveryKey(row.subscription_id, event.seq);
-  await handler(trx, {
-    subscriptionId: row.subscription_id,
-    seq: event.seq,
-    tenantId: event.tenant_id,
-    aggregateType: event.aggregate_type,
-    aggregateId: event.aggregate_id,
-    aggregateVersion: event.aggregate_version,
-    type: event.type,
-    version: event.version,
-    payload: event.payload,
-    idempotencyKey: key,
-  } satisfies DeliveredEvent);
+  const inserted = await sql<{ seq: string }>`
+    INSERT INTO kernel.delivery (subscription_id, seq, idempotency_key)
+    VALUES (${row.subscription_id}::uuid, ${event.seq}::bigint, ${key})
+    ON CONFLICT (subscription_id, seq) DO NOTHING
+    RETURNING seq::text AS seq`.execute(trx);
+  if (inserted.rows.length === 1) {
+    await handler(trx, {
+      subscriptionId: row.subscription_id,
+      seq: event.seq,
+      tenantId: event.tenant_id,
+      aggregateType: event.aggregate_type,
+      aggregateId: event.aggregate_id,
+      aggregateVersion: event.aggregate_version,
+      type: event.type,
+      version: event.version,
+      payload: event.payload,
+      idempotencyKey: key,
+    } satisfies DeliveredEvent);
+  }
   const moved = await sql<{ package_id: string }>`
     UPDATE kernel.package_enablement
     SET watermark_seq = ${event.seq}::bigint
@@ -123,7 +134,7 @@ async function deliverOne(
       AND watermark_seq = ${row.watermark_seq}::bigint
     RETURNING package_id`.execute(trx);
   if (moved.rows.length !== 1) throw new Error('watermark advance lost the row');
-  return 'delivered';
+  return inserted.rows.length === 1 ? 'delivered' : 'duplicate';
 }
 
 function accepted(filter: readonly TypeFilter[], type: string, version: number): boolean {

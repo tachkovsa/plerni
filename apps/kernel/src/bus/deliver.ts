@@ -22,7 +22,7 @@ import {
   RETRY_RESERVE,
 } from './constants.ts';
 import { countRelayListeners } from './listen.ts';
-import { advanceEnabledWatermark, installationDelivery } from '../package/delivery.ts';
+import { installationDelivery, noteInstallationCursor } from '../package/delivery.ts';
 import { decide, parseFilter } from './validate.ts';
 
 export interface DeliveredEvent {
@@ -398,6 +398,7 @@ async function applyClaim(
     if (action === 'skip') {
       const advanced = await advanceCursor(trx, current, event.seq);
       if (!advanced) return { kind: 'stale', subscriptionId: claim.subscriptionId };
+      await noteInstallationCursor(trx, current.id, event.seq);
       return { kind: 'skipped', subscriptionId: claim.subscriptionId, seq: event.seq };
     }
     if (action === 'park') {
@@ -405,10 +406,11 @@ async function applyClaim(
       if (!parked) return { kind: 'stale', subscriptionId: claim.subscriptionId };
       return { kind: 'parked', subscriptionId: claim.subscriptionId, seq: event.seq };
     }
-    const gate = await installationDelivery(trx, current.id, event.tenantId);
+    const gate = await installationDelivery(trx, current.id, event.tenantId, event.seq);
     if (gate === 'withhold') {
       const withheld = await advanceCursor(trx, current, event.seq);
       if (!withheld) return { kind: 'stale', subscriptionId: claim.subscriptionId };
+      await noteInstallationCursor(trx, current.id, event.seq);
       return { kind: 'withheld', subscriptionId: current.id, seq: event.seq };
     }
     const key = deliveryKey(current.id, event.seq);
@@ -420,9 +422,7 @@ async function applyClaim(
         throw new HandlerFailed(error);
       }
     }
-    if (gate === 'accept') {
-      await advanceEnabledWatermark(trx, current.id, event.tenantId, event.seq);
-    }
+    if (gate === 'accept') await noteInstallationCursor(trx, current.id, event.seq);
     const advanced = await advanceCursor(trx, current, event.seq);
     if (!advanced) throw new Error('cursor advance lost the fencing check');
     return inserted

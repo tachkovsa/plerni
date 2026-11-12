@@ -238,7 +238,7 @@ test('one process: A receives the fixture event, B holds past the quota, and onl
 
     await setPackageEnabled(db, { tenantId: TENANT_B }, installed.id, false, blankEvidence(), terminate);
     assert.equal((await cursorOf(db, installed.subscriptionId)).status, 'live');
-    await exportPackage(db, operatorSession, installed.id, blankEvidence(), terminate);
+    await exportPackage(db, operatorSession, installed.id, TENANT_B, blankEvidence(), terminate);
     const advanced = await forceAdvancePackage(
       db,
       operatorSession,
@@ -272,7 +272,7 @@ test('one process: A receives the fixture event, B holds past the quota, and onl
   }
 });
 
-test('catch-up delivers at most the stated batch', async () => {
+test('catch-up stays behind the installation cursor and does not deliver twice', async () => {
   await resetBus();
   await insertCustomer(TENANT_A);
   const db = appDb(POOLED, 2);
@@ -292,26 +292,188 @@ test('catch-up delivers at most the stated batch', async () => {
       seqs.push(appended.seq);
     }
     await ageSeqs(seqs);
+    const ahead = await catchUpTenant(
+      db,
+      installed.id,
+      TENANT_A,
+      async () => {
+        throw new Error('catch-up passed the installation cursor');
+      },
+      blankEvidence(),
+      terminate,
+    );
+    assert.equal(ahead, 0);
+    await setPackageEnabled(db, { tenantId: TENANT_A }, installed.id, false, blankEvidence(), terminate);
+    await deliverAvailable(db, async () => {
+      throw new Error('a disabled tenant received the event');
+    }, terminate);
+    await setPackageEnabled(db, { tenantId: TENANT_A }, installed.id, true, blankEvidence(), terminate);
+    const seen: string[] = [];
     const first = await catchUpTenant(
       db,
       installed.id,
       TENANT_A,
-      async () => undefined,
+      async (_trx, event) => {
+        seen.push(event.seq);
+      },
       blankEvidence(),
       terminate,
     );
     assert.equal(first, CATCHUP_BATCH);
-    assert.equal(await watermark(db, installed.id, TENANT_A), seqs[CATCHUP_BATCH - 1]);
+    assert.deepEqual(seen, seqs.slice(0, CATCHUP_BATCH));
+    const relayAgain: string[] = [];
+    await deliverAvailable(db, async (_trx, event) => {
+      relayAgain.push(event.seq);
+    }, terminate);
+    assert.deepEqual(relayAgain, []);
     const second = await catchUpTenant(
       db,
       installed.id,
       TENANT_A,
-      async () => undefined,
+      async (_trx, event) => {
+        seen.push(event.seq);
+      },
       blankEvidence(),
       terminate,
     );
     assert.equal(second, 1);
-    assert.equal(await watermark(db, installed.id, TENANT_A), seqs[CATCHUP_BATCH]);
+    assert.deepEqual(seen, seqs);
+    const markers = await sql<{ count: string }>`
+      SELECT count(*)::text AS count
+      FROM kernel.delivery
+      WHERE subscription_id = ${installed.subscriptionId}::uuid`.execute(db);
+    assert.equal(markers.rows[0]?.count, String(seqs.length));
+  } finally {
+    await db.destroy();
+  }
+});
+
+test('re-enable does not advance the watermark past retained backlog', async () => {
+  await resetBus();
+  await insertCustomer(TENANT_A);
+  const db = appDb(POOLED, 2);
+  try {
+    const operator = await bootstrapOperatorTenant(db, blankEvidence(), terminate);
+    const installed = await installPackage(
+      db,
+      { tenantId: operator.id },
+      installInput('fixture_gap'),
+      blankEvidence(),
+      terminate,
+    );
+    await setPackageEnabled(db, { tenantId: TENANT_A }, installed.id, false, blankEvidence(), terminate);
+    const older = await publish(db, TENANT_A, FIXTURE_TYPE, 1);
+    await ageSeqs([older.seq]);
+    await deliverAvailable(db, async () => {
+      throw new Error('disabled tenant received the older event');
+    }, terminate);
+    const frozen = await watermark(db, installed.id, TENANT_A);
+    await setPackageEnabled(db, { tenantId: TENANT_A }, installed.id, true, blankEvidence(), terminate);
+    const newer = await publish(db, TENANT_A, FIXTURE_TYPE, 1);
+    await ageSeqs([newer.seq]);
+    await deliverAvailable(db, async () => {
+      throw new Error('live delivery skipped the retained backlog');
+    }, terminate);
+    assert.equal(await watermark(db, installed.id, TENANT_A), frozen);
+    const caught: string[] = [];
+    const delivered = await catchUpTenant(
+      db,
+      installed.id,
+      TENANT_A,
+      async (_trx, event) => {
+        caught.push(event.seq);
+      },
+      blankEvidence(),
+      terminate,
+    );
+    assert.equal(delivered, 2);
+    assert.deepEqual(caught, [older.seq, newer.seq]);
+    assert.equal(await watermark(db, installed.id, TENANT_A), newer.seq);
+  } finally {
+    await db.destroy();
+  }
+});
+
+test('a caught-up enabled watermark moves across events it does not consume', async () => {
+  await resetBus();
+  await insertCustomer(TENANT_A);
+  const db = appDb(POOLED, 2);
+  try {
+    const operator = await bootstrapOperatorTenant(db, blankEvidence(), terminate);
+    const installed = await installPackage(
+      db,
+      { tenantId: operator.id },
+      installInput('fixture_quiet'),
+      blankEvidence(),
+      terminate,
+    );
+    await setPackageEnabled(db, { tenantId: TENANT_A }, installed.id, true, blankEvidence(), terminate);
+    const first = await publish(db, TENANT_A, OTHER_TYPE, 1);
+    const second = await publish(db, TENANT_A, OTHER_TYPE, 1);
+    await ageSeqs([first.seq, second.seq]);
+    await deliverAvailable(db, async () => {
+      throw new Error('a filtered type was delivered');
+    }, terminate);
+    assert.equal(await watermark(db, installed.id, TENANT_A), second.seq);
+    assert.equal((await cursorOf(db, installed.subscriptionId)).lastSeq, second.seq);
+    await retainLog(db);
+    const remaining = await outboxSeqs(db);
+    assert.equal(remaining.includes(first.seq), false);
+    assert.equal(remaining.includes(second.seq), true);
+  } finally {
+    await db.destroy();
+  }
+});
+
+test('force-advance cannot release backlog past the tenant export', async () => {
+  await resetBus();
+  await insertCustomer(TENANT_B);
+  const db = appDb(POOLED, 2);
+  try {
+    const operator = await bootstrapOperatorTenant(db, blankEvidence(), terminate);
+    const session = { tenantId: operator.id };
+    const installed = await installPackage(
+      db,
+      session,
+      installInput('fixture_export'),
+      blankEvidence(),
+      terminate,
+    );
+    await setPackageEnabled(db, { tenantId: TENANT_B }, installed.id, false, blankEvidence(), terminate);
+    const covered = await publish(db, TENANT_B, FIXTURE_TYPE, 1);
+    await ageSeqs([covered.seq]);
+    await deliverAvailable(db, async () => undefined, terminate);
+    const exported = await exportPackage(db, session, installed.id, TENANT_B, blankEvidence(), terminate);
+    assert.equal(exported.exportedThroughSeq, covered.seq);
+    const later = await publish(db, TENANT_B, FIXTURE_TYPE, 1);
+    await ageSeqs([later.seq]);
+    await deliverAvailable(db, async () => undefined, terminate);
+    const advanced = await forceAdvancePackage(
+      db,
+      session,
+      installed.id,
+      TENANT_B,
+      blankEvidence(),
+      terminate,
+    );
+    assert.equal(advanced.watermarkSeq, covered.seq);
+    await retainLog(db);
+    assert.equal((await outboxSeqs(db)).includes(covered.seq), true);
+    assert.equal((await outboxSeqs(db)).includes(later.seq), true);
+    await exportPackage(db, session, installed.id, TENANT_B, blankEvidence(), terminate);
+    const released = await forceAdvancePackage(
+      db,
+      session,
+      installed.id,
+      TENANT_B,
+      blankEvidence(),
+      terminate,
+    );
+    assert.equal(released.watermarkSeq, later.seq);
+    await retainLog(db);
+    const remaining = await outboxSeqs(db);
+    assert.equal(remaining.includes(covered.seq), false);
+    assert.equal(remaining.includes(later.seq), true);
   } finally {
     await db.destroy();
   }
@@ -442,6 +604,27 @@ test('enablement routes use the envelope and do not widen grants', async () => {
     assert.equal(refusal.code, 'FORBIDDEN');
     assert.match(refusal.next_step, /export/i);
     assert.equal(await watermark(db, 'fixture_grant', TENANT_A), before);
+
+    const disabled = await handleKernelRequest(
+      request('/kernel/package-enablement', { packageId: 'fixture_grant', enabled: false }),
+      tenantCtx,
+    );
+    assert.equal(disabled.status, 200);
+    const exported = await handleKernelRequest(
+      request('/kernel/package-export', { packageId: 'fixture_grant', tenantId: TENANT_A }),
+      ctx,
+    );
+    assert.equal(exported.status, 200);
+    const advanced = await handleKernelRequest(
+      request('/kernel/package-force-advance', { packageId: 'fixture_grant', tenantId: TENANT_A }),
+      ctx,
+    );
+    assert.equal(advanced.status, 200);
+    const advancedBody = await advanced.json() as Record<string, unknown>;
+    assert.deepEqual(Object.keys(advancedBody).sort(), ['packageId', 'tenantId', 'watermarkSeq']);
+    assert.equal(advancedBody.packageId, 'fixture_grant');
+    assert.equal(advancedBody.tenantId, TENANT_A);
+    assert.equal(advancedBody.enabled, undefined);
 
     const app = new pg.Client({ connectionString: DIRECT });
     app.on('error', () => undefined);

@@ -25,7 +25,6 @@ CREATE TABLE kernel.package (
   subscription_id uuid NOT NULL UNIQUE REFERENCES kernel.subscription (id),
   requires jsonb NOT NULL,
   optional_requires jsonb NOT NULL,
-  exported_at timestamptz,
   installed_at timestamptz NOT NULL DEFAULT clock_timestamp(),
   CONSTRAINT package_id CHECK (id ~ '^[a-z][a-z0-9_]{0,40}$'),
   CONSTRAINT package_version CHECK (version ~ '^[0-9]+\.[0-9]+\.[0-9]+$'),
@@ -39,7 +38,8 @@ REVOKE ALL ON TABLE kernel.package FROM PUBLIC;
 GRANT SELECT, INSERT, UPDATE ON TABLE kernel.package TO plerni_app;
 
 -- One watermark per tenant. released_at drops it out of the retention minimum.
--- That column is set only after the package export is recorded.
+-- That happens only when this tenant's export covers the installation cursor.
+-- exported_through_seq is that boundary. A later backlog needs a new export.
 CREATE TABLE kernel.package_enablement (
   package_id text NOT NULL REFERENCES kernel.package (id),
   tenant_id uuid NOT NULL REFERENCES kernel.tenants (id),
@@ -47,9 +47,19 @@ CREATE TABLE kernel.package_enablement (
   watermark_seq bigint NOT NULL,
   held_since timestamptz NOT NULL DEFAULT clock_timestamp(),
   released_at timestamptz,
+  exported_through_seq bigint,
+  exported_at timestamptz,
   PRIMARY KEY (package_id, tenant_id),
   CONSTRAINT enablement_watermark_nonnegative CHECK (watermark_seq >= 0),
-  CONSTRAINT enablement_release CHECK (released_at IS NULL OR enabled = false)
+  CONSTRAINT enablement_release CHECK (released_at IS NULL OR enabled = false),
+  CONSTRAINT enablement_export CHECK (
+    (exported_through_seq IS NULL AND exported_at IS NULL)
+    OR (
+      exported_through_seq IS NOT NULL
+      AND exported_through_seq >= 0
+      AND exported_at IS NOT NULL
+    )
+  )
 );
 
 REVOKE ALL ON TABLE kernel.package_enablement FROM PUBLIC;

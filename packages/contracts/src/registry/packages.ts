@@ -54,10 +54,13 @@ export const packageEnablementResponseSchema = z.strictObject({
 
 export const packageExportRequestSchema = z.strictObject({
   packageId: z.string().regex(PACKAGE_ID),
+  tenantId: z.string().regex(UUID),
 });
 
 export const packageExportResponseSchema = z.strictObject({
   packageId: z.string().regex(PACKAGE_ID),
+  tenantId: z.string().regex(UUID),
+  exportedThroughSeq: z.string().regex(SEQ),
   exportedAt: z.iso.datetime(),
 });
 

@@ -54,7 +54,6 @@ export interface Database {
     subscription_id: string;
     requires: unknown;
     optional_requires: unknown;
-    exported_at: Date | null;
     installed_at: Date;
   };
   package_enablement: {
@@ -64,6 +63,8 @@ export interface Database {
     watermark_seq: string;
     held_since: Date;
     released_at: Date | null;
+    exported_through_seq: string | null;
+    exported_at: Date | null;
   };
   quota_warning: {
     id: string;

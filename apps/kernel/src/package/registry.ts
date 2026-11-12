@@ -63,6 +63,8 @@ export interface EnablementRecord {
 
 export interface ExportRecord {
   packageId: string;
+  tenantId: string;
+  exportedThroughSeq: string;
   exportedAt: Date;
 }
 
@@ -76,7 +78,6 @@ interface PackageRow {
   digest: string;
   subscription_id: string;
   requires: unknown;
-  exported_at: Date | null;
 }
 
 function postgresCode(error: unknown): string | undefined {
@@ -138,8 +139,7 @@ async function readPackage(trx: Transaction<Database>, id: string): Promise<Pack
            version,
            digest,
            subscription_id::text AS subscription_id,
-           requires,
-           exported_at
+           requires
     FROM kernel.package
     WHERE id = ${id}`.execute(trx);
   return result.rows[0] ?? null;
@@ -249,8 +249,7 @@ export async function setPackageEnabled(
              version,
              digest,
              subscription_id::text AS subscription_id,
-             requires,
-             exported_at
+             requires
       FROM kernel.package
       WHERE id = ${packageId}
       FOR UPDATE`.execute(trx);
@@ -314,21 +313,36 @@ export async function exportPackage(
   db: Kysely<Database>,
   session: SessionTenant,
   packageId: string,
+  tenantId: string,
   evidence: HygieneEvidence,
   terminateBackend: (pid: number) => Promise<void>,
 ): Promise<ExportRecord> {
   if (!PLUGIN_ID.test(packageId)) throw new PackageInputError();
+  assertUuid(tenantId);
   return withTenant(db, session.tenantId, evidence, terminateBackend, async (trx) => {
     await assertTenantContext(trx);
     await requireOperator(trx, session);
-    const updated = await sql<{ exported_at: Date }>`
-      UPDATE kernel.package
-      SET exported_at = COALESCE(exported_at, clock_timestamp())
-      WHERE id = ${packageId}
-      RETURNING exported_at`.execute(trx);
+    const pkg = await sql<{ id: string }>`
+      SELECT id FROM kernel.package WHERE id = ${packageId} FOR UPDATE`.execute(trx);
+    if (!pkg.rows[0]) throw new PackageNotFoundError();
+    const updated = await sql<{ exported_through_seq: string; exported_at: Date }>`
+      UPDATE kernel.package_enablement AS e
+      SET exported_through_seq = GREATEST(COALESCE(e.exported_through_seq, s.last_seq), s.last_seq),
+          exported_at = clock_timestamp()
+      FROM kernel.package AS p
+      JOIN kernel.subscription AS s ON s.id = p.subscription_id
+      WHERE e.package_id = p.id
+        AND p.id = ${packageId}
+        AND e.tenant_id = ${tenantId}::uuid
+      RETURNING e.exported_through_seq::text AS exported_through_seq, e.exported_at`.execute(trx);
     const row = updated.rows[0];
-    if (!row) throw new PackageNotFoundError();
-    return { packageId, exportedAt: row.exported_at };
+    if (!row) throw new EnablementNotFoundError();
+    return {
+      packageId,
+      tenantId,
+      exportedThroughSeq: row.exported_through_seq,
+      exportedAt: row.exported_at,
+    };
   });
 }
 
@@ -345,16 +359,23 @@ export async function forceAdvancePackage(
   return withTenant(db, session.tenantId, evidence, terminateBackend, async (trx) => {
     await assertTenantContext(trx);
     await requireOperator(trx, session);
-    const pkg = await sql<{ exported_at: Date | null; subscription_id: string }>`
-      SELECT exported_at, subscription_id::text AS subscription_id
+    const pkg = await sql<{ subscription_id: string }>`
+      SELECT subscription_id::text AS subscription_id
       FROM kernel.package
       WHERE id = ${packageId}
       FOR UPDATE`.execute(trx);
     const header = pkg.rows[0];
     if (!header) throw new PackageNotFoundError();
-    if (!header.exported_at) throw new ExportRequiredError();
-    const held = await sql<{ enabled: boolean; watermark_seq: string; released_at: Date | null }>`
-      SELECT enabled, watermark_seq::text AS watermark_seq, released_at
+    const held = await sql<{
+      enabled: boolean;
+      watermark_seq: string;
+      released_at: Date | null;
+      exported_through_seq: string | null;
+    }>`
+      SELECT enabled,
+             watermark_seq::text AS watermark_seq,
+             released_at,
+             exported_through_seq::text AS exported_through_seq
       FROM kernel.package_enablement
       WHERE package_id = ${packageId}
         AND tenant_id = ${tenantId}::uuid
@@ -364,17 +385,21 @@ export async function forceAdvancePackage(
     if (row.released_at) {
       return { packageId, tenantId, enabled: row.enabled, watermarkSeq: row.watermark_seq };
     }
+    if (row.exported_through_seq === null) throw new ExportRequiredError();
     if (row.enabled) throw new PackageHoldError();
+    if (BigInt(row.watermark_seq) > BigInt(row.exported_through_seq)) throw new ExportRequiredError();
     const cursor = await sql<{ last_seq: string }>`
       SELECT last_seq::text AS last_seq
       FROM kernel.subscription
       WHERE id = ${header.subscription_id}::uuid`.execute(trx);
-    const target = cursor.rows[0]?.last_seq;
-    if (target === undefined) throw new Error('installation cursor missing');
+    const cursorSeq = cursor.rows[0]?.last_seq;
+    if (cursorSeq === undefined) throw new Error('installation cursor missing');
+    const covered = BigInt(cursorSeq) <= BigInt(row.exported_through_seq);
+    const target = covered ? cursorSeq : row.exported_through_seq;
     const advanced = await sql<{ enabled: boolean; watermark_seq: string }>`
       UPDATE kernel.package_enablement
       SET watermark_seq = GREATEST(watermark_seq, ${target}::bigint),
-          released_at = clock_timestamp()
+          released_at = CASE WHEN ${covered} THEN clock_timestamp() ELSE released_at END
       WHERE package_id = ${packageId}
         AND tenant_id = ${tenantId}::uuid
         AND enabled = false

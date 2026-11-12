@@ -40,7 +40,7 @@ export interface PackageHttp {
     enabled: boolean,
     session: SessionTenant,
   ) => Promise<EnablementRecord>;
-  exportPackage: (packageId: string, session: SessionTenant) => Promise<ExportRecord>;
+  exportPackage: (packageId: string, tenantId: string, session: SessionTenant) => Promise<ExportRecord>;
   forceAdvancePackage: (
     packageId: string,
     tenantId: string,
@@ -129,8 +129,13 @@ export async function handlePackageRequest(
     if (operationId === 'kernel.package.export') {
       const parsed = packageExportRequestSchema.safeParse(payload);
       if (!parsed.success) return fail(rejectedBody());
-      const record = await http.exportPackage(parsed.data.packageId, session);
-      const body = { packageId: record.packageId, exportedAt: record.exportedAt.toISOString() };
+      const record = await http.exportPackage(parsed.data.packageId, parsed.data.tenantId, session);
+      const body = {
+        packageId: record.packageId,
+        tenantId: record.tenantId,
+        exportedThroughSeq: record.exportedThroughSeq,
+        exportedAt: record.exportedAt.toISOString(),
+      };
       const checked = packageExportResponseSchema.safeParse(body);
       if (!checked.success) return fail(internalFailure());
       return json(200, checked.data);
@@ -139,7 +144,11 @@ export async function handlePackageRequest(
       const parsed = packageForceAdvanceRequestSchema.safeParse(payload);
       if (!parsed.success) return fail(rejectedBody());
       const record = await http.forceAdvancePackage(parsed.data.packageId, parsed.data.tenantId, session);
-      const checked = packageForceAdvanceResponseSchema.safeParse(record);
+      const checked = packageForceAdvanceResponseSchema.safeParse({
+        packageId: record.packageId,
+        tenantId: record.tenantId,
+        watermarkSeq: record.watermarkSeq,
+      });
       if (!checked.success) return fail(internalFailure());
       return json(200, checked.data);
     }
@@ -170,10 +179,11 @@ export function packageHttp(deps: {
       deps.evidence,
       deps.terminateBackend,
     ),
-    exportPackage: (packageId, session) => exportPackage(
+    exportPackage: (packageId, tenantId, session) => exportPackage(
       deps.db,
       session,
       packageId,
+      tenantId,
       deps.evidence,
       deps.terminateBackend,
     ),
